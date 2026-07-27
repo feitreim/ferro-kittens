@@ -54,6 +54,10 @@ use cuda_device::{
     DisjointSlice, cluster_launch, cuda_module, kernel, launch_contract, thread, warp,
 };
 
+// Host side: the launcher's error type, and the benchmark's size and clock.
+use crate::bench::{Shape, Timings, time};
+use std::error::Error;
+
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
@@ -291,20 +295,19 @@ pub mod kernels {
     /// of the `cta_group::2` allocator instructions say the same thing about
     /// who issues them: *one full warp in each peer CTA*. So both CTAs
     /// allocate, both relinquish and both deallocate, and each reads the
-    /// address out of its own staging word — the collective writes one into
-    /// each. That is a hardware fact about a cluster accumulator and belongs
-    /// in `tmem.rs` rather than in every kernel that wants one.
+    /// address out of its own staging word — the collective writes one to
+    /// each. All of that is a hardware fact about a cluster accumulator and
+    /// belongs in `tmem.rs` rather than in every kernel that wants one.
     ///
-    /// This file used to issue all three from rank 0 alone, with the peer
-    /// reading the leader's address over distributed shared memory, and #40 is
-    /// how that surfaced: a single launch was always fine, and the *second*
-    /// launch of the same kernel in one process hung forever. A CTA that
-    /// exits without relinquishing its allocation permit, or without taking
-    /// its half in the pair's dealloc, leaves the SM's allocator short, and
-    /// the next CTA scheduled there waits in `tcgen05.alloc` for columns that
-    /// are never coming back. No one-shot correctness run can see that, which
-    /// is the general shape of the thing: launching twice is a strictly
-    /// stronger claim than launching once, and until #40 nothing made it.
+    /// This file used to issue all three from rank 0 alone, and #40 is how
+    /// that surfaced: a single launch was always fine, and the *second* launch
+    /// of the same kernel in a process hung forever inside `tcgen05.alloc`.
+    /// A CTA that never relinquishes its allocation permit, or never
+    /// participates in the pair's dealloc, leaves the SM's allocator short by
+    /// its half, and the next CTA scheduled there waits on columns that are
+    /// never coming back. Nothing a one-shot correctness run does can see it,
+    /// which is the general shape of the thing: launching twice is a different
+    /// claim from launching once.
     ///
     /// The `cluster_sync` here is load-bearing twice over: it publishes the
     /// staging word, and it is the point after which the peer's TMA may write
@@ -362,13 +365,13 @@ fn to_bf16(value: f32) -> u16 {
     (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16
 }
 
-/// A `[rows, K]` bf16 operand as the packed `u32` words a device buffer holds,
+/// A `[rows, k]` bf16 operand as the packed `u32` words a device buffer holds,
 /// K contiguous — which is what makes both operands K-major and the MMA
 /// transpose-free.
-fn stage(rows: usize, value: impl Fn(usize, usize) -> f32) -> Vec<u32> {
-    let mut staged = Vec::with_capacity(rows * K / 2);
+fn stage(rows: usize, k: usize, value: impl Fn(usize, usize) -> f32) -> Vec<u32> {
+    let mut staged = Vec::with_capacity(rows * k / 2);
     for row in 0..rows {
-        for pair in 0..K / 2 {
+        for pair in 0..k / 2 {
             let (low, high) = (value(row, 2 * pair), value(row, 2 * pair + 1));
             staged.push(to_bf16(low) as u32 | ((to_bf16(high) as u32) << 16));
         }
@@ -376,77 +379,150 @@ fn stage(rows: usize, value: impl Fn(usize, usize) -> f32) -> Vec<u32> {
     staged
 }
 
-/// Launch the kernel over `[M, K] · [N, K]ᵀ` and compare every element against
-/// a CPU reference, returning a one-line note on success.
+/// Blocks a `[m, n]` output takes: one CTA pair per `2·BLOCK_M` by `BLOCK_N`
+/// tile of `C`. The benchmark prints it, because at the small end of a size
+/// sweep this number and not the arithmetic is what the run is bound by.
+pub fn grid(m: usize, n: usize) -> u32 {
+    2 * (m / (2 * BLOCK_M) * (n / BLOCK_N)) as u32
+}
+
+/// The `then` a run that is only being checked passes: nothing follows the
+/// comparison.
+fn nothing_after(
+    _: &cuda_core::CudaStream,
+    _: &mut dyn FnMut() -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+/// Launch `[m, k] · [n, k]ᵀ`, compare every element of `C` against a CPU
+/// reference, and only then hand the launch to `then`.
+///
+/// That order is the whole design: `then` — [`crate::bench::time`] for a timed
+/// run — is unreachable from a launch whose output was wrong, so no throughput
+/// figure can be printed for a kernel that did not compute. It receives the
+/// launch as a closure over buffers that are already staged, so a repeat costs
+/// a launch and nothing else.
 ///
 /// The two operands differ only in their extents, and neither states a box:
 /// [`kittens::global::GlobalLayout::tensor_map`] takes the tile the kernel
 /// loads into and reads the box, the swizzle and the data type off it. `A` is
-/// `[K, M]` in the driver's fastest-first dimension order and `B` is `[K, N]`,
+/// `[k, m]` in the driver's fastest-first dimension order and `B` is `[k, n]`,
 /// which is the same order the kernel gives its
 /// [`SharedTile::tma_load_2d`] coordinates in.
-pub fn check(
+fn run<T>(
     context: &std::sync::Arc<cuda_core::CudaContext>,
-) -> Result<String, Box<dyn std::error::Error>> {
+    m: usize,
+    n: usize,
+    k: usize,
+    then: impl FnOnce(
+        &cuda_core::CudaStream,
+        &mut dyn FnMut() -> Result<(), Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<(String, T), Box<dyn Error>> {
     use cuda_core::{DeviceBuffer, LaunchConfig1D};
     use kittens::global::GlobalLayout;
+
+    // The tiling is the constraint on what sizes exist: a cluster owns a whole
+    // `2·BLOCK_M` by `BLOCK_N` tile and a stage is a whole `BLOCK_K`, and the
+    // kernel bounds-checks none of it. A size that does not divide is rejected
+    // rather than launched into somebody else's memory.
+    if m % (2 * BLOCK_M) != 0 || n % BLOCK_N != 0 || k % BLOCK_K != 0 {
+        return Err(format!(
+            "{m}x{n}x{k} does not divide the {}x{BLOCK_N}x{BLOCK_K} tiling",
+            2 * BLOCK_M
+        )
+        .into());
+    }
 
     let stream = context.default_stream();
     // SAFETY: the artifact is this crate's own, and `gemm_cg2` is the only
     // entry point in it — the ABI the contract declares is the one compiled.
     let module = unsafe { kernels::load(context)? };
 
-    let a = DeviceBuffer::from_host(&stream, &stage(M, a_value))?;
-    let b = DeviceBuffer::from_host(&stream, &stage(N, b_value))?;
+    let a = DeviceBuffer::from_host(&stream, &stage(m, k, a_value))?;
+    let b = DeviceBuffer::from_host(&stream, &stage(n, k, b_value))?;
     // SAFETY: both buffers outlive every launch consuming their maps below.
     let (a_layout, b_layout) = unsafe {
         (
-            GlobalLayout::<Bf16, 2>::packed(a.cu_deviceptr(), [K, M]),
-            GlobalLayout::<Bf16, 2>::packed(b.cu_deviceptr(), [K, N]),
+            GlobalLayout::<Bf16, 2>::packed(a.cu_deviceptr(), [k, m]),
+            GlobalLayout::<Bf16, 2>::packed(b.cu_deviceptr(), [k, n]),
         )
     };
     let a_map = a_layout.tensor_map::<ATile>(&stream)?;
     let b_map = b_layout.tensor_map::<BTile>(&stream)?;
 
-    let mut c = DeviceBuffer::<f32>::zeroed(&stream, M * N)?;
-    let (tiles_m, tiles_n) = (M / (2 * BLOCK_M), N / BLOCK_N);
+    let mut c = DeviceBuffer::<f32>::zeroed(&stream, m * n)?;
     let launch = module.prepare_gemm_cg2(LaunchConfig1D::new(
-        (2 * tiles_m * tiles_n) as u32,
+        grid(m, n),
         THREADS,
         SHARED_BYTES as u32,
     ))?;
-    unsafe {
-        module.gemm_cg2(
-            &stream,
-            &launch,
-            a_map.as_ptr(),
-            b_map.as_ptr(),
-            tiles_n as u32,
-            (K / BLOCK_K) as u32,
-            N as u32,
-            &mut c,
-        )?
+    let tiles_n = (n / BLOCK_N) as u32;
+    let launch_once = |c: &mut DeviceBuffer<f32>| -> Result<(), Box<dyn Error>> {
+        // SAFETY: both maps describe live buffers covering the walk the grid
+        // above takes, and `c` holds `n` columns for every row of it.
+        unsafe {
+            module.gemm_cg2(
+                &stream,
+                &launch,
+                a_map.as_ptr(),
+                b_map.as_ptr(),
+                tiles_n,
+                (k / BLOCK_K) as u32,
+                n as u32,
+                c,
+            )?
+        };
+        Ok(())
     };
+    launch_once(&mut c)?;
 
+    // `a_value` repeats every 7 rows and `b_value` every 5 columns, so the
+    // reference has 35 distinct dot products at any size and the naive
+    // `O(m·n·k)` form is pure waste — minutes of host time at the sizes the
+    // benchmark reaches, for the same 35 numbers. Every element of `C` is
+    // still compared against its own expected value, in the same summation
+    // order, so the comparison is the one it always was.
+    let reference: Vec<f32> = (0..7 * 5)
+        .map(|cell| {
+            (0..k)
+                .map(|depth| a_value(cell / 5, depth) * b_value(cell % 5, depth))
+                .sum()
+        })
+        .collect();
     let observed = c.to_host_vec(&stream)?;
-    let mut wrong = Vec::new();
-    for row in 0..M {
-        for column in 0..N {
-            let expected: f32 = (0..K).map(|k| a_value(row, k) * b_value(column, k)).sum();
-            let value = observed[row * N + column];
-            if value != expected && wrong.len() < 8 {
-                wrong.push(format!("C[{row}, {column}] = {value}, want {expected}"));
+    let (mut wrong, mut sample) = (0usize, Vec::new());
+    for row in 0..m {
+        for column in 0..n {
+            let expected = reference[(row % 7) * 5 + column % 5];
+            let value = observed[row * n + column];
+            if value != expected {
+                wrong += 1;
+                if sample.len() < 8 {
+                    sample.push(format!("C[{row}, {column}] = {value}, want {expected}"));
+                }
             }
         }
     }
-    if !wrong.is_empty() {
-        return Err(format!(
-            "{} of {} elements wrong: {}",
-            wrong.len(),
-            M * N,
-            wrong.join("; ")
-        )
-        .into());
+    if wrong > 0 {
+        return Err(format!("{wrong} of {} elements wrong: {}", m * n, sample.join("; ")).into());
     }
-    Ok(format!("{M}x{N}x{K} exact"))
+
+    let after = then(&stream, &mut || launch_once(&mut c))?;
+    Ok((format!("{m}x{n}x{k} exact"), after))
+}
+
+/// The correctness run: one size, checked, nothing timed.
+pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String, Box<dyn Error>> {
+    run(context, M, N, K, nothing_after).map(|(note, ())| note)
+}
+
+/// The benchmark's entry point: the same check at `shape`, and then the same
+/// launch timed.
+pub fn bench(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    shape: Shape,
+) -> Result<Timings, Box<dyn Error>> {
+    run(context, shape.m, shape.n, shape.k, time).map(|(_, timings)| timings)
 }

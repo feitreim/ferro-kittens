@@ -26,9 +26,13 @@
 //! `main` now prints the table and then runs every kernel that has one, so on
 //! a B200 this binary reports numbers and exits non-zero when they are wrong;
 //! off a GPU it degrades to the table it always printed.
+//!
+//! Pass `bench` and it says how *fast* the ones that run are instead — see
+//! [`bench`], which checks each size before it times it.
 
 use std::process::ExitCode;
 
+pub mod bench;
 pub mod gemm;
 pub mod softmax;
 
@@ -99,6 +103,13 @@ fn checks(
 }
 
 fn main() -> ExitCode {
+    // `cargo oxide run kittens-examples -- bench` (#40): the same kernels at
+    // several sizes, checked and then timed. It lives behind an argument rather
+    // than in the default path so the correctness run stays a few seconds.
+    if std::env::args().nth(1).as_deref() == Some("bench") {
+        return bench::main();
+    }
+
     println!(
         "{:<16}{:<38}{:>8}{:>14}",
         "kernel", "status", "threads", "shared"

@@ -33,6 +33,14 @@ them, and closing it took nothing but the store: `SharedTile::tma_store` walks
 the same boxes `tma_load` does, and `tma_store_commit` / `tma_store_wait::<0>()`
 are the completion side.
 
+`modal run modal_app.py::bench` is that claim with a clock on it (#40): both
+kernels that run, at several sizes each, every one checked against the same CPU
+reference *before* it is timed — there is no path through `bench.rs` that prints
+a throughput figure for a launch it did not verify. The metric follows what the
+kernel is bound by, TFLOP/s for the GEMM and GB/s for the memory-bound softmax,
+and the sizes are picked to cross a regime rather than to be large, so what the
+table shows is the shape of a curve and not one headline number.
+
 Nothing on the remaining lists is arithmetic, and nothing on them is a mover.
 #5 and #6 between them closed every elementwise op and every reduction the four
 kernels asked for and **#38** closed the scalar-operand forms they left behind;

@@ -12,6 +12,7 @@ Local usage:
     modal run modal_app.py::regcount  # ptxas -v register/spill table, no GPU
     modal run modal_app.py            # the device tests, on a B200
     modal run modal_app.py::examples  # the examples crate's kernels, on a B200
+    modal run modal_app.py::bench     # those kernels timed at several sizes
     modal run modal_app.py::doctor    # env / GPU sanity check
 """
 
@@ -204,6 +205,35 @@ def examples() -> None:
     behaves, but that a whole kernel written against the library computes."""
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
     _run(["cargo", "oxide", "run", "kittens-examples"], cwd=EXAMPLES_DIR)
+
+
+@app.function(gpu=DEFAULT_GPU, timeout=1800)
+def bench() -> None:
+    """The same kernels, timed at several sizes, reporting achieved throughput.
+
+    Separate from `examples` so the correctness path stays a few seconds: this
+    one stages problems up to 8192^3 and launches each of them dozens of times.
+    Every size is checked against the same CPU reference `examples` uses before
+    it is timed at all, so a throughput figure here always belongs to a run that
+    computed the right answer -- the harness has no path that prints one for a
+    launch it did not verify.
+
+    The clock is CUDA events either side of the launch, not wall clock around
+    the driver call, and the headline per size is the minimum over the timed
+    launches, with the median and maximum printed beside it. Each example states
+    whether it is compute- or memory-bound and the table prints the matching
+    metric: a FLOP/s figure for a normalization kernel would be misleading, so
+    the harness carries the distinction rather than assuming one.
+    """
+    _run(
+        [
+            "nvidia-smi",
+            "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
+            "--format=csv",
+        ],
+        cwd="/",
+    )
+    _run(["cargo", "oxide", "run", "kittens-examples", "--", "bench"], cwd=EXAMPLES_DIR)
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=600)
