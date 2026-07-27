@@ -99,9 +99,10 @@ section 2.
 Both directions of TK's `tensor_to_register.cuh`: TMEM → register
 (`TmemTile::fragment`, `fragment_tile`, LDTM) and register → TMEM
 (`TmemTile::store_fragment`, `store_fragment_tile`, `tmem::store_wait`, STTM).
-Both sides are `16x256b` at `[16, 16]` granularity, so composing a larger
-shape stays the caller's on either side. The store leaves its wait to the
-caller, since a store's registers are consumed at issue.
+Both sides are `16x256b` at `[16, 16]` granularity, with `TmemTile::tile` and
+`TmemTile::store_tile` composing a whole `[M, N]` band out of them (#22). The
+store leaves its wait to the caller, since a store's registers are consumed at
+issue.
 
 ### 2.1a Shared ↔ register — done (#21)
 
@@ -112,9 +113,9 @@ host-testable and the two cannot drift. Missed by this inventory until the
 examples crate (#18) hit it: a kernel whose input is not an MMA operand had no
 way to reach registers at all.
 
-Same `[16, 16]` granularity as 2.1, and the same restriction as every other
-`SwizzledChunks` user — one swizzle subtile of width (#25). Composing larger
-shapes on either side is #22.
+Same `[16, 16]` granularity as 2.1, composed into a band by `ldst::load_tile`
+and `ldst::store_tile` (#22) out of the same helpers the TMEM side uses, at any
+width the cursor can describe (#25).
 
 ### 2.2 No global ↔ register path
 

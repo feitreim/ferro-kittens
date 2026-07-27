@@ -18,12 +18,8 @@
 //!   they are loaded once, shared by every row, and belong in shared memory.
 //!   With no `SharedVec` they would be re-read from global by every thread.
 //!
-//! Blocked on: **#13** (`SharedVec` and its TMA path), **#22**
-//! (`ldst::load_tile`/`store_tile`, the whole-tile forms of the
-//! per-`[16, 16]`-block movers — the cursor underneath them spans this
-//! 128-wide tile since **#25** and `load_fragment` exists since **#21**, so
-//! what is left is composition, not addressing), and one leftover with no
-//! issue of its own — **scalar broadcast ops**. #5 listed `scale`/`shift` on
+//! Blocked on: **#13** (`SharedVec` and its TMA path), and one leftover with
+//! no issue of its own — **scalar broadcast ops**. #5 listed `scale`/`shift` on
 //! `RegTile` and `RegVec` and a free `rsqrt(f32)`, and shipped the op
 //! mechanism without them, so a per-row or per-tile *constant* still has to be
 //! splatted into a whole vector to be combined with one.
@@ -111,7 +107,7 @@ pub mod kernels {
             let g: Columns = gamma.to_registers(lane);
             let b: Columns = beta.to_registers(lane);
 
-            let x: Band = load_tile(tile, row_base as usize, 0, lane);
+            let x: Band = load_tile(tile.chunk_writer(), row_base, 0, lane);
 
             // The algorithm, in the real API — except `scale`/`shift`, the
             // scalar broadcasts #5 named and did not ship. Written the way
@@ -125,7 +121,7 @@ pub mod kernels {
                 .mul_col(g)
                 .add_col(b);
 
-            store_tile(tile, row_base, 0, lane, x);
+            store_tile(tile.chunk_writer(), row_base, 0, lane, x);
             // `store_tile` writes through the generic proxy and the TMA engine
             // reads through the async one, so the store side owes this fence
             // exactly as an MMA reading the same tile would.
@@ -171,7 +167,7 @@ pub mod kernels {
             loaded.wait(0);
             thread::sync_threads();
 
-            let x: Band = load_tile(tile, row_base as usize, 0, lane);
+            let x: Band = load_tile(tile.chunk_writer(), row_base, 0, lane);
 
             // `tile_sum` (#6) folds this warp's band to one f32, warp-uniform.
             //
@@ -186,7 +182,7 @@ pub mod kernels {
             let variance = block_reduce_sum(partials, x.mul(x).tile_sum()) * scale;
             let x = x.scale(rsqrt(variance + epsilon));
 
-            store_tile(tile, row_base, 0, lane, x);
+            store_tile(tile.chunk_writer(), row_base, 0, lane, x);
             // `store_tile` writes through the generic proxy and the TMA engine
             // reads through the async one, so the store side owes this fence
             // exactly as an MMA reading the same tile would.
