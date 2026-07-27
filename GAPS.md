@@ -94,13 +94,14 @@ section 2.
 
 ## 2. Missing data movement
 
-### 2.1 Register ↔ TMEM is one-directional
+### 2.1 Register ↔ TMEM — done (#10)
 
-We have TMEM → register (`TmemTile::fragment`, `fragment_tile`, LDTM). TK's
-`tensor_to_register.cuh` has both `load_async` and `store_async`; the STTM path
-(register → TMEM) is missing here. Needed for any kernel that seeds an
-accumulator, or that computes in registers and feeds the result back as an MMA
-accumulator instead of an operand. **~60 lines.**
+Both directions of TK's `tensor_to_register.cuh`: TMEM → register
+(`TmemTile::fragment`, `fragment_tile`, LDTM) and register → TMEM
+(`TmemTile::store_fragment`, `store_fragment_tile`, `tmem::store_wait`, STTM).
+Both sides are `16x256b` at `[16, 16]` granularity, so composing a larger
+shape stays the caller's on either side. The store leaves its wait to the
+caller, since a store's registers are consumed at issue.
 
 ### 2.2 No global ↔ register path
 
@@ -247,11 +248,12 @@ Missing from `prototype/`:
   harness over the type/layout cross product. We have 19 `#[cfg(test)]` unit
   tests, all of them pure coordinate and pointer math — they prove the crate is
   self-consistent, not that it agrees with silicon.
-- **Device tests cover three paths.** `device-tests/` (a separate kernel crate,
+- **Device tests cover four paths.** `device-tests/` (a separate kernel crate,
   run on a B200 through `modal_app.py`) checks the SWIZZLE_128B round trip
   against the TMA engine, `BaseLdtm`'s fragment ownership map against a
-  position-encoding MMA at all three layout shapes, and the `stmatrix` store
-  path. Everything else — the phase-parity rules, the pipeline scaffold, the
+  position-encoding MMA at all three layout shapes, the `stmatrix` store path,
+  and STTM — as a register round trip through TMEM, and by restaging a probed
+  accumulator into a second column band and re-draining it. Everything else — the phase-parity rules, the pipeline scaffold, the
   cluster/multicast paths, the MMA walks beyond the single `M128_N64` the probe
   issues — is still verified only by downstream kernels being numerically
   correct.

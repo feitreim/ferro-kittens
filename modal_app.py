@@ -119,6 +119,10 @@ image = (
         # command tries to rebuild the project itself as a backend library.
         "cd /opt/warmup && LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs cargo oxide build warmup",
     )
+    # Lints. A layer of its own, after the expensive ones, so adding it leaves
+    # the shared backend-build layers cached. `RUSTUP_TOOLCHAIN` shadows
+    # rust-toolchain.toml, so the component list there does not reach here.
+    .run_commands(f"rustup component add clippy --toolchain {RUST_TOOLCHAIN}")
     # Live mounts (re-read each run; edits need no image rebuild). The harness
     # path-depends on the library, so both trees come along.
     .add_local_dir(str(Path(__file__).parent / "src"), f"{PROJECT_DIR}/src")
@@ -132,6 +136,15 @@ image = (
         str(Path(__file__).parent / "device-tests/Cargo.toml"),
         f"{PROJECT_DIR}/device-tests/Cargo.toml",
     )
+    # The examples crate: also standalone, also path-depends on the library.
+    .add_local_dir(
+        str(Path(__file__).parent / "examples/src"),
+        f"{PROJECT_DIR}/examples/src",
+    )
+    .add_local_file(
+        str(Path(__file__).parent / "examples/Cargo.toml"),
+        f"{PROJECT_DIR}/examples/Cargo.toml",
+    )
     .add_local_file(
         str(Path(__file__).parent / "rust-toolchain.toml"),
         f"{PROJECT_DIR}/rust-toolchain.toml",
@@ -141,6 +154,7 @@ image = (
 app = modal.App("ferro-kittens", image=image)
 
 HARNESS_DIR = f"{PROJECT_DIR}/device-tests"
+EXAMPLES_DIR = f"{PROJECT_DIR}/examples"
 # The driver stub satisfies cargo-oxide's link step where there is no GPU.
 STUB_ENV = ["env", "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs"]
 
@@ -156,12 +170,20 @@ def build() -> None:
     cannot be checked off a CUDA box, `global.rs` needs cuda.h) and a full
     device build of the harness against the driver stub. Iterate compile errors
     here; the B200 function is for running, not for finding typos."""
-    _run(["cargo", "check", "--features", "host", "--all-targets"], cwd=PROJECT_DIR)
+    _run(["cargo", "clippy", "--features", "host", "--all-targets"], cwd=PROJECT_DIR)
     _run(["cargo", "test", "--features", "host"], cwd=PROJECT_DIR)
+    # The harness only typechecks where cuda.h is, so its lints live here too.
+    _run(["cargo", "clippy", "--all-targets"], cwd=HARNESS_DIR)
     # `build` (unlike `run`) does not auto-detect the GPU arch, and tcgen05
     # exists only on Blackwell -- pin it or the artifact fails to compile.
     _run([*STUB_ENV, "cargo", "oxide", "build", "device-tests", "--arch", "sm_100a"],
          cwd=HARNESS_DIR)
+    # The examples crate, same treatment. Only the kernels marked *compiles*
+    # are in the default feature set, so this is what keeps that claim honest:
+    # a post-monomorphization `const { assert!(..) }` in a tile shape is
+    # invisible to `cargo check` and shows up only in a real device build.
+    _run([*STUB_ENV, "cargo", "oxide", "build", "kittens-examples", "--arch", "sm_100a"],
+         cwd=EXAMPLES_DIR)
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=1800)
