@@ -3,9 +3,9 @@
 //! **Status: aspirational.** Excluded from the default build; read its gap
 //! list with `cargo check --features softmax`.
 //!
-//! This is the kernel #5 and #6 were filed for, and it is five lines long once
-//! they land. It was also the shortest possible demonstration of the hole
-//! underneath both of them — the library could neither get data *out* of a
+//! This is the kernel #5 and #6 were filed for, and it is four lines long now
+//! that both have landed. It was also the shortest possible demonstration of
+//! the hole underneath them — the library could neither get data *out* of a
 //! shared tile (#21) nor address one wider than a single swizzle atom (#25), so
 //! a kernel whose input is not an MMA operand could not start. Both are closed:
 //! [`kittens::ldst::load_fragment`] is the `ldmatrix` half of `ldst`, and
@@ -13,19 +13,16 @@
 //! at `COLUMNS = 128` this tile has a register ↔ shared path in both
 //! directions and the two movers below are the real API.
 //!
-//! Blocked on:
-//!
-//! - **#6** — `row_max` and `row_sum` on `RegTile`. The whole algorithm is four
-//!   lines and two of them do not exist.
-//! - **#9** — the TMA store path, so the result can leave.
+//! Blocked on **#9**, and nothing else: the TMA store path, so the result can
+//! leave. That is the whole list — this kernel went from five gaps to one.
 //!
 //! Not blocking, but visible: the movers are per-`[16, 16]`-block, so the band
 //! loop is written twice below (#22). It compiles — it is a cost, not a hole.
 //!
 //! Note what is *not* in that list: nothing about layouts, swizzles,
-//! semaphores, or the fragment map. Every gap here is an op or a mover, which
-//! is what makes this example worth writing — it says the missing surface is
-//! shallow and wide, not deep.
+//! semaphores, the fragment map, or the arithmetic. The one thing left is a
+//! mover, which is what makes this example worth writing — it says the missing
+//! surface is shallow and wide, not deep.
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
@@ -169,8 +166,11 @@ pub mod kernels {
 
             let x = load_band(tile, row_base, lane);
 
-            // WANT (#6): the two reductions. Everything else in the algorithm
-            // is a `RegTile` op that exists (#5).
+            // The whole algorithm, in the real API. `row_max`/`row_sum` (#6)
+            // fold a thread's own 32 values and then the quad holding the rest
+            // of the row; the broadcasts back down each row are shuffle-free,
+            // because the fragment map already gives a thread every one of its
+            // rows' values.
             let x = x.sub_row(x.row_max()).exp2();
             let x = x.div_row(x.row_sum());
 

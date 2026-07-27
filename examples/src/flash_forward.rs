@@ -5,15 +5,6 @@
 //!
 //! Blocked on:
 //!
-//! - **#5** (generic map + standard elementwise set) — `RegTile` has no
-//!   `exp2`, no `sub_row`, no `div_row`, no `add_assign`. The softmax
-//!   numerator, the most characteristic line in the kernel, cannot be
-//!   written. `RegVec` has `exp2`; the tile does not, and there is no
-//!   mechanism to lift one to the other.
-//! - **#6** (reductions) — `RegTile` has no `row_max`/`row_sum`. `quad_max`
-//!   and `quad_sum` are the *second* half of a row reduction, the fold across
-//!   a quad; the first half, folding a thread's own values together, is
-//!   open-coded per kernel.
 //! - **#7** (masking) — no `make_causal`. And #7 as filed describes TK's
 //!   signature, which takes no coordinate origin. A flash kernel masks a
 //!   `[queries, keys]` band whose diagonal sits at `query_base - key_base`,
@@ -21,17 +12,21 @@
 //! - **#11** (global ↔ register) — the epilogue writes fp32 out of registers.
 //!   Today that means packing to bf16, `stmatrix` into a shared tile, and a
 //!   TMA store (#9): a precision loss the epilogue never asked for.
+//! - **#31, and one leftover of #5** — `RegTile::add_assign`, and the scalar
+//!   broadcast `scale`. #5 shipped the map mechanism and the vector/vector
+//!   forms; a tile combined with a bare `f32`, and any in-place form of a
+//!   tile op, are still missing. This kernel's `[32, 128]` output accumulator
+//!   is exactly the shape #31 measured the by-value cost on.
 //!
-//! Plus three things with no open issue behind them, named at their call
-//! sites below:
+//! Plus three things named at their call sites below:
 //!
-//! - **`TmemTile::drain`** — a whole-band TMEM read. `fragment_tile` returns
-//!   `[16, 16]`, so every kernel wanting a `[32, N]` band writes the same
-//!   block-composition loop (see `gemm.rs`, and `fragment_probe` in
+//! - **#22, `TmemTile::drain`** — a whole-band TMEM read. `fragment_tile`
+//!   returns `[16, 16]`, so every kernel wanting a `[32, N]` band writes the
+//!   same block-composition loop (see `gemm.rs`, and `fragment_probe` in
 //!   `device-tests`).
-//! - **`ldst::store_tile`** — the mirror on the shared side.
+//! - **#22, `ldst::store_tile`** — the mirror on the shared side.
 //!   [`kittens::ldst::store_fragment`] is per-`[16, 16]`-block too.
-//! - **the `RegTile` shape set is closed.** `BaseLdtm` implements
+//! - **#23, the `RegTile` shape set is closed.** `BaseLdtm` implements
 //!   `FragmentLayout` for `(16,16)`, `(32,32)` and `(32,128)` only, because
 //!   each shape is a line of `base_ldtm_shapes!` *inside* `src/reg.rs`. This
 //!   kernel's score band is `[32, 64]`, and an out-of-tree kernel has no way
@@ -86,7 +81,7 @@ type Output = TmemTile<QUERIES, HEAD>;
 
 /// One warp's band of the score tile.
 ///
-/// GAP (no open issue): `BaseLdtm` has no `FragmentLayout<32, 64>` impl. The
+/// GAP (#23): `BaseLdtm` has no `FragmentLayout<32, 64>` impl. The
 /// implemented shapes are a `base_ldtm_shapes!` invocation inside
 /// `src/reg.rs`, so the set of tiles a kernel may hold is fixed by the
 /// library and this line does not compile out of tree. Dodging
@@ -199,7 +194,7 @@ pub mod kernels {
                 }
                 scored.wait(block & 1);
 
-                // WANT (no open issue): a whole-band TMEM read.
+                // WANT (#22): a whole-band TMEM read.
                 //
                 //     TmemTile::<R, C>::drain::<M, N, L>(row, column) -> RegTile<M, N, L>
                 //
@@ -215,22 +210,23 @@ pub mod kernels {
                 // to delete, in the one place every attention kernel needs it.
                 s.make_causal_at(lane, query_base + 32 * warp_id, key_base, f32::NEG_INFINITY);
 
-                // WANT (#5, #6): the softmax numerator. Five lines of paper,
-                // not one of which `RegTile` can say today.
-                s.scale(scale * LOG2E);
+                // The softmax numerator, in the real API (#5, #6) — except
+                // `scale`, the scalar broadcast #5 named and did not ship.
+                // `row_max`/`row_sum` are both halves of the reduction now:
+                // the thread's own 16 values, then the quad.
+                let s = s.scale(scale * LOG2E);
                 let row_max = s.row_max();
                 online_rescale(&mut running_max, row_max, &mut running_sum, &mut out_acc);
-                s.sub_row(running_max);
-                s.exp2();
+                let s = s.sub_row(running_max).exp2();
                 running_sum.add_assign(s.row_sum());
 
-                // WANT (no open issue): a whole-tile register → shared store,
-                // the mirror of the drain above. `store_fragment` is
+                // WANT (#22): a whole-tile register → shared store, the
+                // mirror of the drain above. `store_fragment` is
                 // per-`[16, 16]`-block and takes the block's `(row, column)`
                 // apart from the fragment, so staging a band is a second
-                // hand-written composition loop. Taking the tile rather than
-                // its [`kittens::shared::SwizzledChunks`] also lets the store
-                // span stacked subtiles, which the chunk cursor cannot.
+                // hand-written composition loop. Only the composition is
+                // missing: #25 gave the cursor underneath it stacked
+                // subtiles, so the addressing already spans any width.
                 store_tile(p, 32 * warp_id, 0, lane, s);
                 thread::sync_threads();
 
@@ -243,6 +239,9 @@ pub mod kernels {
                 accumulated.wait(block & 1);
 
                 let contribution: OutBand = output.drain(32 * warp_id, 0);
+                // WANT (#31): `RegTile` has the by-value `add` but no
+                // in-place form, and this is the accumulator #31 measured —
+                // at 128 columns the by-value spelling cost 87 registers.
                 out_acc.add_assign(contribution);
                 if leader {
                     free.sem(block).arrive();
@@ -250,8 +249,8 @@ pub mod kernels {
                 block += 1;
             }
 
-            // WANT (#5): the softmax denominator, broadcast down the rows.
-            out_acc.div_row(running_sum);
+            // The softmax denominator, broadcast down the rows (#5).
+            let out_acc = out_acc.div_row(running_sum);
 
             // WANT (#11): fp32 straight out of registers, at the coordinates
             // the fragment layout already knows.

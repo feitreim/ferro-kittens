@@ -19,9 +19,23 @@ target *of the library*.)
 | Kernel | Status | Blocked on |
 | --- | --- | --- |
 | [`gemm`](src/gemm.rs) | **compiles** | — (three gaps worked around in-file, all marked) |
-| [`flash_forward`](src/flash_forward.rs) | aspirational | #5, #6, #7, #11 + 3 unfiled |
-| [`softmax`](src/softmax.rs) | aspirational | #6, #9 (both movers are real now) |
-| [`layernorm`](src/layernorm.rs) | aspirational | #3, #5, #6, #9, #13, #22 + 1 unfiled |
+| [`flash_forward`](src/flash_forward.rs) | aspirational | #7, #11, #22, #23, #31 + scalar broadcasts |
+| [`softmax`](src/softmax.rs) | aspirational | **#9, and nothing else** |
+| [`layernorm`](src/layernorm.rs) | aspirational | #3, #9, #13, #22 + scalar broadcasts |
+
+Nothing on those lists is arithmetic any more. #5 and #6 between them closed
+every elementwise op and every reduction the four kernels asked for, and #21 and
+#25 closed both halves of the shared ↔ register path. `softmax` is down to one
+item: **#9**, the TMA store, so the result can leave. What remains across the
+four is movers (#22, composition only), the store side (#9), masking (#7), and
+one structural gap (#3 + #13, layernorm's block-scope statistic).
+
+The one arithmetic leftover is the **scalar broadcast** forms —
+`RegTile::scale`/`shift`, `RegVec::scale`/`shift`, a free `rsqrt(f32)`, and
+`RegTile::add_assign` — which #5's list named and #5's implementation did not
+ship. A tile or vector combined with a bare `f32` still has to splat it into a
+whole operand first. They have no issue of their own; #31 covers the in-place
+half of the argument.
 
 ```sh
 cargo oxide build kittens-examples --arch sm_100a   # the default set: gemm
@@ -49,23 +63,32 @@ hardware.
 
 ### Already filed
 
-**#5 — generic map and the standard elementwise set.** Demanded by all three
-aspirational kernels, and the single highest-leverage item in the backlog by
-this measure. Specifically wanted, on `RegTile`: `exp2`, `mul` (elementwise),
-`scale`/`shift` (scalar), `add_assign`, and the broadcast forms `sub_row`,
-`mul_row`, `div_row`, `mul_col`, `add_col`. On `RegVec`: `rsqrt`, `scale`,
-`shift`. A free `rsqrt(f32)` beside `exp2_approx`/`log2_approx`.
+**#5 — generic map and the standard elementwise set. Landed.** The map
+mechanism and every vector/vector and broadcast form the kernels asked for:
+`exp2`, elementwise `mul`, `sub_row`, `mul_row`, `div_row`, `mul_col`,
+`add_col`, `RegVec::rsqrt`. **Not** landed, and still named at call sites in
+`flash_forward` and `layernorm`: the *scalar* broadcasts `scale`/`shift` on
+both `RegTile` and `RegVec`, a free `rsqrt(f32)`, and `RegTile::add_assign`.
+A tile or vector combined with a bare `f32` has to splat it into a whole
+operand first.
 
-> Note the asymmetry the examples expose: `RegVec` already has `exp2`, `max`,
-> `sub`, `add_assign`, `mul_assign`. `RegTile` has none of them. Every op the
+> Note the asymmetry the examples exposed: `RegVec` already had `exp2`, `max`,
+> `sub`, `add_assign`, `mul_assign`. `RegTile` had none of them. Every op the
 > vector has, the tile wants — which is exactly the argument for the mechanism
-> rather than another round of hand-written methods.
+> rather than another round of hand-written methods. It still holds for the
+> in-place forms: the vector has them and the tile does not (#31).
 
-**#6 — reductions.** `row_max` and `row_sum` on `RegTile` (softmax, layernorm,
-flash), `col_sum` (layernorm), whole-tile `sum` (layernorm's group-norm form).
-`quad_max`/`quad_sum` are the *second* half of a row reduction — the fold across
-a quad. The first half, folding a thread's own values across its `VALUES`
-registers, is open-coded in every kernel today.
+**#6 — reductions. Landed.** `row_reduce`/`col_reduce`/`tile_reduce` over a
+`ReduceOp` (a `BinaryOp` with an identity), with `row_max`/`row_min`/`row_sum`/`row_prod`, the `col_*` mirrors,
+and `tile_max`/`tile_min`/`tile_sum`/`tile_prod` derived from them. Both halves
+are in the library now: a thread's own registers, then the `shuffle_xor`
+butterfly over the lanes the ownership map spreads the folded axis across —
+masks 1,2 for a row (what `quad_max`/`quad_sum` already were), 4,8,16 for a
+column, all five for a tile.
+
+All of it is **warp scope**. `tile_sum` folds one warp's band; layernorm's
+group-norm statistic spans four warps' bands and still needs them to agree,
+which is the #3 + #13 entry below.
 
 **#7 — masking.** `make_causal`, for flash. One correction to the issue as
 filed: it describes ThunderKittens' signature, which takes no coordinate origin.
@@ -86,9 +109,20 @@ exists to delete.
 every row, wanted in shared memory with their own TMA path (a `[1, N]` box is
 not a tile, and making it one wastes a swizzle atom of padding per row).
 
-**#3 — scope parameterization.** Layernorm's whole-tile statistic. A tile owned
-by four warps needs the warps to agree, and a block-scope reduction is a
-`Scope` the library does not have.
+**#3 — scope parameterization.** Layernorm's whole-tile statistic, and the one
+demand #6 deliberately did not meet. A tile owned by four warps needs the warps
+to agree.
+
+> A finding from writing #6 against this, worth having before #3 is picked up:
+> **`Scope` as filed cannot express the block reduction.** The proposed trait is
+> `WARPS` / `THREADS` / `rank()` / `sync()`, and a block-scope fold needs none
+> of those so much as it needs *storage* — somewhere for each warp's partial to
+> live between the two barriers. `groupnorm_tile` guesses at that today with a
+> bare `*mut f32` carved out of its own shared plan, and the library cannot
+> allocate one on its behalf: the shared plan belongs to the kernel. So the
+> block reduction's signature is either "take a scratch pointer" (not scope
+> parameterization at all) or "take #13's `SharedVec`". #3 and #13 have to be
+> sequenced together, and #6 does not force either.
 
 **#8 — global layout.** Not reachable from a kernel at all, which is why it does
 not appear in the code: `encode_bf16_panels` builds one shape of tensor map (3-D
@@ -101,11 +135,13 @@ result: the MMA layer is the part of this library that is finished.
 
 ---
 
-### Not covered by any open issue
+### Came from writing kernels, not from ThunderKittens' feature list
 
-This is the part of the backlog that came from writing kernels rather than from
-reading ThunderKittens' feature list, and it is the most valuable output here.
-Ordered by how badly it hurts.
+The most valuable output here. Ordered by how badly it hurts. Items 1–6 were
+filed as **#21**, **#22**, **#25**, **#23** and **#24** (which covers both
+cluster-scope entries); **1 and 3 have since shipped**. The numbers are noted
+inline and the prose is kept as written, because it is the argument rather than
+the ticket.
 
 #### 1. ~~There is no shared → register path at all~~ — **closed by #21**
 
@@ -126,7 +162,7 @@ exists at every width the library can describe. Only item 2 is left, and it is
 a cost rather than a hole: `load_fragment`/`store_fragment` move one
 `[16, 16]` block, so a band is a loop the kernel writes.
 
-#### 2. The movers are per-`[16, 16]`-block, so every kernel writes the same loop
+#### 2. The movers are per-`[16, 16]`-block, so every kernel writes the same loop (#22)
 
 `TmemTile::fragment_tile` returns a `[16, 16]` `Fragment`, and
 `ldst::store_fragment` takes one. A kernel that wants a `[32, 128]` band writes
@@ -159,7 +195,7 @@ all. Checked against silicon at width by the `swizzle/stmatrix/ldmatrix … wide
 device cases, and by a 4-row tile whose second subtile starts mid-period —
 which is the only shape where an absolute phase and a per-subtile one differ.
 
-#### 4. The `RegTile` shape set is closed by the library
+#### 4. The `RegTile` shape set is closed by the library (#23)
 
 `BaseLdtm` implements `FragmentLayout` for `(16,16)`, `(32,32)` and `(32,128)` —
 because each shape is a line of `base_ldtm_shapes!` *inside* `src/reg.rs`. Flash
@@ -172,7 +208,7 @@ chose.
 Wanted: export the macro, or a blanket impl over the shapes the layout actually
 supports.
 
-#### 5. No cluster-scope TMEM allocation
+#### 5. No cluster-scope TMEM allocation (#24)
 
 `tmem::alloc_block` is `tcgen05.alloc.cta_group::1`. A `cg2` accumulator is one
 allocation spanning the CTA pair, so exactly one warp in the leader may issue
@@ -184,7 +220,7 @@ halves are hardware facts about a cluster accumulator; both are open-coded in
 
 Wanted: `tmem::alloc_cluster(slot, columns) -> u32`.
 
-#### 6. No cluster-scope semaphore arrival
+#### 6. No cluster-scope semaphore arrival (#24)
 
 A 2-CTA MMA consumes four tiles staged by two CTAs, so the issuer needs one
 barrier that says *the whole stage is present* — the peer's TMA has to complete
