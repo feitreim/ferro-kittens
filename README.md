@@ -15,6 +15,13 @@ device code monomorphizes into the *calling* crate's artifact the same way
 `cuda-device` does, so a kernel crate pays nothing for the abstraction unless
 ptxas says otherwise.
 
+Asking ptxas is `modal run modal_app.py::regcount`: it builds the device-test
+harness, runs `ptxas -v -arch=sm_100a` over the emitted PTX, and prints a
+sorted registers/spills/shared table. `ptxas` is a host compiler, so this needs
+no GPU. Run it either side of a change and diff. Only kernels that are actually
+monomorphized appear, so a library function with no caller gets a codegen probe
+in `device-tests` to put it on the table.
+
 ## Modules
 
 | Module | What it holds |

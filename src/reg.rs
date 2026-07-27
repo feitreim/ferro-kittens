@@ -13,7 +13,11 @@
 //! [`exp2_approx`] (the FMA polynomial, bit-identical to what the flash
 //! kernels shipped with) and [`exp2_hw`] (one `ex2.approx` SFU instruction,
 //! also pure-PTX-safe post-#56). Ports that must hold "same SASS" keep the
-//! polynomial; swapping to the SFU is a separate, measured change.
+//! polynomial; swapping to the SFU is a separate, measured change — and the
+//! measurement does not favour it: pointing `exp2` at the SFU takes
+//! `softmax_probe_128` from 168 registers and no spill to 255 and 112 bytes
+//! of spill stores (`modal_app.py::regcount`). One instruction, but the FMA
+//! chain schedules where `ex2.approx` serializes.
 //!
 //! Elementwise work goes through [`UnaryOp`] / [`BinaryOp`] / [`TernaryOp`]
 //! and the `*_map` methods, so a scalar function is written once and reaches
@@ -444,13 +448,22 @@ macro_rules! op_methods {
             self.col_map::<$op>(cols)
         }
     )*};
+    (assign $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
+        $(#[$meta])*
+        #[inline(always)]
+        pub fn $name(&mut self, other: Self) {
+            *self = self.bin_map::<$op>(other);
+        }
+    )*};
 }
 
-/// The unary names every register family carries, minus `exp2` — [`RegVec`]'s
-/// is hand-written and predates the mechanism, so each family names its own.
+/// The unary names every register family carries.
 macro_rules! unary_op_methods {
     () => {
         op_methods! { unary
+            /// Software `2^x` ([`exp2_approx`]) — the shipped kernels'
+            /// rounding, and what every `exp2` in the crate resolves to.
+            exp2 = Exp2Approx;
             /// SFU `2^x` ([`exp2_hw`]); a different result from `exp2`.
             exp2_hw = Exp2Hw;
             exp = Exp;
@@ -471,8 +484,10 @@ macro_rules! unary_op_methods {
 /// slots (2 per 16-row block × 2 blocks per warp).
 ///
 /// Every op is a compile-time-length loop over the slot array — plain
-/// straight-line FMA/select code after inlining, nothing the register
-/// allocator can see through less clearly than the hand-written form.
+/// straight-line FMA/select code after inlining. `max`/`sub`/`exp2`/
+/// `mul_assign`/`add_assign` were hand-written copies of exactly that loop
+/// until `modal_app.py::regcount` showed the generic maps assemble to the same
+/// registers and spills at both probe shapes; they are the maps now.
 pub struct RegVec<const M: usize, L: RowLayout<M>>(pub L::Slots);
 
 impl<const M: usize, L: RowLayout<M>> Clone for RegVec<M, L> {
@@ -515,65 +530,6 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     #[inline(always)]
     pub fn row(lane: u32, slot: usize) -> u32 {
         L::row_of(lane, slot)
-    }
-
-    /// Slotwise max with `other`.
-    #[inline(always)]
-    pub fn max(self, other: Self) -> Self {
-        let mut out = self;
-        let mut slot = 0;
-        while slot < L::SLOTS {
-            out.set(slot, fmax(self.get(slot), other.get(slot)));
-            slot += 1;
-        }
-        out
-    }
-
-    /// Slotwise `self - other`. A plain method rather than `ops::Sub` so
-    /// every op the device code takes stays a direct `#[inline(always)]`
-    /// call.
-    #[allow(clippy::should_implement_trait)]
-    #[inline(always)]
-    pub fn sub(self, other: Self) -> Self {
-        let mut out = self;
-        let mut slot = 0;
-        while slot < L::SLOTS {
-            out.set(slot, self.get(slot) - other.get(slot));
-            slot += 1;
-        }
-        out
-    }
-
-    /// Slotwise software `2^x` ([`exp2_approx`]).
-    #[inline(always)]
-    pub fn exp2(self) -> Self {
-        let mut out = self;
-        let mut slot = 0;
-        while slot < L::SLOTS {
-            out.set(slot, exp2_approx(self.get(slot)));
-            slot += 1;
-        }
-        out
-    }
-
-    /// Slotwise `self *= other`.
-    #[inline(always)]
-    pub fn mul_assign(&mut self, other: Self) {
-        let mut slot = 0;
-        while slot < L::SLOTS {
-            self.set(slot, self.get(slot) * other.get(slot));
-            slot += 1;
-        }
-    }
-
-    /// Slotwise `self += other`.
-    #[inline(always)]
-    pub fn add_assign(&mut self, other: Self) {
-        let mut slot = 0;
-        while slot < L::SLOTS {
-            self.set(slot, self.get(slot) + other.get(slot));
-            slot += 1;
-        }
     }
 
     /// True if any slot exceeds `reference + slack` — the correction-vote
@@ -660,9 +616,18 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
 
     op_methods! { binary
         add = Add;
+        sub = Sub;
         mul = Mul;
         div = Div;
+        max = Max;
         min = Min;
+    }
+
+    op_methods! { assign
+        /// Slotwise `self *= other` — the running sum's rescale.
+        mul_assign = Mul;
+        /// Slotwise `self += other`.
+        add_assign = Add;
     }
 }
 
@@ -744,11 +709,6 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
     }
 
     unary_op_methods!();
-
-    op_methods! { unary
-        /// Software `2^x` ([`exp2_approx`]).
-        exp2 = Exp2Approx;
-    }
 
     op_methods! { binary
         add = Add;
@@ -859,6 +819,14 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
 
     /// Scale every value in row-slot `s` by `factors` slot `s` — the
     /// running-max rescale of an online-softmax accumulator.
+    ///
+    /// Not [`Self::mul_row`], despite meaning exactly that
+    /// (`scale_rows_is_the_multiply_row_map`): this form rewrites the
+    /// accumulator in place, while a `row_map` builds a second tile and leaves
+    /// the allocator to prove the first one dead. At the flash accumulator's
+    /// width that proof does not land — `softmax_probe_128` goes 168 → 255
+    /// registers/thread on the swap (`modal_app.py::regcount`). The two are
+    /// the same at 32 columns; the difference is a whole tile wide.
     #[inline(always)]
     pub fn scale_rows(&mut self, factors: RegVec<M, L>) {
         let mut slot = 0;
@@ -985,11 +953,6 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
 
     unary_op_methods!();
 
-    op_methods! { unary
-        /// Software `2^x` ([`exp2_approx`]) — the shipped kernels' rounding.
-        exp2 = Exp2Approx;
-    }
-
     op_methods! { binary
         add = Add;
         sub = Sub;
@@ -1023,6 +986,13 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
 /// `exp2`/`scale_rows`) keeps two full vectors live across the accumulator
 /// scaling and measurably costs registers in register-tight kernels
 /// (persistent forward: 206 → 212 regs/thread on B200).
+///
+/// `softmax_probe_32` reproduces that direction at 56 vs 64 regs/thread and
+/// `softmax_probe_128` does not reproduce it at all (168 either way) — the
+/// probe holds its accumulator in registers, where the real kernel holds it in
+/// TMEM and drains, so the probe bounds the fusion's worth but does not
+/// license undoing it. The 206 → 212 number stands until a kernel of that
+/// shape says otherwise.
 #[inline(always)]
 pub fn online_rescale<const M: usize, const N: usize, L: FragmentLayout<M, N>>(
     m_ref: &mut RegVec<M, L>,
@@ -1321,12 +1291,20 @@ mod tests {
                 vec.min(other).get(slot),
                 fmin(vec.get(slot), other.get(slot))
             );
-            // The hand-written pair, unchanged by the mechanism.
             assert_eq!(
                 vec.max(other).get(slot),
                 fmax(vec.get(slot), other.get(slot))
             );
             assert_eq!(vec.sub(other).get(slot), vec.get(slot) - other.get(slot));
+        }
+
+        let mut scaled = vec;
+        scaled.mul_assign(other);
+        let mut summed = vec;
+        summed.add_assign(other);
+        for slot in 0..Rows::SLOTS {
+            assert_eq!(scaled.get(slot), vec.get(slot) * other.get(slot));
+            assert_eq!(summed.get(slot), vec.get(slot) + other.get(slot));
         }
     }
 
@@ -1412,8 +1390,9 @@ mod tests {
 
     #[test]
     fn scale_rows_is_the_multiply_row_map() {
-        // `scale_rows` stays hand-written and in place; this is what says it
-        // means the same thing as the generic path that replaced nothing.
+        // `scale_rows` stays in place because the by-value `row_map` costs 87
+        // registers/thread at the flash width; this is what says the two
+        // nevertheless mean the same thing.
         for lane in 0..32 {
             let tile = coordinate_tile(lane);
             let factors = row_indices(lane);
