@@ -32,15 +32,12 @@ use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 use cuda_device::DisjointSlice;
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
-use cuda_device::tcgen05::{
-    Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
-};
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, thread, warp};
 
 use kittens::global::encode_bf16_panels;
 use kittens::ldst::store_fragment;
-use kittens::mma::{self, mma_abt};
+use kittens::mma::{self, MmaShape, mma_abt};
 use kittens::reg::{
     BaseLdtm, Fragment, FragmentLayout, Mul, RegTile, RegVec, fmax, online_rescale,
 };
@@ -474,19 +471,14 @@ pub mod kernels {
             tma.wait(0);
             thread::sync_threads();
 
-            let instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N64)
-                .element_type(Tcgen05ElementType::BF16)
-                .accumulator_type(Tcgen05AccumulatorType::F32)
-                .build()
-                .raw();
+            let shape = MmaShape::M128_N64;
             if leader {
-                mma_abt(accumulator.raw(), a, b_low, instruction, false);
+                mma_abt(accumulator.raw(), a, b_low, shape, false);
                 mma_abt(
                     accumulator.columns_right(TILE as u32).raw(),
                     a,
                     b_high,
-                    instruction,
+                    shape,
                     false,
                 );
                 mma::commit(mma_done);

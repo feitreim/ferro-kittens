@@ -41,13 +41,12 @@ use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::cluster;
 use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tcgen05::{
-    Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
     tcgen05_alloc_cg2, tcgen05_dealloc_cg2, tcgen05_fence_before_thread_sync,
 };
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{DisjointSlice, cluster_launch, cuda_module, kernel, thread, warp};
 
-use kittens::mma::{commit_multicast_cg2, mma_walk_cg2};
+use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::reg::{BaseLdtm, Fragment, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
@@ -141,14 +140,10 @@ pub mod kernels {
             // them before it writes to anything of its own.
             let accumulator = Accumulator::from_raw(alloc_cluster(tmem_slot, BLOCK_N as u32, rank));
 
-            // Both operands are K-major, so `A·Bᵀ` needs no transpose bits;
-            // `M` is the pair's 256 rows and `N` its 128 columns.
-            let instruction = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M256_N128)
-                .element_type(Tcgen05ElementType::BF16)
-                .accumulator_type(Tcgen05AccumulatorType::F32)
-                .build()
-                .raw();
+            // `M` is the pair's 256 rows and `N` its 128 columns. The rest of
+            // the descriptor is the walk's: both operands are K-major, so the
+            // MMA takes no transpose bits, and bf16 comes from the tiles.
+            let shape = MmaShape::M256_N128;
 
             if warp_id == 0 && lane == 0 {
                 // Producer. The pair's four tiles all complete on the leader's
@@ -177,11 +172,11 @@ pub mod kernels {
                 let mut k = 0u32;
                 while k < k_blocks {
                     load.wait(k);
-                    mma_walk_cg2::<CHUNKS>(
+                    mma_walk_cg2::<Bf16, CHUNKS>(
                         accumulator.raw(),
                         a_ring.tile(k).k_walk(),
                         b_ring.tile(k).k_walk(),
-                        instruction,
+                        shape,
                         k > 0,
                     );
                     // The MMA releases its own operands, in both CTAs: a
