@@ -57,6 +57,11 @@ pub trait Element {
     /// Pack one word's worth of fp32 values — the inverse of the unpack a
     /// TMEM drain does, with the first value in the low half.
     fn pack(values: Self::Unpacked) -> u32;
+
+    /// Split one packed word back into fp32, the exact inverse of
+    /// [`Self::pack`] for every element narrower than fp32 — widening loses
+    /// nothing, so a load path is free of the rounding the store side has.
+    fn unpack(word: u32) -> Self::Unpacked;
 }
 
 /// Element types a tcgen05 MMA accepts as an operand.
@@ -89,6 +94,18 @@ impl Element for Bf16 {
     #[inline(always)]
     fn pack(values: [f32; 2]) -> u32 {
         cvt_f32x2_bf16x2(values[0], values[1])
+    }
+
+    /// bf16 is fp32's leading 16 bits, so widening is a shift and no
+    /// instruction — `cuda-device` exposes conversions in the narrowing
+    /// direction only, and there is nothing here for one to do. Unlike
+    /// [`Self::pack`] this is ordinary bit math, so it holds on the host too.
+    #[inline(always)]
+    fn unpack(word: u32) -> [f32; 2] {
+        [
+            f32::from_bits(word << 16),
+            f32::from_bits(word & 0xffff_0000),
+        ]
     }
 }
 
@@ -555,6 +572,23 @@ mod tests {
         assert_eq!(Bf16::PER_WORD, 2);
         // `Bf16::pack` is `cvt_f32x2_bf16x2`, a device intrinsic whose host
         // body is `unreachable!()` — its bit layout is only checkable on a GPU.
+        // `Bf16::unpack` is not: widening needs no instruction (below).
+    }
+
+    #[test]
+    fn bf16_unpack_widens_both_halves_exactly() {
+        // The low half first, matching `pack`'s "first value in the low half".
+        assert_eq!(Bf16::unpack(0x4000_3f80), [1.0, 2.0]);
+        // Widening is exact, so every fp32 whose low 16 bits are zero — which
+        // is every value a bf16 tile can hold — comes back bit for bit.
+        for high in [0x0000u32, 0x3f80, 0xbf80, 0x7f7f, 0x4049] {
+            for low in [0x0000u32, 0x3f80, 0xc180, 0x0080] {
+                let word = (high << 16) | low;
+                let [first, second] = Bf16::unpack(word);
+                assert_eq!(first.to_bits(), low << 16);
+                assert_eq!(second.to_bits(), high << 16);
+            }
+        }
     }
 
     #[test]

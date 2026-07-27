@@ -3,7 +3,7 @@
 //! The library's `#[cfg(test)]` suites establish that its address and
 //! coordinate arithmetic is *self-consistent*. Nothing there can show that
 //! [`BaseLdtm`]'s ownership map, the SWIZZLE_128B phase math, or the
-//! `stmatrix` store path are the ones the silicon actually uses — those were
+//! `stmatrix`/`ldmatrix` movers are the ones the silicon actually uses — those were
 //! only ever established indirectly, by downstream kernels producing correct
 //! numbers. This binary closes that gap by running each of them on a B200 and
 //! checking the result against the library's own maps.
@@ -36,7 +36,7 @@ use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, thread, warp};
 
 use kittens::global::encode_bf16_panels;
-use kittens::ldst::store_fragment;
+use kittens::ldst::{load_fragment, store_fragment};
 use kittens::mma::{self, MmaShape, mma_abt};
 use kittens::reg::{
     BaseLdtm, Fragment, FragmentLayout, Mul, RegTile, RegVec, fmax, online_rescale,
@@ -53,6 +53,8 @@ const TILE: usize = 64;
 const CHUNKS: usize = 8;
 /// 32-bit words in one row of a `[TILE, TILE]` bf16 tile.
 const ROW_WORDS: usize = TILE / 2;
+/// `[16, 16]` fragment blocks along one edge of a `[TILE, TILE]` tile.
+const BLOCKS: usize = TILE / 16;
 
 /// Rows of the probe accumulator — one full `M128` MMA shape, and the four
 /// warps' 32 TMEM rows each.
@@ -96,6 +98,15 @@ const fn cell_bits(row: usize, column: usize) -> u16 {
 /// conversion uses.
 const fn cell(row: usize, column: usize) -> f32 {
     f32::from_bits((cell_bits(row, column) as u32) << 16)
+}
+
+/// Decode a [`cell`] back to the `[TILE, TILE]` position it names, or `None`
+/// if the value is not one — how a failing register-side case reports the
+/// coordinate the hardware actually delivered.
+fn decode_cell(value: f32) -> Option<(usize, usize)> {
+    let bits = (value.to_bits() >> 16) as usize;
+    let (row, column) = ((bits >> 6) & 0x3f, bits & 0x3f);
+    (bits == 0x4000 | (row << 6) | column).then_some((row, column))
 }
 
 /// The probe accumulator's value at `(row, column)` — `COLUMNS * row + column`,
@@ -217,6 +228,73 @@ pub mod kernels {
             thread::sync_threads();
 
             dump_rows(tile, lane as usize, 32, &mut out);
+        }
+    }
+
+    /// TMA the same `[TILE, TILE]` tile [`swizzle_roundtrip`] stages, then read
+    /// every `[16, 16]` block of it into registers through [`load_fragment`]
+    /// and dump by thread coordinate.
+    ///
+    /// **What this proves.** The tile's contents are placed by the TMA engine,
+    /// which the `swizzle round trip` case checks independently, and the values
+    /// are position identities the register path never computes. So a value
+    /// arriving at the register the host expects means `ldmatrix`'s ownership
+    /// map *is* [`BaseLdtm`] and `load_fragment`'s addressing is the one the
+    /// hardware uses — not merely that the load inverts the store. Nothing here
+    /// touches `stmatrix`; the two directions are checked against silicon
+    /// separately, and only the shared [`kittens::ldst::fragment_address`]
+    /// derivation is common to both.
+    ///
+    /// Launch with one warp: `load_fragment` is warp-scope and takes its
+    /// addresses from lanes 0..16.
+    #[kernel]
+    pub unsafe fn ldmatrix_map(source: *const TmaDescriptor, mut out: DisjointSlice<f32>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tile = Square::from_raw(smem);
+            let tma = Semaphore::attach(smem.add(Square::BYTES) as *mut Barrier);
+            let lane = warp::lane_id();
+
+            if lane == 0 {
+                tma.init(1);
+                fence_proxy_async_shared_cta();
+            }
+            thread::sync_threads();
+            if lane == 0 {
+                tile.tma_load(source, 0, 0, tma);
+                tma.expect_tx(Square::BYTES as u32);
+            }
+            tma.wait(0);
+            thread::sync_threads();
+
+            let chunks = tile.chunk_writer();
+            let mut row_block = 0usize;
+            while row_block < BLOCKS {
+                let mut column_block = 0usize;
+                while column_block < BLOCKS {
+                    let fragment = load_fragment::<Bf16>(
+                        chunks,
+                        (16 * row_block) as u32,
+                        (16 * column_block) as u32,
+                        lane,
+                    );
+                    // The dump is one band per block rather than per warp, so
+                    // the block index takes the warp's place in `dump_index`.
+                    dump_band(
+                        fragment,
+                        (row_block * BLOCKS + column_block) as u32,
+                        lane,
+                        &mut out,
+                    );
+                    column_block += 1;
+                }
+                row_block += 1;
+            }
+
+            thread::sync_threads();
+            if lane == 0 {
+                tma.inval();
+            }
         }
     }
 
@@ -907,6 +985,86 @@ fn check_stmatrix(
     compare_tile(&out.to_host_vec(stream)?, &expected)
 }
 
+/// Does `ldmatrix` hand each register the element [`BaseLdtm`] says it owns?
+///
+/// The tile is TMA-staged position identities, so every drained value names the
+/// `(row, column)` it came from. The assertion is that the value at
+/// `(block, lane, slot, value)` is the identity of that block's
+/// `Fragment::coordinate` — a statement about the hardware's ownership map, not
+/// about the load and store being mutually inverse. `stmatrix round trip` is
+/// the other direction's case and shares nothing with this one but the
+/// `fragment_address` derivation.
+fn check_ldmatrix(
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<String, Box<dyn Error>> {
+    let staged = identity_tile();
+    let source = DeviceBuffer::from_host(stream, &staged)?;
+    let map = unsafe { encode_bf16_panels::<TILE, TILE>(stream, source.cu_deviceptr(), TILE, 1)? };
+    let (slots, values) = (Fragment::SLOTS, Fragment::VALUES);
+    let mut out = DeviceBuffer::<f32>::zeroed(stream, BLOCKS * BLOCKS * 32 * slots * values)?;
+    unsafe {
+        module.ldmatrix_map(
+            stream,
+            launch_config(32, SQUARE_SHARED as u32),
+            map.as_ptr(),
+            &mut out,
+        )?
+    };
+    let observed = out.to_host_vec(stream)?;
+
+    let mut report = String::new();
+    let mut mismatches = 0usize;
+    for row_block in 0..BLOCKS {
+        for column_block in 0..BLOCKS {
+            let block = row_block * BLOCKS + column_block;
+            for lane in 0..32u32 {
+                for slot in 0..slots {
+                    for value in 0..values {
+                        let (row, column) = Fragment::coordinate(lane, slot, value);
+                        let (row, column) = (
+                            16 * row_block + row as usize,
+                            16 * column_block + column as usize,
+                        );
+                        let got = observed[dump_index(block, lane, slot, value, slots, values)];
+                        if got == cell(row, column) {
+                            continue;
+                        }
+                        mismatches += 1;
+                        if mismatches <= 8 {
+                            let _ = match decode_cell(got) {
+                                Some((got_row, got_column)) => write!(
+                                    report,
+                                    "\n    block ({row_block}, {column_block}) lane {lane} \
+                                     slot {slot} value {value}: map says ({row}, {column}), \
+                                     hardware delivered ({got_row}, {got_column})"
+                                ),
+                                None => write!(
+                                    report,
+                                    "\n    block ({row_block}, {column_block}) lane {lane} \
+                                     slot {slot} value {value}: map says ({row}, {column}), \
+                                     hardware delivered {got}, which names no position"
+                                ),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if mismatches == 0 {
+        return Ok(format!(
+            "{} elements, all at BaseLdtm's coordinates",
+            observed.len()
+        ));
+    }
+    Err(format!(
+        "{mismatches} of {} values misplaced{report}",
+        observed.len()
+    )
+    .into())
+}
+
 /// Does a register fragment survive a trip out to TMEM and back?
 ///
 /// The kernel seeds every register with its own dump index, so the expectation
@@ -1139,6 +1297,7 @@ fn run() -> Result<usize, Box<dyn Error>> {
         "stmatrix round trip",
         Box::new(|| check_stmatrix(stream, module)),
     ));
+    cases.push(("ldmatrix map", Box::new(|| check_ldmatrix(stream, module))));
     cases.push((
         "sttm round trip",
         Box::new(|| check_sttm_roundtrip(stream, module)),

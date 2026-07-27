@@ -63,7 +63,7 @@ fn examples() -> Vec<Example> {
     #[cfg(feature = "softmax")]
     examples.push(Example {
         name: "softmax",
-        status: "aspirational (#5, #6, #9)",
+        status: "aspirational (#5, #6, #9, #22, #25)",
         threads: softmax::THREADS,
         shared_bytes: softmax::SHARED_BYTES,
     });
@@ -83,12 +83,12 @@ fn main() {
     let _ = gemm::kernels::load;
 
     println!(
-        "{:<16}{:<34}{:>8}{:>14}",
+        "{:<16}{:<38}{:>8}{:>14}",
         "kernel", "status", "threads", "shared"
     );
     for example in examples() {
         println!(
-            "{:<16}{:<34}{:>8}{:>13} B",
+            "{:<16}{:<38}{:>8}{:>13} B",
             example.name, example.status, example.threads, example.shared_bytes
         );
     }
