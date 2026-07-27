@@ -47,6 +47,7 @@ use cuda_device::cluster;
 use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tcgen05::{
     tcgen05_alloc_cg2, tcgen05_dealloc_cg2, tcgen05_fence_before_thread_sync,
+    tcgen05_relinquish_alloc_permit_cg2,
 };
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{
@@ -168,7 +169,7 @@ pub mod kernels {
             thread::sync_threads();
             // Also publishes the barriers above to the peer, which writes to
             // them before it writes to anything of its own.
-            let accumulator = Accumulator::from_raw(alloc_cluster(tmem_slot, BLOCK_N as u32, rank));
+            let accumulator = Accumulator::from_raw(alloc_cluster(tmem_slot, BLOCK_N as u32));
 
             // `M` is the pair's 256 rows and `N` its 128 columns. The rest of
             // the descriptor is the walk's: both operands are K-major, so the
@@ -270,7 +271,7 @@ pub mod kernels {
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
             cluster::cluster_sync();
-            if rank == 0 && warp_id == 0 {
+            if warp_id == 0 {
                 tcgen05_dealloc_cg2(accumulator.raw(), BLOCK_N as u32);
             }
             if thread::threadIdx_x() == 0 {
@@ -286,13 +287,24 @@ pub mod kernels {
     /// What this wants to be: `tmem::alloc_cluster(slot, columns)`, the
     /// cta_group::2 twin of [`kittens::tmem::alloc_block`].
     ///
-    /// A `cg2` accumulator is one allocation spanning the pair, so exactly one
-    /// warp in the leader CTA may issue it — and the peer, which drains its own
-    /// 128 rows of the same allocation, has no way to learn the address except
-    /// to read the leader's staging word over distributed shared memory. Both
-    /// halves of that (the `_cg2` intrinsic and the DSMEM read) are hardware
-    /// facts about a cluster accumulator, and both belong in `tmem.rs` rather
-    /// than in every kernel that wants one.
+    /// A `cg2` accumulator is one allocation spanning the pair, and all three
+    /// of the `cta_group::2` allocator instructions say the same thing about
+    /// who issues them: *one full warp in each peer CTA*. So both CTAs
+    /// allocate, both relinquish and both deallocate, and each reads the
+    /// address out of its own staging word — the collective writes one into
+    /// each. That is a hardware fact about a cluster accumulator and belongs
+    /// in `tmem.rs` rather than in every kernel that wants one.
+    ///
+    /// This file used to issue all three from rank 0 alone, with the peer
+    /// reading the leader's address over distributed shared memory, and #40 is
+    /// how that surfaced: a single launch was always fine, and the *second*
+    /// launch of the same kernel in one process hung forever. A CTA that
+    /// exits without relinquishing its allocation permit, or without taking
+    /// its half in the pair's dealloc, leaves the SM's allocator short, and
+    /// the next CTA scheduled there waits in `tcgen05.alloc` for columns that
+    /// are never coming back. No one-shot correctness run can see that, which
+    /// is the general shape of the thing: launching twice is a strictly
+    /// stronger claim than launching once, and until #40 nothing made it.
     ///
     /// The `cluster_sync` here is load-bearing twice over: it publishes the
     /// staging word, and it is the point after which the peer's TMA may write
@@ -303,18 +315,17 @@ pub mod kernels {
     /// Every thread of every CTA in the cluster must call this together, with
     /// `slot` pointing at a shared `u32` at the same offset in both.
     #[inline(always)]
-    unsafe fn alloc_cluster(slot: *mut u32, columns: u32, rank: u32) -> u32 {
+    unsafe fn alloc_cluster(slot: *mut u32, columns: u32) -> u32 {
         unsafe {
-            if rank == 0 && warp::warp_id() == 0 {
+            if warp::warp_id() == 0 {
                 tcgen05_alloc_cg2(slot, columns);
             }
             thread::sync_threads();
             cluster::cluster_sync();
-            if rank == 0 {
-                *(slot as *const u32)
-            } else {
-                cluster::dsmem_read_u32(slot as *const u32, 0)
+            if warp::warp_id() == 0 {
+                tcgen05_relinquish_alloc_permit_cg2();
             }
+            *(slot as *const u32)
         }
     }
 }
