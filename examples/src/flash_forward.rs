@@ -18,14 +18,8 @@
 //!   tile op, are still missing. This kernel's `[32, 128]` output accumulator
 //!   is exactly the shape #31 measured the by-value cost on.
 //!
-//! Plus three things named at their call sites below:
+//! Plus one thing named at its call site below:
 //!
-//! - **#22, `TmemTile::drain`** — a whole-band TMEM read. `fragment_tile`
-//!   returns `[16, 16]`, so every kernel wanting a `[32, N]` band writes the
-//!   same block-composition loop (see `gemm.rs`, and `fragment_probe` in
-//!   `device-tests`).
-//! - **#22, `ldst::store_tile`** — the mirror on the shared side.
-//!   [`kittens::ldst::store_fragment`] is per-`[16, 16]`-block too.
 //! - **#23, the `RegTile` shape set is closed.** `BaseLdtm` implements
 //!   `FragmentLayout` for `(16,16)`, `(32,32)` and `(32,128)` only, because
 //!   each shape is a line of `base_ldtm_shapes!` *inside* `src/reg.rs`. This
@@ -194,15 +188,9 @@ pub mod kernels {
                 }
                 scored.wait(block & 1);
 
-                // WANT (#22): a whole-band TMEM read.
-                //
-                //     TmemTile::<R, C>::drain::<M, N, L>(row, column) -> RegTile<M, N, L>
-                //
-                // `fragment_tile` hands back `[16, 16]`, so the alternative is
-                // the block-composition loop `gemm.rs` and the device harness
-                // both spell out. That composition is a property of the layout,
-                // not of any one kernel.
-                let mut s: ScoreBand = scores.drain(32 * warp_id, 0);
+                // The whole score band in one call (#22), composed out of the
+                // `[16, 16]` blocks LDTM delivers.
+                let mut s: ScoreBand = scores.tile(32 * warp_id, 0);
 
                 // WANT (#7): causal masking against the band's own origin.
                 // Without it this is a loop over `ScoreBand::coordinate`
@@ -220,14 +208,8 @@ pub mod kernels {
                 let s = s.sub_row(running_max).exp2();
                 running_sum.add_assign(s.row_sum());
 
-                // WANT (#22): a whole-tile register → shared store, the
-                // mirror of the drain above. `store_fragment` is
-                // per-`[16, 16]`-block and takes the block's `(row, column)`
-                // apart from the fragment, so staging a band is a second
-                // hand-written composition loop. Only the composition is
-                // missing: #25 gave the cursor underneath it stacked
-                // subtiles, so the addressing already spans any width.
-                store_tile(p, 32 * warp_id, 0, lane, s);
+                // The mirror of the drain above, on the shared side (#22).
+                store_tile(p.chunk_writer(), 32 * warp_id, 0, lane, s);
                 thread::sync_threads();
 
                 if leader {
@@ -238,7 +220,7 @@ pub mod kernels {
                 }
                 accumulated.wait(block & 1);
 
-                let contribution: OutBand = output.drain(32 * warp_id, 0);
+                let contribution: OutBand = output.tile(32 * warp_id, 0);
                 // WANT (#31): `RegTile` has the by-value `add` but no
                 // in-place form, and this is the accumulator #31 measured —
                 // at 128 columns the by-value spelling cost 87 registers.

@@ -12,9 +12,10 @@
 //! could not finish. All three are closed, and this file is the diff going to
 //! zero: five gaps, then one, then none.
 //!
-//! Not blocking, but visible: the movers are per-`[16, 16]`-block, so the band
-//! loop is written twice below (#22). It compiles and it runs — it is a cost,
-//! not a hole.
+//! It used to write the `[16, 16]` block-composition loop twice, once per
+//! direction, for want of a band-shaped mover. [`kittens::ldst::load_tile`] and
+//! [`kittens::ldst::store_tile`] (#22) are that mover, and the two loops are
+//! gone: the body below is four calls and four lines of arithmetic.
 //!
 //! Note what is *not* in that list, and never was: nothing about layouts,
 //! swizzles, semaphores, the fragment map, or the arithmetic. The missing
@@ -38,8 +39,8 @@ use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, thread, warp};
 
-use kittens::ldst::{load_fragment, store_fragment};
-use kittens::reg::{BaseLdtm, Fragment, RegTile};
+use kittens::ldst::{load_tile, store_tile};
+use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, Swizzle128B, tma_store_commit, tma_store_wait};
 use kittens::sync::Semaphore;
 
@@ -58,85 +59,6 @@ pub const THREADS: u32 = (ROWS / 32) as u32 * 32;
 #[cuda_module]
 pub mod kernels {
     use super::*;
-
-    /// One warp's band of the tile, read a `[16, 16]` block at a time.
-    ///
-    /// This is #22's `load_tile(tile, row, 0, lane)` written out by hand: the
-    /// mover is real and spans the tile, it just moves one block per call, so
-    /// every kernel that wants a band writes this same two-deep loop.
-    #[inline(always)]
-    unsafe fn load_band(tile: Tile, row: u32, lane: u32) -> Band {
-        unsafe {
-            let chunks = tile.chunk_writer();
-            let mut band = Band::zero();
-            let mut row_block = 0usize;
-            while row_block < 32 / 16 {
-                let mut column_block = 0usize;
-                while column_block < COLUMNS / 16 {
-                    let fragment = load_fragment::<Bf16>(
-                        chunks,
-                        row + 16 * row_block as u32,
-                        16 * column_block as u32,
-                        lane,
-                    );
-                    let mut slot = 0usize;
-                    while slot < Fragment::SLOTS {
-                        let mut value = 0usize;
-                        while value < Fragment::VALUES {
-                            band.set(
-                                2 * row_block + slot,
-                                4 * column_block + value,
-                                fragment.get(slot, value),
-                            );
-                            value += 1;
-                        }
-                        slot += 1;
-                    }
-                    column_block += 1;
-                }
-                row_block += 1;
-            }
-            band
-        }
-    }
-
-    /// The mirror of [`load_band`] — #22's `store_tile`, same loop, opposite
-    /// direction.
-    #[inline(always)]
-    unsafe fn store_band(tile: Tile, row: u32, lane: u32, band: Band) {
-        unsafe {
-            let chunks = tile.chunk_writer();
-            let mut row_block = 0usize;
-            while row_block < 32 / 16 {
-                let mut column_block = 0usize;
-                while column_block < COLUMNS / 16 {
-                    let mut fragment = Fragment::zero();
-                    let mut slot = 0usize;
-                    while slot < Fragment::SLOTS {
-                        let mut value = 0usize;
-                        while value < Fragment::VALUES {
-                            fragment.set(
-                                slot,
-                                value,
-                                band.get(2 * row_block + slot, 4 * column_block + value),
-                            );
-                            value += 1;
-                        }
-                        slot += 1;
-                    }
-                    store_fragment::<Bf16>(
-                        chunks,
-                        row + 16 * row_block as u32,
-                        16 * column_block as u32,
-                        lane,
-                        fragment,
-                    );
-                    column_block += 1;
-                }
-                row_block += 1;
-            }
-        }
-    }
 
     /// Row-wise `softmax` of one `[ROWS, COLUMNS]` tile per CTA, in place:
     /// TMA in, normalize in registers, TMA out.
@@ -173,7 +95,8 @@ pub mod kernels {
             loaded.wait(0);
             thread::sync_threads();
 
-            let x = load_band(tile, row_base, lane);
+            let chunks = tile.chunk_writer();
+            let x: Band = load_tile(chunks, row_base, 0, lane);
 
             // The whole algorithm, in the real API. `row_max`/`row_sum` (#6)
             // fold a thread's own 32 values and then the quad holding the rest
@@ -183,7 +106,7 @@ pub mod kernels {
             let x = x.sub_row(x.row_max()).exp2();
             let x = x.div_row(x.row_sum());
 
-            store_band(tile, row_base, lane, x);
+            store_tile(chunks, row_base, 0, lane, x);
             // `stmatrix` writes through the generic proxy; the TMA engine reads
             // through the async one.
             fence_proxy_async_shared_cta();

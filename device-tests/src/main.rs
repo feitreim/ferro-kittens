@@ -36,7 +36,7 @@ use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, thread, warp};
 
 use kittens::global::{GlobalLayout, encode_bf16_panels};
-use kittens::ldst::{load_fragment, store_fragment};
+use kittens::ldst::{load_fragment, load_tile, store_fragment, store_tile};
 use kittens::mma::{self, MmaShape, mma_abt};
 use kittens::reg::{
     BaseLdtm, ColVec, Fragment, FragmentLayout, Mul, RegTile, RegVec, online_rescale,
@@ -566,6 +566,56 @@ pub mod kernels {
         unsafe { ldmatrix_probe::<TILE, WIDE>(source, &mut out) }
     }
 
+    /// The composed shared movers, both directions in one trip: `load_tile`
+    /// reads a `[32, WIDE]` band out of the TMA-staged tile's rows `0..32`,
+    /// and `store_tile` writes that same band into its rows `32..64`.
+    ///
+    /// The band is 128 columns, so both directions cross the stacked-subtile
+    /// stride, and the store's `row` base is non-zero — the two places a
+    /// composition loop can be wrong that a single `[16, 16]` block cannot
+    /// show. Rows `32..64` must come back as rows `0..32`; the staged values
+    /// are position identities, so a block landing in the wrong place names
+    /// the row and column it came from.
+    ///
+    /// The values round-trip through bf16 exactly: [`cell`] has sixteen zero
+    /// mantissa bits, so packing it back is the identity whatever the
+    /// conversion rounds to.
+    ///
+    /// Launch with one warp: both movers are warp-scope.
+    #[kernel]
+    pub unsafe fn band_roundtrip(source: *const TmaDescriptor, mut out: DisjointSlice<u32>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tile = Tile::<TILE, WIDE>::from_raw(smem);
+            let tma = Semaphore::attach(smem.add(Tile::<TILE, WIDE>::BYTES) as *mut Barrier);
+            let lane = warp::lane_id();
+
+            if lane == 0 {
+                tma.init(1);
+                fence_proxy_async_shared_cta();
+            }
+            thread::sync_threads();
+            if lane == 0 {
+                tile.tma_load(source, 0, 0, tma);
+                tma.expect_tx(Tile::<TILE, WIDE>::BYTES as u32);
+            }
+            tma.wait(0);
+            thread::sync_threads();
+
+            let chunks = tile.chunk_writer();
+            let band: RegTile<32, WIDE, BaseLdtm> = load_tile(chunks, 0, 0, lane);
+            store_tile(chunks, 32, 0, lane, band);
+            thread::sync_threads();
+
+            dump_rows(tile, lane as usize, 32, &mut out);
+
+            thread::sync_threads();
+            if lane == 0 {
+                tma.inval();
+            }
+        }
+    }
+
     /// Read `tile`'s rows `first`, `first + stride`, … back through the
     /// swizzle and write them to `out` in logical order. The chunk count is
     /// the cursor's own, so the loop covers every stacked subtile without
@@ -592,91 +642,6 @@ pub mod kernels {
                     chunk += 1;
                 }
                 row += stride;
-            }
-        }
-    }
-
-    /// Read a warp's `[M, N]` band out of `tmem`, composing the `[16, 16]`
-    /// fragments `TmemTile::fragment_tile` returns by
-    /// `(2 * row_block + slot, 4 * column_block + value)` — the composition
-    /// every hand-written drain loop spells out.
-    #[inline(always)]
-    unsafe fn drain_band<const M: usize, const N: usize>(
-        tmem: Accumulator,
-        warp_id: u32,
-    ) -> RegTile<M, N, BaseLdtm>
-    where
-        BaseLdtm: FragmentLayout<M, N>,
-    {
-        unsafe {
-            let mut tile = RegTile::<M, N, BaseLdtm>::zero();
-            let mut row_block = 0usize;
-            while row_block < M / 16 {
-                let mut column_block = 0usize;
-                while column_block < N / 16 {
-                    let fragment = tmem.fragment_tile(
-                        32 * warp_id + 16 * row_block as u32,
-                        16 * column_block as u32,
-                    );
-                    let mut slot = 0usize;
-                    while slot < Fragment::SLOTS {
-                        let mut value = 0usize;
-                        while value < Fragment::VALUES {
-                            tile.set(
-                                2 * row_block + slot,
-                                4 * column_block + value,
-                                fragment.get(slot, value),
-                            );
-                            value += 1;
-                        }
-                        slot += 1;
-                    }
-                    column_block += 1;
-                }
-                row_block += 1;
-            }
-            tile
-        }
-    }
-
-    /// The inverse of [`drain_band`]: write a warp's `[M, N]` band back into
-    /// `tmem` through `TmemTile::store_fragment_tile`, block by block. The
-    /// stores are left outstanding — one `store_wait` covers the whole band.
-    #[inline(always)]
-    unsafe fn stage_band<const M: usize, const N: usize>(
-        tmem: Accumulator,
-        warp_id: u32,
-        tile: RegTile<M, N, BaseLdtm>,
-    ) where
-        BaseLdtm: FragmentLayout<M, N>,
-    {
-        unsafe {
-            let mut row_block = 0usize;
-            while row_block < M / 16 {
-                let mut column_block = 0usize;
-                while column_block < N / 16 {
-                    let mut fragment = Fragment::zero();
-                    let mut slot = 0usize;
-                    while slot < Fragment::SLOTS {
-                        let mut value = 0usize;
-                        while value < Fragment::VALUES {
-                            fragment.set(
-                                slot,
-                                value,
-                                tile.get(2 * row_block + slot, 4 * column_block + value),
-                            );
-                            value += 1;
-                        }
-                        slot += 1;
-                    }
-                    tmem.store_fragment_tile(
-                        32 * warp_id + 16 * row_block as u32,
-                        16 * column_block as u32,
-                        fragment,
-                    );
-                    column_block += 1;
-                }
-                row_block += 1;
             }
         }
     }
@@ -709,7 +674,7 @@ pub mod kernels {
     }
 
     /// Round-trip a `[32, COLUMNS]` band of registers through TMEM: seed,
-    /// `store_fragment_tile`, `store_wait`, `fragment_tile`, dump.
+    /// `TmemTile::store_tile`, `store_wait`, `TmemTile::tile`, dump.
     ///
     /// Each thread's value at `(slot, value)` is `dump_index` of its own
     /// `(warp, lane, slot, value)`, so every register in the launch carries a
@@ -747,10 +712,10 @@ pub mod kernels {
                 slot += 1;
             }
 
-            stage_band(band, warp_id, tile);
+            band.store_tile(32 * warp_id, 0, tile);
             store_wait();
             dump_band(
-                drain_band::<32, COLUMNS>(band, warp_id),
+                band.tile::<32, COLUMNS>(32 * warp_id, 0),
                 warp_id,
                 lane,
                 &mut out,
@@ -768,7 +733,7 @@ pub mod kernels {
     /// warps drains its own 32 TMEM rows into a `RegTile<M, N, BaseLdtm>`.
     ///
     /// With `RESTAGE` the drained band takes a detour: it is written back
-    /// through `store_fragment_tile` to the columns `COLUMNS..2*COLUMNS` of a
+    /// through `TmemTile::store_tile` to the columns `COLUMNS..2*COLUMNS` of a
     /// double-width allocation and drained again from there. The values are
     /// absolute position identities the store path never computes, and the
     /// re-drain reads at a column the `fragment map` cases already validated,
@@ -838,12 +803,12 @@ pub mod kernels {
             mma_done.wait(0);
             thread::sync_threads();
 
-            let mut tile = drain_band::<M, N>(accumulator, warp_id);
+            let mut tile = accumulator.tile::<M, N>(32 * warp_id, 0);
             if RESTAGE {
                 let staged = accumulator.columns_right(COLUMNS as u32);
-                stage_band(staged, warp_id, tile);
+                staged.store_tile(32 * warp_id, 0, tile);
                 store_wait();
-                tile = drain_band::<M, N>(staged, warp_id);
+                tile = staged.tile::<M, N>(32 * warp_id, 0);
             }
             dump_band(tile, warp_id, lane, out);
 
@@ -974,8 +939,8 @@ pub mod kernels {
             mma_done.wait(0);
             thread::sync_threads();
 
-            let wide = drain_band::<32, COLUMNS>(accumulator, warp_id);
-            let narrow = drain_band::<32, 32>(accumulator, warp_id);
+            let wide = accumulator.tile::<32, COLUMNS>(32 * warp_id, 0);
+            let narrow = accumulator.tile::<32, 32>(32 * warp_id, 0);
             let rows = wide.row_sum();
             let columns = wide.col_sum();
 
@@ -1676,6 +1641,40 @@ fn check_stmatrix<const R: usize, const C: usize>(
     compare_tile(&out.to_host_vec(stream)?, &expected, C / 2)
 }
 
+/// Do the composed shared movers place a whole `[32, WIDE]` band where the
+/// per-block ones would?
+///
+/// The kernel copies rows `0..32` of a staged tile into its rows `32..64`
+/// through `load_tile` and `store_tile`, so the expectation is the staged tile
+/// with its second half overwritten by its first — and a composition that
+/// transposes a block, drops a row offset or loses the subtile stride shows up
+/// as a `[16, 16]` square of identities naming the wrong position.
+///
+/// The `stmatrix`/`ldmatrix` cases fix each block's own addressing against
+/// silicon; this is the case for the loop around them.
+fn check_band_roundtrip(
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<String, Box<dyn Error>> {
+    let staged = identity_tile(TILE, WIDE);
+    let source = DeviceBuffer::from_host(stream, &staged)?;
+    let map = unsafe { encode_bf16_panels::<TILE, WIDE>(stream, source.cu_deviceptr(), TILE, 1)? };
+    let (band_rows, words) = (TILE / 2, WIDE / 2);
+    let mut expected = staged.clone();
+    expected.copy_within(0..band_rows * words, band_rows * words);
+
+    let mut out = DeviceBuffer::<u32>::zeroed(stream, staged.len())?;
+    unsafe {
+        module.band_roundtrip(
+            stream,
+            launch_config(32, tile_shared::<TILE, WIDE>()),
+            map.as_ptr(),
+            &mut out,
+        )?
+    };
+    compare_tile(&out.to_host_vec(stream)?, &expected, words)
+}
+
 /// Does `ldmatrix` hand each register the element [`BaseLdtm`] says it owns?
 ///
 /// The tile is TMA-staged position identities, so every drained value names the
@@ -1765,8 +1764,8 @@ fn check_ldmatrix<const R: usize, const C: usize>(
 /// is `observed[i] == i` and a mismatch names both the thread coordinate that
 /// should own the value and the one that actually wrote it.
 ///
-/// This establishes that `store_fragment_tile` is the exact inverse of
-/// `fragment_tile` — no more. A store and a load agreeing on the *wrong* lane
+/// This establishes that `TmemTile::store_tile` is the exact inverse of
+/// `TmemTile::tile` — no more. A store and a load agreeing on the *wrong* lane
 /// map would pass identically; it is the `fragment map` cases that fix LDTM's
 /// map against silicon, and `sttm restage` that checks the store's column
 /// arithmetic against a value it did not compute.
@@ -2152,6 +2151,10 @@ fn run() -> Result<usize, Box<dyn Error>> {
                 module.ldmatrix_map_wide(stream, config, map, out)
             })
         }),
+    ));
+    cases.push((
+        "band round trip",
+        Box::new(|| check_band_roundtrip(stream, module)),
     ));
     cases.push((
         "sttm round trip",

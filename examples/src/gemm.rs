@@ -54,7 +54,7 @@ use cuda_device::{
 };
 
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
-use kittens::reg::{BaseLdtm, Fragment, RegTile};
+use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::TmemTile;
@@ -235,32 +235,10 @@ pub mod kernels {
             done.wait(0);
             thread::sync_threads();
 
-            let mut band = Band::zero();
-            let mut row_block = 0usize;
-            while row_block < 32 / 16 {
-                let mut column_block = 0usize;
-                while column_block < BLOCK_N / 16 {
-                    let fragment = accumulator.fragment_tile(
-                        32 * warp_id + 16 * row_block as u32,
-                        16 * column_block as u32,
-                    );
-                    let mut slot = 0usize;
-                    while slot < Fragment::SLOTS {
-                        let mut value = 0usize;
-                        while value < Fragment::VALUES {
-                            band.set(
-                                2 * row_block + slot,
-                                4 * column_block + value,
-                                fragment.get(slot, value),
-                            );
-                            value += 1;
-                        }
-                        slot += 1;
-                    }
-                    column_block += 1;
-                }
-                row_block += 1;
-            }
+            // The whole band in one call (#22): this warp's 32 TMEM lanes by
+            // every column of the accumulator, composed out of the `[16, 16]`
+            // blocks LDTM delivers.
+            let band: Band = accumulator.tile(32 * warp_id, 0);
 
             // ---- GAP (#11, direct global ↔ register store) -----------------
             // What the next twelve lines want to be:

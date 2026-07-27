@@ -20,8 +20,8 @@ target *of the library*.)
 | --- | --- | --- |
 | [`gemm`](src/gemm.rs) | **runs** — exact against a CPU reference | — (two gaps worked around in-file, both marked) |
 | [`softmax`](src/softmax.rs) | **runs** — within 2⁻⁸ of a CPU reference | — |
-| [`flash_forward`](src/flash_forward.rs) | aspirational | #7, #11, #22, #23, #31 + scalar broadcasts |
-| [`layernorm`](src/layernorm.rs) | aspirational | #3, #13, #22 + scalar broadcasts |
+| [`flash_forward`](src/flash_forward.rs) | aspirational | #7, #11, #23, #31 + scalar broadcasts |
+| [`layernorm`](src/layernorm.rs) | aspirational | #3, #13 + scalar broadcasts |
 
 Two of the four **run** rather than merely compile, which is a strictly stronger
 claim and the one worth holding the rest to: a launcher, a CPU reference, and an
@@ -33,10 +33,12 @@ them, and closing it took nothing but the store: `SharedTile::tma_store` walks
 the same boxes `tma_load` does, and `tma_store_commit` / `tma_store_wait::<0>()`
 are the completion side.
 
-Nothing on the remaining lists is arithmetic. #5 and #6 between them closed
-every elementwise op and every reduction the four kernels asked for, and #21 and
-#25 closed both halves of the shared ↔ register path. What remains across the
-four is movers (#22, composition only), masking (#7), and one structural gap
+Nothing on the remaining lists is arithmetic, and nothing on them is a mover.
+#5 and #6 between them closed every elementwise op and every reduction the four
+kernels asked for; #21 and #25 closed both halves of the shared ↔ register path,
+and #22 closed the composition on top of them, in both directions and against
+both memories. What remains across the four is masking (#7), the global ↔
+register path (#11), the closed shape set (#23), and one structural gap
 (#3 + #13, layernorm's block-scope statistic).
 
 The one arithmetic leftover is the **scalar broadcast** forms —
@@ -198,7 +200,7 @@ result: the MMA layer is the part of this library that is finished.
 
 The most valuable output here. Ordered by how badly it hurts. Items 1–6 were
 filed as **#21**, **#22**, **#25**, **#23** and **#24** (which covers both
-cluster-scope entries); **1 and 3 have since shipped**. The numbers are noted
+cluster-scope entries); **1, 2 and 3 have since shipped**. The numbers are noted
 inline and the prose is kept as written, because it is the argument rather than
 the ticket.
 
@@ -217,26 +219,36 @@ compiles to.
 
 What remained of this item was shape, not direction — and item 3 below closed
 the other half of that: `chunk_writer` spans stacked subtiles, so the path
-exists at every width the library can describe. Only item 2 is left, and it is
-a cost rather than a hole: `load_fragment`/`store_fragment` move one
-`[16, 16]` block, so a band is a loop the kernel writes.
+exists at every width the library can describe. Item 2 closed the last of it:
+`load_tile`/`store_tile` move a whole band, so nothing about the shared ↔
+register path is a loop the kernel writes any more.
 
-#### 2. The movers are per-`[16, 16]`-block, so every kernel writes the same loop (#22)
+#### 2. ~~The movers are per-`[16, 16]`-block, so every kernel writes the same loop~~ — **closed by #22**
 
-`TmemTile::fragment_tile` returns a `[16, 16]` `Fragment`, and
-`ldst::store_fragment` takes one. A kernel that wants a `[32, 128]` band writes
-a four-deep block-composition loop to assemble it — `gemm.rs` does, the flash
-kernel would, and `fragment_probe` in `device-tests` already does. The
-composition is a property of the layout; `reg.rs`'s own test
-(`fragment_blocks_tile_the_bigger_shapes`) states it as an invariant, and then
-no function implements it.
+`TmemTile::fragment_tile` returned a `[16, 16]` `Fragment` and
+`ldst::store_fragment` took one, so a kernel that wanted a `[32, 128]` band
+wrote a four-deep block-composition loop to assemble it — `gemm.rs` did, flash
+would have, `softmax.rs` wrote it *twice*, once per direction, and the device
+harness kept its own copy in the test crate. The composition is a property of
+the layout, and `reg.rs`'s own test
+(`fragment_blocks_tile_the_bigger_shapes`) stated it as an invariant that no
+function implemented.
 
-Wanted (filed as #22): `TmemTile::drain::<M, N, L>(row, column) -> RegTile<M, N,
-L>`, `ldst::load_tile(tile, row, column, lane) -> RegTile<M, N, L>` and
-`ldst::store_tile(tile, row, column, lane, values)`, with the block loop inside.
-This is now the *whole* remaining mover gap in both directions: #21 gave the
-load, #25 gave both of them the tile's full width, and `softmax.rs` writes the
-loop twice — once each way — for want of this one function.
+All four directions landed together: `TmemTile::tile(row, column)` and
+`TmemTile::store_tile(row, column, tile)` over TMEM, `ldst::load_tile(chunks,
+row, column, lane)` and `ldst::store_tile(chunks, row, column, lane, tile)`
+over a swizzled shared tile, each composing the single-block mover it is built
+on out of the same two placement helpers — so a band cannot mean one thing in
+TMEM and another in shared memory. The harness' `drain_band`/`stage_band` are
+gone, replaced by the library calls, which is where the TMEM side's device
+coverage comes from; the shared side got a `band round trip` case of its own,
+and `softmax` runs on both directions of it.
+
+The composition is free where it was measured to be dangerous (#5's `row_map`
+cliff at 128 columns): every TMEM drain kernel in `device-tests` reports the
+same register count as its hand-written loop, and the shared-side band is
+*cheaper* composed — 36 registers against 52 for the loop `softmax.rs` used to
+write (`modal run modal_app.py::regcount`).
 
 #### 3. ~~`SwizzledChunks` cannot span stacked subtiles~~ — **closed by #25**
 
@@ -337,8 +349,8 @@ actually needs from it is the address space. Filed as a correction on #24.
   loads it issued. A tile knows its own size; `Semaphore::expect_tiles` or a
   charge returned by `tma_load` would make the two impossible to disagree.
 - **Coordinate-dependent ops need `lane` passed in.** `store_fragment` and
-  `RegTile::coordinate` take it explicitly, so the invented `make_causal_at`,
-  `load_tile` and `store_tile` do too. Consistent, but every call site writes
+  `RegTile::coordinate` take it explicitly, so `ldst::load_tile`/`store_tile`
+  do too, and so would the invented `make_causal_at`. Consistent, but every call site writes
   `warp::lane_id()` into a variable that the op could have read itself. Worth
   settling deliberately when #5 lands, since it fixes the convention for
   thirty functions at once.
