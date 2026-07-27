@@ -18,11 +18,14 @@
 //!   they are loaded once, shared by every row, and belong in shared memory.
 //!   With no `SharedVec` they would be re-read from global by every thread.
 //!
-//! Blocked on: **#13** (`SharedVec` and its TMA path), and one leftover with
-//! no issue of its own — **scalar broadcast ops**. #5 listed `scale`/`shift` on
-//! `RegTile` and `RegVec` and a free `rsqrt(f32)`, and shipped the op
-//! mechanism without them, so a per-row or per-tile *constant* still has to be
-//! splatted into a whole vector to be combined with one.
+//! Blocked on: **#13** (`SharedVec` and its TMA path), and — for
+//! [`kernels::groupnorm_tile`] only — **#3**, discussed below.
+//!
+//! Nothing arithmetic is left. The scalar broadcasts this file used to name as
+//! a gap — `scale`/`shift` on a tile or a vector, and a free `rsqrt(f32)` for
+//! a variance that is already one `f32` — landed with **#38**, so both kernels
+//! below spell their normalization in the real API and every remaining `WANT`
+//! is a mover or a scope.
 //!
 //! The second kernel here, [`kernels::groupnorm_tile`], normalizes over the
 //! *whole* tile rather than per row, and that is the one place a landed #6
@@ -109,10 +112,9 @@ pub mod kernels {
 
             let x: Band = load_tile(tile.chunk_writer(), row_base, 0, lane);
 
-            // The algorithm, in the real API — except `scale`/`shift`, the
-            // scalar broadcasts #5 named and did not ship. Written the way
-            // they would read; without them each constant has to be splatted
-            // into a whole `RegVec` before it can be combined with one.
+            // The whole algorithm, in the real API. `scale`/`shift` (#38) keep
+            // `1/COLUMNS` and `epsilon` in a register: before them a constant
+            // had to be splatted into a whole `RegVec` to be combined with one.
             let mean = x.row_sum().scale(1.0 / COLUMNS as f32);
             let x = x.sub_row(mean);
             let variance = x.mul(x).row_sum().scale(1.0 / COLUMNS as f32);
@@ -178,6 +180,9 @@ pub mod kernels {
             // where the partials live, and `partials` below is this kernel
             // guessing. Every kernel that needs one writes this by hand today.
             let mean = block_reduce_sum(partials, x.tile_sum()) * scale;
+            // `shift`/`scale` against a warp-uniform `f32` (#38), and the free
+            // `rsqrt` beside them: this statistic never becomes a vector, so
+            // there was nothing for `RegVec::rsqrt` to ride on.
             let x = x.shift(-mean);
             let variance = block_reduce_sum(partials, x.mul(x).tile_sum()) * scale;
             let x = x.scale(rsqrt(variance + epsilon));

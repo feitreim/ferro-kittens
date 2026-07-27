@@ -12,11 +12,13 @@
 //! - **#11** (global ↔ register) — the epilogue writes fp32 out of registers.
 //!   Today that means packing to bf16, `stmatrix` into a shared tile, and a
 //!   TMA store (#9): a precision loss the epilogue never asked for.
-//! - **#31, and one leftover of #5** — `RegTile::add_assign`, and the scalar
-//!   broadcast `scale`. #5 shipped the map mechanism and the vector/vector
-//!   forms; a tile combined with a bare `f32`, and any in-place form of a
-//!   tile op, are still missing. This kernel's `[32, 128]` output accumulator
-//!   is exactly the shape #31 measured the by-value cost on.
+//! - **#31** — `RegTile::add_assign`. `RegTile` has the by-value `add` and no
+//!   in-place form, and this kernel's `[32, 128]` output accumulator is
+//!   exactly the shape the by-value cost was measured on. #38 measured the
+//!   same thing for a scalar operand and got the same direction: at 128
+//!   columns the by-value spelling spills where the in-place one does not.
+//!   The scalar broadcast `scale` that used to share this entry landed with
+//!   #38 and is the real API below.
 //!
 //! Plus one thing named at its call site below:
 //!
@@ -198,10 +200,10 @@ pub mod kernels {
                 // to delete, in the one place every attention kernel needs it.
                 s.make_causal_at(lane, query_base + 32 * warp_id, key_base, f32::NEG_INFINITY);
 
-                // The softmax numerator, in the real API (#5, #6) — except
-                // `scale`, the scalar broadcast #5 named and did not ship.
-                // `row_max`/`row_sum` are both halves of the reduction now:
-                // the thread's own 16 values, then the quad.
+                // The softmax numerator, in the real API (#5, #6, #38).
+                // `scale` folds `1/√d` and `log2(e)` into one register-operand
+                // `Mul`; `row_max`/`row_sum` are both halves of the reduction,
+                // the thread's own 16 values and then the quad.
                 let s = s.scale(scale * LOG2E);
                 let row_max = s.row_max();
                 online_rescale(&mut running_max, row_max, &mut running_sum, &mut out_acc);
@@ -224,6 +226,9 @@ pub mod kernels {
                 // WANT (#31): `RegTile` has the by-value `add` but no
                 // in-place form, and this is the accumulator #31 measured —
                 // at 128 columns the by-value spelling cost 87 registers.
+                // `RegVec` has had `add_assign` since #5; #38 deliberately did
+                // not add the tile's, so that #31 lands every in-place form at
+                // once rather than unifying a one-off later.
                 out_acc.add_assign(contribution);
                 if leader {
                     free.sem(block).arrive();
