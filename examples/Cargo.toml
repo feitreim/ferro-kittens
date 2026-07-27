@@ -1,0 +1,33 @@
+[package]
+# Not `examples`: cargo forbids that as a binary target name, since it is one
+# of its own build directory names. The directory keeps the name the issue
+# asked for; the artifact is `kittens-examples`.
+name = "kittens-examples"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone workspace, like `device-tests`: `cargo` at the repo root never sees
+# this crate, so an aspirational kernel that names API we have not written yet
+# cannot break the library's build or its CI.
+[workspace]
+
+[features]
+default = []
+# Each aspirational kernel sits behind its own feature and is off by default,
+# so everything in the default build genuinely compiles. Turning one on is how
+# you read its gap list: the compiler errors *are* the missing API surface,
+# named at the call sites that want it.
+flash = []
+softmax = []
+layernorm = []
+aspirational = ["flash", "layernorm", "softmax"]
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
+kittens = { package = "ferro-kittens", path = ".." }
+
+[profile.release]
+debug = false
+lto = true

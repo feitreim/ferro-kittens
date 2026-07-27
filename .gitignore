@@ -1,3 +1,4 @@
 /target
 /device-tests/target
 __pycache__/
+/examples/target
