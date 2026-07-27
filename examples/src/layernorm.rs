@@ -3,6 +3,10 @@
 //! **Status: aspirational.** Excluded from the default build; read its gap
 //! list with `cargo check --features layernorm`.
 //!
+//! Both kernels here end the way softmax does, and that ending is now real:
+//! `tma_store` + `tma_store_commit` + `tma_store_wait::<0>()` (#9). What keeps
+//! this file aspirational is everything in front of it.
+//!
 //! Layernorm was softmax's gaps plus two about *vectors* rather than tiles.
 //! One of them is closed: [`kittens::reg::ColVec`] exists (#5) and
 //! [`kittens::reg::RegTile::col_reduce`] now fills it (#6), folding a column's
@@ -14,8 +18,8 @@
 //!   they are loaded once, shared by every row, and belong in shared memory.
 //!   With no `SharedVec` they would be re-read from global by every thread.
 //!
-//! Blocked on: **#13** (`SharedVec` and its TMA path), **#9** (the store
-//! side), **#22** (`ldst::load_tile`/`store_tile`, the whole-tile forms of the
+//! Blocked on: **#13** (`SharedVec` and its TMA path), **#22**
+//! (`ldst::load_tile`/`store_tile`, the whole-tile forms of the
 //! per-`[16, 16]`-block movers — the cursor underneath them spans this
 //! 128-wide tile since **#25** and `load_fragment` exists since **#21**, so
 //! what is left is composition, not addressing), and one leftover with no
@@ -92,7 +96,7 @@ pub mod kernels {
             thread::sync_threads();
             if thread::threadIdx_x() == 0 {
                 tile.tma_load(source, row, 0, loaded);
-                // WANT (#13, #9): a vector's own TMA path. A `[1, COLUMNS]`
+                // WANT (#13): a vector's own TMA path. A `[1, COLUMNS]`
                 // box is not a tile, and forcing it to be one wastes a whole
                 // swizzle atom per row of padding.
                 gamma.tma_load(gamma_map, 0, loaded);
@@ -122,6 +126,10 @@ pub mod kernels {
                 .add_col(b);
 
             store_tile(tile, row_base, 0, lane, x);
+            // `store_tile` writes through the generic proxy and the TMA engine
+            // reads through the async one, so the store side owes this fence
+            // exactly as an MMA reading the same tile would.
+            fence_proxy_async_shared_cta();
             thread::sync_threads();
             if thread::threadIdx_x() == 0 {
                 tile.tma_store(destination, row, 0);
@@ -179,6 +187,10 @@ pub mod kernels {
             let x = x.scale(rsqrt(variance + epsilon));
 
             store_tile(tile, row_base, 0, lane, x);
+            // `store_tile` writes through the generic proxy and the TMA engine
+            // reads through the async one, so the store side owes this fence
+            // exactly as an MMA reading the same tile would.
+            fence_proxy_async_shared_cta();
             thread::sync_threads();
             if thread::threadIdx_x() == 0 {
                 tile.tma_store(destination, row, 0);
