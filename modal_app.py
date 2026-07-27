@@ -117,6 +117,10 @@ image = (
         # command tries to rebuild the project itself as a backend library.
         "cd /opt/warmup && LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs cargo oxide build warmup",
     )
+    # Lints. A layer of its own, after the expensive ones, so adding it leaves
+    # the shared backend-build layers cached. `RUSTUP_TOOLCHAIN` shadows
+    # rust-toolchain.toml, so the component list there does not reach here.
+    .run_commands(f"rustup component add clippy --toolchain {RUST_TOOLCHAIN}")
     # Live mounts (re-read each run; edits need no image rebuild). The harness
     # path-depends on the library, so both trees come along.
     .add_local_dir(str(Path(__file__).parent / "src"), f"{PROJECT_DIR}/src")
@@ -154,8 +158,10 @@ def build() -> None:
     cannot be checked off a CUDA box, `global.rs` needs cuda.h) and a full
     device build of the harness against the driver stub. Iterate compile errors
     here; the B200 function is for running, not for finding typos."""
-    _run(["cargo", "check", "--features", "host", "--all-targets"], cwd=PROJECT_DIR)
+    _run(["cargo", "clippy", "--features", "host", "--all-targets"], cwd=PROJECT_DIR)
     _run(["cargo", "test", "--features", "host"], cwd=PROJECT_DIR)
+    # The harness only typechecks where cuda.h is, so its lints live here too.
+    _run(["cargo", "clippy", "--all-targets"], cwd=HARNESS_DIR)
     # `build` (unlike `run`) does not auto-detect the GPU arch, and tcgen05
     # exists only on Blackwell -- pin it or the artifact fails to compile.
     _run([*STUB_ENV, "cargo", "oxide", "build", "device-tests", "--arch", "sm_100a"],
