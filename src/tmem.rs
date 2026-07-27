@@ -144,12 +144,28 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
         self.address + (row << 16) + column
     }
 
-    /// The segment `columns` fp32 columns to the right — accumulator
-    /// ping-pong stages (gemm's `accum_stage * 256`) or a second output
-    /// band sharing one allocation.
+    /// The same-shaped segment `columns` fp32 columns to the right —
+    /// accumulator ping-pong stages (gemm's `accum_stage * 256`), or the
+    /// N-half a second MMA of a wider allocation writes.
     pub const fn columns_right(self, columns: u32) -> Self {
         Self {
             address: self.address + columns,
+        }
+    }
+
+    /// The next segment of the same allocation, `C2` columns wide: one
+    /// `tcgen05_alloc` of `C + C2` columns carved into a `[R, C]` and a
+    /// `[R, C2]` tile, as flash's `S` and `O` share one allocation.
+    ///
+    /// The offset is `C` rather than a parameter because a TMEM segment
+    /// spans all 128 lanes — segments can only be carved along the column
+    /// axis, so the one that follows this tile begins where it ends. An
+    /// explicit offset could name a column inside this tile instead, and
+    /// overlapping segments have no diagnostic: the two MMAs simply write
+    /// each other's accumulator.
+    pub const fn split_columns<const C2: usize>(self) -> TmemTile<R, C2> {
+        TmemTile {
+            address: self.address + C as u32,
         }
     }
 
@@ -261,6 +277,31 @@ mod tests {
         assert_eq!(tile.at(0, 0), 0x0001_0000);
         assert_eq!(tile.at(32, 24), 0x0021_0018);
         assert_eq!(tile.columns_right(64).at(0, 0), 0x0001_0040);
+    }
+
+    /// Flash's carve: one `[128, 64 + 128]` allocation as a score segment
+    /// and an output segment beside it. The output's first column has to be
+    /// the score's last plus one, in both directions — a short offset
+    /// overlaps the scores and a long one runs off the allocation, and TMEM
+    /// reports neither.
+    #[test]
+    fn split_columns_carves_an_allocation_without_overlap() {
+        const KEYS: usize = 64;
+        const HEAD: usize = 128;
+
+        let base = 0x0000_0000;
+        let scores = TmemTile::<128, KEYS>::from_raw(base);
+        let output: TmemTile<128, HEAD> = scores.split_columns();
+
+        assert_eq!(output.at(0, 0), scores.at(0, KEYS as u32 - 1) + 1);
+        assert_eq!(
+            output.at(127, HEAD as u32 - 1),
+            base + (127 << 16) + (KEYS + HEAD) as u32 - 1
+        );
+
+        // A third segment chains off the second, not off the first.
+        let spare = output.split_columns::<32>();
+        assert_eq!(spare.at(0, 0), base + (KEYS + HEAD) as u32);
     }
 
     /// The simd-pair interleaving, both directions. `split` is what the store

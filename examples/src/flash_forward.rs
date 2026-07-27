@@ -160,7 +160,7 @@ pub mod kernels {
             // `[128, HEAD]` beside it.
             let tmem = alloc_block(tmem_slot, (KEYS + HEAD) as u32);
             let scores = Scores::from_raw(tmem);
-            let output = Output::from_raw(tmem + KEYS as u32);
+            let output: Output = scores.split_columns();
 
             if leader {
                 q.tma_load(q_map, query_base as i32, head, q_loaded);
