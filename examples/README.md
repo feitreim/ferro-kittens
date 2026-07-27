@@ -1,7 +1,7 @@
 # examples
 
 Four kernels written the way we want them to read, and a header on each saying
-whether it compiles.
+whether it runs, whether it only compiles, or whether it is aspirational.
 
 The value of this crate is the **diff** between what the kernels want to say and
 what `kittens` can express. An aspirational example is not a placeholder — it is
@@ -18,10 +18,14 @@ target *of the library*.)
 
 | Kernel | Status | Blocked on |
 | --- | --- | --- |
-| [`gemm`](src/gemm.rs) | **compiles** | — (three gaps worked around in-file, all marked) |
+| [`gemm`](src/gemm.rs) | **runs** — exact against a CPU reference | — (two gaps worked around in-file, both marked) |
 | [`flash_forward`](src/flash_forward.rs) | aspirational | #7, #11, #22, #23, #31 + scalar broadcasts |
 | [`softmax`](src/softmax.rs) | aspirational | **#9, and nothing else** |
 | [`layernorm`](src/layernorm.rs) | aspirational | #3, #9, #13, #22 + scalar broadcasts |
+
+`gemm` is the only one that **runs** rather than merely compiling, which is a
+strictly stronger claim and the one worth holding the others to: a launcher, a
+CPU reference, and an exit code.
 
 Nothing on those lists is arithmetic any more. #5 and #6 between them closed
 every elementwise op and every reduction the four kernels asked for, and #21 and
@@ -39,9 +43,13 @@ half of the argument.
 
 ```sh
 cargo oxide build kittens-examples --arch sm_100a   # the default set: gemm
+cargo oxide run kittens-examples                    # and run it, on a B200
 cargo check --features flash                        # read flash's gap list
 cargo check --features aspirational                 # all of them
 ```
+
+From the repo root: `modal run modal_app.py::build` for the first,
+`modal run modal_app.py::examples` for the second.
 
 Each aspirational kernel is behind its own feature and off by default, so
 everything in the default build genuinely compiles and the two kinds are
@@ -51,11 +59,28 @@ error is `unresolved import`, `no method named`, or an unsatisfied
 `FragmentLayout` bound — there is nothing in these files that fails for any
 reason other than the API not existing.
 
-`gemm` is confirmed to build end-to-end through `cargo oxide build --arch
-sm_100a` (`modal run modal_app.py::build`). It has **not been run**: issue #18
-needs no GPU. Treat it as a statement about expressiveness, not a numerical
-result — in particular the 2-CTA operand split is the first thing to check on
-hardware.
+`gemm` **runs**, and is the first numerical result this library has produced.
+`gemm::check` launches it over `[512, 256] x [256, 256]ᵀ` on a B200 and compares
+every element against a CPU reference. The operands are integers in `[-3, 3]`
+and `[-2, 2]`, so every product and every partial sum is exact in bf16 and fp32
+alike and the comparison is `==` — a mismatch is a wrong coordinate, a wrong
+stride or a wrong operand half, and never a rounding artifact to argue about.
+`main` runs every kernel that has a launcher and exits non-zero on a wrong
+number; off a GPU it prints the status table and stops.
+
+Getting there cost one real bug, recorded here because the aspirational-vs-
+compiling distinction is exactly what missed it. The kernel compiled, and hung.
+Both CTAs' TMA loads have to complete on the *leader's* stage barrier, and the
+kernel mapped that barrier by hand — but a plain `cp.async.bulk.tensor`
+completes on a barrier in the **issuing** CTA's own shared memory, so the
+peer's 24 KiB never reached the count the leader had charged for 48 KiB. §8
+below used to say this kernel "cannot use" `tma_load_2d_multicast_cg2`, on the
+grounds that a 2-CTA UMMA replicates nothing. That is true and beside the
+point: the multicast form's barrier operand is `.shared::cluster`, which is the
+only way one CTA may name another's barrier. With the CTA's own bit as the
+whole mask it delivers to exactly one CTA and completes on the leader — no
+replication, right address space. `Semaphore::multicast_alias` was already in
+the library, filed under the opposite problem.
 
 ---
 
@@ -124,10 +149,17 @@ to agree.
 > parameterization at all) or "take #13's `SharedVec`". #3 and #13 have to be
 > sequenced together, and #6 does not force either.
 
-**#8 — global layout.** Not reachable from a kernel at all, which is why it does
-not appear in the code: `encode_bf16_panels` builds one shape of tensor map (3-D
-bf16 panels), and the GEMM's 2-D operands and layernorm's parameter vectors both
-want another. This is why the crate ships no host launcher.
+**#8 — global layout.** ~~Not reachable from a kernel at all~~ — **closed**, and
+it is why this crate now has a launcher at all. `kittens::global::GlobalLayout<E,
+RANK>` describes a buffer by extents and byte strides at any rank, packed or with
+a leading dimension, and `tensor_map::<Tile>()` reads the box, the swizzle and
+the data type off the `SharedTile` the map is paired with — the agreement
+`encode_bf16_panels` had by being one hardcoded builder, now stated as a type.
+`gemm::check` builds both operands' maps from it and differs only in extents.
+
+What #8 does *not* close: `GlobalLayout` is bf16-only, because `Element` is
+implemented only for `Bf16` (#2 owns that), so layernorm's fp32 parameter
+vectors still cannot be described. Rank 1 is expressible but untried.
 
 **#12 — MMA coverage.** Not demanded. `mma_abt`, `mma_ab` and `mma_walk_cg2`
 covered every multiply in all four kernels. Worth recording as a negative
@@ -255,13 +287,19 @@ first K loads.
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all
-hardcode the 2-CTA pair (GAPS §2.4). But under a 2-CTA UMMA *both* operands are
-already split across the pair, so nothing is replicated and there is nothing for
-the multicast load to do — the GEMM uses the commit and the walk and cannot use
-the load. Multicast starts paying at cluster ≥ 4 (2×2: `A` broadcast along the
-N axis, `B` along the M axis), which the `_cg2` suffix rules out. Generalizing
-the cluster mask is filed nowhere; §2.4 calls it a nice-to-have on the strength
-of flash using pairs, and the GEMM is the counterexample.
+hardcode the 2-CTA pair (GAPS §2.4). Multicast starts paying, as *replication*,
+at cluster ≥ 4 (2×2: `A` broadcast along the N axis, `B` along the M axis),
+which the `_cg2` suffix rules out. Generalizing the cluster mask is filed
+nowhere.
+
+This item said the GEMM "cannot use the load", since under a 2-CTA UMMA both
+operands are already split and nothing is replicated. Running the kernel
+corrected that, and the correction is the more useful fact: the GEMM uses
+`tma_load_2d_multicast_cg2` with a **one-CTA mask**, replicating nothing, purely
+because the multicast form's barrier operand lives in `.shared::cluster` and the
+plain form's does not. A pair-wide producer handoff is impossible without it.
+The `multicast` in the name describes the delivery; what a cluster kernel
+actually needs from it is the address space. Filed as a correction on #24.
 
 #### 9. Smaller things, each one line of API
 

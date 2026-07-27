@@ -1,15 +1,16 @@
 //! Kernels written against the API we want.
 //!
-//! Four kernels, each with a header stating whether it **compiles** today or
-//! is **aspirational** — naming API that does not exist yet, with the issue
-//! numbers it is blocked on. An aspirational example is not a placeholder: it
-//! is a precise statement of a missing surface, in the only terms that matter,
-//! which is what a kernel author has to type. The diff between these files and
-//! the library *is* the backlog. `examples/README.md` collects it.
+//! Four kernels, each with a header stating whether it **runs**, whether it
+//! only **compiles**, or whether it is **aspirational** — naming API that does
+//! not exist yet, with the issue numbers it is blocked on. An aspirational
+//! example is not a placeholder: it is a precise statement of a missing
+//! surface, in the only terms that matter, which is what a kernel author has to
+//! type. The diff between these files and the library *is* the backlog.
+//! `examples/README.md` collects it.
 //!
 //! | Kernel | Status |
 //! | --- | --- |
-//! | [`gemm`] | compiles — `cargo oxide build kittens-examples --arch sm_100a` |
+//! | [`gemm`] | runs — checked against a CPU reference by [`gemm::check`] |
 //! | `flash_forward` | aspirational — `--features flash` |
 //! | `softmax` | aspirational — `--features softmax` |
 //! | `layernorm` | aspirational — `--features layernorm` |
@@ -20,10 +21,13 @@
 //! read that kernel's gap list: the compiler errors *are* the missing API,
 //! reported at the call sites that want it.
 //!
-//! There is no host launcher here. These are statements about kernel code, and
-//! the operands two of them need cannot be described host-side anyway:
-//! `global.rs` builds one shape of tensor map (3-D bf16 panels), and both the
-//! GEMM's 2-D operands and layernorm's parameter vectors want another (#8).
+//! Until #8 there was no launcher here at all, because `global.rs` built one
+//! shape of tensor map (3-D bf16 panels) and the GEMM's operands are 2-D.
+//! `main` now prints the table and then runs every kernel that has one, so on
+//! a B200 this binary reports numbers and exits non-zero when they are wrong;
+//! off a GPU it degrades to the table it always printed.
+
+use std::process::ExitCode;
 
 pub mod gemm;
 
@@ -49,7 +53,7 @@ struct Example {
 fn examples() -> Vec<Example> {
     let mut examples = vec![Example {
         name: "gemm",
-        status: "compiles",
+        status: "runs",
         threads: gemm::THREADS,
         shared_bytes: gemm::SHARED_BYTES,
     }];
@@ -77,11 +81,18 @@ fn examples() -> Vec<Example> {
     examples
 }
 
-fn main() {
-    // Anchors the compiled artifact: the generated loader is what carries the
-    // kernels, and nothing else in this binary refers to them.
-    let _ = gemm::kernels::load;
+/// Every kernel with a launcher, run and checked. `Err` is a wrong number and
+/// not a missing GPU — the caller decides what a missing GPU means.
+fn checks(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+) -> Vec<(&'static str, Result<String, String>)> {
+    vec![(
+        "gemm",
+        gemm::check(context).map_err(|error| error.to_string()),
+    )]
+}
 
+fn main() -> ExitCode {
     println!(
         "{:<16}{:<38}{:>8}{:>14}",
         "kernel", "status", "threads", "shared"
@@ -91,5 +102,29 @@ fn main() {
             "{:<16}{:<38}{:>8}{:>13} B",
             example.name, example.status, example.threads, example.shared_bytes
         );
+    }
+
+    // A build box has no driver, and the table above is the whole point of the
+    // binary there. Only a device that exists can fail a check.
+    let Ok(context) = cuda_core::CudaContext::new(0) else {
+        println!("\nno CUDA device: kernels built, not run");
+        return ExitCode::SUCCESS;
+    };
+
+    println!();
+    let mut failures = 0usize;
+    for (name, result) in checks(&context) {
+        match result {
+            Ok(note) => println!("pass  {name:<16}  {note}"),
+            Err(error) => {
+                println!("FAIL  {name:<16}  {error}");
+                failures += 1;
+            }
+        }
+    }
+    if failures == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
