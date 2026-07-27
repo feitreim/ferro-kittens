@@ -20,8 +20,8 @@ target *of the library*.)
 | --- | --- | --- |
 | [`gemm`](src/gemm.rs) | **compiles** | — (three gaps worked around in-file, all marked) |
 | [`flash_forward`](src/flash_forward.rs) | aspirational | #5, #6, #7, #11 + 3 unfiled |
-| [`softmax`](src/softmax.rs) | aspirational | #5, #6, #9 + 2 unfiled |
-| [`layernorm`](src/layernorm.rs) | aspirational | #3, #5, #6, #9, #13 + 3 unfiled |
+| [`softmax`](src/softmax.rs) | aspirational | #5, #6, #9, #22, #25 |
+| [`layernorm`](src/layernorm.rs) | aspirational | #3, #5, #6, #9, #13, #22, #25 + 1 unfiled |
 
 ```sh
 cargo oxide build kittens-examples --arch sm_100a   # the default set: gemm
@@ -107,20 +107,23 @@ This is the part of the backlog that came from writing kernels rather than from
 reading ThunderKittens' feature list, and it is the most valuable output here.
 Ordered by how badly it hurts.
 
-#### 1. There is no shared → register path at all
+#### 1. ~~There is no shared → register path at all~~ — **closed by #21**
 
-`ldst` is store-only. `SharedTile` hands out raw pointers and a swizzled-chunk
-cursor; `TmemTile::fragment_tile` reads TMEM. **Nothing reads a shared tile into
-registers.** Any kernel whose input is not an MMA operand — every
-normalization, activation, and elementwise epilogue — cannot start. Softmax is
-four lines of algorithm and it is blocked before the first one.
+This was the item this section was written for: `ldst` was store-only, so any
+kernel whose input is not an MMA operand could not start, and softmax was
+blocked before its first line.
 
-GAPS §2 asks for global ↔ register (#11) and register → TMEM (#10) and does not
-mention this. The reason it was never written is presumably the note that
-cuda-oxide's `ldmatrix` lives only in the Hopper `wmma` path — but the swizzled
-address math for a plain vectorized load is already sitting in `SwizzledChunks`.
+`ldst::load_fragment` is now the `ldmatrix` half, sharing the store side's
+address derivation (`ldst::fragment_address`, host-tested) and validated
+against silicon by the `ldmatrix map` device case. `cuda_device::wmma::
+ldmatrix_x2` lowers fine for `sm_100a` — the note that `ldmatrix` "lives only in
+the Hopper `wmma` path" was about where the function is filed, not about what it
+compiles to.
 
-Wanted: `ldst::load_tile(tile, row, column, lane) -> RegTile<M, N, L>`.
+What remains of this item is shape, not direction, and it is items 2 and 3
+below: `load_fragment` moves one `[16, 16]` block, and `chunk_writer` still
+refuses a tile wider than one swizzle atom. Softmax is now blocked on those
+(#22, #25) rather than on the path not existing.
 
 #### 2. The movers are per-`[16, 16]`-block, so every kernel writes the same loop
 
@@ -132,16 +135,20 @@ composition is a property of the layout; `reg.rs`'s own test
 (`fragment_blocks_tile_the_bigger_shapes`) states it as an invariant, and then
 no function implements it.
 
-Wanted: `TmemTile::drain::<M, N, L>(row, column) -> RegTile<M, N, L>` and
+Wanted (filed as #22): `TmemTile::drain::<M, N, L>(row, column) -> RegTile<M, N,
+L>`, `ldst::load_tile(tile, row, column, lane) -> RegTile<M, N, L>` and
 `ldst::store_tile(tile, row, column, lane, values)`, with the block loop inside.
+`ldst::load_fragment` (#21) made this the *whole* remaining gap on the load
+side: the mover exists, it just does not span a tile.
 
 #### 3. `SwizzledChunks` cannot span stacked subtiles
 
 `SharedTile::chunk_writer` const-asserts a one-subtile tile, so **only tiles 64
-bf16 columns wide have a register → shared path at all**. Flash's `P` tile is
-64 wide and fits; softmax's `[128, 128]` tile does not, and there is no way to
-write it back. The store side should walk subtiles the way `tma_load` does, or
-`SharedTile` should hand out a typed subtile view.
+bf16 columns wide have a register ↔ shared path at all** — both directions now,
+since `load_fragment` addresses through the same cursor. Flash's `P` tile is 64
+wide and fits; softmax's `[128, 128]` tile does not, and there is no way to read
+it or write it back. The cursor should walk subtiles the way `tma_load` does, or
+`SharedTile` should hand out a typed subtile view. Filed as #25.
 
 #### 4. The `RegTile` shape set is closed by the library
 
