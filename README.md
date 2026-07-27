@@ -41,3 +41,11 @@ in `cuda-core`; it is off by default so the device-only surface can be
 
 The toolchain is pinned in `rust-toolchain.toml` — cuda-oxide's proc macros need
 nightly features and the codegen backend is built against exactly that nightly.
+
+## Examples
+
+`examples/` holds real kernels — a cluster GEMM, flash-attention forward,
+softmax, layernorm — written the way we want them to read, each with a header
+saying whether it compiles today or names API that does not exist yet.
+`examples/README.md` collects the missing surface all four demand, mapped to
+issues, with the part no issue covers called out separately.
