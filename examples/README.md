@@ -20,8 +20,8 @@ target *of the library*.)
 | --- | --- | --- |
 | [`gemm`](src/gemm.rs) | **compiles** | — (three gaps worked around in-file, all marked) |
 | [`flash_forward`](src/flash_forward.rs) | aspirational | #5, #6, #7, #11 + 3 unfiled |
-| [`softmax`](src/softmax.rs) | aspirational | #5, #6, #9, #22, #25 |
-| [`layernorm`](src/layernorm.rs) | aspirational | #3, #5, #6, #9, #13, #22, #25 + 1 unfiled |
+| [`softmax`](src/softmax.rs) | aspirational | #6, #9 (both movers are real now) |
+| [`layernorm`](src/layernorm.rs) | aspirational | #3, #5, #6, #9, #13, #22 + 1 unfiled |
 
 ```sh
 cargo oxide build kittens-examples --arch sm_100a   # the default set: gemm
@@ -120,10 +120,11 @@ ldmatrix_x2` lowers fine for `sm_100a` — the note that `ldmatrix` "lives only 
 the Hopper `wmma` path" was about where the function is filed, not about what it
 compiles to.
 
-What remains of this item is shape, not direction, and it is items 2 and 3
-below: `load_fragment` moves one `[16, 16]` block, and `chunk_writer` still
-refuses a tile wider than one swizzle atom. Softmax is now blocked on those
-(#22, #25) rather than on the path not existing.
+What remained of this item was shape, not direction — and item 3 below closed
+the other half of that: `chunk_writer` spans stacked subtiles, so the path
+exists at every width the library can describe. Only item 2 is left, and it is
+a cost rather than a hole: `load_fragment`/`store_fragment` move one
+`[16, 16]` block, so a band is a loop the kernel writes.
 
 #### 2. The movers are per-`[16, 16]`-block, so every kernel writes the same loop
 
@@ -138,17 +139,25 @@ no function implements it.
 Wanted (filed as #22): `TmemTile::drain::<M, N, L>(row, column) -> RegTile<M, N,
 L>`, `ldst::load_tile(tile, row, column, lane) -> RegTile<M, N, L>` and
 `ldst::store_tile(tile, row, column, lane, values)`, with the block loop inside.
-`ldst::load_fragment` (#21) made this the *whole* remaining gap on the load
-side: the mover exists, it just does not span a tile.
+This is now the *whole* remaining mover gap in both directions: #21 gave the
+load, #25 gave both of them the tile's full width, and `softmax.rs` writes the
+loop twice — once each way — for want of this one function.
 
-#### 3. `SwizzledChunks` cannot span stacked subtiles
+#### 3. ~~`SwizzledChunks` cannot span stacked subtiles~~ — **closed by #25**
 
-`SharedTile::chunk_writer` const-asserts a one-subtile tile, so **only tiles 64
-bf16 columns wide have a register ↔ shared path at all** — both directions now,
-since `load_fragment` addresses through the same cursor. Flash's `P` tile is 64
-wide and fits; softmax's `[128, 128]` tile does not, and there is no way to read
-it or write it back. The cursor should walk subtiles the way `tma_load` does, or
-`SharedTile` should hand out a typed subtile view. Filed as #25.
+`SharedTile::chunk_writer` const-asserted a one-subtile tile, so only tiles 64
+bf16 columns wide had a register ↔ shared path at all — both directions, since
+`load_fragment` addresses through the same cursor. Softmax's `[128, 128]` tile
+could be neither read nor written back.
+
+The cursor now walks subtiles the way `tma_load` does, and for the same reason:
+a stacked subtile is `SUBTILE_BYTES = rows * 128` further along, so subtile `i`
+row `r` is the tile's 128-byte row `i * rows + r` and the swizzle — which keys
+off *physical* address bits `[9:7]` — takes that row's phase. Chunk indices
+count across the whole logical row, so `fragment_address` needed no change at
+all. Checked against silicon at width by the `swizzle/stmatrix/ldmatrix … wide`
+device cases, and by a 4-row tile whose second subtile starts mid-period —
+which is the only shape where an absolute phase and a per-subtile one differ.
 
 #### 4. The `RegTile` shape set is closed by the library
 
@@ -258,4 +267,5 @@ library is already at that bar:
 - **`online_rescale`.** The one genuinely subtle piece of flash attention is a
   single call.
 - **The swizzle and fragment layers.** No kernel here spells a swizzle phase, a
-  chunk index, or a descriptor field. That is the library working.
+  chunk index, a subtile stride or a descriptor field — at any tile width,
+  since #25. That is the library working.

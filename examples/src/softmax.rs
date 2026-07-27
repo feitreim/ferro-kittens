@@ -5,28 +5,22 @@
 //!
 //! This is the kernel #5 and #6 were filed for, and it is five lines long once
 //! they land. It was also the shortest possible demonstration of the hole
-//! underneath both of them — the library had no way to get data *out* of a
-//! shared tile at all, so a kernel whose input is not an MMA operand could not
-//! start. #21 closed that: [`kittens::ldst::load_fragment`] is the `ldmatrix`
-//! half of `ldst`, and this file now calls it.
-//!
-//! What is left of that hole is shape, not direction. `load_fragment` moves one
-//! `[16, 16]` block, and the cursor it addresses through refuses a tile this
-//! wide — so the two `GAP` blocks below are the movers not spanning a tile,
-//! rather than the movers not existing.
+//! underneath both of them — the library could neither get data *out* of a
+//! shared tile (#21) nor address one wider than a single swizzle atom (#25), so
+//! a kernel whose input is not an MMA operand could not start. Both are closed:
+//! [`kittens::ldst::load_fragment`] is the `ldmatrix` half of `ldst`, and
+//! [`kittens::shared::SharedTile::chunk_writer`] now walks stacked subtiles, so
+//! at `COLUMNS = 128` this tile has a register ↔ shared path in both
+//! directions and the two movers below are the real API.
 //!
 //! Blocked on:
 //!
-//! - **#25** — [`kittens::shared::SharedTile::chunk_writer`] refuses any tile
-//!   wider than one swizzle atom (64 bf16 columns), so this `[128, 128]` tile
-//!   has no register ↔ shared path in *either* direction. The hard blocker:
-//!   with the width halved the rest of this kernel would run.
-//! - **#22** — the movers are per-`[16, 16]`-block, so filling a `[32, 128]`
-//!   band is a composition loop the kernel writes by hand, and there is no
-//!   `store_tile` mirror of it at all.
-//! - **#5** — `sub_row`, `exp2`, `div_row` on `RegTile`.
-//! - **#6** — `row_max`, `row_sum` on `RegTile`.
+//! - **#6** — `row_max` and `row_sum` on `RegTile`. The whole algorithm is four
+//!   lines and two of them do not exist.
 //! - **#9** — the TMA store path, so the result can leave.
+//!
+//! Not blocking, but visible: the movers are per-`[16, 16]`-block, so the band
+//! loop is written twice below (#22). It compiles — it is a cost, not a hole.
 //!
 //! Note what is *not* in that list: nothing about layouts, swizzles,
 //! semaphores, or the fragment map. Every gap here is an op or a mover, which
@@ -38,7 +32,7 @@ use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, thread, warp};
 
-use kittens::ldst::{load_fragment, store_tile};
+use kittens::ldst::{load_fragment, store_fragment};
 use kittens::reg::{BaseLdtm, Fragment, RegTile};
 use kittens::shared::{Bf16, SharedTile, Swizzle128B, tma_store_commit, tma_store_wait};
 use kittens::sync::Semaphore;
@@ -58,6 +52,85 @@ pub const THREADS: u32 = (ROWS / 32) as u32 * 32;
 #[cuda_module]
 pub mod kernels {
     use super::*;
+
+    /// One warp's band of the tile, read a `[16, 16]` block at a time.
+    ///
+    /// This is #22's `load_tile(tile, row, 0, lane)` written out by hand: the
+    /// mover is real and spans the tile, it just moves one block per call, so
+    /// every kernel that wants a band writes this same two-deep loop.
+    #[inline(always)]
+    unsafe fn load_band(tile: Tile, row: u32, lane: u32) -> Band {
+        unsafe {
+            let chunks = tile.chunk_writer();
+            let mut band = Band::zero();
+            let mut row_block = 0usize;
+            while row_block < 32 / 16 {
+                let mut column_block = 0usize;
+                while column_block < COLUMNS / 16 {
+                    let fragment = load_fragment::<Bf16>(
+                        chunks,
+                        row + 16 * row_block as u32,
+                        16 * column_block as u32,
+                        lane,
+                    );
+                    let mut slot = 0usize;
+                    while slot < Fragment::SLOTS {
+                        let mut value = 0usize;
+                        while value < Fragment::VALUES {
+                            band.set(
+                                2 * row_block + slot,
+                                4 * column_block + value,
+                                fragment.get(slot, value),
+                            );
+                            value += 1;
+                        }
+                        slot += 1;
+                    }
+                    column_block += 1;
+                }
+                row_block += 1;
+            }
+            band
+        }
+    }
+
+    /// The mirror of [`load_band`] — #22's `store_tile`, same loop, opposite
+    /// direction.
+    #[inline(always)]
+    unsafe fn store_band(tile: Tile, row: u32, lane: u32, band: Band) {
+        unsafe {
+            let chunks = tile.chunk_writer();
+            let mut row_block = 0usize;
+            while row_block < 32 / 16 {
+                let mut column_block = 0usize;
+                while column_block < COLUMNS / 16 {
+                    let mut fragment = Fragment::zero();
+                    let mut slot = 0usize;
+                    while slot < Fragment::SLOTS {
+                        let mut value = 0usize;
+                        while value < Fragment::VALUES {
+                            fragment.set(
+                                slot,
+                                value,
+                                band.get(2 * row_block + slot, 4 * column_block + value),
+                            );
+                            value += 1;
+                        }
+                        slot += 1;
+                    }
+                    store_fragment::<Bf16>(
+                        chunks,
+                        row + 16 * row_block as u32,
+                        16 * column_block as u32,
+                        lane,
+                        fragment,
+                    );
+                    column_block += 1;
+                }
+                row_block += 1;
+            }
+        }
+    }
 
     /// Row-wise `softmax` of one `[ROWS, COLUMNS]` tile per CTA, in place:
     /// TMA in, normalize in registers, TMA out.
@@ -94,58 +167,17 @@ pub mod kernels {
             loaded.wait(0);
             thread::sync_threads();
 
-            // ---- GAP (#25, #22: the movers do not span this tile) ----------
-            // What the next fifteen lines want to be:
-            //
-            //     let mut x: Band = load_tile(tile, row_base, 0, lane);
-            //
-            // `load_fragment` is the real shared → register path (#21) and it
-            // is what does the work below — but it moves one [16, 16] block, so
-            // the band is a composition loop (#22), and `chunk_writer`
-            // const-asserts a one-subtile tile, so at COLUMNS = 128 this line
-            // does not compile at all (#25). Halve COLUMNS and it does.
-            let chunks = tile.chunk_writer();
-            let mut x = Band::zero();
-            let mut row_block = 0usize;
-            while row_block < 32 / 16 {
-                let mut column_block = 0usize;
-                while column_block < COLUMNS / 16 {
-                    let fragment = load_fragment::<Bf16>(
-                        chunks,
-                        row_base + 16 * row_block as u32,
-                        16 * column_block as u32,
-                        lane,
-                    );
-                    let mut slot = 0usize;
-                    while slot < Fragment::SLOTS {
-                        let mut value = 0usize;
-                        while value < Fragment::VALUES {
-                            x.set(
-                                2 * row_block + slot,
-                                4 * column_block + value,
-                                fragment.get(slot, value),
-                            );
-                            value += 1;
-                        }
-                        slot += 1;
-                    }
-                    column_block += 1;
-                }
-                row_block += 1;
-            }
-            // ---- end GAP ---------------------------------------------------
+            let x = load_band(tile, row_base, lane);
 
-            // WANT (#6, #5): the whole algorithm.
-            let m = x.row_max();
-            x.sub_row(m);
-            x.exp2();
-            let total = x.row_sum();
-            x.div_row(total);
+            // WANT (#6): the two reductions. Everything else in the algorithm
+            // is a `RegTile` op that exists (#5).
+            let x = x.sub_row(x.row_max()).exp2();
+            let x = x.div_row(x.row_sum());
 
-            // WANT (#22, #25): the store mirror of the loop above. There is no
-            // `store_tile`, and `store_fragment` would hit the same
-            // one-subtile assertion.
-            store_tile(tile, row_base, 0, lane, x);
+            store_band(tile, row_base, lane, x);
+            // `stmatrix` writes through the generic proxy; the TMA engine reads
+            // through the async one.
+            fence_proxy_async_shared_cta();
             thread::sync_threads();
 
             // WANT (#9): the TMA store side. `cp_async_bulk_tensor_*_s2g` and
