@@ -12,12 +12,19 @@
 //! come from lanes 0..15 while the data is spread over all 32 — so the two
 //! directions are one derivation ([`fragment_address`]) with the data flowing
 //! opposite ways, and cannot drift apart.
+//!
+//! Each instruction moves one `[16, 16]` block, so [`load_tile`] and
+//! [`store_tile`] compose them into a whole `[M, N]` band — the same
+//! composition [`crate::tmem::TmemTile::tile`] does over the drain, and out of
+//! the same helpers, so a band cannot mean one thing in TMEM and another in
+//! shared memory.
 
 use cuda_device::ptx_asm;
 use cuda_device::wmma::ldmatrix_x2;
 
-use crate::reg::Fragment;
+use crate::reg::{BaseLdtm, Fragment, FragmentLayout, RegTile};
 use crate::shared::{Element, SwizzledChunks};
+use crate::tmem::{place_block, take_block};
 
 /// The `(row, chunk)` that `lane` supplies as slot `slot`'s `m8n8.x2` address,
 /// for a fragment at `(row, column)` of a swizzled tile.
@@ -132,6 +139,93 @@ pub unsafe fn load_fragment<E: Element<Unpacked = [f32; 2]>>(
             slot += 1;
         }
         fragment
+    }
+}
+
+/// A whole `[M, N]` band of a swizzled tile at `(row, column)`, composed out of
+/// the `M/16 × N/16` blocks [`load_fragment`] returns — the shared-side twin of
+/// [`crate::tmem::TmemTile::tile`], and what a kernel whose input is not an MMA
+/// operand reads its band with.
+///
+/// The blocks compose along both axes because chunk indices count across the
+/// tile's whole logical row: a column past the first stacked subtile is the
+/// cursor's problem ([`SwizzledChunks::at`]) and not this loop's.
+///
+/// # Safety
+///
+/// As [`load_fragment`], for every block of the band: all 32 lanes of the warp
+/// must call this together, `chunks` must belong to a tile at least `row + M`
+/// rows tall into which `column + N` fits, and its bytes must already be
+/// visible to the generic proxy.
+#[inline(always)]
+pub unsafe fn load_tile<E: Element<Unpacked = [f32; 2]>, const M: usize, const N: usize>(
+    chunks: SwizzledChunks<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+) -> RegTile<M, N, BaseLdtm>
+where
+    BaseLdtm: FragmentLayout<M, N>,
+{
+    unsafe {
+        let mut tile = RegTile::<M, N, BaseLdtm>::zero();
+        let mut row_block = 0usize;
+        while row_block < M / 16 {
+            let mut column_block = 0usize;
+            while column_block < N / 16 {
+                place_block(
+                    &mut tile,
+                    row_block,
+                    column_block,
+                    load_fragment(
+                        chunks,
+                        row + 16 * row_block as u32,
+                        column + 16 * column_block as u32,
+                        lane,
+                    ),
+                );
+                column_block += 1;
+            }
+            row_block += 1;
+        }
+        tile
+    }
+}
+
+/// The inverse of [`load_tile`]: a whole `[M, N]` band packed to `E` and
+/// written back block by block through [`store_fragment`].
+///
+/// # Safety
+///
+/// As [`store_fragment`], for every block of the band — including the
+/// `fence.proxy.async.shared::cta` the caller owes before any MMA or TMA reads
+/// the tile.
+#[inline(always)]
+pub unsafe fn store_tile<E: Element<Unpacked = [f32; 2]>, const M: usize, const N: usize>(
+    chunks: SwizzledChunks<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+    tile: RegTile<M, N, BaseLdtm>,
+) where
+    BaseLdtm: FragmentLayout<M, N>,
+{
+    unsafe {
+        let mut row_block = 0usize;
+        while row_block < M / 16 {
+            let mut column_block = 0usize;
+            while column_block < N / 16 {
+                store_fragment(
+                    chunks,
+                    row + 16 * row_block as u32,
+                    column + 16 * column_block as u32,
+                    lane,
+                    take_block(&tile, row_block, column_block),
+                );
+                column_block += 1;
+            }
+            row_block += 1;
+        }
     }
 }
 

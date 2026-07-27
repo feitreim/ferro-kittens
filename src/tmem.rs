@@ -19,7 +19,7 @@ use cuda_device::tcgen05::{
 };
 use cuda_device::{thread, warp};
 
-use crate::reg::Fragment;
+use crate::reg::{BaseLdtm, Fragment, FragmentLayout, RegTile};
 
 /// CTA-wide TMEM allocation, the lifecycle every tcgen05 kernel opens with:
 /// warp 0 allocates `columns` into the shared staging word, a block sync
@@ -119,6 +119,67 @@ fn raw_bits(values: TmemRegs4) -> CuSimd<u32, 4> {
         values[2].to_bits(),
         values[3].to_bits(),
     ])
+}
+
+/// Write `fragment` into the `[16, 16]` block at `(row_block, column_block)`
+/// of a composed `[M, N]` tile.
+///
+/// A thread's two slots of a 16-row block are the composed tile's slots
+/// `2 * row_block + {0, 1}`, and its four values of a 16-column block are its
+/// values `4 * column_block + {0..4}`. That is not a convention the movers
+/// chose: it is the same map the bigger shape's own [`RegTile::coordinate`]
+/// gives, which is what `reg.rs`'s `fragment_blocks_tile_the_bigger_shapes`
+/// asserts.
+#[inline(always)]
+pub(crate) fn place_block<const M: usize, const N: usize>(
+    tile: &mut RegTile<M, N, BaseLdtm>,
+    row_block: usize,
+    column_block: usize,
+    fragment: Fragment,
+) where
+    BaseLdtm: FragmentLayout<M, N>,
+{
+    let mut slot = 0usize;
+    while slot < Fragment::SLOTS {
+        let mut value = 0usize;
+        while value < Fragment::VALUES {
+            tile.set(
+                2 * row_block + slot,
+                4 * column_block + value,
+                fragment.get(slot, value),
+            );
+            value += 1;
+        }
+        slot += 1;
+    }
+}
+
+/// The inverse of [`place_block`]: one `[16, 16]` block of a composed tile, as
+/// the [`Fragment`] a single-block mover takes.
+#[inline(always)]
+pub(crate) fn take_block<const M: usize, const N: usize>(
+    tile: &RegTile<M, N, BaseLdtm>,
+    row_block: usize,
+    column_block: usize,
+) -> Fragment
+where
+    BaseLdtm: FragmentLayout<M, N>,
+{
+    let mut fragment = Fragment::zero();
+    let mut slot = 0usize;
+    while slot < Fragment::SLOTS {
+        let mut value = 0usize;
+        while value < Fragment::VALUES {
+            fragment.set(
+                slot,
+                value,
+                tile.get(2 * row_block + slot, 4 * column_block + value),
+            );
+            value += 1;
+        }
+        slot += 1;
+    }
+    fragment
 }
 
 /// An fp32 accumulator segment in tensor memory.
@@ -252,8 +313,7 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     /// [`Self::fragment_tile`], undoing the simd pair's interleaving so a
     /// register pass hands back the same `(slot, value)` coordinates it read.
     ///
-    /// Only the `[16, 16]` block: composing a taller or wider shape out of
-    /// these is the caller's, exactly as it is on the drain side.
+    /// Only the `[16, 16]` block; [`Self::store_tile`] is the composed form.
     ///
     /// # Safety
     ///
@@ -263,6 +323,90 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
         unsafe {
             let (low, high) = split(tile);
             self.store_fragment(row, column, low, high);
+        }
+    }
+
+    /// A whole `[M, N]` band at `(row, column)`, composed out of the
+    /// `M/16 × N/16` blocks [`Self::fragment_tile`] returns — the drain a warp
+    /// holding a `RegTile<32, 128, BaseLdtm>` accumulator wants, rather than
+    /// the four-deep block loop it used to write for itself.
+    ///
+    /// `M` and `N` are the *warp's* logical shape and `row` its first TMEM
+    /// lane, so a warp of an `M128` accumulator drains `tile::<32, N>(32 *
+    /// warp_id, 0)`. The shape set is the one [`BaseLdtm`] implements
+    /// [`FragmentLayout`] for.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::fragment`], for every block of the band: all 32 lanes of a
+    /// warp owning TMEM rows `row..row + M` must call this together after the
+    /// MMA writing them has committed, and `column + N` must fit the
+    /// allocation.
+    #[inline(always)]
+    pub unsafe fn tile<const M: usize, const N: usize>(
+        self,
+        row: u32,
+        column: u32,
+    ) -> RegTile<M, N, BaseLdtm>
+    where
+        BaseLdtm: FragmentLayout<M, N>,
+    {
+        unsafe {
+            let mut tile = RegTile::<M, N, BaseLdtm>::zero();
+            let mut row_block = 0usize;
+            while row_block < M / 16 {
+                let mut column_block = 0usize;
+                while column_block < N / 16 {
+                    place_block(
+                        &mut tile,
+                        row_block,
+                        column_block,
+                        self.fragment_tile(
+                            row + 16 * row_block as u32,
+                            column + 16 * column_block as u32,
+                        ),
+                    );
+                    column_block += 1;
+                }
+                row_block += 1;
+            }
+            tile
+        }
+    }
+
+    /// The inverse of [`Self::tile`]: a whole `[M, N]` band written back
+    /// block by block through [`Self::store_fragment_tile`].
+    ///
+    /// The stores are left outstanding, as the single-block form leaves them —
+    /// one [`store_wait`] retires the whole band.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::store_fragment`], for every block of the band, including the
+    /// wait it does not do.
+    #[inline(always)]
+    pub unsafe fn store_tile<const M: usize, const N: usize>(
+        self,
+        row: u32,
+        column: u32,
+        tile: RegTile<M, N, BaseLdtm>,
+    ) where
+        BaseLdtm: FragmentLayout<M, N>,
+    {
+        unsafe {
+            let mut row_block = 0usize;
+            while row_block < M / 16 {
+                let mut column_block = 0usize;
+                while column_block < N / 16 {
+                    self.store_fragment_tile(
+                        row + 16 * row_block as u32,
+                        column + 16 * column_block as u32,
+                        take_block(&tile, row_block, column_block),
+                    );
+                    column_block += 1;
+                }
+                row_block += 1;
+            }
         }
     }
 }
@@ -328,6 +472,59 @@ mod tests {
         for slot in 0..Fragment::SLOTS {
             for value in 0..Fragment::VALUES {
                 assert_eq!(restored.get(slot, value), tile.get(slot, value));
+            }
+        }
+    }
+
+    /// The block composition, against the coordinate map rather than against
+    /// itself: a fragment placed at `(row_block, column_block)` must land in
+    /// the registers whose `RegTile::coordinate` is that block's `(row,
+    /// column)` offset by `16 * (row_block, column_block)`, and must come back
+    /// out of [`take_block`] unchanged.
+    ///
+    /// `reg.rs` asserts that map is what the bigger shape's own `coordinate`
+    /// gives; this is what ties the movers' storage indexing to it, in both
+    /// directions, so a composed band cannot be a transposition of the drain
+    /// that filled it.
+    #[test]
+    fn block_placement_is_the_composed_coordinate() {
+        type Band = RegTile<32, 128, BaseLdtm>;
+
+        let mut fragment = Fragment::zero();
+        for slot in 0..Fragment::SLOTS {
+            for value in 0..Fragment::VALUES {
+                fragment.set(slot, value, (Fragment::VALUES * slot + value) as f32 + 1.0);
+            }
+        }
+
+        for row_block in 0..32 / 16 {
+            for column_block in 0..128 / 16 {
+                let mut band = Band::zero();
+                place_block(&mut band, row_block, column_block, fragment);
+
+                for lane in 0..32u32 {
+                    for slot in 0..Fragment::SLOTS {
+                        for value in 0..Fragment::VALUES {
+                            let (row, column) = Fragment::coordinate(lane, slot, value);
+                            let composed = (2 * row_block + slot, 4 * column_block + value);
+                            assert_eq!(
+                                Band::coordinate(lane, composed.0, composed.1),
+                                (
+                                    16 * row_block as u32 + row,
+                                    16 * column_block as u32 + column
+                                )
+                            );
+                            assert_eq!(band.get(composed.0, composed.1), fragment.get(slot, value));
+                        }
+                    }
+                }
+
+                let taken = take_block(&band, row_block, column_block);
+                for slot in 0..Fragment::SLOTS {
+                    for value in 0..Fragment::VALUES {
+                        assert_eq!(taken.get(slot, value), fragment.get(slot, value));
+                    }
+                }
             }
         }
     }
