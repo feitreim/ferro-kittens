@@ -4,28 +4,26 @@
 //! list with `cargo check --features softmax`.
 //!
 //! This is the kernel #5 and #6 were filed for, and it is five lines long once
-//! they land. It is also the shortest possible demonstration of the hole
-//! underneath both of them: **the library has no way to get data out of a
-//! shared tile.** `ldst` is store-only, `SharedTile` hands out raw pointers
-//! and a swizzled-chunk cursor, and `TmemTile::fragment_tile` reads TMEM.
-//! Nothing reads a shared tile into registers. A kernel whose input is not an
-//! MMA operand — every normalization, every activation, every elementwise
-//! epilogue — cannot start.
+//! they land. It was also the shortest possible demonstration of the hole
+//! underneath both of them — the library had no way to get data *out* of a
+//! shared tile at all, so a kernel whose input is not an MMA operand could not
+//! start. #21 closed that: [`kittens::ldst::load_fragment`] is the `ldmatrix`
+//! half of `ldst`, and this file now calls it.
+//!
+//! What is left of that hole is shape, not direction. `load_fragment` moves one
+//! `[16, 16]` block, and the cursor it addresses through refuses a tile this
+//! wide — so the two `GAP` blocks below are the movers not spanning a tile,
+//! rather than the movers not existing.
 //!
 //! Blocked on:
 //!
-//! - **no open issue** — `ldst::load_tile`, shared → register. GAPS §2.2 asks
-//!   for global ↔ register (#11) and §2.1 for register → TMEM (#10); shared →
-//!   register is absent from both the gap inventory and the backlog. The
-//!   upstream note that `ldmatrix` exists only in cuda-oxide's Hopper `wmma`
-//!   path is the reason it was never written, not a reason it is not needed:
-//!   the swizzled address math for a plain vectorized load is already in
-//!   [`kittens::shared::SwizzledChunks`].
-//! - **no open issue** — `ldst::store_tile`, the whole-tile mirror of
-//!   [`kittens::ldst::store_fragment`], and one that can span stacked
-//!   subtiles. [`kittens::shared::SharedTile::chunk_writer`] refuses any tile
-//!   wider than one swizzle atom (64 bf16 columns), so today a `[128, 128]`
-//!   tile has no register → shared path at all.
+//! - **#25** — [`kittens::shared::SharedTile::chunk_writer`] refuses any tile
+//!   wider than one swizzle atom (64 bf16 columns), so this `[128, 128]` tile
+//!   has no register ↔ shared path in *either* direction. The hard blocker:
+//!   with the width halved the rest of this kernel would run.
+//! - **#22** — the movers are per-`[16, 16]`-block, so filling a `[32, 128]`
+//!   band is a composition loop the kernel writes by hand, and there is no
+//!   `store_tile` mirror of it at all.
 //! - **#5** — `sub_row`, `exp2`, `div_row` on `RegTile`.
 //! - **#6** — `row_max`, `row_sum` on `RegTile`.
 //! - **#9** — the TMA store path, so the result can leave.
@@ -40,8 +38,8 @@ use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, thread, warp};
 
-use kittens::ldst::{load_tile, store_tile};
-use kittens::reg::{BaseLdtm, RegTile};
+use kittens::ldst::{load_fragment, store_tile};
+use kittens::reg::{BaseLdtm, Fragment, RegTile};
 use kittens::shared::{Bf16, SharedTile, Swizzle128B, tma_store_commit, tma_store_wait};
 use kittens::sync::Semaphore;
 
@@ -96,12 +94,46 @@ pub mod kernels {
             loaded.wait(0);
             thread::sync_threads();
 
-            // WANT (no open issue): shared → register. The inverse of
-            // `store_tile`, at the same coordinates, under the same layout.
+            // ---- GAP (#25, #22: the movers do not span this tile) ----------
+            // What the next fifteen lines want to be:
             //
-            //     ldst::load_tile::<E, R, C, S, M, N, L>(tile, row, column, lane)
-            //         -> RegTile<M, N, L>
-            let mut x: Band = load_tile(tile, row_base as usize, 0, lane);
+            //     let mut x: Band = load_tile(tile, row_base, 0, lane);
+            //
+            // `load_fragment` is the real shared → register path (#21) and it
+            // is what does the work below — but it moves one [16, 16] block, so
+            // the band is a composition loop (#22), and `chunk_writer`
+            // const-asserts a one-subtile tile, so at COLUMNS = 128 this line
+            // does not compile at all (#25). Halve COLUMNS and it does.
+            let chunks = tile.chunk_writer();
+            let mut x = Band::zero();
+            let mut row_block = 0usize;
+            while row_block < 32 / 16 {
+                let mut column_block = 0usize;
+                while column_block < COLUMNS / 16 {
+                    let fragment = load_fragment::<Bf16>(
+                        chunks,
+                        row_base + 16 * row_block as u32,
+                        16 * column_block as u32,
+                        lane,
+                    );
+                    let mut slot = 0usize;
+                    while slot < Fragment::SLOTS {
+                        let mut value = 0usize;
+                        while value < Fragment::VALUES {
+                            x.set(
+                                2 * row_block + slot,
+                                4 * column_block + value,
+                                fragment.get(slot, value),
+                            );
+                            value += 1;
+                        }
+                        slot += 1;
+                    }
+                    column_block += 1;
+                }
+                row_block += 1;
+            }
+            // ---- end GAP ---------------------------------------------------
 
             // WANT (#6, #5): the whole algorithm.
             let m = x.row_max();
@@ -110,6 +142,9 @@ pub mod kernels {
             let total = x.row_sum();
             x.div_row(total);
 
+            // WANT (#22, #25): the store mirror of the loop above. There is no
+            // `store_tile`, and `store_fragment` would hit the same
+            // one-subtile assertion.
             store_tile(tile, row_base, 0, lane, x);
             thread::sync_threads();
 

@@ -103,6 +103,19 @@ Both sides are `16x256b` at `[16, 16]` granularity, so composing a larger
 shape stays the caller's on either side. The store leaves its wait to the
 caller, since a store's registers are consumed at issue.
 
+### 2.1a Shared ↔ register — done (#21)
+
+TK's `shared_to_register.cuh`. `ldst::store_fragment` (`stmatrix`) and
+`ldst::load_fragment` (`ldmatrix`) over one shared `SwizzledChunks` derivation,
+`ldst::fragment_address`, that both directions call — so the address map is
+host-testable and the two cannot drift. Missed by this inventory until the
+examples crate (#18) hit it: a kernel whose input is not an MMA operand had no
+way to reach registers at all.
+
+Same `[16, 16]` granularity as 2.1, and the same restriction as every other
+`SwizzledChunks` user — one swizzle subtile of width (#25). Composing larger
+shapes on either side is #22.
+
 ### 2.2 No global ↔ register path
 
 TK has `global_to_register.cuh` (`load`/`store`) at both warp and group scope —
@@ -299,6 +312,6 @@ Checked against the vendored source, since several gaps turn on it:
 | f32 → fp4/fp6/e8m0 | ❌ absent — hand bit-packing |
 | MXFP block-scale smem→tmem | ✅ `tcgen05_cp_*_b4x16_p64`, `_b6x16_p32` |
 | `stmatrix` | ✅ `x2`/`x4`, plain and `trans` (we use `x2` only) |
-| `ldmatrix` | ❌ only in the Hopper `wmma` path |
+| `ldmatrix` | ✅ `cuda_device::wmma::ldmatrix_{x1,x2,x4}` (+ `trans`); filed under `wmma`, but lowers for `sm_100a` — we use `x2` |
 
 **FP8 is not blocked upstream.** FP4/FP6 and MXFP block scaling are.
