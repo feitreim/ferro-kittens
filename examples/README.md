@@ -224,12 +224,6 @@ of flash using pairs, and the GEMM is the counterexample.
   `(ATile::BYTES + BTile::BYTES) as u32` and has to keep it in step with the
   loads it issued. A tile knows its own size; `Semaphore::expect_tiles` or a
   charge returned by `tma_load` would make the two impossible to disagree.
-- **The instruction descriptor is unchecked against the walk.** `mma_abt` needs
-  no transpose bits, `mma_ab` needs `transpose_b`, an MN-major `mma_walk_cg2`
-  needs both — and all three take the descriptor as a raw `u32` the caller
-  built. `mma.rs`'s header documents the pairing in prose. #12 covers `KIND`
-  routing but not this; the shape and transpose bits could come from the same
-  place the walk does.
 - **Coordinate-dependent ops need `lane` passed in.** `store_fragment` and
   `RegTile::coordinate` take it explicitly, so the invented `make_causal_at`,
   `load_tile` and `store_tile` do too. Consistent, but every call site writes
@@ -246,7 +240,13 @@ compiling is the thing that proves an issue is finished, and half of this
 library is already at that bar:
 
 - **The MMA layer.** `mma_abt`, `mma_ab` and `mma_walk_cg2` covered every
-  multiply in four kernels, in the layouts they wanted, with no gaps.
+  multiply in four kernels, in the layouts they wanted, with no gaps. Each
+  builds its own instruction descriptor from the walk it issues and the
+  operand element, so a kernel names only its accumulator band's `MmaShape`
+  and cannot pair a walk with transpose bits that disagree (#30). The one
+  field still stated by a caller is `mma_walk_cg2`'s element
+  (`mma_walk_cg2::<Bf16, CHUNKS>`) — an `OperandWalk` has erased it, and #12
+  owns whether the walk carries it back.
 - **TMEM segment carving.** Flash splits one allocation into its `[128, 64]`
   scores and `[128, 128]` output with `TmemTile::split_columns`, so no kernel
   here adds a column offset to a bare TMEM address (#28).

@@ -49,15 +49,12 @@
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
-use cuda_device::tcgen05::{
-    Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
-};
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread, warp};
 
 use kittens::global::store_rows;
 use kittens::ldst::store_tile;
-use kittens::mma::{commit, mma_ab, mma_abt};
+use kittens::mma::{MmaShape, commit, mma_ab, mma_abt};
 use kittens::reg::{BaseLdtm, RegTile, RegVec, online_rescale};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
@@ -167,21 +164,11 @@ pub mod kernels {
                 q_loaded.expect_tx(QTile::BYTES as u32);
             }
 
-            let score_shape = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N64)
-                .element_type(Tcgen05ElementType::BF16)
-                .accumulator_type(Tcgen05AccumulatorType::F32)
-                .build()
-                .raw();
-            // `O = P·V` supplies K along V's rows, so the instruction carries
-            // the transpose-B bit `mma_ab`'s walk assumes.
-            let output_shape = Tcgen05InstructionDescriptor::builder()
-                .shape(Tcgen05MmaShape::M128_N128)
-                .element_type(Tcgen05ElementType::BF16)
-                .accumulator_type(Tcgen05AccumulatorType::F32)
-                .transpose_b(true)
-                .build()
-                .raw();
+            // Only the accumulator bands' shapes: `mma_abt`/`mma_ab` each
+            // carry the transpose configuration their own walk reads under,
+            // and the element comes from the tiles.
+            let score_shape = MmaShape::M128_N64;
+            let output_shape = MmaShape::M128_N128;
 
             let mut running_max = Rows::splat(f32::NEG_INFINITY);
             let mut running_sum = Rows::splat(0.0);
