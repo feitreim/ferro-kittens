@@ -130,6 +130,15 @@ image = (
         str(Path(__file__).parent / "device-tests/Cargo.toml"),
         f"{PROJECT_DIR}/device-tests/Cargo.toml",
     )
+    # The examples crate: also standalone, also path-depends on the library.
+    .add_local_dir(
+        str(Path(__file__).parent / "examples/src"),
+        f"{PROJECT_DIR}/examples/src",
+    )
+    .add_local_file(
+        str(Path(__file__).parent / "examples/Cargo.toml"),
+        f"{PROJECT_DIR}/examples/Cargo.toml",
+    )
     .add_local_file(
         str(Path(__file__).parent / "rust-toolchain.toml"),
         f"{PROJECT_DIR}/rust-toolchain.toml",
@@ -139,6 +148,7 @@ image = (
 app = modal.App("ferro-kittens", image=image)
 
 HARNESS_DIR = f"{PROJECT_DIR}/device-tests"
+EXAMPLES_DIR = f"{PROJECT_DIR}/examples"
 # The driver stub satisfies cargo-oxide's link step where there is no GPU.
 STUB_ENV = ["env", "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs"]
 
@@ -160,6 +170,12 @@ def build() -> None:
     # exists only on Blackwell -- pin it or the artifact fails to compile.
     _run([*STUB_ENV, "cargo", "oxide", "build", "device-tests", "--arch", "sm_100a"],
          cwd=HARNESS_DIR)
+    # The examples crate, same treatment. Only the kernels marked *compiles*
+    # are in the default feature set, so this is what keeps that claim honest:
+    # a post-monomorphization `const { assert!(..) }` in a tile shape is
+    # invisible to `cargo check` and shows up only in a real device build.
+    _run([*STUB_ENV, "cargo", "oxide", "build", "kittens-examples", "--arch", "sm_100a"],
+         cwd=EXAMPLES_DIR)
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=1800)
