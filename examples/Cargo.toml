@@ -26,7 +26,10 @@ aspirational = ["flash", "layernorm", "softmax"]
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
-kittens = { package = "ferro-kittens", path = ".." }
+# `host` for the tensor-map builders: the binary is a launcher now, not just a
+# compilation witness, and a kernel with a TMA operand cannot be launched
+# without one.
+kittens = { package = "ferro-kittens", path = "..", features = ["host"] }
 
 [profile.release]
 debug = false

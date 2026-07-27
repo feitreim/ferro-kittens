@@ -1,8 +1,9 @@
 //! # GEMM — `C = A·Bᵀ` on the cta_group::2 cluster path
 //!
-//! **Status: compiles.** Builds under `cargo oxide build kittens-examples --arch
-//! sm_100a`. It has never been run: issue #18 needs no GPU, so this is a
-//! statement about what the library can *express*, not a numerical result.
+//! **Status: runs.** [`check`] launches it against a CPU reference on a B200
+//! (`modal run modal_app.py::examples`). The operands are small integers, so
+//! every product and every partial sum is exact and the comparison is `==`
+//! rather than a tolerance — a mismatch is a wrong index, never rounding.
 //!
 //! A pair of CTAs forms a cluster and shares one `M256_N128` UMMA. Both
 //! operands are split across the pair — each CTA stages its own 128 rows of
@@ -19,23 +20,27 @@
 //!
 //! ## What this kernel had to reach past the library for
 //!
-//! Three `GAP` blocks below, none of which has an open issue behind it:
+//! Two `GAP` blocks below, neither with an open issue behind it:
 //!
 //! - **cluster-scope TMEM allocation.** [`kittens::tmem::alloc_block`] is
 //!   `tcgen05.alloc.cta_group::1`; a 2-CTA accumulator needs the `cg2` form
 //!   plus a way for the peer to learn the address.
-//! - **cluster-scope semaphore arrival.** The pair's four TMA loads have to
-//!   land on *one* barrier for the leader to know the whole stage is present,
-//!   and [`Semaphore`] is CTA-scoped by construction.
 //! - **global stores from registers.** The epilogue is open-coded index math
 //!   against `RegTile::coordinate`, which is the arithmetic this library
 //!   exists to delete (#11).
 //!
-//! And one thing the library has that this kernel *cannot* use:
-//! [`SharedTile::tma_load_2d_multicast_cg2`] delivers the same bytes to both
-//! CTAs, but under a 2-CTA UMMA both operands are already split, so nothing
-//! is replicated. Multicast pays off at cluster > 2 (GAPS §2.4), which the
-//! `_cg2` suffix rules out. See `examples/README.md`.
+//! A third one is gone, and how it went is worth recording. The pair's four
+//! TMA loads have to complete on *one* barrier for the leader to know the
+//! whole stage is present, and this file used to map the leader's barrier by
+//! hand and call it a missing `Semaphore::at_rank`. That deadlocks: a plain
+//! `cp.async.bulk.tensor` completes on a barrier in the *issuing* CTA's own
+//! shared memory, so the peer's bytes never reached the leader's count. The
+//! fix is [`SharedTile::tma_load_2d_multicast_cg2`] with the CTA's own bit as
+//! the whole mask, onto [`Semaphore::multicast_alias`] — the primitive was
+//! already here, filed under the opposite problem (`examples/README.md` §8
+//! said this kernel "cannot use" the multicast load). What the pair needs
+//! from multicast is not replication; it is the right address space for the
+//! barrier operand.
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::cluster;
@@ -44,7 +49,9 @@ use cuda_device::tcgen05::{
     tcgen05_alloc_cg2, tcgen05_dealloc_cg2, tcgen05_fence_before_thread_sync,
 };
 use cuda_device::tma::TmaDescriptor;
-use cuda_device::{DisjointSlice, cluster_launch, cuda_module, kernel, thread, warp};
+use cuda_device::{
+    DisjointSlice, cluster_launch, cuda_module, kernel, launch_contract, thread, warp,
+};
 
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::reg::{BaseLdtm, Fragment, RegTile};
@@ -91,6 +98,13 @@ const SCRATCH_BYTES: usize = 2 * STAGES * 8 + 8 + 8;
 /// Dynamic shared memory the launch must provide.
 pub const SHARED_BYTES: usize = ARing::BYTES + BRing::BYTES + SCRATCH_BYTES;
 
+/// `#[launch_contract]` takes literals, so the envelope is written twice; this
+/// is what keeps the two in step. The contract is not decoration: 72 KiB is
+/// past the 48 KiB a block gets by default, and the opt-in
+/// (`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`) is issued by the
+/// prepared-launch path and by nothing else.
+const _: () = assert!(THREADS == 128 && SHARED_BYTES == 73_792);
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
@@ -101,10 +115,26 @@ pub mod kernels {
     /// The grid is one CTA pair per output tile: `blockIdx.x / 2` selects the
     /// tile, and `cluster::block_rank()` says which half of it this CTA owns.
     /// `a_map` describes `A` as `[rows, K]` bf16, `b_map` describes `B` as
-    /// `[columns, K]`; both are boxed `[R, 64]` the way
-    /// [`SharedTile::tma_load_2d`] walks them.
+    /// `[columns, K]`. Both come from a rank-2 [`kittens::global::GlobalLayout`]
+    /// paired with the tile it feeds, so their `[R, 64]` boxes are `ATile`'s
+    /// and `BTile`'s own constants and not numbers [`check`] wrote down.
+    ///
+    /// # Safety
+    ///
+    /// The launch geometry is the contract's, but the operands are not: both
+    /// maps must describe live buffers covering `k_blocks * BLOCK_K` along K
+    /// and the full `tiles_m`/`tiles_n` extent the grid walks, and `c` must
+    /// hold `ldc` columns for every row of that walk. The grid must be
+    /// `2 * tiles_m * tiles_n` blocks, since a CTA derives its output tile
+    /// from `blockIdx.x` and never bounds-checks it.
     #[kernel]
     #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 73_792,
+        dynamic_shared_alignment = 128
+    )]
     pub unsafe fn gemm_cg2(
         a_map: *const TmaDescriptor,
         b_map: *const TmaDescriptor,
@@ -147,20 +177,34 @@ pub mod kernels {
 
             if warp_id == 0 && lane == 0 {
                 // Producer. The pair's four tiles all complete on the leader's
-                // copy of the stage barrier, which the leader charges in full.
+                // copy of the stage barrier, which the leader charges in full
+                // before either CTA issues, so the count is never short.
+                //
+                // The loads are the *multicast* form with each CTA's own bit
+                // and nothing else, which looks pointless and is not: a plain
+                // `cp.async.bulk.tensor` completes on a barrier in the issuing
+                // CTA's own shared memory, so rank 1 cannot name the leader's.
+                // The multicast form takes a `.shared::cluster` barrier, which
+                // is the only way to say "my bytes, the leader's barrier".
+                // Nothing is replicated — `1 << rank` delivers to one CTA.
                 let a_row = (2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * rank) as i32;
                 let b_row = (BLOCK_N as u32 * tile_n + HALF_N as u32 * rank) as i32;
                 let mut k = 0u32;
                 while k < k_blocks {
                     free.wait_recycled(k);
-                    let arrival = at_leader(load.sem(k), rank);
-                    let column = (BLOCK_K as u32 * k) as i32;
-                    a_ring.tile(k).tma_load_2d(a_map, column, a_row, arrival);
-                    b_ring.tile(k).tma_load_2d(b_map, column, b_row, arrival);
                     if rank == 0 {
                         load.sem(k)
                             .expect_tx(2 * (ATile::BYTES + BTile::BYTES) as u32);
                     }
+                    let arrival = load.sem(k).multicast_alias();
+                    let column = (BLOCK_K as u32 * k) as i32;
+                    let mine = 1u16 << rank;
+                    a_ring
+                        .tile(k)
+                        .tma_load_2d_multicast_cg2(a_map, column, a_row, arrival, mine);
+                    b_ring
+                        .tile(k)
+                        .tma_load_2d_multicast_cg2(b_map, column, b_row, arrival, mine);
                     k += 1;
                 }
             }
@@ -295,32 +339,125 @@ pub mod kernels {
             }
         }
     }
+}
 
-    /// ---- GAP (cluster-scope semaphore arrival; no open issue) ------------
-    ///
-    /// What this wants to be: `Semaphore::at_rank(rank)`.
-    ///
-    /// A 2-CTA MMA consumes four tiles staged by two CTAs, so the issuer needs
-    /// one barrier that says *the whole stage is present* — which means the
-    /// peer's TMA has to complete on the leader's copy. mbarrier addresses are
-    /// cluster-mappable and this is the standard way to build a pair-wide
-    /// producer handoff, but nothing in `sync.rs` says so: [`Semaphore`] is
-    /// CTA-scoped by construction, and [`Semaphore::multicast_alias`] — the
-    /// one cluster-aware thing it has — solves the opposite problem (one
-    /// barrier per CTA, one transfer).
-    ///
-    /// # Safety
-    ///
-    /// `sem` must be at the same shared offset in every CTA of a live cluster,
-    /// and rank 0's copy must be initialized before this CTA arrives on it.
-    #[inline(always)]
-    unsafe fn at_leader(sem: Semaphore, rank: u32) -> Semaphore {
-        unsafe {
-            if rank == 0 {
-                sem
-            } else {
-                Semaphore::attach(cluster::map_shared_rank_mut(sem.raw(), 0))
+/// Rows of `C` the correctness run computes — two clusters' worth of `M`, so
+/// the `blockIdx → (tile_m, tile_n)` map is exercised in both axes.
+pub const M: usize = 512;
+/// Columns of `C`: two `BLOCK_N` tiles.
+pub const N: usize = 256;
+/// Reduction depth: four `BLOCK_K` stages against a three-deep pipeline, so
+/// the ring wraps and `wait_recycled` is on trial rather than skipped.
+pub const K: usize = 256;
+
+/// `A[m, k]` and `B[n, k]`: integers in `[-3, 3]` and `[-2, 2]`.
+///
+/// Every operand is exact in bf16 and every partial sum stays under `6 * K`,
+/// well inside fp32's exact integer range — so the whole GEMM is exact and the
+/// host compares with `==`. That is the point: a mismatch is a wrong
+/// coordinate, a wrong stride or a wrong operand half, and never a rounding
+/// artifact that has to be argued about. The two patterns share no period, so
+/// a transposed or offset read does not accidentally agree.
+fn a_value(row: usize, depth: usize) -> f32 {
+    ((row * 5 + depth * 3) % 7) as f32 - 3.0
+}
+
+fn b_value(column: usize, depth: usize) -> f32 {
+    ((column * 3 + depth * 5) % 5) as f32 - 2.0
+}
+
+/// Round-to-nearest-even fp32 → bf16. Exact for every value [`a_value`] and
+/// [`b_value`] produce, since their low 16 mantissa bits are already zero.
+fn to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+}
+
+/// A `[rows, K]` bf16 operand as the packed `u32` words a device buffer holds,
+/// K contiguous — which is what makes both operands K-major and the MMA
+/// transpose-free.
+fn stage(rows: usize, value: impl Fn(usize, usize) -> f32) -> Vec<u32> {
+    let mut staged = Vec::with_capacity(rows * K / 2);
+    for row in 0..rows {
+        for pair in 0..K / 2 {
+            let (low, high) = (value(row, 2 * pair), value(row, 2 * pair + 1));
+            staged.push(to_bf16(low) as u32 | ((to_bf16(high) as u32) << 16));
+        }
+    }
+    staged
+}
+
+/// Launch the kernel over `[M, K] · [N, K]ᵀ` and compare every element against
+/// a CPU reference, returning a one-line note on success.
+///
+/// The two operands differ only in their extents, and neither states a box:
+/// [`kittens::global::GlobalLayout::tensor_map`] takes the tile the kernel
+/// loads into and reads the box, the swizzle and the data type off it. `A` is
+/// `[K, M]` in the driver's fastest-first dimension order and `B` is `[K, N]`,
+/// which is the same order the kernel gives its
+/// [`SharedTile::tma_load_2d`] coordinates in.
+pub fn check(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use cuda_core::{DeviceBuffer, LaunchConfig1D};
+    use kittens::global::GlobalLayout;
+
+    let stream = context.default_stream();
+    // SAFETY: the artifact is this crate's own, and `gemm_cg2` is the only
+    // entry point in it — the ABI the contract declares is the one compiled.
+    let module = unsafe { kernels::load(context)? };
+
+    let a = DeviceBuffer::from_host(&stream, &stage(M, a_value))?;
+    let b = DeviceBuffer::from_host(&stream, &stage(N, b_value))?;
+    // SAFETY: both buffers outlive every launch consuming their maps below.
+    let (a_layout, b_layout) = unsafe {
+        (
+            GlobalLayout::<Bf16, 2>::packed(a.cu_deviceptr(), [K, M]),
+            GlobalLayout::<Bf16, 2>::packed(b.cu_deviceptr(), [K, N]),
+        )
+    };
+    let a_map = a_layout.tensor_map::<ATile>(&stream)?;
+    let b_map = b_layout.tensor_map::<BTile>(&stream)?;
+
+    let mut c = DeviceBuffer::<f32>::zeroed(&stream, M * N)?;
+    let (tiles_m, tiles_n) = (M / (2 * BLOCK_M), N / BLOCK_N);
+    let launch = module.prepare_gemm_cg2(LaunchConfig1D::new(
+        (2 * tiles_m * tiles_n) as u32,
+        THREADS,
+        SHARED_BYTES as u32,
+    ))?;
+    unsafe {
+        module.gemm_cg2(
+            &stream,
+            &launch,
+            a_map.as_ptr(),
+            b_map.as_ptr(),
+            tiles_n as u32,
+            (K / BLOCK_K) as u32,
+            N as u32,
+            &mut c,
+        )?
+    };
+
+    let observed = c.to_host_vec(&stream)?;
+    let mut wrong = Vec::new();
+    for row in 0..M {
+        for column in 0..N {
+            let expected: f32 = (0..K).map(|k| a_value(row, k) * b_value(column, k)).sum();
+            let value = observed[row * N + column];
+            if value != expected && wrong.len() < 8 {
+                wrong.push(format!("C[{row}, {column}] = {value}, want {expected}"));
             }
         }
     }
+    if !wrong.is_empty() {
+        return Err(format!(
+            "{} of {} elements wrong: {}",
+            wrong.len(),
+            M * N,
+            wrong.join("; ")
+        )
+        .into());
+    }
+    Ok(format!("{M}x{N}x{K} exact"))
 }

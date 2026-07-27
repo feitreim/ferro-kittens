@@ -35,7 +35,7 @@ use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, thread, warp};
 
-use kittens::global::encode_bf16_panels;
+use kittens::global::{GlobalLayout, encode_bf16_panels};
 use kittens::ldst::{load_fragment, store_fragment};
 use kittens::mma::{self, MmaShape, mma_abt};
 use kittens::reg::{
@@ -245,6 +245,52 @@ pub mod kernels {
         mut out: DisjointSlice<u32>,
     ) {
         unsafe { swizzle_probe::<SHORT, WIDE>(source, &mut out) }
+    }
+
+    /// [`swizzle_probe`] against a *rank-2* tensor map.
+    ///
+    /// The 3-D panel map is the only descriptor shape the library could build
+    /// before [`GlobalLayout`], and it is also the only one silicon has ever
+    /// checked. Same round trip, same expectation, through
+    /// [`SharedTile::tma_load_2d`] — so the box geometry and the swizzle are
+    /// held to the standard the panel map is held to, at the rank and stride a
+    /// GEMM operand actually has. Launch with `R` threads, one row each.
+    #[inline(always)]
+    unsafe fn tma_2d_probe<const R: usize, const C: usize>(
+        source: *const TmaDescriptor,
+        out: &mut DisjointSlice<u32>,
+    ) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tile = Tile::<R, C>::from_raw(smem);
+            let tma = Semaphore::attach(smem.add(Tile::<R, C>::BYTES) as *mut Barrier);
+            let tid = thread::threadIdx_x();
+
+            if tid == 0 {
+                tma.init(1);
+                fence_proxy_async_shared_cta();
+            }
+            thread::sync_threads();
+            if tid == 0 {
+                tile.tma_load_2d(source, 0, 0, tma);
+                tma.expect_tx(Tile::<R, C>::BYTES as u32);
+            }
+            tma.wait(0);
+            thread::sync_threads();
+
+            dump_rows(tile, tid as usize, R, out);
+
+            thread::sync_threads();
+            if tid == 0 {
+                tma.inval();
+            }
+        }
+    }
+
+    /// [`tma_2d_probe`] over one subtile.
+    #[kernel]
+    pub unsafe fn tma_2d_roundtrip(source: *const TmaDescriptor, mut out: DisjointSlice<u32>) {
+        unsafe { tma_2d_probe::<TILE, TILE>(source, &mut out) }
     }
 
     /// Fill an `[R, C]` shared tile from registers through [`store_fragment`],
@@ -1365,6 +1411,45 @@ fn decode(value: f32) -> Option<(usize, usize)> {
     Some((integer as usize / COLUMNS, integer as usize % COLUMNS))
 }
 
+/// Does a rank-2 [`GlobalLayout`] over a *pitched* buffer deliver the tile the
+/// packed 3-D panel map does?
+///
+/// Two things the panel map cannot state are on trial: a rank the descriptor
+/// builder used to hardcode, and a row stride that is not the row's own extent.
+/// The staging buffer is `R` rows of `PITCH` bf16 columns with only the first
+/// `C` of each row seeded, and the padding is a bit pattern [`decode_cell`]
+/// rejects — so a descriptor that walks rows by the wrong stride reports
+/// padding at a position rather than a plausible neighbour.
+fn check_tma_2d<const R: usize, const C: usize>(
+    stream: &CudaStream,
+    launch: impl Fn(
+        LaunchConfig,
+        *const TmaDescriptor,
+        &mut DeviceBuffer<u32>,
+    ) -> Result<(), cuda_core::DriverError>,
+) -> Result<String, Box<dyn Error>> {
+    const fn pitch(columns: usize) -> usize {
+        3 * columns / 2
+    }
+    let staged = identity_tile(R, C);
+    let mut pitched = vec![u32::MAX; R * pitch(C) / 2];
+    for row in 0..R {
+        let (source, destination) = (row * C / 2, row * pitch(C) / 2);
+        pitched[destination..destination + C / 2].copy_from_slice(&staged[source..source + C / 2]);
+    }
+    let source = DeviceBuffer::from_host(stream, &pitched)?;
+    let layout =
+        unsafe { GlobalLayout::<Bf16, 2>::strided(source.cu_deviceptr(), [C, R], [1, pitch(C)]) };
+    let map = layout.tensor_map::<Tile<R, C>>(stream)?;
+    let mut out = DeviceBuffer::<u32>::zeroed(stream, staged.len())?;
+    launch(
+        launch_config(R as u32, tile_shared::<R, C>()),
+        map.as_ptr(),
+        &mut out,
+    )?;
+    compare_tile(&out.to_host_vec(stream)?, &staged, C / 2)
+}
+
 /// Does the cursor read back what the TMA engine wrote?
 ///
 /// The staged tile is position identities in logical order and the kernel
@@ -1890,6 +1975,14 @@ fn run() -> Result<usize, Box<dyn Error>> {
     cases.push((
         "reduction shuffles",
         Box::new(|| check_reductions(stream, module)),
+    ));
+    cases.push((
+        "2d tensor map",
+        Box::new(|| {
+            check_tma_2d::<TILE, TILE>(stream, |config, map, out| unsafe {
+                module.tma_2d_roundtrip(stream, config, map, out)
+            })
+        }),
     ));
 
     let mut failures = 0usize;

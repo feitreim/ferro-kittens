@@ -11,6 +11,7 @@ Local usage:
     modal run modal_app.py::build     # host tests + a CPU-only device build
     modal run modal_app.py::regcount  # ptxas -v register/spill table, no GPU
     modal run modal_app.py            # the device tests, on a B200
+    modal run modal_app.py::examples  # the examples crate's kernels, on a B200
     modal run modal_app.py::doctor    # env / GPU sanity check
 """
 
@@ -178,10 +179,12 @@ def build() -> None:
     # exists only on Blackwell -- pin it or the artifact fails to compile.
     _run([*STUB_ENV, "cargo", "oxide", "build", "device-tests", "--arch", "sm_100a"],
          cwd=HARNESS_DIR)
-    # The examples crate, same treatment. Only the kernels marked *compiles*
-    # are in the default feature set, so this is what keeps that claim honest:
-    # a post-monomorphization `const { assert!(..) }` in a tile shape is
-    # invisible to `cargo check` and shows up only in a real device build.
+    # The examples crate, same treatment. Only the kernels marked *runs* or
+    # *compiles* are in the default feature set, so this is what keeps that
+    # claim honest: a post-monomorphization `const { assert!(..) }` in a tile
+    # shape is invisible to `cargo check` and shows up only in a real device
+    # build. Its host launchers are ordinary Rust and get ordinary lints.
+    _run(["cargo", "clippy", "--all-targets"], cwd=EXAMPLES_DIR)
     _run([*STUB_ENV, "cargo", "oxide", "build", "kittens-examples", "--arch", "sm_100a"],
          cwd=EXAMPLES_DIR)
 
@@ -191,6 +194,16 @@ def device_tests() -> None:
     """The harness itself. One binary, every case, non-zero exit on failure."""
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
     _run(["cargo", "oxide", "run", "device-tests"], cwd=HARNESS_DIR)
+
+
+@app.function(gpu=DEFAULT_GPU, timeout=1800)
+def examples() -> None:
+    """The examples crate's own launchers. Prints the status table, then runs
+    every kernel that has one against its CPU reference; non-zero on a wrong
+    number. This is the claim `device-tests` cannot make: not that a primitive
+    behaves, but that a whole kernel written against the library computes."""
+    _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
+    _run(["cargo", "oxide", "run", "kittens-examples"], cwd=EXAMPLES_DIR)
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=600)
