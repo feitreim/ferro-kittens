@@ -12,9 +12,10 @@
 //! type the *drained* shape: `R`/`C` describe what the kernel reads back,
 //! not what the instruction touches.
 
-use cuda_device::cusimd::TmemRegs4;
+use cuda_device::cusimd::{CuSimd, TmemRegs4};
 use cuda_device::tcgen05::{
     tcgen05_alloc, tcgen05_dealloc, tcgen05_ld_16x256b_pure, tcgen05_load_wait,
+    tcgen05_st_16x256b_x1_raw, tcgen05_store_wait,
 };
 use cuda_device::{thread, warp};
 
@@ -53,6 +54,71 @@ pub unsafe fn dealloc_block(address: u32, columns: u32) {
             tcgen05_dealloc(address, columns);
         }
     }
+}
+
+/// Retire the calling warp's outstanding tcgen05 stores.
+///
+/// Split out of [`TmemTile::store_fragment`] rather than folded into it
+/// because a store's registers are consumed at issue: a pass writing many
+/// fragments waits once after the last one instead of once per fragment.
+///
+/// # Safety
+///
+/// All 32 lanes of the warp must call this together, and it retires only that
+/// warp's stores — another warp reading the same TMEM needs its own ordering.
+#[inline(always)]
+pub unsafe fn store_wait() {
+    tcgen05_store_wait()
+}
+
+/// Resolve a `16x256b` pair's eight registers into a fragment's
+/// `(slot, value)` coordinates.
+///
+/// A `16x256b` load hands a thread its two rows of the block by two columns,
+/// row-major: register `2*slot + pair` is slot `slot`'s column `pair` of that
+/// load's 8-column half. The half at `column` is the fragment's values
+/// `{0, 1}`, the half at `column + 8` its values `{2, 3}`.
+#[inline(always)]
+fn interleave(low: TmemRegs4, high: TmemRegs4) -> Fragment {
+    let mut tile = Fragment::zero();
+    let mut reg = 0;
+    while reg < 4 {
+        let (slot, pair) = (reg / 2, reg % 2);
+        tile.set(slot, pair, low[reg]);
+        tile.set(slot, 2 + pair, high[reg]);
+        reg += 1;
+    }
+    tile
+}
+
+/// The inverse of [`interleave`] — a fragment back into the two collective
+/// accesses' registers, low half first.
+#[inline(always)]
+fn split(tile: Fragment) -> (TmemRegs4, TmemRegs4) {
+    let mut low = [0.0f32; 4];
+    let mut high = [0.0f32; 4];
+    let mut reg = 0;
+    while reg < 4 {
+        let (slot, pair) = (reg / 2, reg % 2);
+        low[reg] = tile.get(slot, pair);
+        high[reg] = tile.get(slot, 2 + pair);
+        reg += 1;
+    }
+    (CuSimd::new(low), CuSimd::new(high))
+}
+
+/// fp32 registers as the raw words every `tcgen05_st_*` form takes. There is
+/// no `_pure` store to mirror `tcgen05_ld_16x256b_pure`, and the `_unpack16`
+/// form splits each register into 16-bit halves — an accumulator's fp32 has to
+/// land bit-exact, so it goes through `_raw` and `to_bits`.
+#[inline(always)]
+fn raw_bits(values: TmemRegs4) -> CuSimd<u32, 4> {
+    CuSimd::new([
+        values[0].to_bits(),
+        values[1].to_bits(),
+        values[2].to_bits(),
+        values[3].to_bits(),
+    ])
 }
 
 /// An fp32 accumulator segment in tensor memory.
@@ -129,15 +195,58 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     pub unsafe fn fragment_tile(self, row: u32, column: u32) -> Fragment {
         unsafe {
             let (low, high) = self.fragment(row, column);
-            let mut tile = Fragment::zero();
-            let mut reg = 0;
-            while reg < 4 {
-                let (slot, pair) = (reg / 2, reg % 2);
-                tile.set(slot, pair, low[reg]);
-                tile.set(slot, 2 + pair, high[reg]);
-                reg += 1;
-            }
-            tile
+            interleave(low, high)
+        }
+    }
+
+    /// Write one thread's eight-value fragment back into the 16-row block at
+    /// `row`: two `16x256b` collective stores at `column` and `column + 8`,
+    /// under the same lane → `(row, column)` ownership the load side of
+    /// [`Self::fragment`] reads through, so `low` and `high` are exactly what
+    /// that call returned.
+    ///
+    /// Unlike [`Self::fragment`] this does not wait. A load must, because the
+    /// registers it waits on *are* its return value; a store's registers are
+    /// consumed at issue, so a pass writing many fragments pays one
+    /// [`store_wait`] at the end rather than one per fragment.
+    ///
+    /// # Safety
+    ///
+    /// All 32 lanes of the warp owning TMEM rows `row..row+16` must call this
+    /// together. Ordering the write against whatever reads it — an MMA taking
+    /// the segment as accumulator, a later [`Self::fragment`], or
+    /// [`dealloc_block`] — is the caller's: [`store_wait`] retires it in the
+    /// issuing warp, and a consumer in another warp needs whatever sync it
+    /// would need for any warp-private write besides.
+    ///
+    /// Whether a `tcgen05_fence_before_thread_sync` /
+    /// `tcgen05_fence_after_thread_sync` pair is additionally required around
+    /// such a hand-off is open: this crate uses neither on any path, and
+    /// nothing has been established either way for the store side. Their
+    /// absence here is not a guarantee that they are unnecessary.
+    #[inline(always)]
+    pub unsafe fn store_fragment(self, row: u32, column: u32, low: TmemRegs4, high: TmemRegs4) {
+        unsafe {
+            tcgen05_st_16x256b_x1_raw(self.at(row, column), raw_bits(low));
+            tcgen05_st_16x256b_x1_raw(self.at(row, column + 8), raw_bits(high));
+        }
+    }
+
+    /// [`Self::store_fragment`] from a [`Fragment`] tile — the store twin of
+    /// [`Self::fragment_tile`], undoing the simd pair's interleaving so a
+    /// register pass hands back the same `(slot, value)` coordinates it read.
+    ///
+    /// Only the `[16, 16]` block: composing a taller or wider shape out of
+    /// these is the caller's, exactly as it is on the drain side.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::store_fragment`], including the wait it does not do.
+    #[inline(always)]
+    pub unsafe fn store_fragment_tile(self, row: u32, column: u32, tile: Fragment) {
+        unsafe {
+            let (low, high) = split(tile);
+            self.store_fragment(row, column, low, high);
         }
     }
 }
@@ -152,5 +261,42 @@ mod tests {
         assert_eq!(tile.at(0, 0), 0x0001_0000);
         assert_eq!(tile.at(32, 24), 0x0021_0018);
         assert_eq!(tile.columns_right(64).at(0, 0), 0x0001_0040);
+    }
+
+    /// The simd-pair interleaving, both directions. `split` is what the store
+    /// path hands the hardware and `interleave` what the drain path reads back
+    /// from it, so a fragment that survives the pair unchanged is the whole
+    /// register-side contract between them — the addressing either shares is
+    /// what the device harness is for.
+    #[test]
+    fn splitting_a_fragment_inverts_the_pair_interleaving() {
+        let mut tile = Fragment::zero();
+        for slot in 0..Fragment::SLOTS {
+            for value in 0..Fragment::VALUES {
+                tile.set(slot, value, (Fragment::VALUES * slot + value) as f32);
+            }
+        }
+
+        let (low, high) = split(tile);
+        for reg in 0..4 {
+            assert_eq!(low[reg], tile.get(reg / 2, reg % 2));
+            assert_eq!(high[reg], tile.get(reg / 2, 2 + reg % 2));
+        }
+
+        let restored = interleave(low, high);
+        for slot in 0..Fragment::SLOTS {
+            for value in 0..Fragment::VALUES {
+                assert_eq!(restored.get(slot, value), tile.get(slot, value));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_bits_is_the_fp32_pattern_unchanged() {
+        let values = TmemRegs4::new([0.0, -0.0, 1.5, f32::from_bits(0x0000_8001)]);
+        let bits = raw_bits(values);
+        for reg in 0..4 {
+            assert_eq!(bits[reg], values[reg].to_bits());
+        }
     }
 }
