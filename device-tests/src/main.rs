@@ -41,7 +41,9 @@ use kittens::mma::{self, MmaShape, mma_abt};
 use kittens::reg::{
     BaseLdtm, ColVec, Fragment, FragmentLayout, Mul, RegTile, RegVec, online_rescale,
 };
-use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+use kittens::shared::{
+    Bf16, SharedTile, Swizzle128B, tma_store_commit, tma_store_wait, tma_store_wait_read,
+};
 use kittens::sync::Semaphore;
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block, store_wait};
 
@@ -117,6 +119,14 @@ const fn cell_bits(row: usize, column: usize) -> u16 {
 const fn cell(row: usize, column: usize) -> f32 {
     f32::from_bits((cell_bits(row, column) as u32) << 16)
 }
+
+/// The word a TMA store's destination is seeded with, and what
+/// [`kernels::poison_tile`] fills a recycled tile with. [`cell_bits`] always
+/// sets bit 14 and never bits 8..14 or 15, so no identity can be either half of
+/// this word — an unwritten destination, a row landed at the wrong stride, and
+/// a tile read after it was recycled are all distinguishable from a merely
+/// misplaced element.
+const POISON: u32 = 0xffff_ffff;
 
 /// Decode a [`cell`] back to the position it names, or `None` if the value is
 /// not one — how a failing register-side case reports the coordinate the
@@ -291,6 +301,124 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn tma_2d_roundtrip(source: *const TmaDescriptor, mut out: DisjointSlice<u32>) {
         unsafe { tma_2d_probe::<TILE, TILE>(source, &mut out) }
+    }
+
+    /// TMA a tile in and then straight back out to *two* different global
+    /// buffers — one packed 3-D panel map through [`SharedTile::tma_store`],
+    /// one pitched rank-2 map through [`SharedTile::tma_store_2d`] — under a
+    /// single committed group.
+    ///
+    /// The kernel computes nothing: the host stages position identities and
+    /// expects them back, so the whole assertion is that the store side puts
+    /// each box where its map says. The pitched destination is the sharp half —
+    /// its rows are further apart than they are wide and the gaps hold a bit
+    /// pattern no identity can be, so a wrong row stride reports *padding* at a
+    /// position rather than a plausible neighbour.
+    ///
+    /// With `RECYCLE`, the tile is overwritten between
+    /// [`tma_store_wait_read`] and [`tma_store_wait`]. That is not a variation
+    /// of the same claim but a different one: the `read` wait says the engine
+    /// has finished *reading* shared memory, so the poison must not reach
+    /// either destination — and if that wait did not mean what the API says it
+    /// means, both buffers come back full of it. Launch with `R` threads.
+    #[inline(always)]
+    unsafe fn tma_store_probe<const R: usize, const C: usize, const RECYCLE: bool>(
+        source: *const TmaDescriptor,
+        packed: *const TmaDescriptor,
+        pitched: *const TmaDescriptor,
+    ) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tile = Tile::<R, C>::from_raw(smem);
+            let tma = Semaphore::attach(smem.add(Tile::<R, C>::BYTES) as *mut Barrier);
+            let tid = thread::threadIdx_x();
+
+            if tid == 0 {
+                tma.init(1);
+                fence_proxy_async_shared_cta();
+            }
+            thread::sync_threads();
+            if tid == 0 {
+                tile.tma_load(source, 0, 0, tma);
+                tma.expect_tx(Tile::<R, C>::BYTES as u32);
+            }
+            tma.wait(0);
+            thread::sync_threads();
+
+            // Both proxies are the async one — TMA in, TMA out — so the load's
+            // barrier is the whole ordering and no fence belongs here.
+            if tid == 0 {
+                tile.tma_store(packed, 0, 0);
+                tile.tma_store_2d(pitched, 0, 0);
+                tma_store_commit();
+                if RECYCLE {
+                    tma_store_wait_read::<0>();
+                }
+            }
+            if RECYCLE {
+                // Groups are per thread, so thread 0's wait above is what the
+                // other threads are being released past.
+                thread::sync_threads();
+                poison_tile(tile, tid as usize, R);
+                thread::sync_threads();
+            }
+            if tid == 0 {
+                tma_store_wait::<0>();
+                tma.inval();
+            }
+        }
+    }
+
+    /// Overwrite a tile with a pattern the identity encoding cannot produce.
+    /// Flat over the tile's bytes rather than through the cursor: what the
+    /// recycle case needs is that *nothing* of the old tile survives, which is
+    /// a statement about every byte and not about the swizzle.
+    #[inline(always)]
+    unsafe fn poison_tile<const R: usize, const C: usize>(
+        tile: Tile<R, C>,
+        first: usize,
+        stride: usize,
+    ) {
+        unsafe {
+            let words = tile.base() as *mut u32;
+            let mut word = first;
+            while word < Tile::<R, C>::BYTES / 4 {
+                *words.add(word) = POISON;
+                word += stride;
+            }
+        }
+    }
+
+    /// [`tma_store_probe`] over one subtile.
+    #[kernel]
+    pub unsafe fn tma_store_roundtrip(
+        source: *const TmaDescriptor,
+        packed: *const TmaDescriptor,
+        pitched: *const TmaDescriptor,
+    ) {
+        unsafe { tma_store_probe::<TILE, TILE, false>(source, packed, pitched) }
+    }
+
+    /// [`tma_store_probe`] over two stacked subtiles: the second box has to
+    /// leave with its leading coordinate lifted by `SUBTILE_COLS`, which is the
+    /// store side's whole share of the subtile walk.
+    #[kernel]
+    pub unsafe fn tma_store_roundtrip_wide(
+        source: *const TmaDescriptor,
+        packed: *const TmaDescriptor,
+        pitched: *const TmaDescriptor,
+    ) {
+        unsafe { tma_store_probe::<TILE, WIDE, false>(source, packed, pitched) }
+    }
+
+    /// [`tma_store_probe`] recycling its tile as soon as the reads are done.
+    #[kernel]
+    pub unsafe fn tma_store_recycle(
+        source: *const TmaDescriptor,
+        packed: *const TmaDescriptor,
+        pitched: *const TmaDescriptor,
+    ) {
+        unsafe { tma_store_probe::<TILE, TILE, true>(source, packed, pitched) }
     }
 
     /// Fill an `[R, C]` shared tile from registers through [`store_fragment`],
@@ -1450,6 +1578,63 @@ fn check_tma_2d<const R: usize, const C: usize>(
     compare_tile(&out.to_host_vec(stream)?, &staged, C / 2)
 }
 
+/// Does the TMA store put each box where its map says?
+///
+/// A round trip against the load path this harness has already pinned to
+/// silicon: stage position identities, TMA them in, TMA them straight back out
+/// to two fresh buffers, and expect the staging buffer at both. The kernel
+/// applies no map of its own, so a failure is a wrong coordinate, a wrong
+/// subtile stride or a wrong destination stride, and nothing else.
+///
+/// The two destinations are the two forms a kernel writes through and differ in
+/// more than rank. The packed one is a 3-D panel map — what `softmax` and
+/// `layernorm` end with. The pitched one spaces its rows twice as far apart as
+/// they are wide, so a store that inherited the *source's* stride, or the row
+/// extent's, lands in the padding: every gap holds [`POISON`], which
+/// [`cell_bits`] cannot produce, so the report names padding at a position
+/// instead of a plausible neighbouring element.
+fn check_tma_store<const R: usize, const C: usize>(
+    stream: &CudaStream,
+    launch: impl Fn(
+        LaunchConfig,
+        *const TmaDescriptor,
+        *const TmaDescriptor,
+        *const TmaDescriptor,
+    ) -> Result<(), cuda_core::DriverError>,
+) -> Result<String, Box<dyn Error>> {
+    const fn pitch(columns: usize) -> usize {
+        2 * columns
+    }
+    let staged = identity_tile(R, C);
+    let source = DeviceBuffer::from_host(stream, &staged)?;
+    let source_map = unsafe { encode_bf16_panels::<R, C>(stream, source.cu_deviceptr(), R, 1)? };
+
+    let packed = DeviceBuffer::from_host(stream, &vec![POISON; staged.len()])?;
+    let packed_map = unsafe { encode_bf16_panels::<R, C>(stream, packed.cu_deviceptr(), R, 1)? };
+
+    let mut expected = vec![POISON; R * pitch(C) / 2];
+    let pitched = DeviceBuffer::from_host(stream, &expected)?;
+    let layout =
+        unsafe { GlobalLayout::<Bf16, 2>::strided(pitched.cu_deviceptr(), [C, R], [1, pitch(C)]) };
+    let pitched_map = layout.tensor_map::<Tile<R, C>>(stream)?;
+
+    launch(
+        launch_config(R as u32, tile_shared::<R, C>()),
+        source_map.as_ptr(),
+        packed_map.as_ptr(),
+        pitched_map.as_ptr(),
+    )?;
+
+    for row in 0..R {
+        let (source, destination) = (row * C / 2, row * pitch(C) / 2);
+        expected[destination..destination + C / 2].copy_from_slice(&staged[source..source + C / 2]);
+    }
+    compare_tile(&packed.to_host_vec(stream)?, &staged, C / 2)
+        .map_err(|error| format!("packed destination: {error}"))?;
+    compare_tile(&pitched.to_host_vec(stream)?, &expected, pitch(C) / 2)
+        .map_err(|error| format!("pitched destination: {error}").into())
+}
+
 /// Does the cursor read back what the TMA engine wrote?
 ///
 /// The staged tile is position identities in logical order and the kernel
@@ -1981,6 +2166,31 @@ fn run() -> Result<usize, Box<dyn Error>> {
         Box::new(|| {
             check_tma_2d::<TILE, TILE>(stream, |config, map, out| unsafe {
                 module.tma_2d_roundtrip(stream, config, map, out)
+            })
+        }),
+    ));
+    // The store side (#9), against the load side these cases have just pinned.
+    cases.push((
+        "tma store round trip",
+        Box::new(|| {
+            check_tma_store::<TILE, TILE>(stream, |config, source, packed, pitched| unsafe {
+                module.tma_store_roundtrip(stream, config, source, packed, pitched)
+            })
+        }),
+    ));
+    cases.push((
+        "tma store round trip wide",
+        Box::new(|| {
+            check_tma_store::<TILE, WIDE>(stream, |config, source, packed, pitched| unsafe {
+                module.tma_store_roundtrip_wide(stream, config, source, packed, pitched)
+            })
+        }),
+    ));
+    cases.push((
+        "tma store early recycle",
+        Box::new(|| {
+            check_tma_store::<TILE, TILE>(stream, |config, source, packed, pitched| unsafe {
+                module.tma_store_recycle(stream, config, source, packed, pitched)
             })
         }),
     ));

@@ -123,20 +123,24 @@ the non-TMA path for small, irregular, or unaligned accesses. We only reach
 global memory through TMA into shared. Any epilogue that wants to write fp32
 straight out of registers currently has to round-trip through a shared tile.
 
-### 2.3 TMA store side is absent
+### 2.3 TMA store side — plain stores landed (#9), reductions absent
 
 | TK | ferro-kittens |
 | --- | --- |
 | `load_async` | `tma_load`, `tma_load_at`, `tma_load_2d`, `tma_load_2d_multicast_cg2` ✅ |
-| `store_async` | — |
+| `store_async` | `tma_store`, `tma_store_2d` ✅ |
+| `store_async_wait`, `store_commit_group`, `store_async_read_wait` | `tma_store_wait::<N>`, `tma_store_commit`, `tma_store_wait_read::<N>` ✅ |
 | `store_add_async`, `store_min_async`, `store_max_async` | — |
 | `prefetch` | — |
-| `store_async_wait`, `store_commit_group`, `store_async_read_wait` | — |
 | im2col descriptors | — **[SCOPE]** (conv-only) |
 
-This is the largest single hole in movement. `store_add_async` in particular is
-what makes split-K and multi-CTA reduction epilogues cheap. The commit/wait ops
-are small; the descriptor work is shared with 1.5. **~150 lines given 1.5.**
+What is left of this entry is the *reduction* stores, and they are a different
+kind of missing: `cp.reduce.async.bulk.tensor` is absent from cuda-oxide at the
+pinned revision in every form, so unlike the plain stores they are not a
+transcription. `store_add_async` is what makes split-K and multi-CTA reduction
+epilogues cheap, and getting it means a local `ptx_asm!` intrinsic (`ldst.rs`
+sets the precedent) or an upstream contribution. Prefetch is absent upstream
+for the same reason.
 
 ### 2.4 Cluster ops stop at cg2
 

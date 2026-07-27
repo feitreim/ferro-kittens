@@ -11,8 +11,8 @@
 //! | Kernel | Status |
 //! | --- | --- |
 //! | [`gemm`] | runs — checked against a CPU reference by [`gemm::check`] |
+//! | [`softmax`] | runs — checked against a CPU reference by [`softmax::check`] |
 //! | `flash_forward` | aspirational — `--features flash` |
-//! | `softmax` | aspirational — `--features softmax` |
 //! | `layernorm` | aspirational — `--features layernorm` |
 //!
 //! Each aspirational kernel sits behind its own feature and is off by default,
@@ -30,13 +30,12 @@
 use std::process::ExitCode;
 
 pub mod gemm;
+pub mod softmax;
 
 #[cfg(feature = "flash")]
 pub mod flash_forward;
 #[cfg(feature = "layernorm")]
 pub mod layernorm;
-#[cfg(feature = "softmax")]
-pub mod softmax;
 
 /// A kernel's launch envelope, as the example derives it from the library's
 /// own shape constants — the numbers a host launcher would need.
@@ -51,12 +50,20 @@ struct Example {
 /// build's whole point.
 #[allow(unused_mut)]
 fn examples() -> Vec<Example> {
-    let mut examples = vec![Example {
-        name: "gemm",
-        status: "runs",
-        threads: gemm::THREADS,
-        shared_bytes: gemm::SHARED_BYTES,
-    }];
+    let mut examples = vec![
+        Example {
+            name: "gemm",
+            status: "runs",
+            threads: gemm::THREADS,
+            shared_bytes: gemm::SHARED_BYTES,
+        },
+        Example {
+            name: "softmax",
+            status: "runs",
+            threads: softmax::THREADS,
+            shared_bytes: softmax::SHARED_BYTES,
+        },
+    ];
     #[cfg(feature = "flash")]
     examples.push(Example {
         name: "flash_forward",
@@ -64,17 +71,10 @@ fn examples() -> Vec<Example> {
         threads: flash_forward::THREADS,
         shared_bytes: flash_forward::SHARED_BYTES,
     });
-    #[cfg(feature = "softmax")]
-    examples.push(Example {
-        name: "softmax",
-        status: "aspirational (#9)",
-        threads: softmax::THREADS,
-        shared_bytes: softmax::SHARED_BYTES,
-    });
     #[cfg(feature = "layernorm")]
     examples.push(Example {
         name: "layernorm",
-        status: "aspirational (#3, #9, #13, #22)",
+        status: "aspirational (#3, #13, #22)",
         threads: layernorm::THREADS,
         shared_bytes: layernorm::SHARED_BYTES,
     });
@@ -86,10 +86,16 @@ fn examples() -> Vec<Example> {
 fn checks(
     context: &std::sync::Arc<cuda_core::CudaContext>,
 ) -> Vec<(&'static str, Result<String, String>)> {
-    vec![(
-        "gemm",
-        gemm::check(context).map_err(|error| error.to_string()),
-    )]
+    vec![
+        (
+            "gemm",
+            gemm::check(context).map_err(|error| error.to_string()),
+        ),
+        (
+            "softmax",
+            softmax::check(context).map_err(|error| error.to_string()),
+        ),
+    ]
 }
 
 fn main() -> ExitCode {

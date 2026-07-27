@@ -17,14 +17,18 @@
 //! - **TMA loads a subtile per box.** The tensor maps built by [`crate::global`]
 //!   describe 64-column boxes, so [`SharedTile::tma_load`] issues one
 //!   `cp.async.bulk.tensor` per subtile, lifting the leading coordinate by 64
-//!   per stack level.
+//!   per stack level. [`SharedTile::tma_store`] walks the same boxes the other
+//!   way, and completes through a wholly different mechanism —
+//!   [`tma_store_commit`] and the two waits, not a [`Semaphore`].
 
 use core::marker::PhantomData;
 
 use cuda_device::tcgen05::{Tcgen05ElementType, cvt_f32x2_bf16x2};
 use cuda_device::tma::{
-    TmaDescriptor, cp_async_bulk_tensor_2d_g2s, cp_async_bulk_tensor_2d_g2s_multicast_cg2,
-    cp_async_bulk_tensor_3d_g2s,
+    TmaDescriptor, cp_async_bulk_commit_group, cp_async_bulk_tensor_2d_g2s,
+    cp_async_bulk_tensor_2d_g2s_multicast_cg2, cp_async_bulk_tensor_2d_s2g,
+    cp_async_bulk_tensor_3d_g2s, cp_async_bulk_tensor_3d_s2g, cp_async_bulk_wait_group,
+    cp_async_bulk_wait_group_read,
 };
 
 use crate::sync::Semaphore;
@@ -321,6 +325,79 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
         }
     }
 
+    /// TMA the tile out to a [`crate::global`] panel map: one box per subtile,
+    /// the same coordinates [`Self::tma_load`] reads them from, the bytes
+    /// going the other way.
+    ///
+    /// Completion does not land on a [`Semaphore`], and the difference is not
+    /// cosmetic. A load's destination is shared memory, where an mbarrier can
+    /// live and count the arriving bytes; a store's destination is global
+    /// memory, where none can. So a bulk store completes through
+    /// [`tma_store_commit`] and [`tma_store_wait`] — the issuing thread's
+    /// outstanding stores committed as one group, waited on by counting
+    /// groups, with no barrier to arrive on and no byte accounting anywhere.
+    /// The obligations that buys the caller are in the safety section, and
+    /// they outlive the call.
+    ///
+    /// # Safety
+    ///
+    /// `map` must describe a live global buffer whose box shape matches
+    /// `[R, SUBTILE_COLS]`. Beyond the call itself:
+    ///
+    /// - The tile must stay allocated and unwritten until the issuing thread
+    ///   has waited on the group covering this store —
+    ///   [`tma_store_wait_read`] to overwrite it, [`tma_store_wait`] for the
+    ///   bytes to be readable in global memory. Nothing else republishes the
+    ///   shared memory: dropping the handle, a `sync_threads`, or the kernel
+    ///   ending are all silent here.
+    /// - If the tile's contents arrived through the generic proxy — anything
+    ///   written by `stmatrix` or a plain store, including
+    ///   [`crate::ldst::store_fragment`], which states the same obligation for
+    ///   an MMA reading the tile — the caller owes a
+    ///   `fence.proxy.async.shared::cta` before this call. The TMA engine
+    ///   reads through the async proxy and would otherwise be free to see
+    ///   stale bytes. A tile that got here by [`Self::tma_load`] needs no
+    ///   fence: that is the async proxy on both sides, ordered by the load's
+    ///   own barrier.
+    #[inline(always)]
+    pub unsafe fn tma_store(self, map: *const TmaDescriptor, row: i32, plane: i32) {
+        unsafe {
+            let mut i = 0usize;
+            while i < Self::SUBTILES {
+                cp_async_bulk_tensor_3d_s2g(
+                    self.subtile(i),
+                    map,
+                    (i * Self::SUBTILE_COLS) as i32,
+                    row,
+                    plane,
+                );
+                i += 1;
+            }
+        }
+    }
+
+    /// [`Self::tma_store`] against a 2-D tensor map, taking its coordinates in
+    /// the order [`Self::tma_load_2d`] takes them.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::tma_store`], every clause.
+    #[inline(always)]
+    pub unsafe fn tma_store_2d(self, map: *const TmaDescriptor, leading: i32, minor: i32) {
+        unsafe {
+            let mut i = 0usize;
+            while i < Self::SUBTILES {
+                cp_async_bulk_tensor_2d_s2g(
+                    self.subtile(i),
+                    map,
+                    leading + (i * Self::SUBTILE_COLS) as i32,
+                    minor,
+                );
+                i += 1;
+            }
+        }
+    }
+
     /// The tile base's absolute position in the 8-row swizzle period.
     /// SWIZZLE_128B XORs *physical* address bits `[9:7]` into the chunk index,
     /// so a tile whose base is not 1024-byte aligned starts mid-period and
@@ -414,6 +491,54 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
             transpose: true,
         }
     }
+}
+
+/// Commit this thread's outstanding bulk stores as one group.
+///
+/// Groups are per *thread* and age in issue order: everything issued since the
+/// last commit becomes the youngest group, and every earlier group's index
+/// goes up by one. A tile's store is one instruction per stacked subtile, so
+/// committing per tile is what makes "wait for that tile" expressible at all —
+/// the waits below count groups and cannot name an instruction.
+#[inline(always)]
+pub fn tma_store_commit() {
+    cp_async_bulk_commit_group();
+}
+
+/// Wait until at most `N` of this thread's committed store groups are still in
+/// flight, *complete* meaning the bytes are in global memory and visible to
+/// anything that reads them there — a following kernel, the host, another CTA.
+///
+/// `N = 0` drains every group this thread has committed and is the last thing
+/// a kernel that wrote its result owes; nothing else makes a bulk store
+/// visible, and a kernel that simply ends has not waited.
+///
+/// A pipelined epilogue wants [`tma_store_wait_read`] instead: reusing the
+/// shared tile needs only the engine's *reads* to be done, and blocking on
+/// global visibility to recycle a buffer serializes the overlap the pipeline
+/// exists for.
+///
+/// `N` is a const parameter because the instruction's group count is an
+/// immediate — a runtime depth is not a thing the hardware can be asked for.
+#[inline(always)]
+pub fn tma_store_wait<const N: u32>() {
+    cp_async_bulk_wait_group(N);
+}
+
+/// Wait until at most `N` of this thread's committed store groups still have
+/// their *source reads* outstanding: the shared tiles behind the older groups
+/// are free to overwrite, while their bytes may still be on the way to global
+/// memory.
+///
+/// The cheaper of the two waits, and the one a pipelined epilogue is written
+/// around — store stage `i`, recycle its buffer for stage `i + 1`, and let the
+/// global writes retire behind the next tile's work. It says nothing about
+/// what any other thread, CTA or the host can see, so it is never the last
+/// wait in a kernel: a result that has only been read out of shared memory has
+/// not arrived anywhere.
+#[inline(always)]
+pub fn tma_store_wait_read<const N: u32>() {
+    cp_async_bulk_wait_group_read(N);
 }
 
 #[inline(always)]

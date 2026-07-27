@@ -18,9 +18,8 @@ default = []
 # you read its gap list: the compiler errors *are* the missing API surface,
 # named at the call sites that want it.
 flash = []
-softmax = []
 layernorm = []
-aspirational = ["flash", "layernorm", "softmax"]
+aspirational = ["flash", "layernorm"]
 
 [dependencies]
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }

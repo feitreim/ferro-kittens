@@ -19,20 +19,25 @@ target *of the library*.)
 | Kernel | Status | Blocked on |
 | --- | --- | --- |
 | [`gemm`](src/gemm.rs) | **runs** — exact against a CPU reference | — (two gaps worked around in-file, both marked) |
+| [`softmax`](src/softmax.rs) | **runs** — within 2⁻⁸ of a CPU reference | — |
 | [`flash_forward`](src/flash_forward.rs) | aspirational | #7, #11, #22, #23, #31 + scalar broadcasts |
-| [`softmax`](src/softmax.rs) | aspirational | **#9, and nothing else** |
-| [`layernorm`](src/layernorm.rs) | aspirational | #3, #9, #13, #22 + scalar broadcasts |
+| [`layernorm`](src/layernorm.rs) | aspirational | #3, #13, #22 + scalar broadcasts |
 
-`gemm` is the only one that **runs** rather than merely compiling, which is a
-strictly stronger claim and the one worth holding the others to: a launcher, a
-CPU reference, and an exit code.
+Two of the four **run** rather than merely compile, which is a strictly stronger
+claim and the one worth holding the rest to: a launcher, a CPU reference, and an
+exit code.
 
-Nothing on those lists is arithmetic any more. #5 and #6 between them closed
+`softmax`'s blocked-on column is empty, and it is the first example to have
+gone the whole way — five gaps, then one, then none. **#9** was the last of
+them, and closing it took nothing but the store: `SharedTile::tma_store` walks
+the same boxes `tma_load` does, and `tma_store_commit` / `tma_store_wait::<0>()`
+are the completion side.
+
+Nothing on the remaining lists is arithmetic. #5 and #6 between them closed
 every elementwise op and every reduction the four kernels asked for, and #21 and
-#25 closed both halves of the shared ↔ register path. `softmax` is down to one
-item: **#9**, the TMA store, so the result can leave. What remains across the
-four is movers (#22, composition only), the store side (#9), masking (#7), and
-one structural gap (#3 + #13, layernorm's block-scope statistic).
+#25 closed both halves of the shared ↔ register path. What remains across the
+four is movers (#22, composition only), masking (#7), and one structural gap
+(#3 + #13, layernorm's block-scope statistic).
 
 The one arithmetic leftover is the **scalar broadcast** forms —
 `RegTile::scale`/`shift`, `RegVec::scale`/`shift`, a free `rsqrt(f32)`, and
@@ -42,10 +47,10 @@ whole operand first. They have no issue of their own; #31 covers the in-place
 half of the argument.
 
 ```sh
-cargo oxide build kittens-examples --arch sm_100a   # the default set: gemm
-cargo oxide run kittens-examples                    # and run it, on a B200
+cargo oxide build kittens-examples --arch sm_100a   # the default set: gemm, softmax
+cargo oxide run kittens-examples                    # and run them, on a B200
 cargo check --features flash                        # read flash's gap list
-cargo check --features aspirational                 # all of them
+cargo check --features aspirational                 # both of them
 ```
 
 From the repo root: `modal run modal_app.py::build` for the first,
@@ -58,6 +63,14 @@ missing API as compiler errors, at the call sites that want it. Verified: every
 error is `unresolved import`, `no method named`, or an unsatisfied
 `FragmentLayout` bound — there is nothing in these files that fails for any
 reason other than the API not existing.
+
+`softmax` **runs** too, and what its check can claim is different from the
+GEMM's in a way worth writing down. A softmax has an `exp2` and a divide in it,
+so `==` is not available; instead each row's 128 inputs are a permutation of
+the multiples of 1/8 below 16, which makes each row's 128 outputs distinct with
+the closest pair 9% apart, against a 2⁻⁸ tolerance. Exactness is not the only
+way to make a failure unambiguous — separating the right answer from every
+wrong one by forty times the noise floor also works.
 
 `gemm` **runs**, and is the first numerical result this library has produced.
 `gemm::check` launches it over `[512, 256] x [256, 256]ᵀ` on a B200 and compares
@@ -122,8 +135,22 @@ A flash kernel masks a `[queries, keys]` band whose diagonal sits at
 `make_causal_at(lane, query_base, key_base, fill)`. Without the origin the op
 is unusable for anything but a single-block attention.
 
-**#9 — TMA store.** Both normalization kernels end with one. `tma_store`,
-`tma_store_commit`, `tma_store_wait::<N>()`.
+**#9 — TMA store. Landed**, and it is what promoted `softmax` to **runs**.
+`SharedTile::tma_store` / `tma_store_2d` mirror the load paths box for box;
+`tma_store_commit` and `tma_store_wait::<N>()` are the completion side, and
+they are *not* a `Semaphore` — a load's destination is shared memory where an
+mbarrier can count arriving bytes, a store's is global memory where none can,
+so a bulk store completes by counting per-thread groups with no barrier and no
+byte accounting. `tma_store_wait_read::<N>()` is the weaker of the two waits:
+it says the engine has finished *reading* the shared tile, which is what a
+pipelined epilogue needs to recycle its buffer (#15's `lcsf`) and is never
+enough as a kernel's last wait.
+
+Not landed, and tracked separately as the issue asked: the **reduction** stores
+(`store_add_async` and friends). `cp.reduce.async.bulk.tensor` is absent from
+cuda-oxide at the pinned revision in every form, so that one is a `ptx_asm!`
+intrinsic here or an upstream contribution — and nothing in the plain store
+path prejudges which.
 
 **#11 — global ↔ register.** Flash's epilogue and the GEMM's. The GEMM's is the
 one worth reading: it is fifteen lines of open-coded `RegTile::coordinate`
@@ -279,10 +306,12 @@ pipeline. `prototype::lcf` predates clusters in ThunderKittens too, so this is
 not a porting oversight; it is the scaffold needing #3's `Scope` before it can
 describe who a work item belongs to.
 
-Related, and cheaper: #15's `lcsf` is filed as depending on #9, which is right,
-but the GEMM shows a second reason to want it — with the store folded into
-`finish`, a persistent GEMM cannot overlap its epilogue with the next tile's
-first K loads.
+Related, and cheaper: #15's `lcsf` was filed as depending on #9, which has now
+landed with the wait it needs — `tma_store_wait_read` releases the shared buffer
+as soon as the engine has read it, without blocking on global visibility, which
+is exactly what lets an epilogue overlap the next tile's first K loads. The
+GEMM shows the second reason to want it: with the store folded into `finish`, a
+persistent GEMM cannot overlap those today.
 
 #### 8. Multicast has no geometry to live in
 
