@@ -2,3 +2,5 @@
 /device-tests/target
 __pycache__/
 /examples/target
+# Agent worktrees.
+/.claude
