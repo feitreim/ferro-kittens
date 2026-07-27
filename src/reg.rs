@@ -14,6 +14,18 @@
 //! kernels shipped with) and [`exp2_hw`] (one `ex2.approx` SFU instruction,
 //! also pure-PTX-safe post-#56). Ports that must hold "same SASS" keep the
 //! polynomial; swapping to the SFU is a separate, measured change.
+//!
+//! Elementwise work goes through [`UnaryOp`] / [`BinaryOp`] / [`TernaryOp`]
+//! and the `*_map` methods, so a scalar function is written once and reaches
+//! [`RegTile`], [`RegVec`] and [`ColVec`] alike. The named methods (`exp2`,
+//! `mul_row`, …) are wrappers over those.
+//!
+//! **ThunderKittens naming.** TK names a register vector for the axis it
+//! *spans*: its `col_vec` has one entry per row, its `row_vec` one per column.
+//! We name for the axis that *indexes* it, so TK's `col_vec` is our
+//! [`RegVec`] and TK's `row_vec` is our [`ColVec`] — inverted. The op names
+//! do agree: TK's `row_map`/`mul_row` and ours both broadcast a per-row scalar
+//! along each row.
 
 use cuda_device::warp;
 
@@ -96,6 +108,89 @@ pub fn quad_sum(value: f32) -> f32 {
     value + warp::shuffle_xor_f32(value, 2)
 }
 
+/// A scalar function named as a *type*, so one definition instantiates for
+/// every register family through the `unary_map` methods. Unit structs rather
+/// than `fn` pointers or closures: a type parameter can carry no state to
+/// spill and nothing for the inliner to see through.
+pub trait UnaryOp {
+    /// The scalar function.
+    fn apply(x: f32) -> f32;
+}
+
+/// Two-operand [`UnaryOp`]. Also what the row/column broadcast maps take, with
+/// `b` the per-row or per-column scalar.
+pub trait BinaryOp {
+    /// The scalar function.
+    fn apply(a: f32, b: f32) -> f32;
+}
+
+/// Three-operand [`UnaryOp`] — the fused multiply-add family, which exists
+/// because a separate multiply and add do not contract on their own.
+pub trait TernaryOp {
+    /// The scalar function.
+    fn apply(a: f32, b: f32, c: f32) -> f32;
+}
+
+macro_rules! scalar_ops {
+    ($trait:ident: $($(#[$meta:meta])* $name:ident($($arg:ident),+) = $body:expr;)*) => {$(
+        $(#[$meta])*
+        pub struct $name;
+
+        impl $trait for $name {
+            #[inline(always)]
+            fn apply($($arg: f32),+) -> f32 {
+                $body
+            }
+        }
+    )*};
+}
+
+scalar_ops! { UnaryOp:
+    /// The FMA polynomial ([`exp2_approx`]) — what the validated kernels ship.
+    Exp2Approx(x) = exp2_approx(x);
+    /// The SFU instruction ([`exp2_hw`]). Rounds differently from
+    /// [`Exp2Approx`]; the choice between them is a numerics decision.
+    Exp2Hw(x) = exp2_hw(x);
+    /// `e^x` on [`Exp2Approx`], inheriting that polynomial's error bound and
+    /// its ±125 exponent clamp — so this saturates at `x = ±86.6`, just inside
+    /// where fp32 overflows anyway.
+    Exp(x) = exp2_approx(x * core::f32::consts::LOG2_E);
+    Log2(x) = log2_approx(x);
+    /// `ln(x)` on [`log2_approx`]; see [`Exp`].
+    Log(x) = log2_approx(x) * core::f32::consts::LN_2;
+    /// Sign-bit clear rather than a libdevice `fabsf` — one `abs.f32`, and it
+    /// keeps the op usable in a pure-PTX artifact regardless of #56's fate.
+    Abs(x) = f32::from_bits(x.to_bits() & 0x7fff_ffff);
+    Neg(x) = -x;
+    Relu(x) = fmax(x, 0.0);
+    /// `llvm.sqrt.f32`, which NVPTX lowers to the native `sqrt.rn.f32` with no
+    /// libdevice call.
+    Sqrt(x) = x.sqrt();
+    /// `1/√x` as a correctly-rounded sqrt and divide, not the SFU
+    /// `rsqrt.approx.f32`. Two instructions, but the same numerics on host and
+    /// device; the SFU form is a measured swap, like [`Exp2Hw`].
+    Rsqrt(x) = 1.0 / x.sqrt();
+    Recip(x) = 1.0 / x;
+}
+
+scalar_ops! { BinaryOp:
+    Add(a, b) = a + b;
+    Sub(a, b) = a - b;
+    Mul(a, b) = a * b;
+    Div(a, b) = a / b;
+    Max(a, b) = fmax(a, b);
+    Min(a, b) = fmin(a, b);
+}
+
+scalar_ops! { TernaryOp:
+    /// `a*b + c` in one `fma.rn.f32`. Rust emits no fast-math flags, so a
+    /// separate multiply and add stay separate — the fusion has to be asked
+    /// for. TK's `fma_AxCtB` is this op with the last two operands swapped at
+    /// the call site; our maps fix no operand to a broadcast vector, so the
+    /// second form buys nothing.
+    Fma(a, b, c) = a.mul_add(b, c);
+}
+
 /// The row half of a fragment ownership map: how a warp's 32 lanes divide the
 /// `M` logical rows of a tile into per-thread *slots*, and where the one
 /// `f32` per owned row lives.
@@ -130,8 +225,7 @@ pub trait RowLayout<const M: usize> {
 /// Unlike a [`RowLayout`] slot, a value is *not* warp-uniform in the same
 /// sense: under [`BaseLdtm`] a column depends only on `lane % 4`, so the 8
 /// lanes of a column group each hold their own copy of the same `N/4` columns.
-/// Once #6 can produce one, a
-/// column vector is that per-lane copy.
+/// A [`ColVec`] is that per-lane copy.
 pub trait ColLayout<const N: usize> {
     /// Per-thread storage, one `f32` per owned column (`[f32; VALUES]`).
     type Values: Copy;
@@ -315,6 +409,63 @@ base_ldtm_rows!(16, 32);
 base_ldtm_cols!(16, 32, 128);
 base_ldtm_shapes!((16, 16), (32, 32), (32, 128));
 
+/// The named half of the op set: one line per exposed name, so a new op costs
+/// a [`scalar_ops`] line and one of these. `should_implement_trait` is allowed
+/// wholesale because every op the device code takes must stay a direct
+/// `#[inline(always)]` call, not an operator impl.
+macro_rules! op_methods {
+    (unary $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
+        $(#[$meta])*
+        #[allow(clippy::should_implement_trait)]
+        #[inline(always)]
+        pub fn $name(self) -> Self {
+            self.unary_map::<$op>()
+        }
+    )*};
+    (binary $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
+        $(#[$meta])*
+        #[allow(clippy::should_implement_trait)]
+        #[inline(always)]
+        pub fn $name(self, other: Self) -> Self {
+            self.bin_map::<$op>(other)
+        }
+    )*};
+    (row $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
+        $(#[$meta])*
+        #[inline(always)]
+        pub fn $name(self, rows: RegVec<M, L>) -> Self {
+            self.row_map::<$op>(rows)
+        }
+    )*};
+    (col $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
+        $(#[$meta])*
+        #[inline(always)]
+        pub fn $name(self, cols: ColVec<N, L>) -> Self {
+            self.col_map::<$op>(cols)
+        }
+    )*};
+}
+
+/// The unary names every register family carries, minus `exp2` — [`RegVec`]'s
+/// is hand-written and predates the mechanism, so each family names its own.
+macro_rules! unary_op_methods {
+    () => {
+        op_methods! { unary
+            /// SFU `2^x` ([`exp2_hw`]); a different result from `exp2`.
+            exp2_hw = Exp2Hw;
+            exp = Exp;
+            log = Log;
+            log2 = Log2;
+            abs = Abs;
+            neg = Neg;
+            relu = Relu;
+            sqrt = Sqrt;
+            rsqrt = Rsqrt;
+            recip = Recip;
+        }
+    };
+}
+
 /// Per-thread row statistics of an `[M, _]` fragment-mapped tile: one `f32`
 /// per owned row (slot), replicated across each quad. A 32-row warp tile is 4
 /// slots (2 per 16-row block × 2 blocks per warp).
@@ -462,6 +613,151 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
         }
         out
     }
+
+    /// `Op` on every slot.
+    #[inline(always)]
+    pub fn unary_map<Op: UnaryOp>(self) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            out.set(slot, Op::apply(self.get(slot)));
+            slot += 1;
+        }
+        out
+    }
+
+    /// `Op` slotwise against `other`.
+    #[inline(always)]
+    pub fn bin_map<Op: BinaryOp>(self, other: Self) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            out.set(slot, Op::apply(self.get(slot), other.get(slot)));
+            slot += 1;
+        }
+        out
+    }
+
+    /// `Op` slotwise across three vectors — [`Fma`] and nothing else so far.
+    #[inline(always)]
+    pub fn ternary_map<Op: TernaryOp>(self, b: Self, c: Self) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            out.set(slot, Op::apply(self.get(slot), b.get(slot), c.get(slot)));
+            slot += 1;
+        }
+        out
+    }
+
+    /// Slotwise `self * b + c`, fused.
+    #[inline(always)]
+    pub fn fma(self, b: Self, c: Self) -> Self {
+        self.ternary_map::<Fma>(b, c)
+    }
+
+    unary_op_methods!();
+
+    op_methods! { binary
+        add = Add;
+        mul = Mul;
+        div = Div;
+        min = Min;
+    }
+}
+
+/// Per-thread column statistics of a `[_, N]` fragment-mapped tile: one `f32`
+/// per owned column (value). The mirror of [`RegVec`] across the transpose,
+/// and TK's `row_vec` — see the module docs on that inversion.
+///
+/// Under [`BaseLdtm`] a lane's columns depend only on `lane % 4`, so the 8
+/// lanes of a column group hold 8 identical copies of the same `N/4` entries;
+/// a whole-warp column statistic is consistent only once those 8 copies agree.
+/// Nothing here produces one — the strided shuffle reduction that would is
+/// issue #6. What this type does today is *carry* a column vector (splatted,
+/// or built from `column`) into [`RegTile::col_map`].
+pub struct ColVec<const N: usize, L: ColLayout<N>>(pub L::Values);
+
+impl<const N: usize, L: ColLayout<N>> Clone for ColVec<N, L> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<const N: usize, L: ColLayout<N>> Copy for ColVec<N, L> {}
+
+impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
+    /// Columns of the tile this thread owns.
+    pub const VALUES: usize = L::VALUES;
+
+    /// Wrap this thread's values; see [`RegVec::from_slots`].
+    #[inline(always)]
+    pub fn from_values(values: L::Values) -> Self {
+        Self(values)
+    }
+
+    /// All values set to `value`.
+    #[inline(always)]
+    pub fn splat(value: f32) -> Self {
+        Self(L::splat_values(value))
+    }
+
+    /// The statistic of column-value `value`.
+    #[inline(always)]
+    pub fn get(&self, value: usize) -> f32 {
+        L::get_value(&self.0, value)
+    }
+
+    /// Write the statistic of column-value `value`.
+    #[inline(always)]
+    pub fn set(&mut self, value: usize, x: f32) {
+        L::set_value(&mut self.0, value, x);
+    }
+
+    /// The logical column in `0..N` that `lane`'s `value` holds.
+    #[inline(always)]
+    pub fn column(lane: u32, value: usize) -> u32 {
+        L::col_of(lane, value)
+    }
+
+    /// `Op` on every value.
+    #[inline(always)]
+    pub fn unary_map<Op: UnaryOp>(self) -> Self {
+        let mut out = self;
+        let mut value = 0;
+        while value < L::VALUES {
+            out.set(value, Op::apply(self.get(value)));
+            value += 1;
+        }
+        out
+    }
+
+    /// `Op` valuewise against `other`.
+    #[inline(always)]
+    pub fn bin_map<Op: BinaryOp>(self, other: Self) -> Self {
+        let mut out = self;
+        let mut value = 0;
+        while value < L::VALUES {
+            out.set(value, Op::apply(self.get(value), other.get(value)));
+            value += 1;
+        }
+        out
+    }
+
+    unary_op_methods!();
+
+    op_methods! { unary
+        /// Software `2^x` ([`exp2_approx`]).
+        exp2 = Exp2Approx;
+    }
+
+    op_methods! { binary
+        add = Add;
+        sub = Sub;
+        mul = Mul;
+        div = Div;
+        max = Max;
+        min = Min;
+    }
 }
 
 /// One thread's slice of a logical `[M, N]` fp32 tile held across a warp under
@@ -502,6 +798,46 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
         Self(L::splat(0.0))
     }
 
+    /// Every value set to `value`. TK's nullary `one`/`pos_infty`/`neg_infty`
+    /// ops are this with the constant written out.
+    #[inline(always)]
+    pub fn splat(value: f32) -> Self {
+        Self(L::splat(value))
+    }
+
+    /// Every column of row-slot `s` set to `rows` slot `s`.
+    #[inline(always)]
+    pub fn broadcast_row(rows: RegVec<M, L>) -> Self {
+        let mut out = Self::zero();
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let row = rows.get(slot);
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(slot, value, row);
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
+    /// Every row's `value` set to `cols` value `value`.
+    #[inline(always)]
+    pub fn broadcast_col(cols: ColVec<N, L>) -> Self {
+        let mut out = Self::zero();
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(slot, value, cols.get(value));
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
     /// The value at `(slot, value)`.
     #[inline(always)]
     pub fn get(&self, slot: usize, value: usize) -> f32 {
@@ -535,6 +871,147 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
             }
             slot += 1;
         }
+    }
+
+    /// `Op` on every owned value.
+    #[inline(always)]
+    pub fn unary_map<Op: UnaryOp>(self) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(slot, value, Op::apply(self.get(slot, value)));
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
+    /// `Op` against `other` at the same logical coordinate — which is the same
+    /// `(slot, value)`, since both tiles ride the same map.
+    #[inline(always)]
+    pub fn bin_map<Op: BinaryOp>(self, other: Self) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(
+                    slot,
+                    value,
+                    Op::apply(self.get(slot, value), other.get(slot, value)),
+                );
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
+    /// `Op` across three tiles; see [`Fma`].
+    #[inline(always)]
+    pub fn ternary_map<Op: TernaryOp>(self, b: Self, c: Self) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(
+                    slot,
+                    value,
+                    Op::apply(
+                        self.get(slot, value),
+                        b.get(slot, value),
+                        c.get(slot, value),
+                    ),
+                );
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
+    /// Elementwise `self * b + c`, fused.
+    #[inline(always)]
+    pub fn fma(self, b: Self, c: Self) -> Self {
+        self.ternary_map::<Fma>(b, c)
+    }
+
+    /// `Op` against a per-row scalar broadcast along that row: every value of
+    /// row-slot `s` sees `rows` slot `s`. No shuffle — the map already gives a
+    /// thread every one of its rows' values, so the operand is lane-local.
+    #[inline(always)]
+    pub fn row_map<Op: BinaryOp>(self, rows: RegVec<M, L>) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let row = rows.get(slot);
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(slot, value, Op::apply(self.get(slot, value), row));
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
+    /// `Op` against a per-column scalar broadcast down that column: the value
+    /// at `(slot, value)` sees `cols` value `value`, i.e. the scalar for
+    /// logical column [`ColVec::column`]`(lane, value)`. Also shuffle-free,
+    /// for the mirror reason — but see [`ColVec`] on where the operand can
+    /// legitimately come from today.
+    #[inline(always)]
+    pub fn col_map<Op: BinaryOp>(self, cols: ColVec<N, L>) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(
+                    slot,
+                    value,
+                    Op::apply(self.get(slot, value), cols.get(value)),
+                );
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
+    unary_op_methods!();
+
+    op_methods! { unary
+        /// Software `2^x` ([`exp2_approx`]) — the shipped kernels' rounding.
+        exp2 = Exp2Approx;
+    }
+
+    op_methods! { binary
+        add = Add;
+        sub = Sub;
+        mul = Mul;
+        div = Div;
+        max = Max;
+        min = Min;
+    }
+
+    op_methods! { row
+        add_row = Add;
+        sub_row = Sub;
+        /// The value form of [`Self::scale_rows`].
+        mul_row = Mul;
+        div_row = Div;
+    }
+
+    op_methods! { col
+        add_col = Add;
+        sub_col = Sub;
+        mul_col = Mul;
+        div_col = Div;
     }
 }
 
