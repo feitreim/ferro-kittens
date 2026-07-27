@@ -42,7 +42,7 @@ use kittens::global::encode_bf16_panels;
 use kittens::ldst::store_fragment;
 use kittens::mma::{self, mma_abt};
 use kittens::reg::{
-    BaseLdtm, Fragment, FragmentLayout, Mul, RegTile, RegVec, fmax, online_rescale,
+    BaseLdtm, ColVec, Fragment, FragmentLayout, Mul, RegTile, RegVec, fmax, online_rescale,
 };
 use kittens::shared::{Bf16, SharedTile, Swizzle128B};
 use kittens::sync::Semaphore;
@@ -71,6 +71,10 @@ type Square = SharedTile<Bf16, TILE, TILE, Swizzle128B>;
 type AOperand = SharedTile<Bf16, ROWS, DEPTH, Swizzle128B>;
 type BOperand = SharedTile<Bf16, TILE, DEPTH, Swizzle128B>;
 type Accumulator = TmemTile<ROWS, COLUMNS>;
+/// The lane probe's staging tile: a warp's 32 rows by the one swizzle atom
+/// [`SharedTile::chunk_writer`] accepts, which is what `store_fragment`
+/// addresses into.
+type LaneStage = SharedTile<Bf16, 32, TILE, Swizzle128B>;
 
 /// Dynamic shared plan of the fragment probe: the A operand, the two B
 /// operands, then a 32-byte scratch tail holding the two mbarriers and the
@@ -115,6 +119,17 @@ const HAND_WRITTEN: u32 = 0;
 const FUSED: u32 = 1;
 /// [`HAND_WRITTEN`] with the generic `row_map::<Mul>` in place of `scale_rows`.
 const ROW_MAP: u32 = 2;
+
+/// Which lane-passing convention [`kernels::lane_probe`] compiles — issue #27.
+/// Today's convention: `warp::lane_id()` read once by the caller and threaded
+/// into every coordinate-dependent op.
+const HOISTED: u32 = 0;
+/// One `warp::lane_id()` per *op*, the op reading the register for itself.
+const PER_OP: u32 = 1;
+/// One `warp::lane_id()` per coordinate *query* — the pessimistic implicit
+/// form, where `coordinate` reads `%laneid` once for the row and again for the
+/// column instead of once for the pair.
+const PER_QUERY: u32 = 2;
 
 /// Where `(warp, lane, slot, value)` lands in a dump of `slots` × `values` per
 /// thread. The STTM round trip seeds each register with its own index here, so
@@ -743,6 +758,257 @@ pub mod kernels {
         mut out: DisjointSlice<f32>,
     ) {
         unsafe { softmax_probe::<128, ROW_MAP>(scores, steps, &mut out) }
+    }
+
+    /// The lane an op sees under `CONVENTION`: the caller's already-`hoisted`
+    /// value under [`HOISTED`], and otherwise a fresh `%laneid` read — which is
+    /// the whole of the question in issue #27. `hoisted` is dead in the
+    /// implicit forms, so they carry no lane the ops did not ask for.
+    #[inline(always)]
+    fn op_lane<const CONVENTION: u32>(hoisted: u32) -> u32 {
+        if CONVENTION == HOISTED {
+            hoisted
+        } else {
+            warp::lane_id()
+        }
+    }
+
+    /// **A codegen probe, not a test.** Like [`softmax_probe`] it is launched
+    /// by nothing and checks nothing; it exists so `regcount` can price the
+    /// lane-passing convention, and it stays as the regression guard on that
+    /// price.
+    ///
+    /// The shape is a kernel that leans on *every* lane-taking op in one basic
+    /// block, which is where hoisting would pay off if it pays off anywhere:
+    /// per step, a `coordinate`-addressed load of a `[32, N]` block, a
+    /// `RegVec::row` vector into `sub_row`, a `ColVec::column` vector into
+    /// `add_col`, a second `coordinate` pass for a causal mask, and a
+    /// `store_fragment` of every `[16, 16]` block that fits the staging tile.
+    /// `CONVENTION` picks how the lane reaches those ops and nothing else
+    /// changes, so the forms are comparable line for line:
+    ///
+    /// - [`HOISTED`]: one `warp::lane_id()`, threaded through — today's rule
+    /// - [`PER_OP`]: each op reads `%laneid` itself
+    /// - [`PER_QUERY`]: each row/column *query* reads it, the pessimistic bound
+    ///
+    /// `steps` is a runtime bound so the block stays live across iterations
+    /// rather than unrolling into one straight-line region.
+    ///
+    /// **What it measured** (`regcount`, sm_100a, no spills anywhere):
+    ///
+    /// ```text
+    ///                    regs   stack
+    /// 128 hoisted         198    2816
+    /// 128 per_op          168    2816
+    /// 128 per_query       168    2816
+    ///  32 hoisted          72     256
+    ///  32 per_op           40     512
+    ///  32 per_query        40     512
+    /// ```
+    ///
+    /// [`PER_OP`] and [`PER_QUERY`] agree on every column at both widths, and
+    /// the emitted PTX holds exactly *one* `%laneid` move in all six kernels —
+    /// so the count of `warp::lane_id()` calls is free, and reading the
+    /// register inside an op costs nothing over receiving it. What is left is
+    /// where the value is *defined*: hoisting it into the entry block makes the
+    /// whole coordinate map loop-invariant, which ptxas pays for in live
+    /// registers (+30 at 128, on a PTX body 5 instructions from identical) and
+    /// is repaid in instructions at 32 (517 against 643) and half the local
+    /// traffic. That is an allocator trade, not a property of the convention;
+    /// this probe exists so it stays visible if the backend's `lane_id`
+    /// lowering ever stops being a CSE-able pure read.
+    #[inline(always)]
+    unsafe fn lane_probe<const N: usize, const CONVENTION: u32>(
+        scores: &[f32],
+        steps: u32,
+        out: &mut DisjointSlice<f32>,
+    ) where
+        BaseLdtm: FragmentLayout<32, N>,
+    {
+        unsafe {
+            let slots = RegTile::<32, N, BaseLdtm>::SLOTS;
+            let values = RegTile::<32, N, BaseLdtm>::VALUES;
+            // Column blocks of the tile that fit the one-subtile staging tile.
+            let column_blocks = if N < TILE { N / 16 } else { TILE / 16 };
+            let stage = LaneStage::from_raw(DynamicSharedArray::<u8, 128>::get_raw());
+            let chunks = stage.chunk_writer();
+            let hoisted = if CONVENTION == HOISTED {
+                warp::lane_id()
+            } else {
+                0
+            };
+
+            // A row vector, not a second tile: the accumulator is only here to
+            // keep the loop live, and a `[32, 128]` one puts the probe on the
+            // 255-register ceiling where every variant looks alike by force.
+            let mut acc = RegVec::<32, BaseLdtm>::splat(0.0);
+            let mut step = 0u32;
+            while step < steps {
+                let mut block = RegTile::<32, N, BaseLdtm>::zero();
+                let mut slot = 0usize;
+                while slot < slots {
+                    let mut value = 0usize;
+                    while value < values {
+                        let (row, column) = if CONVENTION == PER_QUERY {
+                            (
+                                RegVec::<32, BaseLdtm>::row(op_lane::<CONVENTION>(hoisted), slot),
+                                ColVec::<N, BaseLdtm>::column(
+                                    op_lane::<CONVENTION>(hoisted),
+                                    value,
+                                ),
+                            )
+                        } else {
+                            RegTile::<32, N, BaseLdtm>::coordinate(
+                                op_lane::<CONVENTION>(hoisted),
+                                slot,
+                                value,
+                            )
+                        };
+                        let index = step as usize * 32 * N + row as usize * N + column as usize;
+                        block.set(slot, value, *scores.get_unchecked(index));
+                        value += 1;
+                    }
+                    slot += 1;
+                }
+
+                let mut rows = RegVec::<32, BaseLdtm>::splat(0.0);
+                let mut slot = 0usize;
+                while slot < slots {
+                    let row = RegVec::<32, BaseLdtm>::row(op_lane::<CONVENTION>(hoisted), slot);
+                    rows.set(slot, row as f32);
+                    slot += 1;
+                }
+                let mut cols = ColVec::<N, BaseLdtm>::splat(0.0);
+                let mut value = 0usize;
+                while value < values {
+                    let column =
+                        ColVec::<N, BaseLdtm>::column(op_lane::<CONVENTION>(hoisted), value);
+                    cols.set(value, column as f32);
+                    value += 1;
+                }
+                let mut block = block.sub_row(rows).add_col(cols);
+
+                let mut slot = 0usize;
+                while slot < slots {
+                    let mut value = 0usize;
+                    while value < values {
+                        let (row, column) = if CONVENTION == PER_QUERY {
+                            (
+                                RegVec::<32, BaseLdtm>::row(op_lane::<CONVENTION>(hoisted), slot),
+                                ColVec::<N, BaseLdtm>::column(
+                                    op_lane::<CONVENTION>(hoisted),
+                                    value,
+                                ),
+                            )
+                        } else {
+                            RegTile::<32, N, BaseLdtm>::coordinate(
+                                op_lane::<CONVENTION>(hoisted),
+                                slot,
+                                value,
+                            )
+                        };
+                        if column > row + 16 * step {
+                            block.set(slot, value, -1.0e30);
+                        }
+                        value += 1;
+                    }
+                    slot += 1;
+                }
+
+                let mut row_block = 0usize;
+                while row_block < 2 {
+                    let mut column_block = 0usize;
+                    while column_block < column_blocks {
+                        let mut fragment = Fragment::zero();
+                        let mut slot = 0usize;
+                        while slot < Fragment::SLOTS {
+                            let mut value = 0usize;
+                            while value < Fragment::VALUES {
+                                let x = block.get(2 * row_block + slot, 4 * column_block + value);
+                                fragment.set(slot, value, x);
+                                value += 1;
+                            }
+                            slot += 1;
+                        }
+                        store_fragment::<Bf16>(
+                            chunks,
+                            (16 * row_block) as u32,
+                            (16 * column_block) as u32,
+                            op_lane::<CONVENTION>(hoisted),
+                            fragment,
+                        );
+                        column_block += 1;
+                    }
+                    row_block += 1;
+                }
+
+                let probabilities = block.exp2();
+                let mut slot = 0usize;
+                while slot < slots {
+                    let mut lane_sum = acc.get(slot);
+                    let mut value = 0usize;
+                    while value < values {
+                        lane_sum += probabilities.get(slot, value);
+                        value += 1;
+                    }
+                    acc.set(slot, lane_sum);
+                    slot += 1;
+                }
+                step += 1;
+            }
+
+            // The accumulator has to reach memory or the loop above is dead and
+            // the register counts describe nothing.
+            let base = op_lane::<CONVENTION>(hoisted) as usize * slots;
+            let mut slot = 0usize;
+            while slot < slots {
+                *out.get_unchecked_mut(base + slot) = acc.get(slot);
+                slot += 1;
+            }
+        }
+    }
+
+    /// [`lane_probe`] at 32 columns, today's hoisted lane. One line per
+    /// instantiation: a generic body compiles nothing on its own.
+    #[kernel]
+    pub unsafe fn lane_probe_32_hoisted(scores: &[f32], steps: u32, mut out: DisjointSlice<f32>) {
+        unsafe { lane_probe::<32, HOISTED>(scores, steps, &mut out) }
+    }
+
+    /// [`lane_probe`] at 32 columns, one `%laneid` read per op.
+    #[kernel]
+    pub unsafe fn lane_probe_32_per_op(scores: &[f32], steps: u32, mut out: DisjointSlice<f32>) {
+        unsafe { lane_probe::<32, PER_OP>(scores, steps, &mut out) }
+    }
+
+    /// [`lane_probe`] at 32 columns, one `%laneid` read per coordinate query.
+    #[kernel]
+    pub unsafe fn lane_probe_32_per_query(scores: &[f32], steps: u32, mut out: DisjointSlice<f32>) {
+        unsafe { lane_probe::<32, PER_QUERY>(scores, steps, &mut out) }
+    }
+
+    /// [`lane_probe`] at the flash accumulator's 128 columns, today's hoisted
+    /// lane. The 32-wide probes did not move under a change worth 87
+    /// registers, so this width is the one that decides anything.
+    #[kernel]
+    pub unsafe fn lane_probe_128_hoisted(scores: &[f32], steps: u32, mut out: DisjointSlice<f32>) {
+        unsafe { lane_probe::<128, HOISTED>(scores, steps, &mut out) }
+    }
+
+    /// [`lane_probe`] at 128 columns, one `%laneid` read per op.
+    #[kernel]
+    pub unsafe fn lane_probe_128_per_op(scores: &[f32], steps: u32, mut out: DisjointSlice<f32>) {
+        unsafe { lane_probe::<128, PER_OP>(scores, steps, &mut out) }
+    }
+
+    /// [`lane_probe`] at 128 columns, one `%laneid` read per coordinate query.
+    #[kernel]
+    pub unsafe fn lane_probe_128_per_query(
+        scores: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { lane_probe::<128, PER_QUERY>(scores, steps, &mut out) }
     }
 }
 
