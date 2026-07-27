@@ -21,7 +21,7 @@
 
 use core::marker::PhantomData;
 
-use cuda_device::tcgen05::cvt_f32x2_bf16x2;
+use cuda_device::tcgen05::{Tcgen05ElementType, cvt_f32x2_bf16x2};
 use cuda_device::tma::{
     TmaDescriptor, cp_async_bulk_tensor_2d_g2s, cp_async_bulk_tensor_2d_g2s_multicast_cg2,
     cp_async_bulk_tensor_3d_g2s,
@@ -70,6 +70,13 @@ pub trait MmaElement: Element {
     /// `tcgen05_mma_shared`/`tcgen05_mma_tensor` exactly, so wiring it up
     /// (#12) is a substitution and not a cast.
     const MMA_KIND: u32;
+
+    /// The instruction descriptor's `atype`/`btype` field, which settles the
+    /// operand's format *within* its [`Self::MMA_KIND`] — f16 and bf16 share
+    /// kind 0 and are told apart only here. Reading the same bits under the
+    /// wrong one produces a full accumulator of wrong numbers, so it belongs
+    /// to the element rather than to whoever assembles the descriptor.
+    const ELEMENT_TYPE: Tcgen05ElementType;
 }
 
 /// bf16 — the only staged-operand element the tcgen05 kernels use.
@@ -89,6 +96,7 @@ impl MmaElement for Bf16 {
     /// bf16 rides the f16 operand kind; bf16-vs-f16 is settled by the
     /// instruction descriptor's element-type field, not by `KIND`.
     const MMA_KIND: u32 = 0;
+    const ELEMENT_TYPE: Tcgen05ElementType = Tcgen05ElementType::BF16;
 }
 
 /// Swizzle mode marker. Only `SWIZZLE_128B` is implemented: it is the only
@@ -373,11 +381,12 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
             chunk_step: 16 * E::BYTES,
             leading_bytes: 16,
             mode: S::DESCRIPTOR_MODE,
+            transpose: false,
         }
     }
 
-    /// This tile as an MN-major [`OperandWalk`] (the instruction carries the
-    /// transpose bits): one K=16 chunk every 16 rows, and the leading offset
+    /// This tile as an MN-major [`OperandWalk`] (the walk carries the
+    /// transpose bit): one K=16 chunk every 16 rows, and the leading offset
     /// jumps to the stacked subtile holding MN columns 64..128
     /// ([`Self::SUBTILE_BYTES`] — not a step along the row).
     #[inline(always)]
@@ -388,6 +397,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
             chunk_step: 16 * S::ATOM_BYTES,
             leading_bytes: Self::SUBTILE_BYTES as u32,
             mode: S::DESCRIPTOR_MODE,
+            transpose: true,
         }
     }
 }
@@ -416,6 +426,7 @@ pub struct OperandWalk {
     chunk_step: usize,
     leading_bytes: u32,
     mode: u8,
+    transpose: bool,
 }
 
 impl OperandWalk {
@@ -427,6 +438,15 @@ impl OperandWalk {
             self.leading_bytes,
             self.mode,
         )
+    }
+
+    /// Whether the MMA must read this operand transposed — an MN-major walk
+    /// supplies K along rows, which is the same fact as its chunk step and
+    /// leading offset. Carried here so the instruction descriptor is built
+    /// from the walk it is issued with rather than beside it.
+    #[inline(always)]
+    pub fn transposed(self) -> bool {
+        self.transpose
     }
 }
 
