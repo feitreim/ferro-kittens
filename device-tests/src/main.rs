@@ -39,7 +39,7 @@ use kittens::global::encode_bf16_panels;
 use kittens::ldst::{load_fragment, store_fragment};
 use kittens::mma::{self, MmaShape, mma_abt};
 use kittens::reg::{
-    BaseLdtm, ColVec, Fragment, FragmentLayout, Mul, RegTile, RegVec, fmax, online_rescale,
+    BaseLdtm, ColVec, Fragment, FragmentLayout, Mul, RegTile, RegVec, online_rescale,
 };
 use kittens::shared::{Bf16, SharedTile, Swizzle128B};
 use kittens::sync::Semaphore;
@@ -133,6 +133,15 @@ fn decode_cell(value: f32) -> Option<(usize, usize)> {
 fn accumulator_value(row: usize, column: usize) -> f32 {
     (COLUMNS * row + column) as f32
 }
+
+/// Row statistics per lane in [`kernels::reduction_probe`]'s dump — the slots
+/// of a `RegTile<32, COLUMNS, BaseLdtm>`.
+const REDUCTION_ROWS: usize = 32 / 8;
+/// Column statistics per lane — that tile's values.
+const REDUCTION_COLUMNS: usize = COLUMNS / 4;
+/// Per-lane stride of that dump: the row sums, the column sums, the wide
+/// band's max and the narrow band's sum.
+const REDUCTION_STRIDE: usize = REDUCTION_ROWS + REDUCTION_COLUMNS + 2;
 
 /// Which spelling of the online-softmax correction [`kernels::softmax_probe`]
 /// compiles. Only the codegen probe reads these; see its doc comment.
@@ -716,48 +725,108 @@ pub mod kernels {
         unsafe { fragment_probe::<32, 128, true>(a_map, b_map, &mut out) }
     }
 
-    /// Each row's max over the values one thread owns, quad-reduced into the
-    /// whole row's max. The row reduction the library does not have yet (#6),
-    /// written out here because the probe below needs one today.
-    #[inline(always)]
-    fn quad_row_max<const N: usize>(tile: RegTile<32, N, BaseLdtm>) -> RegVec<32, BaseLdtm>
-    where
-        BaseLdtm: FragmentLayout<32, N>,
-    {
-        let mut rows = RegVec::<32, BaseLdtm>::splat(f32::NEG_INFINITY);
-        let mut slot = 0usize;
-        while slot < RegTile::<32, N, BaseLdtm>::SLOTS {
-            let mut lane_max = f32::NEG_INFINITY;
-            let mut value = 0usize;
-            while value < RegTile::<32, N, BaseLdtm>::VALUES {
-                lane_max = fmax(lane_max, tile.get(slot, value));
-                value += 1;
-            }
-            rows.set(slot, lane_max);
-            slot += 1;
-        }
-        rows.quad_max()
-    }
+    /// Reductions against silicon: the `shuffle_xor` butterflies, which are
+    /// the half of `row_reduce`/`col_reduce`/`tile_reduce` no host test can
+    /// reach. A wrong mask there returns a plausible number rather than
+    /// failing, so this is the case that has to run.
+    ///
+    /// The seeding is [`fragment_probe`]'s, unchanged: `D = A·Bᵀ` over two
+    /// `M128_N64` bands leaves `D[row, column] == COLUMNS * row + column`
+    /// exactly, hardware-delivered. Each warp then reduces its own 32 TMEM
+    /// rows and dumps the statistics by `(warp, lane)`; the host applies
+    /// [`BaseLdtm`]'s map to say what each of them must be, so nothing here
+    /// encodes an expected answer.
+    ///
+    /// The column sums are the case with no precedent in this crate: they
+    /// fold across the 8 lanes sharing `lane % 4` — `shuffle_xor` masks 4, 8
+    /// and 16 — a butterfly no kernel here has ever run. `tile_sum` is taken
+    /// over a `[32, 32]` band rather than the wide one only so every partial
+    /// sum stays an exact fp32 integer: the wide band's total is 58.7M, past
+    /// 2^24, where an equality assertion would be measuring fp32 rounding
+    /// instead of the reduction.
+    ///
+    /// Launch with `ROWS` threads, as [`fragment_probe`] is.
+    #[kernel]
+    pub unsafe fn reduction_probe(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let a = AOperand::from_raw(smem);
+            let b_low = BOperand::from_raw(smem.add(AOperand::BYTES));
+            let b_high = BOperand::from_raw(smem.add(AOperand::BYTES + BOperand::BYTES));
+            let scratch = smem.add(AOperand::BYTES + 2 * BOperand::BYTES);
+            let tma = Semaphore::attach(scratch as *mut Barrier);
+            let mma_done = Semaphore::attach(scratch.add(8) as *mut Barrier);
+            let tmem_slot = scratch.add(16) as *mut u32;
 
-    /// Each row's sum, quad-reduced; see [`quad_row_max`].
-    #[inline(always)]
-    fn quad_row_sum<const N: usize>(tile: RegTile<32, N, BaseLdtm>) -> RegVec<32, BaseLdtm>
-    where
-        BaseLdtm: FragmentLayout<32, N>,
-    {
-        let mut rows = RegVec::<32, BaseLdtm>::splat(0.0);
-        let mut slot = 0usize;
-        while slot < RegTile::<32, N, BaseLdtm>::SLOTS {
-            let mut lane_sum = 0.0f32;
+            let tid = thread::threadIdx_x();
+            let warp_id = warp::warp_id();
+            let lane = warp::lane_id();
+            let leader = tid == 0;
+
+            if leader {
+                tma.init(1);
+                mma_done.init(1);
+                fence_proxy_async_shared_cta();
+            }
+            thread::sync_threads();
+            let tmem = alloc_block(tmem_slot, COLUMNS as u32);
+            let accumulator = Accumulator::from_raw(tmem);
+
+            if leader {
+                a.tma_load(a_map, 0, 0, tma);
+                b_low.tma_load(b_map, 0, 0, tma);
+                b_high.tma_load(b_map, 0, 1, tma);
+                tma.expect_tx((AOperand::BYTES + 2 * BOperand::BYTES) as u32);
+            }
+            tma.wait(0);
+            thread::sync_threads();
+
+            let shape = MmaShape::M128_N64;
+            if leader {
+                mma_abt(accumulator.raw(), a, b_low, shape, false);
+                mma_abt(
+                    accumulator.columns_right(TILE as u32).raw(),
+                    a,
+                    b_high,
+                    shape,
+                    false,
+                );
+                mma::commit(mma_done);
+            }
+            mma_done.wait(0);
+            thread::sync_threads();
+
+            let wide = drain_band::<32, COLUMNS>(accumulator, warp_id);
+            let narrow = drain_band::<32, 32>(accumulator, warp_id);
+            let rows = wide.row_sum();
+            let columns = wide.col_sum();
+
+            let base = (warp_id as usize * 32 + lane as usize) * REDUCTION_STRIDE;
+            let mut slot = 0usize;
+            while slot < REDUCTION_ROWS {
+                *out.get_unchecked_mut(base + slot) = rows.get(slot);
+                slot += 1;
+            }
             let mut value = 0usize;
-            while value < RegTile::<32, N, BaseLdtm>::VALUES {
-                lane_sum += tile.get(slot, value);
+            while value < REDUCTION_COLUMNS {
+                *out.get_unchecked_mut(base + REDUCTION_ROWS + value) = columns.get(value);
                 value += 1;
             }
-            rows.set(slot, lane_sum);
-            slot += 1;
+            *out.get_unchecked_mut(base + REDUCTION_ROWS + REDUCTION_COLUMNS) = wide.tile_max();
+            *out.get_unchecked_mut(base + REDUCTION_ROWS + REDUCTION_COLUMNS + 1) =
+                narrow.tile_sum();
+
+            thread::sync_threads();
+            dealloc_block(tmem, COLUMNS as u32);
+            if leader {
+                tma.inval();
+                mma_done.inval();
+            }
         }
-        rows.quad_sum()
     }
 
     /// **A codegen probe, not a test.** No host case launches it and it checks
@@ -812,7 +881,7 @@ pub mod kernels {
                     slot += 1;
                 }
 
-                let row_max = quad_row_max::<N>(block);
+                let row_max = block.row_max();
                 if RESCALE == FUSED {
                     online_rescale(&mut m_ref, row_max, &mut running_sum, &mut out_acc);
                 } else {
@@ -828,7 +897,7 @@ pub mod kernels {
                 }
 
                 let probabilities = block.sub_row(m_ref).exp2();
-                running_sum.add_assign(quad_row_sum::<N>(probabilities));
+                running_sum.add_assign(probabilities.row_sum());
                 out_acc = out_acc.add(probabilities);
                 step += 1;
             }
@@ -1594,6 +1663,112 @@ fn check_fragment_map(
     .into())
 }
 
+/// Every statistic [`kernels::reduction_probe`] dumps, as the host derives it:
+/// where it lands in the dump, what it must be, and what to call it in a
+/// failure. All of it comes from [`BaseLdtm`]'s map and [`accumulator_value`],
+/// so the kernel's shuffles are checked against the library's own claim about
+/// which lanes hold which coordinate — never against a relaxed expectation.
+fn reduction_expectations() -> Vec<(usize, f64, String)> {
+    let mut wanted = Vec::new();
+    for warp in 0..ROWS / 32 {
+        let band = 32 * warp;
+        for lane in 0..32u32 {
+            let base = (warp * 32 + lane as usize) * REDUCTION_STRIDE;
+            for slot in 0..REDUCTION_ROWS {
+                let row = band + BaseLdtm::row(lane, slot) as usize;
+                let sum = (0..COLUMNS).map(|c| accumulator_value(row, c) as f64).sum();
+                wanted.push((
+                    base + slot,
+                    sum,
+                    format!("row {row} sum over {COLUMNS} columns"),
+                ));
+            }
+            for value in 0..REDUCTION_COLUMNS {
+                let column = BaseLdtm::column(lane, value) as usize;
+                let sum = (0..32)
+                    .map(|r| accumulator_value(band + r, column) as f64)
+                    .sum();
+                wanted.push((
+                    base + REDUCTION_ROWS + value,
+                    sum,
+                    format!("warp {warp} column {column} sum over 32 rows"),
+                ));
+            }
+            wanted.push((
+                base + REDUCTION_ROWS + REDUCTION_COLUMNS,
+                accumulator_value(band + 31, COLUMNS - 1) as f64,
+                format!("warp {warp} band max"),
+            ));
+            wanted.push((
+                base + REDUCTION_ROWS + REDUCTION_COLUMNS + 1,
+                (0..32)
+                    .flat_map(|r| (0..32).map(move |c| accumulator_value(band + r, c) as f64))
+                    .sum(),
+                format!("warp {warp} [32, 32] band sum"),
+            ));
+        }
+    }
+    wanted
+}
+
+/// Do the shuffle butterflies fold exactly the lanes [`BaseLdtm`] says share a
+/// row, a column, or the band?
+///
+/// The host unit tests establish that the *mask sets* are the map's lane
+/// groups and that the register-local halves fold the right registers. What
+/// they cannot touch is `shuffle_xor` itself, and a mask that reaches the
+/// wrong lanes produces a number rather than a fault — so the column sums
+/// here, over the stride-4/8/16 butterfly, are the first evidence that path
+/// works at all.
+fn check_reductions(
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<String, Box<dyn Error>> {
+    let a = DeviceBuffer::from_host(stream, &probe_a())?;
+    let b = DeviceBuffer::from_host(stream, &probe_b())?;
+    let a_map = unsafe { encode_bf16_panels::<ROWS, DEPTH>(stream, a.cu_deviceptr(), ROWS, 1)? };
+    let b_map = unsafe { encode_bf16_panels::<TILE, DEPTH>(stream, b.cu_deviceptr(), TILE, 2)? };
+
+    let mut out = DeviceBuffer::<f32>::zeroed(stream, ROWS * REDUCTION_STRIDE)?;
+    unsafe {
+        module.reduction_probe(
+            stream,
+            launch_config(ROWS as u32, PROBE_SHARED as u32),
+            a_map.as_ptr(),
+            b_map.as_ptr(),
+            &mut out,
+        )?
+    };
+    let observed = out.to_host_vec(stream)?;
+
+    let wanted = reduction_expectations();
+    let mut report = String::new();
+    let mut mismatches = 0usize;
+    for (index, expected, name) in &wanted {
+        // An expectation fp32 cannot hold exactly would make this a rounding
+        // measurement rather than a reduction test; the shapes are chosen so
+        // that never happens, and this is what says so out loud.
+        if *expected as f32 as f64 != *expected {
+            return Err(format!("{name} is {expected}, which fp32 cannot hold exactly").into());
+        }
+        if observed[*index] as f64 == *expected {
+            continue;
+        }
+        mismatches += 1;
+        if mismatches <= 8 {
+            let _ = write!(
+                report,
+                "\n    {name}: expected {expected}, reduced to {}",
+                observed[*index]
+            );
+        }
+    }
+    if mismatches == 0 {
+        return Ok(format!("{} statistics exact", wanted.len()));
+    }
+    Err(format!("{mismatches} of {} statistics wrong{report}", wanted.len()).into())
+}
+
 /// The ownership map the hardware actually delivered, read off warp 0's dump:
 /// the row each `(lane, slot)` received and the column each `(lane, value)`
 /// received. This is what to compare against `BaseLdtm::row`/`column` when the
@@ -1711,6 +1886,10 @@ fn run() -> Result<usize, Box<dyn Error>> {
     cases.push((
         "sttm round trip",
         Box::new(|| check_sttm_roundtrip(stream, module)),
+    ));
+    cases.push((
+        "reduction shuffles",
+        Box::new(|| check_reductions(stream, module)),
     ));
 
     let mut failures = 0usize;

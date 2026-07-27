@@ -56,21 +56,21 @@ fn examples() -> Vec<Example> {
     #[cfg(feature = "flash")]
     examples.push(Example {
         name: "flash_forward",
-        status: "aspirational (#5, #6, #7, #11)",
+        status: "aspirational (#7, #11, #22, #23, #31)",
         threads: flash_forward::THREADS,
         shared_bytes: flash_forward::SHARED_BYTES,
     });
     #[cfg(feature = "softmax")]
     examples.push(Example {
         name: "softmax",
-        status: "aspirational (#5, #6, #9, #22, #25)",
+        status: "aspirational (#9)",
         threads: softmax::THREADS,
         shared_bytes: softmax::SHARED_BYTES,
     });
     #[cfg(feature = "layernorm")]
     examples.push(Example {
         name: "layernorm",
-        status: "aspirational (#3, #5, #6, #9, #13)",
+        status: "aspirational (#3, #9, #13, #22)",
         threads: layernorm::THREADS,
         shared_bytes: layernorm::SHARED_BYTES,
     });

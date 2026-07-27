@@ -24,6 +24,17 @@
 //! [`RegTile`], [`RegVec`] and [`ColVec`] alike. The named methods (`exp2`,
 //! `mul_row`, …) are wrappers over those.
 //!
+//! Reductions take the same [`BinaryOp`] and come in two halves: a thread's own
+//! registers, then a `shuffle_xor` butterfly over the lanes the map spreads the
+//! folded axis across. Which lanes those are is the entire correctness
+//! question, and it is decided by [`BaseLdtm`]'s two maps — `row_of` ignores
+//! `lane % 4`, `col_of` ignores `lane / 4` — so a row reduction shuffles masks
+//! 1 and 2, a column reduction 4, 8 and 16, and a whole-tile reduction all
+//! five. A wrong mask there yields a plausible wrong number rather than a
+//! crash, which is why `reduction_masks_are_the_ownership_maps_lane_groups`
+//! derives the groups from the maps instead of restating the constants.
+//! All of it is **warp scope**; nothing here makes several warps agree.
+//!
 //! **ThunderKittens naming.** TK names a register vector for the axis it
 //! *spans*: its `col_vec` has one entry per row, its `row_vec` one per column.
 //! We name for the axis that *indexes* it, so TK's `col_vec` is our
@@ -97,19 +108,52 @@ pub fn log2_approx(x: f32) -> f32 {
     exponent as f32 + t * (C0 + t2 * (C1 + t2 * (C2 + t2 * C3)))
 }
 
+/// Fold across the 4 lanes of a quad — the lanes differing only in `lane % 4`,
+/// which under [`BaseLdtm`] is the axis one row's columns are spread along
+/// (`row_of` ignores `lane % 4` entirely). So this is the second half of a row
+/// reduction: the first is folding a thread's own `VALUES` registers.
+///
+/// The result lands in all four lanes, which is what makes a [`RegVec`] a
+/// whole-row statistic rather than a partial one.
+/// `reduction_masks_are_the_ownership_maps_lane_groups` is what pins masks
+/// 1 and 2 to that claim.
+#[inline(always)]
+pub fn quad_reduce<Op: ReduceOp>(value: f32) -> f32 {
+    let value = Op::apply(value, warp::shuffle_xor_f32(value, 1));
+    Op::apply(value, warp::shuffle_xor_f32(value, 2))
+}
+
+/// Fold across the 8 lanes sharing a `lane % 4` — the lanes differing only in
+/// `lane / 4`, which under [`BaseLdtm`] is the axis one column's rows are
+/// spread along (`col_of` ignores `lane / 4`). The second half of a column
+/// reduction, and three shuffles rather than [`quad_reduce`]'s two: this is
+/// the concrete sense in which a column reduction is a different shuffle
+/// rather than a reparameterization of the row one.
+#[inline(always)]
+pub fn column_group_reduce<Op: ReduceOp>(value: f32) -> f32 {
+    let value = Op::apply(value, warp::shuffle_xor_f32(value, 4));
+    let value = Op::apply(value, warp::shuffle_xor_f32(value, 8));
+    Op::apply(value, warp::shuffle_xor_f32(value, 16))
+}
+
+/// Fold across all 32 lanes — both axes, the full butterfly, leaving the
+/// result warp-uniform.
+#[inline(always)]
+pub fn warp_reduce<Op: ReduceOp>(value: f32) -> f32 {
+    column_group_reduce::<Op>(quad_reduce::<Op>(value))
+}
+
 /// Max across the 4 lanes of a quad — how a fragment row's statistic
 /// becomes whole-row (each quad's lanes hold disjoint columns of one row).
 #[inline(always)]
 pub fn quad_max(value: f32) -> f32 {
-    let value = fmax(value, warp::shuffle_xor_f32(value, 1));
-    fmax(value, warp::shuffle_xor_f32(value, 2))
+    quad_reduce::<Max>(value)
 }
 
 /// Sum across the 4 lanes of a quad; see [`quad_max`].
 #[inline(always)]
 pub fn quad_sum(value: f32) -> f32 {
-    let value = value + warp::shuffle_xor_f32(value, 1);
-    value + warp::shuffle_xor_f32(value, 2)
+    quad_reduce::<Add>(value)
 }
 
 /// A scalar function named as a *type*, so one definition instantiates for
@@ -133,6 +177,23 @@ pub trait BinaryOp {
 pub trait TernaryOp {
     /// The scalar function.
     fn apply(a: f32, b: f32, c: f32) -> f32;
+}
+
+/// A [`BinaryOp`] a reduction may fold with: associative and commutative — the
+/// fragment map hands a fold its operands in the layout's order, not the
+/// tile's — and carrying an identity to seed from. `Sub` and `Div` are
+/// deliberately not members.
+///
+/// The bound is narrower than [`BinaryOp`] on purpose: `row_reduce::<Sub>` has
+/// no meaning worth giving it a spelling, and the identity lets every fold
+/// start the same way instead of special-casing element zero. It costs one
+/// extra `apply`, which the FMA-seeded forms fold away
+/// (`Max::apply(-inf, x)` is `x` by construction) and the others do not —
+/// measured at no register cost either way, once the fold is written inline
+/// (see the note above the reductions on `RegTile`).
+pub trait ReduceOp: BinaryOp {
+    /// The value with `apply(IDENTITY, x) == x` for every `x` in the fold.
+    const IDENTITY: f32;
 }
 
 macro_rules! scalar_ops {
@@ -184,6 +245,23 @@ scalar_ops! { BinaryOp:
     Div(a, b) = a / b;
     Max(a, b) = fmax(a, b);
     Min(a, b) = fmin(a, b);
+}
+
+/// The identity of each foldable op; see [`ReduceOp`].
+macro_rules! reduce_ops {
+    ($($op:ty = $identity:expr;)*) => {$(
+        impl ReduceOp for $op {
+            const IDENTITY: f32 = $identity;
+        }
+    )*};
+}
+
+reduce_ops! {
+    Add = 0.0;
+    // `1.0` and not `0.0`: a product folded from an additive identity is zero.
+    Mul = 1.0;
+    Max = f32::NEG_INFINITY;
+    Min = f32::INFINITY;
 }
 
 scalar_ops! { TernaryOp:
@@ -455,6 +533,27 @@ macro_rules! op_methods {
             *self = self.bin_map::<$op>(other);
         }
     )*};
+    (row_reduce $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
+        $(#[$meta])*
+        #[inline(always)]
+        pub fn $name(self) -> RegVec<M, L> {
+            self.row_reduce::<$op>()
+        }
+    )*};
+    (col_reduce $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
+        $(#[$meta])*
+        #[inline(always)]
+        pub fn $name(self) -> ColVec<N, L> {
+            self.col_reduce::<$op>()
+        }
+    )*};
+    (tile_reduce $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
+        $(#[$meta])*
+        #[inline(always)]
+        pub fn $name(self) -> f32 {
+            self.tile_reduce::<$op>()
+        }
+    )*};
 }
 
 /// The unary names every register family carries.
@@ -546,28 +645,52 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
         exceed
     }
 
-    /// Quad-reduce each slot's lane-local max into a whole-row max.
+    /// Complete each slot's lane-local partial into a whole-row statistic by
+    /// folding across the quad ([`quad_reduce`]) — the second half of
+    /// [`RegTile::row_reduce`], and the half a caller holding its own
+    /// partials (a running softmax sum, say) is the one that needs.
     #[inline(always)]
-    pub fn quad_max(self) -> Self {
+    pub fn quad_reduce<Op: ReduceOp>(self) -> Self {
         let mut out = self;
         let mut slot = 0;
         while slot < L::SLOTS {
-            out.set(slot, quad_max(self.get(slot)));
+            out.set(slot, quad_reduce::<Op>(self.get(slot)));
             slot += 1;
         }
         out
     }
 
+    /// Quad-reduce each slot's lane-local max into a whole-row max.
+    #[inline(always)]
+    pub fn quad_max(self) -> Self {
+        self.quad_reduce::<Max>()
+    }
+
     /// Quad-reduce each slot's lane-local partial sum into a whole-row sum.
     #[inline(always)]
     pub fn quad_sum(self) -> Self {
-        let mut out = self;
+        self.quad_reduce::<Add>()
+    }
+
+    /// Fold every row's statistic into one warp-uniform scalar: this thread's
+    /// slots, then [`column_group_reduce`] across the 8 lanes holding the
+    /// tile's other rows.
+    ///
+    /// Only meaningful on a vector that is already a *whole*-row statistic —
+    /// one replicated across each quad, which is what
+    /// [`RegTile::row_reduce`] returns and what a lane-local partial is not.
+    /// [`RegTile::tile_reduce`] gets the same answer in five shuffles instead
+    /// of `2 * SLOTS + 3`; this exists for the case where the row vector is
+    /// wanted anyway.
+    #[inline(always)]
+    pub fn reduce<Op: ReduceOp>(self) -> f32 {
+        let mut folded = Op::IDENTITY;
         let mut slot = 0;
         while slot < L::SLOTS {
-            out.set(slot, quad_sum(self.get(slot)));
+            folded = Op::apply(folded, self.get(slot));
             slot += 1;
         }
-        out
+        column_group_reduce::<Op>(folded)
     }
 
     /// `Op` on every slot.
@@ -636,11 +759,13 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
 /// and TK's `row_vec` — see the module docs on that inversion.
 ///
 /// Under [`BaseLdtm`] a lane's columns depend only on `lane % 4`, so the 8
-/// lanes of a column group hold 8 identical copies of the same `N/4` entries;
-/// a whole-warp column statistic is consistent only once those 8 copies agree.
-/// Nothing here produces one — the strided shuffle reduction that would is
-/// issue #6. What this type does today is *carry* a column vector (splatted,
-/// or built from `column`) into [`RegTile::col_map`].
+/// lanes of a column group hold 8 copies of the same `N/4` entries; a
+/// whole-warp column statistic is consistent only once those copies agree.
+/// [`RegTile::col_reduce`] is what makes them agree — it folds across those 8
+/// lanes ([`column_group_reduce`]) and so returns a vector every lane of the
+/// group reads the same way. A vector built any other way (splatted, or from
+/// [`Self::column`]) is a legitimate `col_map` operand but carries no such
+/// guarantee, and [`Self::reduce`] is only meaningful on one that does.
 pub struct ColVec<const N: usize, L: ColLayout<N>>(pub L::Values);
 
 impl<const N: usize, L: ColLayout<N>> Clone for ColVec<N, L> {
@@ -682,6 +807,38 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
     #[inline(always)]
     pub fn column(lane: u32, value: usize) -> u32 {
         L::col_of(lane, value)
+    }
+
+    /// Fold every column's statistic into one warp-uniform scalar: this
+    /// thread's values, then [`quad_reduce`] across the 4 lanes holding the
+    /// tile's other columns. The mirror of [`RegVec::reduce`], and subject to
+    /// the same precondition — the vector must already hold whole-column
+    /// statistics, i.e. the 8 copies must agree, which is what
+    /// [`RegTile::col_reduce`] establishes.
+    #[inline(always)]
+    pub fn reduce<Op: ReduceOp>(self) -> f32 {
+        let mut folded = Op::IDENTITY;
+        let mut value = 0;
+        while value < L::VALUES {
+            folded = Op::apply(folded, self.get(value));
+            value += 1;
+        }
+        quad_reduce::<Op>(folded)
+    }
+
+    /// Complete each value's lane-local partial into a whole-column statistic
+    /// by folding across the column group ([`column_group_reduce`]) — the
+    /// mirror of [`RegVec::quad_reduce`], and the step that makes the 8 copies
+    /// of a [`ColVec`] agree.
+    #[inline(always)]
+    pub fn column_group_reduce<Op: ReduceOp>(self) -> Self {
+        let mut out = self;
+        let mut value = 0;
+        while value < L::VALUES {
+            out.set(value, column_group_reduce::<Op>(self.get(value)));
+            value += 1;
+        }
+        out
     }
 
     /// `Op` on every value.
@@ -951,6 +1108,86 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
         out
     }
 
+    // The three reductions below each spell their lane-local fold out rather
+    // than sharing one `fold(self, slot)` helper. The helper is the obvious
+    // factoring and it costs a whole tile: even `#[inline(always)]`, taking
+    // `self` by value materializes a second copy of the storage, and
+    // `softmax_probe_32` measures 94 registers/thread against 64 for the
+    // written-out loop, with `softmax_probe_128_row_map` picking up 456 bytes
+    // of spill stores on the same change (`modal_app.py::regcount`). Same
+    // reason `scale_rows` is not `row_map::<Mul>`.
+
+    /// Fold each row across all `N` columns: this thread's columns of the row,
+    /// then [`quad_reduce`] over the quad that holds the rest of them. Two
+    /// shuffles per owned row.
+    ///
+    /// `Op` is applied in the *layout's* order, not left to right along the
+    /// row, so a non-associative one gets a well-defined but unhelpful answer.
+    /// The result is a whole-row statistic replicated across each quad, which
+    /// is exactly the operand [`Self::row_map`] wants.
+    #[inline(always)]
+    pub fn row_reduce<Op: ReduceOp>(self) -> RegVec<M, L> {
+        let mut partials = RegVec::<M, L>::splat(Op::IDENTITY);
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let mut folded = Op::IDENTITY;
+            let mut value = 0;
+            while value < L::VALUES {
+                folded = Op::apply(folded, self.get(slot, value));
+                value += 1;
+            }
+            partials.set(slot, folded);
+            slot += 1;
+        }
+        partials.quad_reduce::<Op>()
+    }
+
+    /// Fold each column across all `M` rows: this thread's rows of the column,
+    /// then [`column_group_reduce`] over the 8 lanes that hold the rest of
+    /// them. Three shuffles per owned column, and the op that makes a
+    /// [`ColVec`] whole — before it, the 8 lanes of a column group hold 8
+    /// independent partials of the same column.
+    #[inline(always)]
+    pub fn col_reduce<Op: ReduceOp>(self) -> ColVec<N, L> {
+        let mut partials = ColVec::<N, L>::splat(Op::IDENTITY);
+        let mut value = 0;
+        while value < L::VALUES {
+            let mut folded = Op::IDENTITY;
+            let mut slot = 0;
+            while slot < L::SLOTS {
+                folded = Op::apply(folded, self.get(slot, value));
+                slot += 1;
+            }
+            partials.set(value, folded);
+            value += 1;
+        }
+        partials.column_group_reduce::<Op>()
+    }
+
+    /// Fold the whole tile to one warp-uniform scalar: every register this
+    /// thread owns, then [`warp_reduce`] over all 32 lanes. Five shuffles
+    /// total, against the `2 * SLOTS + 3` of routing through
+    /// [`Self::row_reduce`] and [`RegVec::reduce`].
+    ///
+    /// Warp scope. A tile that several warps own — layernorm's group-norm
+    /// statistic over four warps' bands — needs those warps to agree, which is
+    /// a shared-memory staging step this returns no help with; see the crate's
+    /// #3/#13 discussion.
+    #[inline(always)]
+    pub fn tile_reduce<Op: ReduceOp>(self) -> f32 {
+        let mut folded = Op::IDENTITY;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let mut value = 0;
+            while value < L::VALUES {
+                folded = Op::apply(folded, self.get(slot, value));
+                value += 1;
+            }
+            slot += 1;
+        }
+        warp_reduce::<Op>(folded)
+    }
+
     unary_op_methods!();
 
     op_methods! { binary
@@ -960,6 +1197,33 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
         div = Div;
         max = Max;
         min = Min;
+    }
+
+    op_methods! { row_reduce
+        row_max = Max;
+        row_min = Min;
+        row_sum = Add;
+        /// The product of each row. [`Mul`] *is* the product op — a separate
+        /// `Prod` would be the same `a * b` under a second name.
+        row_prod = Mul;
+    }
+
+    op_methods! { col_reduce
+        col_max = Max;
+        col_min = Min;
+        col_sum = Add;
+        /// See [`Self::row_prod`].
+        col_prod = Mul;
+    }
+
+    op_methods! { tile_reduce
+        /// Prefixed `tile_` because [`Self::max`] is already the elementwise
+        /// binary op; TK distinguishes the two by C++ overloading, which Rust
+        /// has no equivalent of.
+        tile_max = Max;
+        tile_min = Min;
+        tile_sum = Add;
+        tile_prod = Mul;
     }
 
     op_methods! { row
@@ -1386,6 +1650,181 @@ mod tests {
             .collect();
         columns.sort();
         assert_eq!(columns, (0..32).collect::<Vec<_>>());
+    }
+
+    /// The lanes `shuffle_xor` reaches from `lane` with the given masks: the
+    /// xor-closure, which for a set of distinct bits is every subset xor.
+    fn xor_group(lane: u32, masks: &[u32]) -> Vec<u32> {
+        let mut group: Vec<u32> = (0..1u32 << masks.len())
+            .map(|subset| {
+                masks.iter().enumerate().fold(lane, |l, (bit, mask)| {
+                    if subset >> bit & 1 == 1 { l ^ mask } else { l }
+                })
+            })
+            .collect();
+        group.sort();
+        group.dedup();
+        group
+    }
+
+    /// The lanes holding the same rows as `lane` — where a row reduction's
+    /// shuffle must reach, read off the ownership map rather than assumed.
+    fn lanes_sharing_rows(lane: u32) -> Vec<u32> {
+        (0..32)
+            .filter(|&other| (0..Rows::SLOTS).all(|s| Rows::row(other, s) == Rows::row(lane, s)))
+            .collect()
+    }
+
+    /// The lanes holding the same columns as `lane`; the column mirror.
+    fn lanes_sharing_columns(lane: u32) -> Vec<u32> {
+        (0..32)
+            .filter(|&other| {
+                (0..Cols::VALUES).all(|v| Cols::column(other, v) == Cols::column(lane, v))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reduction_masks_are_the_ownership_maps_lane_groups() {
+        // The whole correctness argument for the reductions, and the half a
+        // wrong answer would look plausible under: a shuffle_xor mask set is
+        // right exactly when its xor-closure is the set of lanes the map says
+        // share the axis being folded away. Masks 1,2 for rows (`row_of`
+        // ignores lane % 4), 4,8,16 for columns (`col_of` ignores lane / 4),
+        // all five for the whole tile.
+        for lane in 0..32u32 {
+            assert_eq!(lanes_sharing_rows(lane), xor_group(lane, &[1, 2]));
+            assert_eq!(lanes_sharing_columns(lane), xor_group(lane, &[4, 8, 16]));
+            assert_eq!(
+                xor_group(lane, &[1, 2, 4, 8, 16]),
+                (0..32).collect::<Vec<_>>()
+            );
+        }
+        // And that those groups are complete: a quad's values cover every
+        // column of a row exactly once, a column group's slots every row.
+        let mut columns: Vec<u32> = xor_group(0, &[1, 2])
+            .into_iter()
+            .flat_map(|lane| (0..Cols::VALUES).map(move |v| Cols::column(lane, v)))
+            .collect();
+        columns.sort();
+        assert_eq!(columns, (0..32).collect::<Vec<_>>());
+        let mut rows: Vec<u32> = xor_group(0, &[4, 8, 16])
+            .into_iter()
+            .flat_map(|lane| (0..Rows::SLOTS).map(move |s| Rows::row(lane, s)))
+            .collect();
+        rows.sort();
+        assert_eq!(rows, (0..32).collect::<Vec<_>>());
+    }
+
+    /// The device half of a reduction, simulated: each lane's contribution
+    /// combined over the lane group the *map* names, so nothing here depends
+    /// on the mask constants the previous test pins.
+    fn fold_over<F: Fn(f32, f32) -> f32>(
+        group: &[u32],
+        contribution: impl Fn(u32) -> f32,
+        op: F,
+    ) -> f32 {
+        group
+            .iter()
+            .map(|&lane| contribution(lane))
+            .reduce(op)
+            .unwrap()
+    }
+
+    /// One lane's own registers of a row-slot, folded. The reductions spell
+    /// this out inline rather than share it — see the note in `RegTile` on
+    /// what the shared helper cost — so the host test carries its own copy.
+    fn lane_row_partial<Op: ReduceOp>(tile: Scores, slot: usize) -> f32 {
+        (0..Scores::VALUES).fold(Op::IDENTITY, |folded, value| {
+            Op::apply(folded, tile.get(slot, value))
+        })
+    }
+
+    /// The column mirror of [`lane_row_partial`].
+    fn lane_column_partial<Op: ReduceOp>(tile: Scores, value: usize) -> f32 {
+        (0..Scores::SLOTS).fold(Op::IDENTITY, |folded, slot| {
+            Op::apply(folded, tile.get(slot, value))
+        })
+    }
+
+    #[test]
+    fn reductions_fold_exactly_their_logical_axis() {
+        // The lane-local halves are pure arithmetic and run on the host; the
+        // shuffle halves are simulated by folding over the lane groups the
+        // *map* names, so nothing here depends on the mask constants the
+        // previous test pins. The expectation is the reduction of the
+        // *logical* tile — 256*row + column over every column of a row, every
+        // row of a column, every coordinate of the tile — so a fold reaching
+        // the wrong registers or the wrong lanes lands on a different number.
+        let value = |row: u32, column: u32| (256 * row + column) as f32;
+        for lane in 0..32u32 {
+            for slot in 0..Scores::SLOTS {
+                let row = Scores::coordinate(lane, slot, 0).0;
+                let quad = lanes_sharing_rows(lane);
+                let sum = fold_over(
+                    &quad,
+                    |l| lane_row_partial::<Add>(coordinate_tile(l), slot),
+                    |a, b| a + b,
+                );
+                let max = fold_over(
+                    &quad,
+                    |l| lane_row_partial::<Max>(coordinate_tile(l), slot),
+                    fmax,
+                );
+                assert_eq!(sum, (0..32).map(|c| value(row, c)).sum::<f32>());
+                assert_eq!(max, value(row, 31));
+            }
+
+            for v in 0..Scores::VALUES {
+                let column = Scores::coordinate(lane, 0, v).1;
+                let group = lanes_sharing_columns(lane);
+                let sum = fold_over(
+                    &group,
+                    |l| lane_column_partial::<Add>(coordinate_tile(l), v),
+                    |a, b| a + b,
+                );
+                let min = fold_over(
+                    &group,
+                    |l| lane_column_partial::<Min>(coordinate_tile(l), v),
+                    fmin,
+                );
+                assert_eq!(sum, (0..32).map(|r| value(r, column)).sum::<f32>());
+                assert_eq!(min, value(0, column));
+            }
+
+            let whole = fold_over(
+                &(0..32).collect::<Vec<_>>(),
+                |l| {
+                    (0..Scores::SLOTS)
+                        .map(|s| lane_row_partial::<Add>(coordinate_tile(l), s))
+                        .sum::<f32>()
+                },
+                |a, b| a + b,
+            );
+            let total: f32 = (0..32)
+                .flat_map(|r| (0..32).map(move |c| value(r, c)))
+                .sum();
+            assert_eq!(whole, total);
+        }
+    }
+
+    #[test]
+    fn reduce_op_identities_are_neutral() {
+        // Every fold in the crate starts from `IDENTITY` and folds all of its
+        // elements, so a transposed line in `reduce_ops!` is not a slow
+        // reduction, it is a wrong one — `Mul` seeded from zero is zero.
+        for x in [-3.5f32, -0.0, 0.0, 1.0, 2.5, 1.0e30] {
+            assert_eq!(Add::apply(Add::IDENTITY, x), x);
+            assert_eq!(Mul::apply(Mul::IDENTITY, x), x);
+            assert_eq!(Max::apply(Max::IDENTITY, x), x);
+            assert_eq!(Min::apply(Min::IDENTITY, x), x);
+        }
+        // And that they are the identities of the right ops, not just neutral
+        // for the values above.
+        assert_eq!(Add::IDENTITY, 0.0);
+        assert_eq!(Mul::IDENTITY, 1.0);
+        assert_eq!(Max::IDENTITY, f32::NEG_INFINITY);
+        assert_eq!(Min::IDENTITY, f32::INFINITY);
     }
 
     #[test]

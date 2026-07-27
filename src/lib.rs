@@ -25,8 +25,8 @@ pub mod sync;
 pub mod tmem;
 
 pub use reg::{
-    BaseLdtm, BinaryOp, ColLayout, ColVec, Fragment, FragmentLayout, RegTile, RegVec, RowLayout,
-    TernaryOp, UnaryOp,
+    BaseLdtm, BinaryOp, ColLayout, ColVec, Fragment, FragmentLayout, ReduceOp, RegTile, RegVec,
+    RowLayout, TernaryOp, UnaryOp,
 };
 pub use shared::{
     Bf16, Element, MmaElement, OperandWalk, SharedTile, SharedTileRing, Swizzle, Swizzle128B,
