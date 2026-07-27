@@ -20,8 +20,8 @@ target *of the library*.)
 | --- | --- | --- |
 | [`gemm`](src/gemm.rs) | **runs** — exact against a CPU reference | — (two gaps worked around in-file, both marked) |
 | [`softmax`](src/softmax.rs) | **runs** — within 2⁻⁸ of a CPU reference | — |
-| [`flash_forward`](src/flash_forward.rs) | aspirational | #7, #11, #23, #31 + scalar broadcasts |
-| [`layernorm`](src/layernorm.rs) | aspirational | #3, #13 + scalar broadcasts |
+| [`flash_forward`](src/flash_forward.rs) | aspirational | #7, #11, #23, #31 |
+| [`layernorm`](src/layernorm.rs) | aspirational | #3, #13 |
 
 Two of the four **run** rather than merely compile, which is a strictly stronger
 claim and the one worth holding the rest to: a launcher, a CPU reference, and an
@@ -35,18 +35,17 @@ are the completion side.
 
 Nothing on the remaining lists is arithmetic, and nothing on them is a mover.
 #5 and #6 between them closed every elementwise op and every reduction the four
-kernels asked for; #21 and #25 closed both halves of the shared ↔ register path,
-and #22 closed the composition on top of them, in both directions and against
-both memories. What remains across the four is masking (#7), the global ↔
-register path (#11), the closed shape set (#23), and one structural gap
-(#3 + #13, layernorm's block-scope statistic).
+kernels asked for and **#38** closed the scalar-operand forms they left behind;
+#21 and #25 closed both halves of the shared ↔ register path, and #22 closed the
+composition on top of them, in both directions and against both memories. What
+remains across the four is masking (#7), the global ↔ register path (#11), the
+closed shape set (#23), and one structural gap (#3 + #13, layernorm's
+block-scope statistic).
 
-The one arithmetic leftover is the **scalar broadcast** forms —
-`RegTile::scale`/`shift`, `RegVec::scale`/`shift`, a free `rsqrt(f32)`, and
-`RegTile::add_assign` — which #5's list named and #5's implementation did not
-ship. A tile or vector combined with a bare `f32` still has to splat it into a
-whole operand first. They have no issue of their own; #31 covers the in-place
-half of the argument.
+The one arithmetic entry still open is `RegTile::add_assign`, and it is **#31**
+rather than a leftover: it is an *in-place* form, and #31 exists to land every
+in-place map variant at once. #38 deliberately did not add a one-off. See §
+"in-place versus by-value" below for what #38 measured about it.
 
 ```sh
 cargo oxide build kittens-examples --arch sm_100a   # the default set: gemm, softmax
@@ -65,6 +64,20 @@ missing API as compiler errors, at the call sites that want it. Verified: every
 error is `unresolved import`, `no method named`, or an unsatisfied
 `FragmentLayout` bound — there is nothing in these files that fails for any
 reason other than the API not existing.
+
+Only two kernels are still behind a feature, and their error lists are now short
+enough to write out:
+
+- **`flash_forward`** — `FragmentLayout<32, 64>` (#23), `global::store_rows`
+  (#11), `RegTile::add_assign` (#31). **`make_causal_at` (#7) is wanted too and
+  does not appear as its own error** — it is called on the `[32, 64]` band
+  whose layout bound already failed, and an unsatisfied bound on the receiver
+  suppresses method resolution on it. Closing #23 would make #7 surface, not
+  disappear; a reader who counts errors will otherwise conclude #7 has landed.
+- **`layernorm`** — `SharedVec` (#13), and `sync::block_reduce_sum` (#3), the
+  latter only in `groupnorm_tile`.
+
+Nothing named `scale`, `shift` or `rsqrt` is in either list any more (#38).
 
 `softmax` **runs** too, and what its check can claim is different from the
 GEMM's in a way worth writing down. A softmax has an `exp2` and a divide in it,
@@ -106,17 +119,61 @@ the library, filed under the opposite problem.
 **#5 — generic map and the standard elementwise set. Landed.** The map
 mechanism and every vector/vector and broadcast form the kernels asked for:
 `exp2`, elementwise `mul`, `sub_row`, `mul_row`, `div_row`, `mul_col`,
-`add_col`, `RegVec::rsqrt`. **Not** landed, and still named at call sites in
-`flash_forward` and `layernorm`: the *scalar* broadcasts `scale`/`shift` on
-both `RegTile` and `RegVec`, a free `rsqrt(f32)`, and `RegTile::add_assign`.
-A tile or vector combined with a bare `f32` has to splat it into a whole
-operand first.
+`add_col`, `RegVec::rsqrt`.
 
 > Note the asymmetry the examples exposed: `RegVec` already had `exp2`, `max`,
 > `sub`, `add_assign`, `mul_assign`. `RegTile` had none of them. Every op the
 > vector has, the tile wants — which is exactly the argument for the mechanism
 > rather than another round of hand-written methods. It still holds for the
 > in-place forms: the vector has them and the tile does not (#31).
+
+**#38 — scalar operands. Landed.** What #5 listed and did not ship, and the
+last arithmetic on any of these lists: `scale`/`shift`/`clamp_min`/`clamp_max`
+on `RegTile`, `RegVec` and `ColVec`, plus a free `rsqrt(f32)` for a statistic
+that never becomes a vector (`groupnorm_tile`'s variance).
+
+The reason it was missed is worth keeping, because it decided the fix.
+`UnaryOp::apply` is an associated function on a unit struct, so `scale(k)` has
+**nowhere to put `k`** — the mechanism could not express it, which is a hole in
+the trait shape rather than a missed line item. Treating the scalar as the
+*second operand* of the existing `BinaryOp` set closes it:
+`scalar_map::<Op>(k)` is one method per family, `scale` is `Mul` and `shift` is
+`Add`, and `Div`/`Sub`/`Max`/`Min` against a constant are reachable with no new
+op at all.
+
+#### in-place versus by-value
+
+#38's probe (`scalar_map_probe_*` in `device-tests`) prices the same tile-loop
+three ways — the pre-#38 `bin_map::<Mul>(splat(k))`, the new `scale(k)`, and an
+in-place multiply written through `set` — at both probe widths:
+
+| | 32 columns | 128 columns |
+| --- | --- | --- |
+| `bin_map::<Mul>(splat(k))` | 48 regs, no spill | 255 regs, 124 B spill |
+| `scale(k)` | 48 regs, no spill | 255 regs, 60 B spill |
+| in place, through `set` | 48 regs, no spill | 252 regs, no spill |
+
+Two things follow. `scale` is strictly better than what a kernel had to write
+before it, at every width — half the spill at 128 and free at 32. And the
+by-value/in-place gap #31 was filed about **reproduces for a scalar operand**:
+at 128 columns both by-value forms spill where the in-place one does not. That
+is the argument for #31 covering `scalar_map` alongside `row_map` and
+`add_assign`, rather than the three being separate decisions.
+
+But "by-value costs registers" is probably the wrong lesson, and an
+intermediate form of the same probe says why. Written as
+`out_acc.add(block.scale(k))` — the scaled tile chained inside another map, so
+`block` and its scaled copy are both live at the peak — it took 84 B of spill,
+where the rebinding `block = block.scale(k)` took none. Same op, same width,
+same by-value map; only the peak liveness differs. Read that way, three results
+that look unrelated line up: #5's `row_map` cliff (a second tile live beside
+the accumulator it replaces), the 60 B above (same), and #22's composed movers
+coming out *cheaper* than the loops they replaced (36 against 52 — the
+composed form has one band live where the loop kept a band and a fragment). The
+variable is how many tiles are live at once, not whether a method takes `self`
+by value. If that holds, #31's job is narrower than it looks: in-place forms
+pay only where the input is live across the op, and a by-value map whose input
+dies at the call already costs nothing.
 
 **#6 — reductions. Landed.** `row_reduce`/`col_reduce`/`tile_reduce` over a
 `ReduceOp` (a `BinaryOp` with an identity), with `row_max`/`row_min`/`row_sum`/`row_prod`, the `col_*` mirrors,

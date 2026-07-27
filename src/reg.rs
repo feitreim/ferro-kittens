@@ -22,7 +22,13 @@
 //! Elementwise work goes through [`UnaryOp`] / [`BinaryOp`] / [`TernaryOp`]
 //! and the `*_map` methods, so a scalar function is written once and reaches
 //! [`RegTile`], [`RegVec`] and [`ColVec`] alike. The named methods (`exp2`,
-//! `mul_row`, …) are wrappers over those.
+//! `mul_row`, `scale`, …) are wrappers over those.
+//!
+//! A *scalar* operand is a [`BinaryOp`] too — `scalar_map::<Mul>(k)` is
+//! `scale`, `scalar_map::<Add>(k)` is `shift` — rather than a stateful op
+//! trait, because a `UnaryOp` is a unit struct with an associated function and
+//! has nowhere to keep a `k`. The consequence is that every tile-against-scalar
+//! form the op set can express is reachable without a new op.
 //!
 //! Reductions take the same [`BinaryOp`] and come in two halves: a thread's own
 //! registers, then a `shuffle_xor` butterfly over the lanes the map spreads the
@@ -106,6 +112,16 @@ pub fn log2_approx(x: f32) -> f32 {
     let t = (mantissa - 1.0) / (mantissa + 1.0);
     let t2 = t * t;
     exponent as f32 + t * (C0 + t2 * (C1 + t2 * (C2 + t2 * C3)))
+}
+
+/// `1/√x` as a correctly-rounded `sqrt.rn.f32` and a divide rather than the SFU
+/// `rsqrt.approx.f32`: two instructions, but the same number on host and device,
+/// which is what lets a normalization kernel's host reference be `==`. Free
+/// beside [`exp2_approx`] because a scalar variance — layernorm's, over a
+/// statistic that is already one `f32` — has no vector to reach [`Rsqrt`] with.
+#[inline(always)]
+pub fn rsqrt(x: f32) -> f32 {
+    1.0 / x.sqrt()
 }
 
 /// Fold across the 4 lanes of a quad — the lanes differing only in `lane % 4`,
@@ -231,10 +247,9 @@ scalar_ops! { UnaryOp:
     /// `llvm.sqrt.f32`, which NVPTX lowers to the native `sqrt.rn.f32` with no
     /// libdevice call.
     Sqrt(x) = x.sqrt();
-    /// `1/√x` as a correctly-rounded sqrt and divide, not the SFU
-    /// `rsqrt.approx.f32`. Two instructions, but the same numerics on host and
-    /// device; the SFU form is a measured swap, like [`Exp2Hw`].
-    Rsqrt(x) = 1.0 / x.sqrt();
+    /// [`rsqrt`] — correctly rounded, not the SFU `rsqrt.approx.f32`, whose
+    /// adoption would be a measured swap like [`Exp2Hw`]'s.
+    Rsqrt(x) = rsqrt(x);
     Recip(x) = 1.0 / x;
 }
 
@@ -512,6 +527,13 @@ macro_rules! op_methods {
             self.bin_map::<$op>(other)
         }
     )*};
+    (scalar $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
+        $(#[$meta])*
+        #[inline(always)]
+        pub fn $name(self, k: f32) -> Self {
+            self.scalar_map::<$op>(k)
+        }
+    )*};
     (row $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
         $(#[$meta])*
         #[inline(always)]
@@ -574,6 +596,28 @@ macro_rules! unary_op_methods {
             sqrt = Sqrt;
             rsqrt = Rsqrt;
             recip = Recip;
+        }
+    };
+}
+
+/// The scalar-operand names every register family carries. The generic
+/// [`RegTile::scalar_map`] already reaches every [`BinaryOp`] — `Div`, `Sub`
+/// and the rest need no wrapper to be callable — so this table holds only the
+/// spellings a kernel would otherwise invent a worse name for.
+macro_rules! scalar_op_methods {
+    () => {
+        op_methods! { scalar
+            /// Multiply by a warp-uniform constant — attention's `1/√d`, a
+            /// normalization's `1/N`.
+            scale = Mul;
+            /// Add a warp-uniform constant; `shift(-mean)` is the centering
+            /// step, and the reason there is no separate `Sub` name.
+            shift = Add;
+            /// Lower-bound every value (`Max` against `k`) — a leaky floor, or
+            /// a variance kept off zero.
+            clamp_min = Max;
+            /// Upper-bound every value; the mirror of [`Self::clamp_min`].
+            clamp_max = Min;
         }
     };
 }
@@ -717,6 +761,18 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
         out
     }
 
+    /// `Op` slotwise against one scalar; see [`RegTile::scalar_map`].
+    #[inline(always)]
+    pub fn scalar_map<Op: BinaryOp>(self, k: f32) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            out.set(slot, Op::apply(self.get(slot), k));
+            slot += 1;
+        }
+        out
+    }
+
     /// `Op` slotwise across three vectors — [`Fma`] and nothing else so far.
     #[inline(always)]
     pub fn ternary_map<Op: TernaryOp>(self, b: Self, c: Self) -> Self {
@@ -736,6 +792,7 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     }
 
     unary_op_methods!();
+    scalar_op_methods!();
 
     op_methods! { binary
         add = Add;
@@ -865,7 +922,20 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
         out
     }
 
+    /// `Op` valuewise against one scalar; see [`RegTile::scalar_map`].
+    #[inline(always)]
+    pub fn scalar_map<Op: BinaryOp>(self, k: f32) -> Self {
+        let mut out = self;
+        let mut value = 0;
+        while value < L::VALUES {
+            out.set(value, Op::apply(self.get(value), k));
+            value += 1;
+        }
+        out
+    }
+
     unary_op_methods!();
+    scalar_op_methods!();
 
     op_methods! { binary
         add = Add;
@@ -1035,6 +1105,32 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
         out
     }
 
+    /// `Op` against one scalar broadcast over every owned value — `k` in a
+    /// register, not a tile, so the operand costs one register rather than
+    /// `SLOTS * VALUES` and no [`Self::splat`] runs.
+    ///
+    /// A [`BinaryOp`] and not a stateful op trait: `UnaryOp::apply` is an
+    /// associated function on a unit struct, so a scaling factor has nowhere to
+    /// live, and making it live somewhere would put a value in a type
+    /// parameter's shadow where the inliner has to rediscover it. Treating the
+    /// scalar as the second operand instead means the whole existing op set —
+    /// `Div` for a divide by a constant, `Max`/`Min` for a bound, `Sub` — is
+    /// reachable the day it is written.
+    #[inline(always)]
+    pub fn scalar_map<Op: BinaryOp>(self, k: f32) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(slot, value, Op::apply(self.get(slot, value), k));
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
     /// `Op` across three tiles; see [`Fma`].
     #[inline(always)]
     pub fn ternary_map<Op: TernaryOp>(self, b: Self, c: Self) -> Self {
@@ -1189,6 +1285,7 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     }
 
     unary_op_methods!();
+    scalar_op_methods!();
 
     op_methods! { binary
         add = Add;
@@ -1569,6 +1666,99 @@ mod tests {
         for slot in 0..Rows::SLOTS {
             assert_eq!(scaled.get(slot), vec.get(slot) * other.get(slot));
             assert_eq!(summed.get(slot), vec.get(slot) + other.get(slot));
+        }
+    }
+
+    #[test]
+    fn scalar_map_is_bin_map_against_the_splatted_scalar() {
+        // The claim that makes `scalar_map` a `BinaryOp` map and not a second
+        // mechanism: it is the vector/vector form with the operand splatted,
+        // for every op, on all three families — so the only thing it saves is
+        // the splat, and it saves it identically everywhere.
+        let k = -0.75f32;
+        let tiles_agree = |mapped: Scores, splatted: Scores| {
+            for slot in 0..Scores::SLOTS {
+                for value in 0..Scores::VALUES {
+                    assert_eq!(mapped.get(slot, value), splatted.get(slot, value));
+                }
+            }
+        };
+        let rows_agree = |mapped: Rows, splatted: Rows| {
+            for slot in 0..Rows::SLOTS {
+                assert_eq!(mapped.get(slot), splatted.get(slot));
+            }
+        };
+        let cols_agree = |mapped: Cols, splatted: Cols| {
+            for value in 0..Cols::VALUES {
+                assert_eq!(mapped.get(value), splatted.get(value));
+            }
+        };
+
+        for lane in 0..32 {
+            let (tile, wide) = (coordinate_tile(lane), Scores::splat(k));
+            tiles_agree(tile.scalar_map::<Add>(k), tile.bin_map::<Add>(wide));
+            tiles_agree(tile.scalar_map::<Sub>(k), tile.bin_map::<Sub>(wide));
+            tiles_agree(tile.scalar_map::<Mul>(k), tile.bin_map::<Mul>(wide));
+            tiles_agree(tile.scalar_map::<Div>(k), tile.bin_map::<Div>(wide));
+            tiles_agree(tile.scalar_map::<Max>(k), tile.bin_map::<Max>(wide));
+            tiles_agree(tile.scalar_map::<Min>(k), tile.bin_map::<Min>(wide));
+
+            let (vec, wide) = (row_indices(lane), Rows::splat(k));
+            rows_agree(vec.scalar_map::<Mul>(k), vec.bin_map::<Mul>(wide));
+            rows_agree(vec.scalar_map::<Max>(k), vec.bin_map::<Max>(wide));
+
+            let (cols, wide) = (column_indices(lane), Cols::splat(k));
+            cols_agree(cols.scalar_map::<Add>(k), cols.bin_map::<Add>(wide));
+            cols_agree(cols.scalar_map::<Div>(k), cols.bin_map::<Div>(wide));
+        }
+    }
+
+    #[test]
+    fn scalar_names_resolve_to_their_ops() {
+        // The generated name table, per family: a transposed line here makes
+        // `shift` mean `scale`, which is a wrong kernel and not a slow one.
+        let k = 2.5f32;
+        let tile = coordinate_tile(7);
+        let vec = Rows::from_slots([-3.0f32, 0.25, 2.0, 9.0]);
+        let cols = column_indices(7);
+        for slot in 0..Scores::SLOTS {
+            for value in 0..Scores::VALUES {
+                let x = tile.get(slot, value);
+                assert_eq!(tile.scale(k).get(slot, value), x * k);
+                assert_eq!(tile.shift(k).get(slot, value), x + k);
+                assert_eq!(tile.clamp_min(k).get(slot, value), fmax(x, k));
+                assert_eq!(tile.clamp_max(k).get(slot, value), fmin(x, k));
+            }
+        }
+        for slot in 0..Rows::SLOTS {
+            let x = vec.get(slot);
+            assert_eq!(vec.scale(k).get(slot), x * k);
+            assert_eq!(vec.shift(k).get(slot), x + k);
+            assert_eq!(vec.clamp_min(k).get(slot), fmax(x, k));
+            assert_eq!(vec.clamp_max(k).get(slot), fmin(x, k));
+        }
+        for value in 0..Cols::VALUES {
+            let x = cols.get(value);
+            assert_eq!(cols.scale(k).get(value), x * k);
+            assert_eq!(cols.shift(k).get(value), x + k);
+            assert_eq!(cols.clamp_min(k).get(value), fmax(x, k));
+            assert_eq!(cols.clamp_max(k).get(value), fmin(x, k));
+        }
+        // And that the ops it does *not* name stay reachable, which is the
+        // whole argument for `scalar_map` over a wrapper per op.
+        assert_eq!(vec.scalar_map::<Div>(k).get(1), vec.get(1) / k);
+        assert_eq!(vec.scalar_map::<Sub>(k).get(1), vec.get(1) - k);
+    }
+
+    #[test]
+    fn free_rsqrt_is_the_op_struct() {
+        // Layernorm's variance is one f32 with no vector to reach `Rsqrt`
+        // through, so the two spellings have to be the same number — a host
+        // reference compares them with `==`.
+        for x in [0.25f32, 1.0, 2.0, 3.75, 1.0e-6, 1.0e12] {
+            assert_eq!(rsqrt(x), Rsqrt::apply(x));
+            assert_eq!(rsqrt(x), 1.0 / x.sqrt());
+            assert_eq!(Rows::splat(x).rsqrt().get(0), rsqrt(x));
         }
     }
 

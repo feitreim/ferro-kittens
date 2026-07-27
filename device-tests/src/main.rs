@@ -161,6 +161,17 @@ const FUSED: u32 = 1;
 /// [`HAND_WRITTEN`] with the generic `row_map::<Mul>` in place of `scale_rows`.
 const ROW_MAP: u32 = 2;
 
+/// How [`kernels::scalar_map_probe`] spells its two scalar multiplies. The
+/// pre-#38 spelling: `bin_map::<Mul>(splat(k))`, the scalar widened into a
+/// whole second tile because there was no other way to reach a `BinaryOp` with
+/// one. This is the number `scale` has to beat.
+const SPLATTED: u32 = 0;
+/// `RegTile::scale` — the same `Mul` with the operand left in a register.
+const SCALED: u32 = 1;
+/// Neither: both multiplies written through `set`, mutating in place. #31's
+/// shape, and nothing in `kittens` spells it; it is here as the floor.
+const IN_PLACE: u32 = 2;
+
 /// Which lane-passing convention [`kernels::lane_probe`] compiles — issue #27.
 /// Today's convention: `warp::lane_id()` read once by the caller and threaded
 /// into every coordinate-dependent op.
@@ -1112,6 +1123,171 @@ pub mod kernels {
         mut out: DisjointSlice<f32>,
     ) {
         unsafe { softmax_probe::<128, ROW_MAP>(scores, steps, &mut out) }
+    }
+
+    /// **A codegen probe, not a test.** The scalar-operand half of
+    /// [`softmax_probe`]'s question (#38), in the flash inner loop's shape: a
+    /// `[32, N]` block per step, scaled and folded into an accumulator that is
+    /// itself rescaled and stays live across the runtime loop.
+    ///
+    /// Both scalar multiplies are spelled the same way in a given
+    /// instantiation, and all three instantiations compute the same tile, so a
+    /// difference in the table is the spelling and nothing else:
+    ///
+    /// - [`SPLATTED`]: `bin_map::<Mul>(splat(k))`, the pre-#38 spelling — the
+    ///   scalar widened into a whole second tile
+    /// - [`SCALED`]: `scale(k)`, the same `Mul` with the operand in a register
+    /// - [`IN_PLACE`]: neither, both multiplies written through `set`
+    ///
+    /// The first pair is #38's own question. The third is #31's, and is here
+    /// because a by-value map at this width is exactly what #31 was filed
+    /// about.
+    #[inline(always)]
+    unsafe fn scalar_map_probe<const N: usize, const FORM: u32>(
+        scores: &[f32],
+        steps: u32,
+        k: f32,
+        out: &mut DisjointSlice<f32>,
+    ) where
+        BaseLdtm: FragmentLayout<32, N>,
+    {
+        unsafe {
+            let slots = RegTile::<32, N, BaseLdtm>::SLOTS;
+            let values = RegTile::<32, N, BaseLdtm>::VALUES;
+            let lane = warp::lane_id();
+
+            let mut out_acc = RegTile::<32, N, BaseLdtm>::zero();
+
+            let mut step = 0u32;
+            while step < steps {
+                let mut block = RegTile::<32, N, BaseLdtm>::zero();
+                let mut slot = 0usize;
+                while slot < slots {
+                    let mut value = 0usize;
+                    while value < values {
+                        let (row, column) =
+                            RegTile::<32, N, BaseLdtm>::coordinate(lane, slot, value);
+                        let index = step as usize * 32 * N + row as usize * N + column as usize;
+                        block.set(slot, value, *scores.get_unchecked(index));
+                        value += 1;
+                    }
+                    slot += 1;
+                }
+
+                if FORM == SCALED {
+                    block = block.scale(k);
+                    out_acc = out_acc.scale(k);
+                } else if FORM == SPLATTED {
+                    let widened = RegTile::<32, N, BaseLdtm>::splat(k);
+                    block = block.bin_map::<Mul>(widened);
+                    out_acc = out_acc.bin_map::<Mul>(widened);
+                } else {
+                    // Two passes, not one fused pass: the by-value forms above
+                    // are two maps, and a floor that fuses them would be
+                    // measuring the fusion instead of the operand.
+                    let mut slot = 0usize;
+                    while slot < slots {
+                        let mut value = 0usize;
+                        while value < values {
+                            block.set(slot, value, block.get(slot, value) * k);
+                            value += 1;
+                        }
+                        slot += 1;
+                    }
+                    let mut slot = 0usize;
+                    while slot < slots {
+                        let mut value = 0usize;
+                        while value < values {
+                            out_acc.set(slot, value, out_acc.get(slot, value) * k);
+                            value += 1;
+                        }
+                        slot += 1;
+                    }
+                }
+
+                out_acc = out_acc.add(block);
+                step += 1;
+            }
+
+            let base = lane as usize * slots * values;
+            let mut slot = 0usize;
+            while slot < slots {
+                let mut value = 0usize;
+                while value < values {
+                    *out.get_unchecked_mut(base + slot * values + value) = out_acc.get(slot, value);
+                    value += 1;
+                }
+                slot += 1;
+            }
+        }
+    }
+
+    /// [`scalar_map_probe`] at a 32-wide block, the pre-#38 splatted operand.
+    #[kernel]
+    pub unsafe fn scalar_map_probe_32_splatted(
+        scores: &[f32],
+        steps: u32,
+        k: f32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { scalar_map_probe::<32, SPLATTED>(scores, steps, k, &mut out) }
+    }
+
+    /// [`scalar_map_probe`] at a 32-wide block, `RegTile::scale`.
+    #[kernel]
+    pub unsafe fn scalar_map_probe_32_scaled(
+        scores: &[f32],
+        steps: u32,
+        k: f32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { scalar_map_probe::<32, SCALED>(scores, steps, k, &mut out) }
+    }
+
+    /// [`scalar_map_probe`] at a 32-wide block, the in-place floor.
+    #[kernel]
+    pub unsafe fn scalar_map_probe_32_in_place(
+        scores: &[f32],
+        steps: u32,
+        k: f32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { scalar_map_probe::<32, IN_PLACE>(scores, steps, k, &mut out) }
+    }
+
+    /// [`scalar_map_probe`] with the pre-#38 splatted operand at the flash
+    /// accumulator's 128 columns — 32 values a thread, the width
+    /// `row_map::<Mul>` failed at.
+    #[kernel]
+    pub unsafe fn scalar_map_probe_128_splatted(
+        scores: &[f32],
+        steps: u32,
+        k: f32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { scalar_map_probe::<128, SPLATTED>(scores, steps, k, &mut out) }
+    }
+
+    /// [`scalar_map_probe`] at 128 wide, `RegTile::scale`.
+    #[kernel]
+    pub unsafe fn scalar_map_probe_128_scaled(
+        scores: &[f32],
+        steps: u32,
+        k: f32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { scalar_map_probe::<128, SCALED>(scores, steps, k, &mut out) }
+    }
+
+    /// [`scalar_map_probe`] at 128 wide, the in-place floor.
+    #[kernel]
+    pub unsafe fn scalar_map_probe_128_in_place(
+        scores: &[f32],
+        steps: u32,
+        k: f32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { scalar_map_probe::<128, IN_PLACE>(scores, steps, k, &mut out) }
     }
 
     /// The lane an op sees under `CONVENTION`: the caller's already-`hoisted`
