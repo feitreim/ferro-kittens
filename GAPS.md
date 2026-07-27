@@ -147,16 +147,18 @@ neg sqrt rsqrt copy sum sub mul div min max fma_AxBtC fma_AxCtB`) applied by
 generic `unary_map`/`bin_map`/`row_map`/`col_map`, then instantiates the whole
 family for **register tiles, register vectors, shared tiles, and shared vectors**.
 
-We have, on `RegVec`/`RegTile`: `exp2`, `max`, `sub`, `add_assign`,
-`mul_assign`, `splat`, `zero`, plus free `exp2_approx`/`exp2_hw`/`log2_approx`/
-`fmax`/`fmin`.
+Done for the register families (#5): `UnaryOp`/`BinaryOp`/`TernaryOp`, the
+`unary_map`/`bin_map`/`ternary_map`/`row_map`/`col_map` entry points on
+`RegTile` and the two vector types, and the op set — `Exp2Approx` `Exp2Hw`
+`Exp` `Log` `Log2` `Abs` `Neg` `Relu` `Sqrt` `Rsqrt` `Recip` `Add` `Sub` `Mul`
+`Div` `Max` `Min` `Fma` — with named wrappers (`sqrt`, `mul_row`, `div_col`,
+`broadcast_row`, …). TK's nullary `zero`/`one`/`pos_infty`/`neg_infty` are
+`splat` with the constant written out; TK's `copy`/`copy2` have no by-value
+equivalent to be.
 
-Missing: `div`, `sqrt`, `rsqrt`, `abs`, `relu`, `neg`, `log`, `min`, the
-`*_row`/`*_col` broadcast-operand forms (`add_row`, `mul_col`, …), and any
-generic `unary_map`/`bin_map` entry point to build new ops without hand-writing
-each. The generic-map refactor is the high-leverage piece: it collapses ~30
-missing functions into a trait plus a handful of impls. **~120 lines for the
-mechanism + the standard op set.**
+Missing: the shared-tile and shared-vector instantiations (#13). The per-column
+operand of `col_map` can be carried and broadcast today but not yet *produced* —
+that reduction is #6.
 
 ### 3.2 Reductions
 
@@ -168,7 +170,9 @@ max and sum only), and `online_rescale`/`scale_rows` for the flash softmax
 pattern. Missing: everything column-wise, `prod`, `min`, generic `row_reduce`,
 and all shared-tile reductions. Column reductions are the awkward ones — the
 fragment map replicates rows across a quad, so a column reduce needs a different
-shuffle pattern than the one `quad_*` uses.
+shuffle pattern than the one `quad_*` uses. #5 added the destination type
+(`ColVec`) and the layout half (`ColLayout`) a column reduce would fill; what is
+left is the strided shuffle across the 8 lanes of a column group.
 
 ### 3.3 MMA shape and dtype coverage
 
@@ -188,8 +192,8 @@ walk skeleton. **~80 lines for the missing walks.**
 ### 3.4 Tile-shape utilities
 
 Absent: `transpose`, `swap_layout`, `tril`/`triu`, `make_causal`/`make_causal_t`,
-`left_fill`/`right_fill`/`upper_fill`/`lower_fill`, `broadcast_row`/
-`broadcast_col`, `copy` between layouts.
+`left_fill`/`right_fill`/`upper_fill`/`lower_fill`, `copy` between layouts.
+`broadcast_row`/`broadcast_col` landed with 3.1.
 
 `make_causal` is the notable one — every causal attention kernel needs it, and
 without it the masking is open-coded in the kernel against raw fragment indices,

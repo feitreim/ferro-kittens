@@ -41,7 +41,9 @@ use cuda_device::{cuda_module, kernel, thread, warp};
 use kittens::global::encode_bf16_panels;
 use kittens::ldst::store_fragment;
 use kittens::mma::{self, mma_abt};
-use kittens::reg::{BaseLdtm, Fragment, FragmentLayout, RegTile};
+use kittens::reg::{
+    BaseLdtm, Fragment, FragmentLayout, Mul, RegTile, RegVec, fmax, online_rescale,
+};
 use kittens::shared::{Bf16, SharedTile, Swizzle128B};
 use kittens::sync::Semaphore;
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block, store_wait};
@@ -105,6 +107,14 @@ const fn cell(row: usize, column: usize) -> f32 {
 fn accumulator_value(row: usize, column: usize) -> f32 {
     (COLUMNS * row + column) as f32
 }
+
+/// Which spelling of the online-softmax correction [`kernels::softmax_probe`]
+/// compiles. Only the codegen probe reads these; see its doc comment.
+const HAND_WRITTEN: u32 = 0;
+/// [`online_rescale`], the deliberately fused form.
+const FUSED: u32 = 1;
+/// [`HAND_WRITTEN`] with the generic `row_map::<Mul>` in place of `scale_rows`.
+const ROW_MAP: u32 = 2;
 
 /// Where `(warp, lane, slot, value)` lands in a dump of `slots` × `values` per
 /// thread. The STTM round trip seeds each register with its own index here, so
@@ -543,6 +553,196 @@ pub mod kernels {
         mut out: DisjointSlice<f32>,
     ) {
         unsafe { fragment_probe::<32, 128, true>(a_map, b_map, &mut out) }
+    }
+
+    /// Each row's max over the values one thread owns, quad-reduced into the
+    /// whole row's max. The row reduction the library does not have yet (#6),
+    /// written out here because the probe below needs one today.
+    #[inline(always)]
+    fn quad_row_max<const N: usize>(tile: RegTile<32, N, BaseLdtm>) -> RegVec<32, BaseLdtm>
+    where
+        BaseLdtm: FragmentLayout<32, N>,
+    {
+        let mut rows = RegVec::<32, BaseLdtm>::splat(f32::NEG_INFINITY);
+        let mut slot = 0usize;
+        while slot < RegTile::<32, N, BaseLdtm>::SLOTS {
+            let mut lane_max = f32::NEG_INFINITY;
+            let mut value = 0usize;
+            while value < RegTile::<32, N, BaseLdtm>::VALUES {
+                lane_max = fmax(lane_max, tile.get(slot, value));
+                value += 1;
+            }
+            rows.set(slot, lane_max);
+            slot += 1;
+        }
+        rows.quad_max()
+    }
+
+    /// Each row's sum, quad-reduced; see [`quad_row_max`].
+    #[inline(always)]
+    fn quad_row_sum<const N: usize>(tile: RegTile<32, N, BaseLdtm>) -> RegVec<32, BaseLdtm>
+    where
+        BaseLdtm: FragmentLayout<32, N>,
+    {
+        let mut rows = RegVec::<32, BaseLdtm>::splat(0.0);
+        let mut slot = 0usize;
+        while slot < RegTile::<32, N, BaseLdtm>::SLOTS {
+            let mut lane_sum = 0.0f32;
+            let mut value = 0usize;
+            while value < RegTile::<32, N, BaseLdtm>::VALUES {
+                lane_sum += tile.get(slot, value);
+                value += 1;
+            }
+            rows.set(slot, lane_sum);
+            slot += 1;
+        }
+        rows.quad_sum()
+    }
+
+    /// **A codegen probe, not a test.** No host case launches it and it checks
+    /// nothing; it exists so `modal run modal_app.py::regcount` has something
+    /// that *monomorphizes* the register-side softmax ops. A library function
+    /// no kernel calls emits no PTX, and so measures nothing at all.
+    ///
+    /// The shape is flash attention's inner loop as the register file sees it:
+    /// one `[32, N]` score block per step, a `RegVec` running maximum and sum,
+    /// and a `RegTile<32, N, BaseLdtm>` accumulator rescaled into each new
+    /// reference — the pattern `online_rescale` and the hand-written `RegVec`
+    /// ops were extracted from. `RESCALE` picks which spelling of the
+    /// correction is compiled and nothing else changes, so the three forms are
+    /// comparable line for line:
+    ///
+    /// - [`HAND_WRITTEN`]: `max`/`sub`/`exp2`/`mul_assign` and `scale_rows`
+    /// - [`FUSED`]: [`online_rescale`], one scalar factor live at a time
+    /// - [`ROW_MAP`]: [`HAND_WRITTEN`] with `row_map::<Mul>` for `scale_rows`
+    ///
+    /// `steps` is a runtime bound so the accumulators stay live across
+    /// iterations rather than unrolling into one straight-line block.
+    #[inline(always)]
+    unsafe fn softmax_probe<const N: usize, const RESCALE: u32>(
+        scores: &[f32],
+        steps: u32,
+        out: &mut DisjointSlice<f32>,
+    ) where
+        BaseLdtm: FragmentLayout<32, N>,
+    {
+        unsafe {
+            let slots = RegTile::<32, N, BaseLdtm>::SLOTS;
+            let values = RegTile::<32, N, BaseLdtm>::VALUES;
+            let lane = warp::lane_id();
+
+            let mut m_ref = RegVec::<32, BaseLdtm>::splat(f32::NEG_INFINITY);
+            let mut running_sum = RegVec::<32, BaseLdtm>::splat(0.0);
+            let mut out_acc = RegTile::<32, N, BaseLdtm>::zero();
+
+            let mut step = 0u32;
+            while step < steps {
+                let mut block = RegTile::<32, N, BaseLdtm>::zero();
+                let mut slot = 0usize;
+                while slot < slots {
+                    let mut value = 0usize;
+                    while value < values {
+                        let (row, column) =
+                            RegTile::<32, N, BaseLdtm>::coordinate(lane, slot, value);
+                        let index = step as usize * 32 * N + row as usize * N + column as usize;
+                        block.set(slot, value, *scores.get_unchecked(index));
+                        value += 1;
+                    }
+                    slot += 1;
+                }
+
+                let row_max = quad_row_max::<N>(block);
+                if RESCALE == FUSED {
+                    online_rescale(&mut m_ref, row_max, &mut running_sum, &mut out_acc);
+                } else {
+                    let next = m_ref.max(row_max);
+                    let factor = m_ref.sub(next).exp2();
+                    m_ref = next;
+                    running_sum.mul_assign(factor);
+                    if RESCALE == ROW_MAP {
+                        out_acc = out_acc.row_map::<Mul>(factor);
+                    } else {
+                        out_acc.scale_rows(factor);
+                    }
+                }
+
+                let probabilities = block.sub_row(m_ref).exp2();
+                running_sum.add_assign(quad_row_sum::<N>(probabilities));
+                out_acc = out_acc.add(probabilities);
+                step += 1;
+            }
+
+            // Every accumulator has to reach memory or the loop above is dead
+            // and the register counts describe nothing.
+            let normalized = out_acc.div_row(running_sum);
+            let base = lane as usize * slots * values;
+            let mut slot = 0usize;
+            while slot < slots {
+                let reference = m_ref.get(slot);
+                let mut value = 0usize;
+                while value < values {
+                    *out.get_unchecked_mut(base + slot * values + value) =
+                        normalized.get(slot, value) + reference;
+                    value += 1;
+                }
+                slot += 1;
+            }
+        }
+    }
+
+    /// [`softmax_probe`] at a 32-wide score block. One line per instantiation:
+    /// a generic body compiles nothing on its own.
+    #[kernel]
+    pub unsafe fn softmax_probe_32_hand_written(
+        scores: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { softmax_probe::<32, HAND_WRITTEN>(scores, steps, &mut out) }
+    }
+
+    /// [`softmax_probe`] at 32 wide, [`online_rescale`].
+    #[kernel]
+    pub unsafe fn softmax_probe_32_fused(scores: &[f32], steps: u32, mut out: DisjointSlice<f32>) {
+        unsafe { softmax_probe::<32, FUSED>(scores, steps, &mut out) }
+    }
+
+    /// [`softmax_probe`] at 32 wide, `row_map::<Mul>` for `scale_rows`.
+    #[kernel]
+    pub unsafe fn softmax_probe_32_row_map(
+        scores: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { softmax_probe::<32, ROW_MAP>(scores, steps, &mut out) }
+    }
+
+    /// [`softmax_probe`] at the flash accumulator's 128 columns — 32 values a
+    /// thread on top of the score block, which is where register pressure
+    /// stops being theoretical.
+    #[kernel]
+    pub unsafe fn softmax_probe_128_hand_written(
+        scores: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { softmax_probe::<128, HAND_WRITTEN>(scores, steps, &mut out) }
+    }
+
+    /// [`softmax_probe`] at 128 wide, [`online_rescale`].
+    #[kernel]
+    pub unsafe fn softmax_probe_128_fused(scores: &[f32], steps: u32, mut out: DisjointSlice<f32>) {
+        unsafe { softmax_probe::<128, FUSED>(scores, steps, &mut out) }
+    }
+
+    /// [`softmax_probe`] at 128 wide, `row_map::<Mul>` for `scale_rows`.
+    #[kernel]
+    pub unsafe fn softmax_probe_128_row_map(
+        scores: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { softmax_probe::<128, ROW_MAP>(scores, steps, &mut out) }
     }
 }
 

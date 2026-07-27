@@ -9,10 +9,12 @@ codegen backend from scratch.
 
 Local usage:
     modal run modal_app.py::build     # host tests + a CPU-only device build
+    modal run modal_app.py::regcount  # ptxas -v register/spill table, no GPU
     modal run modal_app.py            # the device tests, on a B200
     modal run modal_app.py::doctor    # env / GPU sanity check
 """
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -195,6 +197,93 @@ def device_tests() -> None:
 def doctor() -> None:
     _run(["nvidia-smi"], cwd="/")
     _run(["cargo", "oxide", "doctor"], cwd="/opt/warmup")
+
+
+# `ptxas -v` writes one block per entry function on stderr:
+#
+#     ptxas info    : Compiling entry function 'foo' for 'sm_100a'
+#     ptxas info    : Function properties for foo
+#         0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+#     ptxas info    : Used 40 registers, 8192 bytes smem, 356 bytes cmem[0]
+#
+# The fields drift between CUDA releases (`used N barriers` appeared in 12.x),
+# so each is matched independently rather than by one line-shaped regex.
+_ENTRY = re.compile(r"Compiling entry function '([^']+)' for '([^']+)'")
+_PROPERTIES = re.compile(r"Function properties for (\S+)")
+_FRAME = re.compile(
+    r"(\d+) bytes stack frame, (\d+) bytes spill stores, (\d+) bytes spill loads"
+)
+_REGISTERS = re.compile(r"Used (\d+) registers")
+_SMEM = re.compile(r"(\d+) bytes smem")
+
+
+def _parse_ptxas(log: str) -> dict[str, dict[str, int]]:
+    """Per-entry-function counters, keyed by mangled kernel name."""
+    kernels: dict[str, dict[str, int]] = {}
+    current = None
+    for line in log.splitlines():
+        named = _ENTRY.search(line) or _PROPERTIES.search(line)
+        if named:
+            current = kernels.setdefault(
+                named.group(1),
+                {"registers": 0, "spill_stores": 0, "spill_loads": 0, "stack": 0, "smem": 0},
+            )
+            continue
+        if current is None:
+            continue
+        if frame := _FRAME.search(line):
+            current["stack"] = int(frame.group(1))
+            current["spill_stores"] = int(frame.group(2))
+            current["spill_loads"] = int(frame.group(3))
+        if registers := _REGISTERS.search(line):
+            current["registers"] = int(registers.group(1))
+            current["smem"] = int(_SMEM.search(line).group(1)) if _SMEM.search(line) else 0
+    return kernels
+
+
+@app.function(cpu=8, timeout=1800)
+def regcount(arch: str = "sm_100a", label: str = "") -> None:
+    """Register pressure of every kernel the harness emits, from `ptxas -v`.
+
+    Register count is *the* performance number for this library — a tile
+    abstraction that costs registers has failed at the thing it exists for, and
+    "ptxas says otherwise" is the escape hatch the README promises. `ptxas` is a
+    host compiler, so this needs no GPU: build the harness, feed the emitted PTX
+    back through `ptxas -v`, and print a sorted table. Run it before and after a
+    change and diff the two.
+
+    Only kernels that are actually monomorphized appear — an op no kernel calls
+    emits no PTX and measures nothing, so a codegen probe in `device-tests` is
+    how a bare library function gets onto this table at all.
+    """
+    _run([*STUB_ENV, "cargo", "oxide", "build", "device-tests", "--arch", arch], cwd=HARNESS_DIR)
+
+    ptx_files = sorted(Path(HARNESS_DIR).rglob("*.ptx"))
+    if not ptx_files:
+        listing = sorted(p for p in Path(HARNESS_DIR, "target").rglob("*") if p.is_file())
+        raise RuntimeError(
+            "no PTX under the harness target dir; cargo-oxide's artifact layout "
+            f"must have moved. Files found:\n" + "\n".join(map(str, listing[:200]))
+        )
+
+    subprocess.run(["ptxas", "--version"], check=True)
+    print(f"\nregisters per thread, {arch}" + (f" — {label}" if label else ""))
+    for ptx in ptx_files:
+        compiled = subprocess.run(
+            ["ptxas", "-v", f"-arch={arch}", "-o", "/dev/null", str(ptx)],
+            capture_output=True,
+            text=True,
+        )
+        if compiled.returncode != 0:
+            raise RuntimeError(f"ptxas failed on {ptx}:\n{compiled.stderr}")
+        kernels = _parse_ptxas(compiled.stderr)
+        print(f"\n{ptx.relative_to(HARNESS_DIR)}  ({len(kernels)} kernels)")
+        print(f"  {'kernel':<44}{'regs':>6}{'spill st':>10}{'spill ld':>10}{'stack':>8}{'smem':>8}")
+        for name, counts in sorted(kernels.items()):
+            print(
+                f"  {name:<44}{counts['registers']:>6}{counts['spill_stores']:>10}"
+                f"{counts['spill_loads']:>10}{counts['stack']:>8}{counts['smem']:>8}"
+            )
 
 
 @app.local_entrypoint()

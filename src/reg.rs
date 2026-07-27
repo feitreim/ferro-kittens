@@ -13,7 +13,23 @@
 //! [`exp2_approx`] (the FMA polynomial, bit-identical to what the flash
 //! kernels shipped with) and [`exp2_hw`] (one `ex2.approx` SFU instruction,
 //! also pure-PTX-safe post-#56). Ports that must hold "same SASS" keep the
-//! polynomial; swapping to the SFU is a separate, measured change.
+//! polynomial; swapping to the SFU is a separate, measured change — and the
+//! measurement does not favour it: pointing `exp2` at the SFU takes
+//! `softmax_probe_128` from 168 registers and no spill to 255 and 112 bytes
+//! of spill stores (`modal_app.py::regcount`). One instruction, but the FMA
+//! chain schedules where `ex2.approx` serializes.
+//!
+//! Elementwise work goes through [`UnaryOp`] / [`BinaryOp`] / [`TernaryOp`]
+//! and the `*_map` methods, so a scalar function is written once and reaches
+//! [`RegTile`], [`RegVec`] and [`ColVec`] alike. The named methods (`exp2`,
+//! `mul_row`, …) are wrappers over those.
+//!
+//! **ThunderKittens naming.** TK names a register vector for the axis it
+//! *spans*: its `col_vec` has one entry per row, its `row_vec` one per column.
+//! We name for the axis that *indexes* it, so TK's `col_vec` is our
+//! [`RegVec`] and TK's `row_vec` is our [`ColVec`] — inverted. The op names
+//! do agree: TK's `row_map`/`mul_row` and ours both broadcast a per-row scalar
+//! along each row.
 
 use cuda_device::warp;
 
@@ -96,6 +112,89 @@ pub fn quad_sum(value: f32) -> f32 {
     value + warp::shuffle_xor_f32(value, 2)
 }
 
+/// A scalar function named as a *type*, so one definition instantiates for
+/// every register family through the `unary_map` methods. Unit structs rather
+/// than `fn` pointers or closures: a type parameter can carry no state to
+/// spill and nothing for the inliner to see through.
+pub trait UnaryOp {
+    /// The scalar function.
+    fn apply(x: f32) -> f32;
+}
+
+/// Two-operand [`UnaryOp`]. Also what the row/column broadcast maps take, with
+/// `b` the per-row or per-column scalar.
+pub trait BinaryOp {
+    /// The scalar function.
+    fn apply(a: f32, b: f32) -> f32;
+}
+
+/// Three-operand [`UnaryOp`] — the fused multiply-add family, which exists
+/// because a separate multiply and add do not contract on their own.
+pub trait TernaryOp {
+    /// The scalar function.
+    fn apply(a: f32, b: f32, c: f32) -> f32;
+}
+
+macro_rules! scalar_ops {
+    ($trait:ident: $($(#[$meta:meta])* $name:ident($($arg:ident),+) = $body:expr;)*) => {$(
+        $(#[$meta])*
+        pub struct $name;
+
+        impl $trait for $name {
+            #[inline(always)]
+            fn apply($($arg: f32),+) -> f32 {
+                $body
+            }
+        }
+    )*};
+}
+
+scalar_ops! { UnaryOp:
+    /// The FMA polynomial ([`exp2_approx`]) — what the validated kernels ship.
+    Exp2Approx(x) = exp2_approx(x);
+    /// The SFU instruction ([`exp2_hw`]). Rounds differently from
+    /// [`Exp2Approx`]; the choice between them is a numerics decision.
+    Exp2Hw(x) = exp2_hw(x);
+    /// `e^x` on [`Exp2Approx`], inheriting that polynomial's error bound and
+    /// its ±125 exponent clamp — so this saturates at `x = ±86.6`, just inside
+    /// where fp32 overflows anyway.
+    Exp(x) = exp2_approx(x * core::f32::consts::LOG2_E);
+    Log2(x) = log2_approx(x);
+    /// `ln(x)` on [`log2_approx`]; see [`Exp`].
+    Log(x) = log2_approx(x) * core::f32::consts::LN_2;
+    /// Sign-bit clear rather than a libdevice `fabsf` — one `abs.f32`, and it
+    /// keeps the op usable in a pure-PTX artifact regardless of #56's fate.
+    Abs(x) = f32::from_bits(x.to_bits() & 0x7fff_ffff);
+    Neg(x) = -x;
+    Relu(x) = fmax(x, 0.0);
+    /// `llvm.sqrt.f32`, which NVPTX lowers to the native `sqrt.rn.f32` with no
+    /// libdevice call.
+    Sqrt(x) = x.sqrt();
+    /// `1/√x` as a correctly-rounded sqrt and divide, not the SFU
+    /// `rsqrt.approx.f32`. Two instructions, but the same numerics on host and
+    /// device; the SFU form is a measured swap, like [`Exp2Hw`].
+    Rsqrt(x) = 1.0 / x.sqrt();
+    Recip(x) = 1.0 / x;
+}
+
+scalar_ops! { BinaryOp:
+    Add(a, b) = a + b;
+    Sub(a, b) = a - b;
+    Mul(a, b) = a * b;
+    Div(a, b) = a / b;
+    Max(a, b) = fmax(a, b);
+    Min(a, b) = fmin(a, b);
+}
+
+scalar_ops! { TernaryOp:
+    /// `a*b + c` in one `fma.rn.f32`. Rust emits no fast-math flags, so a
+    /// separate multiply and add stay separate — the fusion has to be asked
+    /// for. TK's `fma_AxCtB` is this op with the last two operands swapped at
+    /// the call site; our maps fix no operand to a broadcast vector, so the
+    /// second form buys nothing.
+    Fma(a, b, c) = a.mul_add(b, c);
+}
+
 /// The row half of a fragment ownership map: how a warp's 32 lanes divide the
 /// `M` logical rows of a tile into per-thread *slots*, and where the one
 /// `f32` per owned row lives.
@@ -123,23 +222,46 @@ pub trait RowLayout<const M: usize> {
     fn set_slot(slots: &mut Self::Slots, slot: usize, value: f32);
 }
 
-/// A fragment ownership map for a logical `[M, N]` fp32 tile: which `(row,
-/// column)` each of a lane's `SLOTS * VALUES` registers holds, plus the
-/// storage they live in.
+/// The column half of a fragment ownership map, mirroring [`RowLayout`]: the
+/// `N` logical columns a thread holds per row, and where one `f32` per owned
+/// column lives.
 ///
-/// The storage is an associated type rather than `[[f32; VALUES]; SLOTS]`
-/// because an array length must be a const expression of the generic
-/// parameters, which would need `generic_const_exprs`. Each implemented
-/// `(M, N)` shape names its own storage instead — one macro line per shape.
-pub trait FragmentLayout<const M: usize, const N: usize>: RowLayout<M> {
-    /// Per-thread storage, `VALUES` values for each of `SLOTS` rows.
-    type Storage: Copy;
+/// Unlike a [`RowLayout`] slot, a value is *not* warp-uniform in the same
+/// sense: under [`BaseLdtm`] a column depends only on `lane % 4`, so the 8
+/// lanes of a column group each hold their own copy of the same `N/4` columns.
+/// A [`ColVec`] is that per-lane copy.
+pub trait ColLayout<const N: usize> {
+    /// Per-thread storage, one `f32` per owned column (`[f32; VALUES]`).
+    type Values: Copy;
 
     /// Values one thread owns per slot — the columns of `0..N` it holds.
     const VALUES: usize;
 
     /// The logical column in `0..N` that `lane` holds in `value`.
     fn col_of(lane: u32, value: usize) -> u32;
+
+    /// Every value set to `value`.
+    fn splat_values(value: f32) -> Self::Values;
+
+    /// The value in `value`.
+    fn get_value(values: &Self::Values, value: usize) -> f32;
+
+    /// Write `x` into `value`.
+    fn set_value(values: &mut Self::Values, value: usize, x: f32);
+}
+
+/// A fragment ownership map for a logical `[M, N]` fp32 tile: which `(row,
+/// column)` each of a lane's `SLOTS * VALUES` registers holds, plus the
+/// storage they live in. The two coordinate halves come from [`RowLayout`] and
+/// [`ColLayout`]; what a tile adds is the joint storage.
+///
+/// The storage is an associated type rather than `[[f32; VALUES]; SLOTS]`
+/// because an array length must be a const expression of the generic
+/// parameters, which would need `generic_const_exprs`. Each implemented
+/// `(M, N)` shape names its own storage instead — one macro line per shape.
+pub trait FragmentLayout<const M: usize, const N: usize>: RowLayout<M> + ColLayout<N> {
+    /// Per-thread storage, `VALUES` values for each of `SLOTS` rows.
+    type Storage: Copy;
 
     /// Every value of every slot set to `value`.
     fn splat(value: f32) -> Self::Storage;
@@ -228,21 +350,46 @@ macro_rules! base_ldtm_rows {
     )*};
 }
 
-/// One [`FragmentLayout`] impl per logical `(M, N)` shape; `VALUES` is `N / 4`
-/// because each 16-column block gives a thread four values. Adding a shape is
-/// one line — do it when a call site needs it.
-macro_rules! base_ldtm_shapes {
-    ($(($m:literal, $n:literal)),* $(,)?) => {$(
+/// One [`ColLayout`] impl per logical column count; `VALUES` is `N / 4`
+/// because each 16-column block gives a thread four values.
+macro_rules! base_ldtm_cols {
+    ($($n:literal),* $(,)?) => {$(
         const _: () = assert!($n % 16 == 0, "BaseLdtm columns come in 16-column blocks");
 
-        impl FragmentLayout<$m, $n> for BaseLdtm {
-            type Storage = [[f32; $n / 4]; $m / 8];
+        impl ColLayout<$n> for BaseLdtm {
+            type Values = [f32; $n / 4];
             const VALUES: usize = $n / 4;
 
             #[inline(always)]
             fn col_of(lane: u32, value: usize) -> u32 {
                 Self::column(lane, value)
             }
+
+            #[inline(always)]
+            fn splat_values(value: f32) -> Self::Values {
+                [value; $n / 4]
+            }
+
+            #[inline(always)]
+            fn get_value(values: &Self::Values, value: usize) -> f32 {
+                values[value]
+            }
+
+            #[inline(always)]
+            fn set_value(values: &mut Self::Values, value: usize, x: f32) {
+                values[value] = x;
+            }
+        }
+    )*};
+}
+
+/// One [`FragmentLayout`] impl per logical `(M, N)` shape, joining a
+/// [`RowLayout`] to a [`ColLayout`]. Adding a shape is one line — do it when a
+/// call site needs it.
+macro_rules! base_ldtm_shapes {
+    ($(($m:literal, $n:literal)),* $(,)?) => {$(
+        impl FragmentLayout<$m, $n> for BaseLdtm {
+            type Storage = [[f32; $n / 4]; $m / 8];
 
             #[inline(always)]
             fn splat(value: f32) -> Self::Storage {
@@ -263,15 +410,84 @@ macro_rules! base_ldtm_shapes {
 }
 
 base_ldtm_rows!(16, 32);
+base_ldtm_cols!(16, 32, 128);
 base_ldtm_shapes!((16, 16), (32, 32), (32, 128));
+
+/// The named half of the op set: one line per exposed name, so a new op costs
+/// a [`scalar_ops`] line and one of these. `should_implement_trait` is allowed
+/// wholesale because every op the device code takes must stay a direct
+/// `#[inline(always)]` call, not an operator impl.
+macro_rules! op_methods {
+    (unary $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
+        $(#[$meta])*
+        #[allow(clippy::should_implement_trait)]
+        #[inline(always)]
+        pub fn $name(self) -> Self {
+            self.unary_map::<$op>()
+        }
+    )*};
+    (binary $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
+        $(#[$meta])*
+        #[allow(clippy::should_implement_trait)]
+        #[inline(always)]
+        pub fn $name(self, other: Self) -> Self {
+            self.bin_map::<$op>(other)
+        }
+    )*};
+    (row $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
+        $(#[$meta])*
+        #[inline(always)]
+        pub fn $name(self, rows: RegVec<M, L>) -> Self {
+            self.row_map::<$op>(rows)
+        }
+    )*};
+    (col $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
+        $(#[$meta])*
+        #[inline(always)]
+        pub fn $name(self, cols: ColVec<N, L>) -> Self {
+            self.col_map::<$op>(cols)
+        }
+    )*};
+    (assign $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
+        $(#[$meta])*
+        #[inline(always)]
+        pub fn $name(&mut self, other: Self) {
+            *self = self.bin_map::<$op>(other);
+        }
+    )*};
+}
+
+/// The unary names every register family carries.
+macro_rules! unary_op_methods {
+    () => {
+        op_methods! { unary
+            /// Software `2^x` ([`exp2_approx`]) — the shipped kernels'
+            /// rounding, and what every `exp2` in the crate resolves to.
+            exp2 = Exp2Approx;
+            /// SFU `2^x` ([`exp2_hw`]); a different result from `exp2`.
+            exp2_hw = Exp2Hw;
+            exp = Exp;
+            log = Log;
+            log2 = Log2;
+            abs = Abs;
+            neg = Neg;
+            relu = Relu;
+            sqrt = Sqrt;
+            rsqrt = Rsqrt;
+            recip = Recip;
+        }
+    };
+}
 
 /// Per-thread row statistics of an `[M, _]` fragment-mapped tile: one `f32`
 /// per owned row (slot), replicated across each quad. A 32-row warp tile is 4
 /// slots (2 per 16-row block × 2 blocks per warp).
 ///
 /// Every op is a compile-time-length loop over the slot array — plain
-/// straight-line FMA/select code after inlining, nothing the register
-/// allocator can see through less clearly than the hand-written form.
+/// straight-line FMA/select code after inlining. `max`/`sub`/`exp2`/
+/// `mul_assign`/`add_assign` were hand-written copies of exactly that loop
+/// until `modal_app.py::regcount` showed the generic maps assemble to the same
+/// registers and spills at both probe shapes; they are the maps now.
 pub struct RegVec<const M: usize, L: RowLayout<M>>(pub L::Slots);
 
 impl<const M: usize, L: RowLayout<M>> Clone for RegVec<M, L> {
@@ -316,65 +532,6 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
         L::row_of(lane, slot)
     }
 
-    /// Slotwise max with `other`.
-    #[inline(always)]
-    pub fn max(self, other: Self) -> Self {
-        let mut out = self;
-        let mut slot = 0;
-        while slot < L::SLOTS {
-            out.set(slot, fmax(self.get(slot), other.get(slot)));
-            slot += 1;
-        }
-        out
-    }
-
-    /// Slotwise `self - other`. A plain method rather than `ops::Sub` so
-    /// every op the device code takes stays a direct `#[inline(always)]`
-    /// call.
-    #[allow(clippy::should_implement_trait)]
-    #[inline(always)]
-    pub fn sub(self, other: Self) -> Self {
-        let mut out = self;
-        let mut slot = 0;
-        while slot < L::SLOTS {
-            out.set(slot, self.get(slot) - other.get(slot));
-            slot += 1;
-        }
-        out
-    }
-
-    /// Slotwise software `2^x` ([`exp2_approx`]).
-    #[inline(always)]
-    pub fn exp2(self) -> Self {
-        let mut out = self;
-        let mut slot = 0;
-        while slot < L::SLOTS {
-            out.set(slot, exp2_approx(self.get(slot)));
-            slot += 1;
-        }
-        out
-    }
-
-    /// Slotwise `self *= other`.
-    #[inline(always)]
-    pub fn mul_assign(&mut self, other: Self) {
-        let mut slot = 0;
-        while slot < L::SLOTS {
-            self.set(slot, self.get(slot) * other.get(slot));
-            slot += 1;
-        }
-    }
-
-    /// Slotwise `self += other`.
-    #[inline(always)]
-    pub fn add_assign(&mut self, other: Self) {
-        let mut slot = 0;
-        while slot < L::SLOTS {
-            self.set(slot, self.get(slot) + other.get(slot));
-            slot += 1;
-        }
-    }
-
     /// True if any slot exceeds `reference + slack` — the correction-vote
     /// predicate (this lane's vote only; the warp/warpgroup OR is the
     /// caller's collective step).
@@ -411,6 +568,155 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
             slot += 1;
         }
         out
+    }
+
+    /// `Op` on every slot.
+    #[inline(always)]
+    pub fn unary_map<Op: UnaryOp>(self) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            out.set(slot, Op::apply(self.get(slot)));
+            slot += 1;
+        }
+        out
+    }
+
+    /// `Op` slotwise against `other`.
+    #[inline(always)]
+    pub fn bin_map<Op: BinaryOp>(self, other: Self) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            out.set(slot, Op::apply(self.get(slot), other.get(slot)));
+            slot += 1;
+        }
+        out
+    }
+
+    /// `Op` slotwise across three vectors — [`Fma`] and nothing else so far.
+    #[inline(always)]
+    pub fn ternary_map<Op: TernaryOp>(self, b: Self, c: Self) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            out.set(slot, Op::apply(self.get(slot), b.get(slot), c.get(slot)));
+            slot += 1;
+        }
+        out
+    }
+
+    /// Slotwise `self * b + c`, fused.
+    #[inline(always)]
+    pub fn fma(self, b: Self, c: Self) -> Self {
+        self.ternary_map::<Fma>(b, c)
+    }
+
+    unary_op_methods!();
+
+    op_methods! { binary
+        add = Add;
+        sub = Sub;
+        mul = Mul;
+        div = Div;
+        max = Max;
+        min = Min;
+    }
+
+    op_methods! { assign
+        /// Slotwise `self *= other` — the running sum's rescale.
+        mul_assign = Mul;
+        /// Slotwise `self += other`.
+        add_assign = Add;
+    }
+}
+
+/// Per-thread column statistics of a `[_, N]` fragment-mapped tile: one `f32`
+/// per owned column (value). The mirror of [`RegVec`] across the transpose,
+/// and TK's `row_vec` — see the module docs on that inversion.
+///
+/// Under [`BaseLdtm`] a lane's columns depend only on `lane % 4`, so the 8
+/// lanes of a column group hold 8 identical copies of the same `N/4` entries;
+/// a whole-warp column statistic is consistent only once those 8 copies agree.
+/// Nothing here produces one — the strided shuffle reduction that would is
+/// issue #6. What this type does today is *carry* a column vector (splatted,
+/// or built from `column`) into [`RegTile::col_map`].
+pub struct ColVec<const N: usize, L: ColLayout<N>>(pub L::Values);
+
+impl<const N: usize, L: ColLayout<N>> Clone for ColVec<N, L> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<const N: usize, L: ColLayout<N>> Copy for ColVec<N, L> {}
+
+impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
+    /// Columns of the tile this thread owns.
+    pub const VALUES: usize = L::VALUES;
+
+    /// Wrap this thread's values; see [`RegVec::from_slots`].
+    #[inline(always)]
+    pub fn from_values(values: L::Values) -> Self {
+        Self(values)
+    }
+
+    /// All values set to `value`.
+    #[inline(always)]
+    pub fn splat(value: f32) -> Self {
+        Self(L::splat_values(value))
+    }
+
+    /// The statistic of column-value `value`.
+    #[inline(always)]
+    pub fn get(&self, value: usize) -> f32 {
+        L::get_value(&self.0, value)
+    }
+
+    /// Write the statistic of column-value `value`.
+    #[inline(always)]
+    pub fn set(&mut self, value: usize, x: f32) {
+        L::set_value(&mut self.0, value, x);
+    }
+
+    /// The logical column in `0..N` that `lane`'s `value` holds.
+    #[inline(always)]
+    pub fn column(lane: u32, value: usize) -> u32 {
+        L::col_of(lane, value)
+    }
+
+    /// `Op` on every value.
+    #[inline(always)]
+    pub fn unary_map<Op: UnaryOp>(self) -> Self {
+        let mut out = self;
+        let mut value = 0;
+        while value < L::VALUES {
+            out.set(value, Op::apply(self.get(value)));
+            value += 1;
+        }
+        out
+    }
+
+    /// `Op` valuewise against `other`.
+    #[inline(always)]
+    pub fn bin_map<Op: BinaryOp>(self, other: Self) -> Self {
+        let mut out = self;
+        let mut value = 0;
+        while value < L::VALUES {
+            out.set(value, Op::apply(self.get(value), other.get(value)));
+            value += 1;
+        }
+        out
+    }
+
+    unary_op_methods!();
+
+    op_methods! { binary
+        add = Add;
+        sub = Sub;
+        mul = Mul;
+        div = Div;
+        max = Max;
+        min = Min;
     }
 }
 
@@ -452,6 +758,46 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
         Self(L::splat(0.0))
     }
 
+    /// Every value set to `value`. TK's nullary `one`/`pos_infty`/`neg_infty`
+    /// ops are this with the constant written out.
+    #[inline(always)]
+    pub fn splat(value: f32) -> Self {
+        Self(L::splat(value))
+    }
+
+    /// Every column of row-slot `s` set to `rows` slot `s`.
+    #[inline(always)]
+    pub fn broadcast_row(rows: RegVec<M, L>) -> Self {
+        let mut out = Self::zero();
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let row = rows.get(slot);
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(slot, value, row);
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
+    /// Every row's `value` set to `cols` value `value`.
+    #[inline(always)]
+    pub fn broadcast_col(cols: ColVec<N, L>) -> Self {
+        let mut out = Self::zero();
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(slot, value, cols.get(value));
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
     /// The value at `(slot, value)`.
     #[inline(always)]
     pub fn get(&self, slot: usize, value: usize) -> f32 {
@@ -473,6 +819,14 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
 
     /// Scale every value in row-slot `s` by `factors` slot `s` — the
     /// running-max rescale of an online-softmax accumulator.
+    ///
+    /// Not [`Self::mul_row`], despite meaning exactly that
+    /// (`scale_rows_is_the_multiply_row_map`): this form rewrites the
+    /// accumulator in place, while a `row_map` builds a second tile and leaves
+    /// the allocator to prove the first one dead. At the flash accumulator's
+    /// width that proof does not land — `softmax_probe_128` goes 168 → 255
+    /// registers/thread on the swap (`modal_app.py::regcount`). The two are
+    /// the same at 32 columns; the difference is a whole tile wide.
     #[inline(always)]
     pub fn scale_rows(&mut self, factors: RegVec<M, L>) {
         let mut slot = 0;
@@ -486,6 +840,142 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
             slot += 1;
         }
     }
+
+    /// `Op` on every owned value.
+    #[inline(always)]
+    pub fn unary_map<Op: UnaryOp>(self) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(slot, value, Op::apply(self.get(slot, value)));
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
+    /// `Op` against `other` at the same logical coordinate — which is the same
+    /// `(slot, value)`, since both tiles ride the same map.
+    #[inline(always)]
+    pub fn bin_map<Op: BinaryOp>(self, other: Self) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(
+                    slot,
+                    value,
+                    Op::apply(self.get(slot, value), other.get(slot, value)),
+                );
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
+    /// `Op` across three tiles; see [`Fma`].
+    #[inline(always)]
+    pub fn ternary_map<Op: TernaryOp>(self, b: Self, c: Self) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(
+                    slot,
+                    value,
+                    Op::apply(
+                        self.get(slot, value),
+                        b.get(slot, value),
+                        c.get(slot, value),
+                    ),
+                );
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
+    /// Elementwise `self * b + c`, fused.
+    #[inline(always)]
+    pub fn fma(self, b: Self, c: Self) -> Self {
+        self.ternary_map::<Fma>(b, c)
+    }
+
+    /// `Op` against a per-row scalar broadcast along that row: every value of
+    /// row-slot `s` sees `rows` slot `s`. No shuffle — the map already gives a
+    /// thread every one of its rows' values, so the operand is lane-local.
+    #[inline(always)]
+    pub fn row_map<Op: BinaryOp>(self, rows: RegVec<M, L>) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let row = rows.get(slot);
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(slot, value, Op::apply(self.get(slot, value), row));
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
+    /// `Op` against a per-column scalar broadcast down that column: the value
+    /// at `(slot, value)` sees `cols` value `value`, i.e. the scalar for
+    /// logical column [`ColVec::column`]`(lane, value)`. Also shuffle-free,
+    /// for the mirror reason — but see [`ColVec`] on where the operand can
+    /// legitimately come from today.
+    #[inline(always)]
+    pub fn col_map<Op: BinaryOp>(self, cols: ColVec<N, L>) -> Self {
+        let mut out = self;
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let mut value = 0;
+            while value < L::VALUES {
+                out.set(
+                    slot,
+                    value,
+                    Op::apply(self.get(slot, value), cols.get(value)),
+                );
+                value += 1;
+            }
+            slot += 1;
+        }
+        out
+    }
+
+    unary_op_methods!();
+
+    op_methods! { binary
+        add = Add;
+        sub = Sub;
+        mul = Mul;
+        div = Div;
+        max = Max;
+        min = Min;
+    }
+
+    op_methods! { row
+        add_row = Add;
+        sub_row = Sub;
+        /// The value form of [`Self::scale_rows`].
+        mul_row = Mul;
+        div_row = Div;
+    }
+
+    op_methods! { col
+        add_col = Add;
+        sub_col = Sub;
+        mul_col = Mul;
+        div_col = Div;
+    }
 }
 
 /// One correction step of the online softmax, in the exact per-slot order of
@@ -496,6 +986,13 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
 /// `exp2`/`scale_rows`) keeps two full vectors live across the accumulator
 /// scaling and measurably costs registers in register-tight kernels
 /// (persistent forward: 206 → 212 regs/thread on B200).
+///
+/// `softmax_probe_32` reproduces that direction at 56 vs 64 regs/thread and
+/// `softmax_probe_128` does not reproduce it at all (168 either way) — the
+/// probe holds its accumulator in registers, where the real kernel holds it in
+/// TMEM and drains, so the probe bounds the fusion's worth but does not
+/// license undoing it. The 206 → 212 number stands until a kernel of that
+/// shape says otherwise.
 #[inline(always)]
 pub fn online_rescale<const M: usize, const N: usize, L: FragmentLayout<M, N>>(
     m_ref: &mut RegVec<M, L>,
@@ -527,6 +1024,39 @@ mod tests {
     type Scores = RegTile<32, 32, BaseLdtm>;
     /// Its row statistics.
     type Rows = RegVec<32, BaseLdtm>;
+    /// Its column statistics.
+    type Cols = ColVec<32, BaseLdtm>;
+
+    /// A tile whose value at `(row, column)` names that coordinate exactly, so
+    /// a map that reads the wrong operand shows up as a wrong coordinate.
+    fn coordinate_tile(lane: u32) -> Scores {
+        let mut tile = Scores::zero();
+        for slot in 0..Scores::SLOTS {
+            for value in 0..Scores::VALUES {
+                let (row, column) = Scores::coordinate(lane, slot, value);
+                tile.set(slot, value, (256 * row + column) as f32);
+            }
+        }
+        tile
+    }
+
+    /// The row vector holding each row's own index.
+    fn row_indices(lane: u32) -> Rows {
+        let mut rows = Rows::splat(0.0);
+        for slot in 0..Rows::SLOTS {
+            rows.set(slot, Rows::row(lane, slot) as f32);
+        }
+        rows
+    }
+
+    /// The column vector holding each column's own index.
+    fn column_indices(lane: u32) -> Cols {
+        let mut cols = Cols::splat(0.0);
+        for value in 0..Cols::VALUES {
+            cols.set(value, Cols::column(lane, value) as f32);
+        }
+        cols
+    }
 
     #[test]
     fn exp2_polynomial_stays_inside_its_error_bound() {
@@ -685,6 +1215,209 @@ mod tests {
         composes::<16, 16, BaseLdtm>();
         composes::<32, 32, BaseLdtm>();
         composes::<32, 128, BaseLdtm>();
+    }
+
+    #[test]
+    fn unary_ops_are_their_scalar_definitions() {
+        // Exp2Hw is absent on purpose: `ex2_approx_f32` has no host body, so
+        // only a device kernel can exercise it.
+        for x in [0.25f32, 1.0, 2.0, 3.75, 40.0] {
+            assert_eq!(Sqrt::apply(x), x.sqrt());
+            assert_eq!(Rsqrt::apply(x), 1.0 / x.sqrt());
+            assert_eq!(Recip::apply(x), 1.0 / x);
+            assert_eq!(Log2::apply(x), log2_approx(x));
+            assert_eq!(Exp2Approx::apply(x), exp2_approx(x));
+            let ln = Log::apply(x) as f64;
+            assert!((ln - (x as f64).ln()).abs() < 1.0e-6 * (1.0 + ln.abs()));
+            let exp = Exp::apply(x) as f64;
+            assert!((exp / (x as f64).exp() - 1.0).abs() < 2.0e-4);
+        }
+        for x in [-3.0f32, -0.0, 0.0, 2.5, f32::INFINITY] {
+            assert_eq!(Abs::apply(x), x.abs());
+            assert_eq!(Neg::apply(x), -x);
+            assert_eq!(Relu::apply(x), if x > 0.0 { x } else { 0.0 });
+        }
+    }
+
+    #[test]
+    fn binary_ops_are_their_scalar_definitions() {
+        // Tautological per op, but it is what pins the generated name table:
+        // a transposed line in `scalar_ops!` makes `div` mean `mul`.
+        for (a, b) in [(1.0f32, 2.0f32), (-3.5, 0.25), (7.0, -7.0)] {
+            assert_eq!(Add::apply(a, b), a + b);
+            assert_eq!(Sub::apply(a, b), a - b);
+            assert_eq!(Mul::apply(a, b), a * b);
+            assert_eq!(Div::apply(a, b), a / b);
+            assert_eq!(Max::apply(a, b), a.max(b));
+            assert_eq!(Min::apply(a, b), a.min(b));
+            assert_eq!(Fma::apply(a, b, 0.5), a * b + 0.5);
+        }
+    }
+
+    #[test]
+    fn maps_reach_every_owned_value() {
+        let tile = coordinate_tile(0);
+        let negated = tile.neg();
+        let doubled = tile.bin_map::<Add>(tile);
+        let fused = tile.fma(Scores::splat(3.0), Scores::splat(1.0));
+        for slot in 0..Scores::SLOTS {
+            for value in 0..Scores::VALUES {
+                let x = tile.get(slot, value);
+                assert_eq!(negated.get(slot, value), -x);
+                assert_eq!(doubled.get(slot, value), x + x);
+                assert_eq!(fused.get(slot, value), x * 3.0 + 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn named_wrappers_resolve_to_their_ops() {
+        let vec = Rows::from_slots([0.25f32, 2.0, 4.0, 9.0]);
+        let other = Rows::from_slots([1.0f32, -2.0, 0.5, 3.0]);
+        for slot in 0..Rows::SLOTS {
+            assert_eq!(vec.sqrt().get(slot), Sqrt::apply(vec.get(slot)));
+            assert_eq!(vec.rsqrt().get(slot), Rsqrt::apply(vec.get(slot)));
+            assert_eq!(vec.recip().get(slot), Recip::apply(vec.get(slot)));
+            assert_eq!(vec.relu().get(slot), Relu::apply(vec.get(slot)));
+            assert_eq!(vec.abs().get(slot), Abs::apply(vec.get(slot)));
+            assert_eq!(vec.neg().get(slot), Neg::apply(vec.get(slot)));
+            assert_eq!(vec.log2().get(slot), Log2::apply(vec.get(slot)));
+            assert_eq!(vec.log().get(slot), Log::apply(vec.get(slot)));
+            assert_eq!(vec.exp().get(slot), Exp::apply(vec.get(slot)));
+            assert_eq!(vec.add(other).get(slot), vec.get(slot) + other.get(slot));
+            assert_eq!(vec.mul(other).get(slot), vec.get(slot) * other.get(slot));
+            assert_eq!(vec.div(other).get(slot), vec.get(slot) / other.get(slot));
+            assert_eq!(
+                vec.min(other).get(slot),
+                fmin(vec.get(slot), other.get(slot))
+            );
+            assert_eq!(
+                vec.max(other).get(slot),
+                fmax(vec.get(slot), other.get(slot))
+            );
+            assert_eq!(vec.sub(other).get(slot), vec.get(slot) - other.get(slot));
+        }
+
+        let mut scaled = vec;
+        scaled.mul_assign(other);
+        let mut summed = vec;
+        summed.add_assign(other);
+        for slot in 0..Rows::SLOTS {
+            assert_eq!(scaled.get(slot), vec.get(slot) * other.get(slot));
+            assert_eq!(summed.get(slot), vec.get(slot) + other.get(slot));
+        }
+    }
+
+    #[test]
+    fn exp2_stays_the_polynomial_everywhere() {
+        // Which of the two `exp2`s a *name* resolves to is a numerics
+        // decision, so it gets an assertion rather than a convention.
+        let vec = Rows::from_slots([-3.0f32, 0.0, 1.5, 7.25]);
+        for slot in 0..Rows::SLOTS {
+            assert_eq!(vec.exp2().get(slot), exp2_approx(vec.get(slot)));
+        }
+        let mut tile = Scores::zero();
+        tile.set(1, 2, 3.5);
+        assert_eq!(tile.exp2().get(1, 2), exp2_approx(3.5));
+        assert_eq!(Cols::splat(3.5).exp2().get(0), exp2_approx(3.5));
+    }
+
+    #[test]
+    fn row_map_broadcasts_along_the_layouts_rows() {
+        for lane in 0..32 {
+            let tile = coordinate_tile(lane);
+            let sums = tile.add_row(row_indices(lane));
+            let products = tile.mul_row(row_indices(lane));
+            for slot in 0..Scores::SLOTS {
+                for value in 0..Scores::VALUES {
+                    let (row, _) = Scores::coordinate(lane, slot, value);
+                    let x = tile.get(slot, value);
+                    assert_eq!(sums.get(slot, value), x + row as f32);
+                    assert_eq!(products.get(slot, value), x * row as f32);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn col_map_broadcasts_down_the_layouts_columns() {
+        for lane in 0..32 {
+            let tile = coordinate_tile(lane);
+            let sums = tile.add_col(column_indices(lane));
+            let differences = tile.sub_col(column_indices(lane));
+            for slot in 0..Scores::SLOTS {
+                for value in 0..Scores::VALUES {
+                    let (_, column) = Scores::coordinate(lane, slot, value);
+                    let x = tile.get(slot, value);
+                    assert_eq!(sums.get(slot, value), x + column as f32);
+                    assert_eq!(differences.get(slot, value), x - column as f32);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn broadcasts_are_constant_along_their_free_axis() {
+        for lane in 0..32 {
+            let rows = Scores::broadcast_row(row_indices(lane));
+            let cols = Scores::broadcast_col(column_indices(lane));
+            for slot in 0..Scores::SLOTS {
+                for value in 0..Scores::VALUES {
+                    let (row, column) = Scores::coordinate(lane, slot, value);
+                    assert_eq!(rows.get(slot, value), row as f32);
+                    assert_eq!(cols.get(slot, value), column as f32);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn column_values_are_a_lane_groups_share_of_the_columns() {
+        // A ColVec entry belongs to `col_of(lane, value)`, which depends only
+        // on `lane % 4` — so the four groups' entries tile 0..N exactly once
+        // and the other 28 lanes hold duplicates of them.
+        for lane in 0..32u32 {
+            for value in 0..Cols::VALUES {
+                assert_eq!(Cols::column(lane, value), Cols::column(lane % 4, value));
+            }
+        }
+        let mut columns: Vec<u32> = (0..4)
+            .flat_map(|lane| (0..Cols::VALUES).map(move |value| Cols::column(lane, value)))
+            .collect();
+        columns.sort();
+        assert_eq!(columns, (0..32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn scale_rows_is_the_multiply_row_map() {
+        // `scale_rows` stays in place because the by-value `row_map` costs 87
+        // registers/thread at the flash width; this is what says the two
+        // nevertheless mean the same thing.
+        for lane in 0..32 {
+            let tile = coordinate_tile(lane);
+            let factors = row_indices(lane);
+            let mut scaled = tile;
+            scaled.scale_rows(factors);
+            let mapped = tile.row_map::<Mul>(factors);
+            for slot in 0..Scores::SLOTS {
+                for value in 0..Scores::VALUES {
+                    assert_eq!(scaled.get(slot, value), mapped.get(slot, value));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn splat_fills_every_owned_value() {
+        let tile = Scores::splat(f32::NEG_INFINITY);
+        for slot in 0..Scores::SLOTS {
+            for value in 0..Scores::VALUES {
+                assert_eq!(tile.get(slot, value), f32::NEG_INFINITY);
+            }
+        }
+        for value in 0..Cols::VALUES {
+            assert_eq!(Cols::splat(1.0).get(value), 1.0);
+        }
     }
 
     #[test]
