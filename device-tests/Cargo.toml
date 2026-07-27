@@ -1,0 +1,19 @@
+[package]
+name = "device-tests"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone workspace: the library ships no kernels and no `#[cuda_module]`,
+# so the harness that needs both lives outside its package. `cargo` at the
+# repo root never sees this crate.
+[workspace]
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
+kittens = { package = "ferro-kittens", path = "..", features = ["host"] }
+
+[profile.release]
+debug = false
+lto = true

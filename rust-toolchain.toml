@@ -1,0 +1,6 @@
+# cuda-oxide's proc macros need nightly features, and its codegen backend is
+# built against exactly this toolchain. Consumers must pin the same nightly so
+# local tooling and the GPU builds agree.
+[toolchain]
+channel = "nightly-2026-04-03"
+components = ["rust-src", "rust-analyzer", "clippy"]
