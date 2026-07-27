@@ -160,6 +160,21 @@ at 128 columns both by-value forms spill where the in-place one does not. That
 is the argument for #31 covering `scalar_map` alongside `row_map` and
 `add_assign`, rather than the three being separate decisions.
 
+But "by-value costs registers" is probably the wrong lesson, and an
+intermediate form of the same probe says why. Written as
+`out_acc.add(block.scale(k))` — the scaled tile chained inside another map, so
+`block` and its scaled copy are both live at the peak — it took 84 B of spill,
+where the rebinding `block = block.scale(k)` took none. Same op, same width,
+same by-value map; only the peak liveness differs. Read that way, three results
+that look unrelated line up: #5's `row_map` cliff (a second tile live beside
+the accumulator it replaces), the 60 B above (same), and #22's composed movers
+coming out *cheaper* than the loops they replaced (36 against 52 — the
+composed form has one band live where the loop kept a band and a fragment). The
+variable is how many tiles are live at once, not whether a method takes `self`
+by value. If that holds, #31's job is narrower than it looks: in-place forms
+pay only where the input is live across the op, and a by-value map whose input
+dies at the call already costs nothing.
+
 **#6 — reductions. Landed.** `row_reduce`/`col_reduce`/`tile_reduce` over a
 `ReduceOp` (a `BinaryOp` with an identity), with `row_max`/`row_min`/`row_sum`/`row_prod`, the `col_*` mirrors,
 and `tile_max`/`tile_min`/`tile_sum`/`tile_prod` derived from them. Both halves
