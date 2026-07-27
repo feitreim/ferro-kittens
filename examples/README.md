@@ -213,11 +213,6 @@ of flash using pairs, and the GEMM is the counterexample.
 
 #### 9. Smaller things, each one line of API
 
-- **`TmemTile::columns_right` cannot change shape.** Flash carves one allocation
-  into a `[128, 64]` score segment and a `[128, 128]` output segment; the second
-  goes through `TmemTile::from_raw(tmem + 64)` on a bare `u32`, because
-  `columns_right` returns the same `TmemTile<R, C>`. A `split_columns` that
-  re-types would keep the raw address out of kernel code.
 - **`expect_tx` byte accounting is hand-summed.** Every producer writes
   `(ATile::BYTES + BTile::BYTES) as u32` and has to keep it in step with the
   loads it issued. A tile knows its own size; `Semaphore::expect_tiles` or a
@@ -245,6 +240,9 @@ library is already at that bar:
 
 - **The MMA layer.** `mma_abt`, `mma_ab` and `mma_walk_cg2` covered every
   multiply in four kernels, in the layouts they wanted, with no gaps.
+- **TMEM segment carving.** Flash splits one allocation into its `[128, 64]`
+  scores and `[128, 128]` output with `TmemTile::split_columns`, so no kernel
+  here adds a column offset to a bare TMEM address (#28).
 - **The pipeline primitives.** `SharedTileRing` + `SemaphoreRing` express the
   GEMM's K pipeline exactly, including the subtle part: `free` is released by
   the MMA's own commit, so the accumulator instruction rather than a thread is
