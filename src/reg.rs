@@ -123,23 +123,47 @@ pub trait RowLayout<const M: usize> {
     fn set_slot(slots: &mut Self::Slots, slot: usize, value: f32);
 }
 
-/// A fragment ownership map for a logical `[M, N]` fp32 tile: which `(row,
-/// column)` each of a lane's `SLOTS * VALUES` registers holds, plus the
-/// storage they live in.
+/// The column half of a fragment ownership map, mirroring [`RowLayout`]: the
+/// `N` logical columns a thread holds per row, and where one `f32` per owned
+/// column lives.
 ///
-/// The storage is an associated type rather than `[[f32; VALUES]; SLOTS]`
-/// because an array length must be a const expression of the generic
-/// parameters, which would need `generic_const_exprs`. Each implemented
-/// `(M, N)` shape names its own storage instead — one macro line per shape.
-pub trait FragmentLayout<const M: usize, const N: usize>: RowLayout<M> {
-    /// Per-thread storage, `VALUES` values for each of `SLOTS` rows.
-    type Storage: Copy;
+/// Unlike a [`RowLayout`] slot, a value is *not* warp-uniform in the same
+/// sense: under [`BaseLdtm`] a column depends only on `lane % 4`, so the 8
+/// lanes of a column group each hold their own copy of the same `N/4` columns.
+/// Once #6 can produce one, a
+/// column vector is that per-lane copy.
+pub trait ColLayout<const N: usize> {
+    /// Per-thread storage, one `f32` per owned column (`[f32; VALUES]`).
+    type Values: Copy;
 
     /// Values one thread owns per slot — the columns of `0..N` it holds.
     const VALUES: usize;
 
     /// The logical column in `0..N` that `lane` holds in `value`.
     fn col_of(lane: u32, value: usize) -> u32;
+
+    /// Every value set to `value`.
+    fn splat_values(value: f32) -> Self::Values;
+
+    /// The value in `value`.
+    fn get_value(values: &Self::Values, value: usize) -> f32;
+
+    /// Write `x` into `value`.
+    fn set_value(values: &mut Self::Values, value: usize, x: f32);
+}
+
+/// A fragment ownership map for a logical `[M, N]` fp32 tile: which `(row,
+/// column)` each of a lane's `SLOTS * VALUES` registers holds, plus the
+/// storage they live in. The two coordinate halves come from [`RowLayout`] and
+/// [`ColLayout`]; what a tile adds is the joint storage.
+///
+/// The storage is an associated type rather than `[[f32; VALUES]; SLOTS]`
+/// because an array length must be a const expression of the generic
+/// parameters, which would need `generic_const_exprs`. Each implemented
+/// `(M, N)` shape names its own storage instead — one macro line per shape.
+pub trait FragmentLayout<const M: usize, const N: usize>: RowLayout<M> + ColLayout<N> {
+    /// Per-thread storage, `VALUES` values for each of `SLOTS` rows.
+    type Storage: Copy;
 
     /// Every value of every slot set to `value`.
     fn splat(value: f32) -> Self::Storage;
@@ -228,21 +252,46 @@ macro_rules! base_ldtm_rows {
     )*};
 }
 
-/// One [`FragmentLayout`] impl per logical `(M, N)` shape; `VALUES` is `N / 4`
-/// because each 16-column block gives a thread four values. Adding a shape is
-/// one line — do it when a call site needs it.
-macro_rules! base_ldtm_shapes {
-    ($(($m:literal, $n:literal)),* $(,)?) => {$(
+/// One [`ColLayout`] impl per logical column count; `VALUES` is `N / 4`
+/// because each 16-column block gives a thread four values.
+macro_rules! base_ldtm_cols {
+    ($($n:literal),* $(,)?) => {$(
         const _: () = assert!($n % 16 == 0, "BaseLdtm columns come in 16-column blocks");
 
-        impl FragmentLayout<$m, $n> for BaseLdtm {
-            type Storage = [[f32; $n / 4]; $m / 8];
+        impl ColLayout<$n> for BaseLdtm {
+            type Values = [f32; $n / 4];
             const VALUES: usize = $n / 4;
 
             #[inline(always)]
             fn col_of(lane: u32, value: usize) -> u32 {
                 Self::column(lane, value)
             }
+
+            #[inline(always)]
+            fn splat_values(value: f32) -> Self::Values {
+                [value; $n / 4]
+            }
+
+            #[inline(always)]
+            fn get_value(values: &Self::Values, value: usize) -> f32 {
+                values[value]
+            }
+
+            #[inline(always)]
+            fn set_value(values: &mut Self::Values, value: usize, x: f32) {
+                values[value] = x;
+            }
+        }
+    )*};
+}
+
+/// One [`FragmentLayout`] impl per logical `(M, N)` shape, joining a
+/// [`RowLayout`] to a [`ColLayout`]. Adding a shape is one line — do it when a
+/// call site needs it.
+macro_rules! base_ldtm_shapes {
+    ($(($m:literal, $n:literal)),* $(,)?) => {$(
+        impl FragmentLayout<$m, $n> for BaseLdtm {
+            type Storage = [[f32; $n / 4]; $m / 8];
 
             #[inline(always)]
             fn splat(value: f32) -> Self::Storage {
@@ -263,6 +312,7 @@ macro_rules! base_ldtm_shapes {
 }
 
 base_ldtm_rows!(16, 32);
+base_ldtm_cols!(16, 32, 128);
 base_ldtm_shapes!((16, 16), (32, 32), (32, 128));
 
 /// Per-thread row statistics of an `[M, _]` fragment-mapped tile: one `f32`
