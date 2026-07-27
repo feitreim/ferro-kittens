@@ -330,33 +330,30 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
         (self.base as usize >> 7) & 7
     }
 
-    /// Address of 16-byte chunk `chunk` in subtile row `row`, with the
-    /// swizzle applied exactly as the TMA engine would have — the store-side
-    /// twin of a swizzled TMA load, valid for single-subtile tiles (P/dS)
-    /// where the eight chunks index the whole row. For store loops, hoist
-    /// the phase once with [`Self::chunk_writer`].
+    /// Address of 16-byte chunk `chunk` of row `row`, with the swizzle applied
+    /// exactly as the TMA engine would have — the store-side twin of a
+    /// swizzled TMA load. Chunks are counted across the tile's whole logical
+    /// row, so chunk `8 * i + c` is chunk `c` of stacked subtile `i`. For
+    /// store loops, hoist the phase once with [`Self::chunk_writer`].
     ///
     /// # Safety
     ///
-    /// `row < R`, `chunk < 8`, and the tile must be a single subtile wide.
+    /// `row < R` and `chunk < C * E::BYTES / 16`.
     #[inline(always)]
     pub unsafe fn swizzled_chunk(self, row: usize, chunk: usize) -> *mut u8 {
         unsafe { self.chunk_writer().at(row, chunk) }
     }
 
-    /// The tile's swizzled-store handle with the base's absolute phase
-    /// captured once — hoist it outside a fragment-store loop exactly like
-    /// the hand-written kernels hoisted their `p_phase` variables.
+    /// The tile's swizzled-access handle with the base's absolute phase and
+    /// the subtile stride captured once — hoist it outside a fragment loop
+    /// exactly like the hand-written kernels hoisted their `p_phase`
+    /// variables.
     #[inline(always)]
     pub fn chunk_writer(self) -> SwizzledChunks<E> {
-        const {
-            assert!(
-                C * E::BYTES == S::ATOM_BYTES,
-                "swizzled chunk stores need a one-subtile tile"
-            )
-        };
         SwizzledChunks {
             base: self.base,
+            rows: R,
+            chunks: C * E::BYTES / 16,
             phase: self.swizzle_phase(),
             _marker: PhantomData,
         }
@@ -467,10 +464,19 @@ impl OperandWalk {
     }
 }
 
-/// A single-subtile tile's swizzled-store cursor: 128-byte rows, eight
-/// 16-byte chunks per row, chunk index XORed with `(row + phase) & 7` where
-/// `phase` is the tile base's absolute position in the swizzle period
-/// (captured once at construction).
+/// A tile's swizzled cursor: the tile as one flat stack of 128-byte rows,
+/// eight 16-byte chunks each, chunk index XORed with the row's own position in
+/// the swizzle period — `(row + phase) & 7`, `phase` being the tile base's
+/// absolute position in it (captured once at construction).
+///
+/// Stacked subtiles need no term of their own because they *are* further rows
+/// of that stack: subtile `i` starts [`SharedTile::SUBTILE_BYTES`] =
+/// `rows * 128` bytes along, and SWIZZLE_128B keys off *physical* address bits
+/// `[9:7]`, so subtile `i`'s row `r` is the tile's 128-byte row `i * rows + r`
+/// and takes that row's phase. A logical chunk index therefore splits into
+/// `(subtile, chunk)` and the two row terms simply add; the phase is never
+/// re-derived per subtile, and no relation between `rows` and the 8-row
+/// swizzle period is assumed.
 ///
 /// The chunk arithmetic is element-independent — a 16-byte chunk is 16 bytes
 /// whatever it holds — but the cursor still carries its tile's `E` so a store
@@ -478,6 +484,8 @@ impl OperandWalk {
 /// caller naming it a second time.
 pub struct SwizzledChunks<E: Element> {
     base: *mut u8,
+    rows: usize,
+    chunks: usize,
     phase: usize,
     _marker: PhantomData<E>,
 }
@@ -490,13 +498,23 @@ impl<E: Element> Clone for SwizzledChunks<E> {
 impl<E: Element> Copy for SwizzledChunks<E> {}
 
 impl<E: Element> SwizzledChunks<E> {
-    /// Address of chunk `chunk` in row `row`.
+    /// 16-byte chunks in one logical row of the tile — eight per stacked
+    /// subtile, and the exclusive bound on [`Self::at`]'s chunk index.
+    #[inline(always)]
+    pub fn chunks(self) -> usize {
+        self.chunks
+    }
+
+    /// Address of chunk `chunk` of row `row`, counting chunks across the whole
+    /// logical row: chunk `8 * i + c` is chunk `c` of stacked subtile `i`.
     ///
     /// # Safety
     ///
-    /// `row` inside the tile, `chunk < 8`.
+    /// `row` inside the tile, `chunk < self.chunks()`.
     #[inline(always)]
     pub unsafe fn at(self, row: usize, chunk: usize) -> *mut u8 {
+        let (subtile, chunk) = (chunk / 8, chunk % 8);
+        let row = subtile * self.rows + row;
         unsafe {
             self.base
                 .add(row * 128 + (chunk ^ ((row + self.phase) & 7)) * 16)
@@ -648,6 +666,85 @@ mod tests {
                 }
             }
             assert!(seen.iter().all(|&slot| slot));
+        }
+    }
+
+    #[test]
+    fn a_wide_tiles_chunks_walk_the_stacked_subtiles() {
+        // Chunk 8*i + c is chunk c of subtile i: the same one-subtile formula
+        // applied at the subtile's own base, which is what a reader who knows
+        // `tma_load` expects. R = 64 here, a whole number of swizzle periods,
+        // so subtile 1 lands back at subtile 0's phase.
+        let base = 0x2000usize;
+        let tile = unsafe { Panel::from_raw(base as *mut u8) };
+        let chunks = tile.chunk_writer();
+        assert_eq!(chunks.chunks(), 16);
+        let phase = tile.swizzle_phase();
+        for subtile in 0..Panel::SUBTILES {
+            for row in [0usize, 1, 7, 63] {
+                for chunk in 0usize..8 {
+                    let expected = base
+                        + subtile * Panel::SUBTILE_BYTES
+                        + row * 128
+                        + (chunk ^ ((row + phase) & 7)) * 16;
+                    assert_eq!(
+                        unsafe { chunks.at(row, 8 * subtile + chunk) } as usize,
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_subtiles_phase_is_its_absolute_row_not_its_own_row() {
+        // The part of the derivation that only shows up when the subtile
+        // height is *not* a whole number of swizzle periods: SWIZZLE_128B XORs
+        // physical address bits [9:7], so subtile 1 of a 4-row tile begins 4
+        // 128-byte rows down and starts at phase 4, not at phase 0. Written
+        // down because at every shape the crate ships (R = 64, 128) the two
+        // readings coincide and a wrong one would never be noticed.
+        type Short = SharedTile<Bf16, 4, 128, Swizzle128B>;
+        let base = 0x2000usize;
+        let chunks = unsafe { Short::from_raw(base as *mut u8) }.chunk_writer();
+        for row in 0..4usize {
+            for chunk in 0usize..8 {
+                let expected =
+                    base + Short::SUBTILE_BYTES + row * 128 + (chunk ^ ((row + 4) & 7)) * 16;
+                assert_eq!(unsafe { chunks.at(row, 8 + chunk) } as usize, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn chunks_of_a_wide_tile_are_injective_over_the_whole_tile() {
+        // A wrong subtile stride collides or escapes here immediately. Note
+        // what this cannot see: any phase is a permutation of a row's eight
+        // chunks, so a wrong phase stays a bijection — that one is pinned by
+        // the two tests above and, against the TMA engine itself, by the
+        // device harness. Swept over every base phase and over a subtile
+        // height that is not a multiple of the swizzle period.
+        fn injective<const R: usize, const C: usize>(base: usize) {
+            type Tile<const R: usize, const C: usize> = SharedTile<Bf16, R, C, Swizzle128B>;
+            let chunks = unsafe { Tile::<R, C>::from_raw(base as *mut u8) }.chunk_writer();
+            let mut seen = vec![false; Tile::<R, C>::BYTES / 16];
+            for row in 0..R {
+                for chunk in 0..chunks.chunks() {
+                    let offset = unsafe { chunks.at(row, chunk) } as usize - base;
+                    assert!(
+                        offset < Tile::<R, C>::BYTES,
+                        "row {row} chunk {chunk} escaped"
+                    );
+                    assert!(!seen[offset / 16], "slot {} twice", offset / 16);
+                    seen[offset / 16] = true;
+                }
+            }
+            assert!(seen.iter().all(|&slot| slot));
+        }
+        for phase in 0..8usize {
+            injective::<128, 128>(0x10000 + phase * 128);
+            injective::<64, 256>(0x10000 + phase * 128);
+            injective::<4, 128>(0x10000 + phase * 128);
         }
     }
 

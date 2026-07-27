@@ -25,8 +25,8 @@
 //! `sum`, and the column-vector type above), **#13** (`SharedVec` and its TMA
 //! path), **#9** (the store side), and the two movers `softmax.rs` names:
 //! `ldst::load_tile` and `ldst::store_tile` — whole-tile forms of the
-//! per-`[16, 16]`-block movers, which is **#22**, over a cursor that refuses a
-//! 128-wide tile, which is **#25**.
+//! per-`[16, 16]`-block movers, which is **#22**. The cursor underneath them
+//! spans this 128-wide tile since **#25**, so what is left is composition.
 //!
 //! The second kernel here, [`kernels::groupnorm_tile`], normalizes over the
 //! *whole* tile rather than per row. It costs one more thing than the first:

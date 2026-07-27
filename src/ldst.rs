@@ -20,7 +20,11 @@ use crate::reg::Fragment;
 use crate::shared::{Element, SwizzledChunks};
 
 /// The `(row, chunk)` that `lane` supplies as slot `slot`'s `m8n8.x2` address,
-/// for a fragment at `(row, column)` of a single-subtile tile.
+/// for a fragment at `(row, column)` of a swizzled tile.
+///
+/// The chunk index is the column's, counted across the tile's whole logical
+/// row — which is the index [`SwizzledChunks::at`] takes, so a column past the
+/// first stacked subtile needs nothing extra here.
 ///
 /// `ldmatrix`/`stmatrix` take their 16 addresses from lanes 0..15 only — lanes
 /// 0..7 the first 8x8 matrix, 8..15 the second — a different lane set than the
@@ -40,8 +44,8 @@ pub const fn fragment_address(row: u32, column: u32, lane: u32, slot: usize) -> 
     (row as usize + (lane % 8) as usize + 8 * slot, chunk)
 }
 
-/// Pack one thread's [`Fragment`] to `E` and store it into a single-subtile
-/// swizzled tile — the store twin of
+/// Pack one thread's [`Fragment`] to `E` and store it into a swizzled tile —
+/// the store twin of
 /// [`crate::tmem::TmemTile::fragment_tile`], addressed by the same
 /// `(row, column)` the drain used.
 ///
@@ -60,9 +64,9 @@ pub const fn fragment_address(row: u32, column: u32, lane: u32, slot: usize) -> 
 /// # Safety
 ///
 /// All 32 lanes of the warp owning TMEM rows `row..row+16` must call this
-/// together, `chunks` must belong to a tile at least `row + 16` rows tall, and
-/// the caller owes a `fence.proxy.async.shared::cta` before any MMA reads the
-/// tile.
+/// together, `chunks` must belong to a tile at least `row + 16` rows tall into
+/// which `column + 16` fits, and the caller owes a
+/// `fence.proxy.async.shared::cta` before any MMA reads the tile.
 #[inline(always)]
 pub unsafe fn store_fragment<E: Element<Unpacked = [f32; 2]>>(
     chunks: SwizzledChunks<E>,
@@ -85,8 +89,8 @@ pub unsafe fn store_fragment<E: Element<Unpacked = [f32; 2]>>(
     }
 }
 
-/// Read a `[16, 16]` block at `(row, column)` of a single-subtile swizzled tile
-/// into one thread's [`Fragment`] — the inverse of [`store_fragment`], and the
+/// Read a `[16, 16]` block at `(row, column)` of a swizzled tile into one
+/// thread's [`Fragment`] — the inverse of [`store_fragment`], and the
 /// way a kernel whose input is not an MMA operand gets its data into registers
 /// at all.
 ///

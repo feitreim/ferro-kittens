@@ -45,16 +45,22 @@ use kittens::shared::{Bf16, SharedTile, Swizzle128B};
 use kittens::sync::Semaphore;
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block, store_wait};
 
-/// Edge of the square single-subtile tiles the swizzle and `stmatrix` cases
-/// use: 64 bf16 columns is exactly one 128-byte swizzle atom per row, the only
-/// width [`SharedTile::chunk_writer`] accepts.
+/// Edge of the square tiles the swizzle and `stmatrix` cases use: 64 bf16
+/// columns is exactly one 128-byte swizzle atom per row, so these tiles are a
+/// single subtile and their cursor never leaves it. Every case below runs at
+/// this width *and* at [`WIDE`], because the narrow path is the one the
+/// hardware has always agreed with and the subtile term must leave it alone.
 const TILE: usize = 64;
-/// 16-byte chunks in one 128-byte swizzled row.
-const CHUNKS: usize = 8;
-/// 32-bit words in one row of a `[TILE, TILE]` bf16 tile.
-const ROW_WORDS: usize = TILE / 2;
-/// `[16, 16]` fragment blocks along one edge of a `[TILE, TILE]` tile.
-const BLOCKS: usize = TILE / 16;
+/// Columns of the wide tiles: two stacked 64-column subtiles, so the cursor
+/// has to cross a [`SharedTile::SUBTILE_BYTES`] stride mid-row (#25).
+const WIDE: usize = 128;
+/// Rows of the short wide tile. Deliberately *not* a multiple of the 8-row
+/// swizzle period: its second subtile therefore begins mid-period, and the
+/// tile comes back in order only if a subtile's swizzle phase follows its
+/// absolute 128-byte row in shared memory rather than restarting per subtile.
+/// At every shape the library ships (R = 64, 128) the two readings coincide,
+/// so this is the only case that can tell them apart.
+const SHORT: usize = 4;
 
 /// Rows of the probe accumulator — one full `M128` MMA shape, and the four
 /// warps' 32 TMEM rows each.
@@ -65,32 +71,40 @@ const COLUMNS: usize = 128;
 /// K of the probe MMA: one swizzle atom of bf16, four chained K=16 chunks.
 const DEPTH: usize = 64;
 
-/// The MMA operands and the square tiles, as the library types.
-type Square = SharedTile<Bf16, TILE, TILE, Swizzle128B>;
-type AOperand = SharedTile<Bf16, ROWS, DEPTH, Swizzle128B>;
-type BOperand = SharedTile<Bf16, TILE, DEPTH, Swizzle128B>;
+/// The MMA operands and the tiles the swizzle cases move, as the library
+/// types. The shape-generic alias is what lets one probe body serve the narrow
+/// and wide cases, so a case cannot drift between widths.
+type Tile<const R: usize, const C: usize> = SharedTile<Bf16, R, C, Swizzle128B>;
+type AOperand = Tile<ROWS, DEPTH>;
+type BOperand = Tile<TILE, DEPTH>;
 type Accumulator = TmemTile<ROWS, COLUMNS>;
+
+/// Bytes a swizzle case's plan needs: its tile plus a scratch tail for the TMA
+/// barrier.
+const fn tile_shared<const R: usize, const C: usize>() -> u32 {
+    (Tile::<R, C>::BYTES + 32) as u32
+}
 
 /// Dynamic shared plan of the fragment probe: the A operand, the two B
 /// operands, then a 32-byte scratch tail holding the two mbarriers and the
 /// TMEM staging word.
 const PROBE_SHARED: usize = AOperand::BYTES + 2 * BOperand::BYTES + 32;
-/// Dynamic shared plan of the square-tile cases: the tile plus a scratch tail
-/// for the swizzle case's TMA barrier.
-const SQUARE_SHARED: usize = Square::BYTES + 32;
 /// The STTM round trip touches no shared tile at all — its whole plan is the
 /// TMEM staging word.
 const STTM_SHARED: usize = 32;
 
-/// A bf16 bit pattern naming a position in a `[TILE, TILE]` tile.
+/// A bf16 bit pattern naming a position in a tile of at most 64 rows by 128
+/// columns.
 ///
-/// Bit 14 is set so the pattern is a *normal* bf16 (exponent field 0x80..0xa0)
-/// — a position encoding down in the subnormal range would be at the mercy of
-/// flush-to-zero somewhere in the conversion. Nothing here is ever read as a
-/// number: the tests compare bit patterns, so the round trip is exact by
-/// construction and a mismatch is always a misplaced element.
+/// Bit 14 is set so the pattern is a *normal* bf16 — a position encoding down
+/// in the subnormal range would be at the mercy of flush-to-zero somewhere in
+/// the conversion. Columns take the low seven bits and rows the next six, so
+/// the exponent field lands in 0x80..0xbf: never subnormal, never Inf or NaN.
+/// Nothing here is ever read as a number: the tests compare bit patterns, so
+/// the round trip is exact by construction and a mismatch is always a
+/// misplaced element.
 const fn cell_bits(row: usize, column: usize) -> u16 {
-    0x4000 | ((row as u16) << 6) | column as u16
+    0x4000 | ((row as u16) << 7) | column as u16
 }
 
 /// [`cell_bits`] as the fp32 a register-side path carries. The low 16 bits are
@@ -100,13 +114,13 @@ const fn cell(row: usize, column: usize) -> f32 {
     f32::from_bits((cell_bits(row, column) as u32) << 16)
 }
 
-/// Decode a [`cell`] back to the `[TILE, TILE]` position it names, or `None`
-/// if the value is not one — how a failing register-side case reports the
-/// coordinate the hardware actually delivered.
+/// Decode a [`cell`] back to the position it names, or `None` if the value is
+/// not one — how a failing register-side case reports the coordinate the
+/// hardware actually delivered.
 fn decode_cell(value: f32) -> Option<(usize, usize)> {
     let bits = (value.to_bits() >> 16) as usize;
-    let (row, column) = ((bits >> 6) & 0x3f, bits & 0x3f);
-    (bits == 0x4000 | (row << 6) | column).then_some((row, column))
+    let (row, column) = ((bits >> 7) & 0x3f, bits & 0x7f);
+    (bits == 0x4000 | (row << 7) | column).then_some((row, column))
 }
 
 /// The probe accumulator's value at `(row, column)` — `COLUMNS * row + column`,
@@ -143,20 +157,23 @@ const fn dump_index(
 pub mod kernels {
     use super::*;
 
-    /// TMA one `[TILE, TILE]` bf16 tile into shared memory, then read it back
+    /// TMA one `[R, C]` bf16 tile into shared memory, then read it back
     /// through [`SharedTile::chunk_writer`] and write it out in *logical*
     /// order — so the host's expectation is simply the buffer it staged.
     ///
     /// This is the swizzle path with nothing else in it: it checks
-    /// `swizzle_phase`, the chunk XOR, and the tensor map's box geometry
-    /// against the TMA engine, and needs no MMA. Launch with `TILE` threads,
-    /// one row each.
-    #[kernel]
-    pub unsafe fn swizzle_roundtrip(source: *const TmaDescriptor, mut out: DisjointSlice<u32>) {
+    /// `swizzle_phase`, the chunk XOR, the stacked-subtile stride and the
+    /// tensor map's box geometry against the TMA engine, and needs no MMA.
+    /// Launch with `R` threads, one row each.
+    #[inline(always)]
+    unsafe fn swizzle_probe<const R: usize, const C: usize>(
+        source: *const TmaDescriptor,
+        out: &mut DisjointSlice<u32>,
+    ) {
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tile = Square::from_raw(smem);
-            let tma = Semaphore::attach(smem.add(Square::BYTES) as *mut Barrier);
+            let tile = Tile::<R, C>::from_raw(smem);
+            let tma = Semaphore::attach(smem.add(Tile::<R, C>::BYTES) as *mut Barrier);
             let tid = thread::threadIdx_x();
 
             if tid == 0 {
@@ -166,12 +183,12 @@ pub mod kernels {
             thread::sync_threads();
             if tid == 0 {
                 tile.tma_load(source, 0, 0, tma);
-                tma.expect_tx(Square::BYTES as u32);
+                tma.expect_tx(Tile::<R, C>::BYTES as u32);
             }
             tma.wait(0);
             thread::sync_threads();
 
-            dump_rows(tile, tid as usize, TILE, &mut out);
+            dump_rows(tile, tid as usize, R, out);
 
             thread::sync_threads();
             if tid == 0 {
@@ -180,9 +197,34 @@ pub mod kernels {
         }
     }
 
-    /// Fill a `[TILE, TILE]` shared tile from registers through
-    /// [`store_fragment`], then read it back the same way
-    /// [`swizzle_roundtrip`] does.
+    /// [`swizzle_probe`] over one subtile — the width the cursor has always
+    /// handled.
+    #[kernel]
+    pub unsafe fn swizzle_roundtrip(source: *const TmaDescriptor, mut out: DisjointSlice<u32>) {
+        unsafe { swizzle_probe::<TILE, TILE>(source, &mut out) }
+    }
+
+    /// [`swizzle_probe`] over two stacked subtiles.
+    #[kernel]
+    pub unsafe fn swizzle_roundtrip_wide(
+        source: *const TmaDescriptor,
+        mut out: DisjointSlice<u32>,
+    ) {
+        unsafe { swizzle_probe::<TILE, WIDE>(source, &mut out) }
+    }
+
+    /// [`swizzle_probe`] over two stacked subtiles only [`SHORT`] rows tall, so
+    /// the second one starts mid-swizzle-period. Launch with `SHORT` threads.
+    #[kernel]
+    pub unsafe fn swizzle_roundtrip_short(
+        source: *const TmaDescriptor,
+        mut out: DisjointSlice<u32>,
+    ) {
+        unsafe { swizzle_probe::<SHORT, WIDE>(source, &mut out) }
+    }
+
+    /// Fill an `[R, C]` shared tile from registers through [`store_fragment`],
+    /// then read it back the same way [`swizzle_probe`] does.
     ///
     /// The fragment of each 16x16 block is built *from the ownership map* —
     /// value `(slot, value)` gets `cell(BaseLdtm::row(..), BaseLdtm::column(..))`
@@ -190,18 +232,18 @@ pub mod kernels {
     /// agree, and the tile comes out in plain logical order. Launch with one
     /// warp: `store_fragment` is warp-scope and takes its addresses from lanes
     /// 0..16.
-    #[kernel]
-    pub unsafe fn stmatrix_roundtrip(mut out: DisjointSlice<u32>) {
+    #[inline(always)]
+    unsafe fn stmatrix_probe<const R: usize, const C: usize>(out: &mut DisjointSlice<u32>) {
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tile = Square::from_raw(smem);
+            let tile = Tile::<R, C>::from_raw(smem);
             let chunks = tile.chunk_writer();
             let lane = warp::lane_id();
 
             let mut row_block = 0usize;
-            while row_block < TILE / 16 {
+            while row_block < R / 16 {
                 let mut column_block = 0usize;
-                while column_block < TILE / 16 {
+                while column_block < C / 16 {
                     let mut fragment = Fragment::zero();
                     let mut slot = 0usize;
                     while slot < Fragment::SLOTS {
@@ -227,13 +269,26 @@ pub mod kernels {
             }
             thread::sync_threads();
 
-            dump_rows(tile, lane as usize, 32, &mut out);
+            dump_rows(tile, lane as usize, 32, out);
         }
     }
 
-    /// TMA the same `[TILE, TILE]` tile [`swizzle_roundtrip`] stages, then read
-    /// every `[16, 16]` block of it into registers through [`load_fragment`]
-    /// and dump by thread coordinate.
+    /// [`stmatrix_probe`] over one subtile.
+    #[kernel]
+    pub unsafe fn stmatrix_roundtrip(mut out: DisjointSlice<u32>) {
+        unsafe { stmatrix_probe::<TILE, TILE>(&mut out) }
+    }
+
+    /// [`stmatrix_probe`] over two stacked subtiles: the blocks at columns
+    /// 64.. are the ones whose addresses cross the subtile stride.
+    #[kernel]
+    pub unsafe fn stmatrix_roundtrip_wide(mut out: DisjointSlice<u32>) {
+        unsafe { stmatrix_probe::<TILE, WIDE>(&mut out) }
+    }
+
+    /// TMA the same tile [`swizzle_probe`] stages, then read every `[16, 16]`
+    /// block of it into registers through [`load_fragment`] and dump by thread
+    /// coordinate.
     ///
     /// **What this proves.** The tile's contents are placed by the TMA engine,
     /// which the `swizzle round trip` case checks independently, and the values
@@ -247,12 +302,15 @@ pub mod kernels {
     ///
     /// Launch with one warp: `load_fragment` is warp-scope and takes its
     /// addresses from lanes 0..16.
-    #[kernel]
-    pub unsafe fn ldmatrix_map(source: *const TmaDescriptor, mut out: DisjointSlice<f32>) {
+    #[inline(always)]
+    unsafe fn ldmatrix_probe<const R: usize, const C: usize>(
+        source: *const TmaDescriptor,
+        out: &mut DisjointSlice<f32>,
+    ) {
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tile = Square::from_raw(smem);
-            let tma = Semaphore::attach(smem.add(Square::BYTES) as *mut Barrier);
+            let tile = Tile::<R, C>::from_raw(smem);
+            let tma = Semaphore::attach(smem.add(Tile::<R, C>::BYTES) as *mut Barrier);
             let lane = warp::lane_id();
 
             if lane == 0 {
@@ -262,16 +320,16 @@ pub mod kernels {
             thread::sync_threads();
             if lane == 0 {
                 tile.tma_load(source, 0, 0, tma);
-                tma.expect_tx(Square::BYTES as u32);
+                tma.expect_tx(Tile::<R, C>::BYTES as u32);
             }
             tma.wait(0);
             thread::sync_threads();
 
             let chunks = tile.chunk_writer();
             let mut row_block = 0usize;
-            while row_block < BLOCKS {
+            while row_block < R / 16 {
                 let mut column_block = 0usize;
-                while column_block < BLOCKS {
+                while column_block < C / 16 {
                     let fragment = load_fragment::<Bf16>(
                         chunks,
                         (16 * row_block) as u32,
@@ -282,9 +340,9 @@ pub mod kernels {
                     // the block index takes the warp's place in `dump_index`.
                     dump_band(
                         fragment,
-                        (row_block * BLOCKS + column_block) as u32,
+                        (row_block * (C / 16) + column_block) as u32,
                         lane,
-                        &mut out,
+                        out,
                     );
                     column_block += 1;
                 }
@@ -298,21 +356,39 @@ pub mod kernels {
         }
     }
 
+    /// [`ldmatrix_probe`] over one subtile.
+    #[kernel]
+    pub unsafe fn ldmatrix_map(source: *const TmaDescriptor, mut out: DisjointSlice<f32>) {
+        unsafe { ldmatrix_probe::<TILE, TILE>(source, &mut out) }
+    }
+
+    /// [`ldmatrix_probe`] over two stacked subtiles.
+    #[kernel]
+    pub unsafe fn ldmatrix_map_wide(source: *const TmaDescriptor, mut out: DisjointSlice<f32>) {
+        unsafe { ldmatrix_probe::<TILE, WIDE>(source, &mut out) }
+    }
+
     /// Read `tile`'s rows `first`, `first + stride`, … back through the
-    /// swizzle and write them to `out` in logical order.
+    /// swizzle and write them to `out` in logical order. The chunk count is
+    /// the cursor's own, so the loop covers every stacked subtile without
+    /// restating the tile's shape.
     #[inline(always)]
-    unsafe fn dump_rows(tile: Square, first: usize, stride: usize, out: &mut DisjointSlice<u32>) {
+    unsafe fn dump_rows<const R: usize, const C: usize>(
+        tile: Tile<R, C>,
+        first: usize,
+        stride: usize,
+        out: &mut DisjointSlice<u32>,
+    ) {
         unsafe {
             let chunks = tile.chunk_writer();
             let mut row = first;
-            while row < TILE {
+            while row < R {
                 let mut chunk = 0usize;
-                while chunk < CHUNKS {
+                while chunk < chunks.chunks() {
                     let words = chunks.at(row, chunk) as *const u32;
                     let mut word = 0usize;
                     while word < 4 {
-                        *out.get_unchecked_mut(row * ROW_WORDS + chunk * 4 + word) =
-                            *words.add(word);
+                        *out.get_unchecked_mut(row * (C / 2) + chunk * 4 + word) = *words.add(word);
                         word += 1;
                     }
                     chunk += 1;
@@ -907,12 +983,12 @@ fn pack(low: u16, high: u16) -> u32 {
     low as u32 | ((high as u32) << 16)
 }
 
-/// A `[TILE, TILE]` bf16 tile of position identities, packed as the staging
-/// buffer a [`kittens::global::PanelMap`] describes.
-fn identity_tile() -> Vec<u32> {
-    let mut staged = Vec::with_capacity(TILE * ROW_WORDS);
-    for row in 0..TILE {
-        for pair in 0..ROW_WORDS {
+/// An `[rows, columns]` bf16 tile of position identities, packed as the
+/// staging buffer a [`kittens::global::PanelMap`] describes.
+fn identity_tile(rows: usize, columns: usize) -> Vec<u32> {
+    let mut staged = Vec::with_capacity(rows * columns / 2);
+    for row in 0..rows {
+        for pair in 0..columns / 2 {
             staged.push(pack(cell_bits(row, 2 * pair), cell_bits(row, 2 * pair + 1)));
         }
     }
@@ -954,35 +1030,45 @@ fn decode(value: f32) -> Option<(usize, usize)> {
     Some((integer as usize / COLUMNS, integer as usize % COLUMNS))
 }
 
-fn check_swizzle(
+/// Does the cursor read back what the TMA engine wrote?
+///
+/// The staged tile is position identities in logical order and the kernel
+/// dumps it in logical order, so the expectation is the staging buffer itself.
+/// The engine placed the bytes and `SwizzledChunks` found them again: at
+/// `C > 64` that is the statement that the subtile stride and the swizzle
+/// phase are the hardware's, which nothing on the host can establish.
+fn check_swizzle<const R: usize, const C: usize>(
     stream: &CudaStream,
-    module: &kernels::LoadedModule,
+    launch: impl Fn(
+        LaunchConfig,
+        *const TmaDescriptor,
+        &mut DeviceBuffer<u32>,
+    ) -> Result<(), cuda_core::DriverError>,
 ) -> Result<String, Box<dyn Error>> {
-    let staged = identity_tile();
+    let staged = identity_tile(R, C);
     let source = DeviceBuffer::from_host(stream, &staged)?;
-    let map = unsafe { encode_bf16_panels::<TILE, TILE>(stream, source.cu_deviceptr(), TILE, 1)? };
+    let map = unsafe { encode_bf16_panels::<R, C>(stream, source.cu_deviceptr(), R, 1)? };
     let mut out = DeviceBuffer::<u32>::zeroed(stream, staged.len())?;
-    unsafe {
-        module.swizzle_roundtrip(
-            stream,
-            launch_config(TILE as u32, SQUARE_SHARED as u32),
-            map.as_ptr(),
-            &mut out,
-        )?
-    };
-    compare_tile(&out.to_host_vec(stream)?, &staged)
+    launch(
+        launch_config(R as u32, tile_shared::<R, C>()),
+        map.as_ptr(),
+        &mut out,
+    )?;
+    compare_tile(&out.to_host_vec(stream)?, &staged, C / 2)
 }
 
-fn check_stmatrix(
+/// Does `stmatrix` put a fragment where the cursor says, at every block of the
+/// tile? The read-back path is the one `swizzle round trip` pinned to the TMA
+/// engine, so a block landing in the wrong subtile shows up as a whole `[16,
+/// 16]` square of misplaced words.
+fn check_stmatrix<const R: usize, const C: usize>(
     stream: &CudaStream,
-    module: &kernels::LoadedModule,
+    launch: impl Fn(LaunchConfig, &mut DeviceBuffer<u32>) -> Result<(), cuda_core::DriverError>,
 ) -> Result<String, Box<dyn Error>> {
-    let expected = identity_tile();
+    let expected = identity_tile(R, C);
     let mut out = DeviceBuffer::<u32>::zeroed(stream, expected.len())?;
-    unsafe {
-        module.stmatrix_roundtrip(stream, launch_config(32, SQUARE_SHARED as u32), &mut out)?
-    };
-    compare_tile(&out.to_host_vec(stream)?, &expected)
+    launch(launch_config(32, tile_shared::<R, C>()), &mut out)?;
+    compare_tile(&out.to_host_vec(stream)?, &expected, C / 2)
 }
 
 /// Does `ldmatrix` hand each register the element [`BaseLdtm`] says it owns?
@@ -994,30 +1080,33 @@ fn check_stmatrix(
 /// about the load and store being mutually inverse. `stmatrix round trip` is
 /// the other direction's case and shares nothing with this one but the
 /// `fragment_address` derivation.
-fn check_ldmatrix(
+fn check_ldmatrix<const R: usize, const C: usize>(
     stream: &CudaStream,
-    module: &kernels::LoadedModule,
+    launch: impl Fn(
+        LaunchConfig,
+        *const TmaDescriptor,
+        &mut DeviceBuffer<f32>,
+    ) -> Result<(), cuda_core::DriverError>,
 ) -> Result<String, Box<dyn Error>> {
-    let staged = identity_tile();
+    let staged = identity_tile(R, C);
     let source = DeviceBuffer::from_host(stream, &staged)?;
-    let map = unsafe { encode_bf16_panels::<TILE, TILE>(stream, source.cu_deviceptr(), TILE, 1)? };
+    let map = unsafe { encode_bf16_panels::<R, C>(stream, source.cu_deviceptr(), R, 1)? };
+    let (row_blocks, column_blocks) = (R / 16, C / 16);
     let (slots, values) = (Fragment::SLOTS, Fragment::VALUES);
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, BLOCKS * BLOCKS * 32 * slots * values)?;
-    unsafe {
-        module.ldmatrix_map(
-            stream,
-            launch_config(32, SQUARE_SHARED as u32),
-            map.as_ptr(),
-            &mut out,
-        )?
-    };
+    let mut out =
+        DeviceBuffer::<f32>::zeroed(stream, row_blocks * column_blocks * 32 * slots * values)?;
+    launch(
+        launch_config(32, tile_shared::<R, C>()),
+        map.as_ptr(),
+        &mut out,
+    )?;
     let observed = out.to_host_vec(stream)?;
 
     let mut report = String::new();
     let mut mismatches = 0usize;
-    for row_block in 0..BLOCKS {
-        for column_block in 0..BLOCKS {
-            let block = row_block * BLOCKS + column_block;
+    for row_block in 0..row_blocks {
+        for column_block in 0..column_blocks {
+            let block = row_block * column_blocks + column_block;
             for lane in 0..32u32 {
                 for slot in 0..slots {
                     for value in 0..values {
@@ -1136,7 +1225,11 @@ fn check_sttm_roundtrip(
 
 /// Compare a logical-order tile dump against the identities that were staged
 /// into it, reporting the first few misplaced elements by coordinate.
-fn compare_tile(observed: &[u32], expected: &[u32]) -> Result<String, Box<dyn Error>> {
+fn compare_tile(
+    observed: &[u32],
+    expected: &[u32],
+    row_words: usize,
+) -> Result<String, Box<dyn Error>> {
     let mut report = String::new();
     let mut mismatches = 0usize;
     for (index, (&got, &want)) in observed.iter().zip(expected).enumerate() {
@@ -1145,7 +1238,7 @@ fn compare_tile(observed: &[u32], expected: &[u32]) -> Result<String, Box<dyn Er
         }
         mismatches += 1;
         if mismatches <= 8 {
-            let (row, pair) = (index / ROW_WORDS, index % ROW_WORDS);
+            let (row, pair) = (index / row_words, index % row_words);
             let _ = write!(
                 report,
                 "\n    (row {row}, columns {}..{}): staged {want:#010x}, read back {got:#010x}",
@@ -1285,7 +1378,11 @@ fn run() -> Result<usize, Box<dyn Error>> {
     );
     let mut cases: Vec<Case<'_>> = vec![(
         "swizzle round trip",
-        Box::new(|| check_swizzle(stream, module)),
+        Box::new(|| {
+            check_swizzle::<TILE, TILE>(stream, |config, map, out| unsafe {
+                module.swizzle_roundtrip(stream, config, map, out)
+            })
+        }),
     )];
     for shape in Shape::ALL {
         cases.push((
@@ -1295,9 +1392,56 @@ fn run() -> Result<usize, Box<dyn Error>> {
     }
     cases.push((
         "stmatrix round trip",
-        Box::new(|| check_stmatrix(stream, module)),
+        Box::new(|| {
+            check_stmatrix::<TILE, TILE>(stream, |config, out| unsafe {
+                module.stmatrix_roundtrip(stream, config, out)
+            })
+        }),
     ));
-    cases.push(("ldmatrix map", Box::new(|| check_ldmatrix(stream, module))));
+    cases.push((
+        "ldmatrix map",
+        Box::new(|| {
+            check_ldmatrix::<TILE, TILE>(stream, |config, map, out| unsafe {
+                module.ldmatrix_map(stream, config, map, out)
+            })
+        }),
+    ));
+    // The same three cases over a tile of two stacked subtiles (#25), plus the
+    // short tile that separates a per-subtile swizzle phase from an absolute
+    // one. Everything above runs on the narrow path these were derived from,
+    // so a regression there is distinguishable from a wrong subtile term.
+    cases.push((
+        "swizzle round trip wide",
+        Box::new(|| {
+            check_swizzle::<TILE, WIDE>(stream, |config, map, out| unsafe {
+                module.swizzle_roundtrip_wide(stream, config, map, out)
+            })
+        }),
+    ));
+    cases.push((
+        "swizzle phase carry",
+        Box::new(|| {
+            check_swizzle::<SHORT, WIDE>(stream, |config, map, out| unsafe {
+                module.swizzle_roundtrip_short(stream, config, map, out)
+            })
+        }),
+    ));
+    cases.push((
+        "stmatrix round trip wide",
+        Box::new(|| {
+            check_stmatrix::<TILE, WIDE>(stream, |config, out| unsafe {
+                module.stmatrix_roundtrip_wide(stream, config, out)
+            })
+        }),
+    ));
+    cases.push((
+        "ldmatrix map wide",
+        Box::new(|| {
+            check_ldmatrix::<TILE, WIDE>(stream, |config, map, out| unsafe {
+                module.ldmatrix_map_wide(stream, config, map, out)
+            })
+        }),
+    ));
     cases.push((
         "sttm round trip",
         Box::new(|| check_sttm_roundtrip(stream, module)),
@@ -1306,9 +1450,9 @@ fn run() -> Result<usize, Box<dyn Error>> {
     let mut failures = 0usize;
     for (name, case) in &cases {
         match case() {
-            Ok(note) => println!("pass  {name:<24}  {note}"),
+            Ok(note) => println!("pass  {name:<26}  {note}"),
             Err(error) => {
-                println!("FAIL  {name:<24}  {error}");
+                println!("FAIL  {name:<26}  {error}");
                 failures += 1;
             }
         }
