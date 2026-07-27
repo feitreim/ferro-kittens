@@ -1054,6 +1054,39 @@ mod tests {
     type Scores = RegTile<32, 32, BaseLdtm>;
     /// Its row statistics.
     type Rows = RegVec<32, BaseLdtm>;
+    /// Its column statistics.
+    type Cols = ColVec<32, BaseLdtm>;
+
+    /// A tile whose value at `(row, column)` names that coordinate exactly, so
+    /// a map that reads the wrong operand shows up as a wrong coordinate.
+    fn coordinate_tile(lane: u32) -> Scores {
+        let mut tile = Scores::zero();
+        for slot in 0..Scores::SLOTS {
+            for value in 0..Scores::VALUES {
+                let (row, column) = Scores::coordinate(lane, slot, value);
+                tile.set(slot, value, (256 * row + column) as f32);
+            }
+        }
+        tile
+    }
+
+    /// The row vector holding each row's own index.
+    fn row_indices(lane: u32) -> Rows {
+        let mut rows = Rows::splat(0.0);
+        for slot in 0..Rows::SLOTS {
+            rows.set(slot, Rows::row(lane, slot) as f32);
+        }
+        rows
+    }
+
+    /// The column vector holding each column's own index.
+    fn column_indices(lane: u32) -> Cols {
+        let mut cols = Cols::splat(0.0);
+        for value in 0..Cols::VALUES {
+            cols.set(value, Cols::column(lane, value) as f32);
+        }
+        cols
+    }
 
     #[test]
     fn exp2_polynomial_stays_inside_its_error_bound() {
@@ -1212,6 +1245,200 @@ mod tests {
         composes::<16, 16, BaseLdtm>();
         composes::<32, 32, BaseLdtm>();
         composes::<32, 128, BaseLdtm>();
+    }
+
+    #[test]
+    fn unary_ops_are_their_scalar_definitions() {
+        // Exp2Hw is absent on purpose: `ex2_approx_f32` has no host body, so
+        // only a device kernel can exercise it.
+        for x in [0.25f32, 1.0, 2.0, 3.75, 40.0] {
+            assert_eq!(Sqrt::apply(x), x.sqrt());
+            assert_eq!(Rsqrt::apply(x), 1.0 / x.sqrt());
+            assert_eq!(Recip::apply(x), 1.0 / x);
+            assert_eq!(Log2::apply(x), log2_approx(x));
+            assert_eq!(Exp2Approx::apply(x), exp2_approx(x));
+            let ln = Log::apply(x) as f64;
+            assert!((ln - (x as f64).ln()).abs() < 1.0e-6 * (1.0 + ln.abs()));
+            let exp = Exp::apply(x) as f64;
+            assert!((exp / (x as f64).exp() - 1.0).abs() < 2.0e-4);
+        }
+        for x in [-3.0f32, -0.0, 0.0, 2.5, f32::INFINITY] {
+            assert_eq!(Abs::apply(x), x.abs());
+            assert_eq!(Neg::apply(x), -x);
+            assert_eq!(Relu::apply(x), if x > 0.0 { x } else { 0.0 });
+        }
+    }
+
+    #[test]
+    fn binary_ops_are_their_scalar_definitions() {
+        // Tautological per op, but it is what pins the generated name table:
+        // a transposed line in `scalar_ops!` makes `div` mean `mul`.
+        for (a, b) in [(1.0f32, 2.0f32), (-3.5, 0.25), (7.0, -7.0)] {
+            assert_eq!(Add::apply(a, b), a + b);
+            assert_eq!(Sub::apply(a, b), a - b);
+            assert_eq!(Mul::apply(a, b), a * b);
+            assert_eq!(Div::apply(a, b), a / b);
+            assert_eq!(Max::apply(a, b), a.max(b));
+            assert_eq!(Min::apply(a, b), a.min(b));
+            assert_eq!(Fma::apply(a, b, 0.5), a * b + 0.5);
+        }
+    }
+
+    #[test]
+    fn maps_reach_every_owned_value() {
+        let tile = coordinate_tile(0);
+        let negated = tile.neg();
+        let doubled = tile.bin_map::<Add>(tile);
+        let fused = tile.fma(Scores::splat(3.0), Scores::splat(1.0));
+        for slot in 0..Scores::SLOTS {
+            for value in 0..Scores::VALUES {
+                let x = tile.get(slot, value);
+                assert_eq!(negated.get(slot, value), -x);
+                assert_eq!(doubled.get(slot, value), x + x);
+                assert_eq!(fused.get(slot, value), x * 3.0 + 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn named_wrappers_resolve_to_their_ops() {
+        let vec = Rows::from_slots([0.25f32, 2.0, 4.0, 9.0]);
+        let other = Rows::from_slots([1.0f32, -2.0, 0.5, 3.0]);
+        for slot in 0..Rows::SLOTS {
+            assert_eq!(vec.sqrt().get(slot), Sqrt::apply(vec.get(slot)));
+            assert_eq!(vec.rsqrt().get(slot), Rsqrt::apply(vec.get(slot)));
+            assert_eq!(vec.recip().get(slot), Recip::apply(vec.get(slot)));
+            assert_eq!(vec.relu().get(slot), Relu::apply(vec.get(slot)));
+            assert_eq!(vec.abs().get(slot), Abs::apply(vec.get(slot)));
+            assert_eq!(vec.neg().get(slot), Neg::apply(vec.get(slot)));
+            assert_eq!(vec.log2().get(slot), Log2::apply(vec.get(slot)));
+            assert_eq!(vec.log().get(slot), Log::apply(vec.get(slot)));
+            assert_eq!(vec.exp().get(slot), Exp::apply(vec.get(slot)));
+            assert_eq!(vec.add(other).get(slot), vec.get(slot) + other.get(slot));
+            assert_eq!(vec.mul(other).get(slot), vec.get(slot) * other.get(slot));
+            assert_eq!(vec.div(other).get(slot), vec.get(slot) / other.get(slot));
+            assert_eq!(
+                vec.min(other).get(slot),
+                fmin(vec.get(slot), other.get(slot))
+            );
+            // The hand-written pair, unchanged by the mechanism.
+            assert_eq!(
+                vec.max(other).get(slot),
+                fmax(vec.get(slot), other.get(slot))
+            );
+            assert_eq!(vec.sub(other).get(slot), vec.get(slot) - other.get(slot));
+        }
+    }
+
+    #[test]
+    fn exp2_stays_the_polynomial_everywhere() {
+        // Which of the two `exp2`s a *name* resolves to is a numerics
+        // decision, so it gets an assertion rather than a convention.
+        let vec = Rows::from_slots([-3.0f32, 0.0, 1.5, 7.25]);
+        for slot in 0..Rows::SLOTS {
+            assert_eq!(vec.exp2().get(slot), exp2_approx(vec.get(slot)));
+        }
+        let mut tile = Scores::zero();
+        tile.set(1, 2, 3.5);
+        assert_eq!(tile.exp2().get(1, 2), exp2_approx(3.5));
+        assert_eq!(Cols::splat(3.5).exp2().get(0), exp2_approx(3.5));
+    }
+
+    #[test]
+    fn row_map_broadcasts_along_the_layouts_rows() {
+        for lane in 0..32 {
+            let tile = coordinate_tile(lane);
+            let sums = tile.add_row(row_indices(lane));
+            let products = tile.mul_row(row_indices(lane));
+            for slot in 0..Scores::SLOTS {
+                for value in 0..Scores::VALUES {
+                    let (row, _) = Scores::coordinate(lane, slot, value);
+                    let x = tile.get(slot, value);
+                    assert_eq!(sums.get(slot, value), x + row as f32);
+                    assert_eq!(products.get(slot, value), x * row as f32);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn col_map_broadcasts_down_the_layouts_columns() {
+        for lane in 0..32 {
+            let tile = coordinate_tile(lane);
+            let sums = tile.add_col(column_indices(lane));
+            let differences = tile.sub_col(column_indices(lane));
+            for slot in 0..Scores::SLOTS {
+                for value in 0..Scores::VALUES {
+                    let (_, column) = Scores::coordinate(lane, slot, value);
+                    let x = tile.get(slot, value);
+                    assert_eq!(sums.get(slot, value), x + column as f32);
+                    assert_eq!(differences.get(slot, value), x - column as f32);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn broadcasts_are_constant_along_their_free_axis() {
+        for lane in 0..32 {
+            let rows = Scores::broadcast_row(row_indices(lane));
+            let cols = Scores::broadcast_col(column_indices(lane));
+            for slot in 0..Scores::SLOTS {
+                for value in 0..Scores::VALUES {
+                    let (row, column) = Scores::coordinate(lane, slot, value);
+                    assert_eq!(rows.get(slot, value), row as f32);
+                    assert_eq!(cols.get(slot, value), column as f32);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn column_values_are_a_lane_groups_share_of_the_columns() {
+        // A ColVec entry belongs to `col_of(lane, value)`, which depends only
+        // on `lane % 4` — so the four groups' entries tile 0..N exactly once
+        // and the other 28 lanes hold duplicates of them.
+        for lane in 0..32u32 {
+            for value in 0..Cols::VALUES {
+                assert_eq!(Cols::column(lane, value), Cols::column(lane % 4, value));
+            }
+        }
+        let mut columns: Vec<u32> = (0..4)
+            .flat_map(|lane| (0..Cols::VALUES).map(move |value| Cols::column(lane, value)))
+            .collect();
+        columns.sort();
+        assert_eq!(columns, (0..32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn scale_rows_is_the_multiply_row_map() {
+        // `scale_rows` stays hand-written and in place; this is what says it
+        // means the same thing as the generic path that replaced nothing.
+        for lane in 0..32 {
+            let tile = coordinate_tile(lane);
+            let factors = row_indices(lane);
+            let mut scaled = tile;
+            scaled.scale_rows(factors);
+            let mapped = tile.row_map::<Mul>(factors);
+            for slot in 0..Scores::SLOTS {
+                for value in 0..Scores::VALUES {
+                    assert_eq!(scaled.get(slot, value), mapped.get(slot, value));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn splat_fills_every_owned_value() {
+        let tile = Scores::splat(f32::NEG_INFINITY);
+        for slot in 0..Scores::SLOTS {
+            for value in 0..Scores::VALUES {
+                assert_eq!(tile.get(slot, value), f32::NEG_INFINITY);
+            }
+        }
+        for value in 0..Cols::VALUES {
+            assert_eq!(Cols::splat(1.0).get(value), 1.0);
+        }
     }
 
     #[test]
