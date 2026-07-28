@@ -1,0 +1,90 @@
+# Tier 2 — the host feature and a real device codegen, on CPU.
+#
+# This is `modal run modal_app.py::build`: clippy over all three crates with
+# `--features host`, the host tests, and a full `cargo oxide build --arch
+# sm_100a` of *both* kernel crates against the CUDA driver stub. That last part
+# is the reason this job exists. A post-monomorphization `const { assert!(..) }`
+# in a tile shape fires at codegen, not at type-check, so it is invisible to
+# `cargo check` and only a real device build finds it. Highest value per minute
+# in the whole setup, and it needs no GPU.
+#
+# WHY MODAL AND NOT A CUDA CONTAINER ON A GITHUB RUNNER
+#
+# A `nvidia/cuda:13.0.0-devel-ubuntu24.04` job container would supply `cuda.h`
+# cheaply, but the toolkit is the small half of what this needs. The rest is
+# LLVM 21 from apt.llvm.org, the pinned nightly with rust-src/rustc-dev/
+# llvm-tools, `cargo-oxide` installed from git, and a bootstrap build of the
+# cuda-oxide rustc codegen backend. On Modal that is a content-addressed image
+# layer, already built, shared byte-for-byte with the recipe it was copied
+# from. On a fresh GitHub runner it is a cold build every time unless we
+# publish our own image to GHCR — which means a second definition of the
+# toolchain, maintained beside `modal_app.py` and free to drift from it.
+#
+# So: one definition of the toolchain, in `modal_app.py`, invoked identically
+# from a laptop and from CI. The price is that this tier needs a credential,
+# and therefore cannot run on a pull request from a fork. See CI.md.
+#
+# Cost: ~8 CPU for the length of a cold cargo build of the pinned deps. No GPU
+# is allocated, so this is Modal CPU-minutes — cents, not dollars. It is still
+# not free, which is why it does not run on every branch push.
+
+name: cuda
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ref to check out (e.g. refs/pull/17/merge). Defaults to this workflow's ref."
+        required: false
+        type: string
+
+concurrency:
+  group: cuda-${{ github.event.inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Secrets are absent on a pull request from a fork, so the job would fail
+    # at `modal run` rather than skip. Skip it explicitly instead, and leave a
+    # maintainer to dispatch it by hand against the merge ref after reading the
+    # diff — that manual step *is* the review gate on spending our compute.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      # The `secrets` context is not readable from a job-level `if`, so an
+      # unconfigured repo cannot be turned into a skip. Fail it legibly and
+      # first instead: a named secret beats a Modal auth traceback.
+      - name: Modal credential is configured
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "::error::MODAL_TOKEN_ID / MODAL_TOKEN_SECRET are not set on this repository, so tier 2 cannot run. Get them from \`modal token new\`. See CI.md."
+            exit 1
+          fi
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # Nothing else to cache: the expensive artifacts live in the Modal image,
+      # which is content-addressed and rebuilt only when `modal_app.py`'s
+      # recipe changes.
+      - run: pip install modal
+
+      - name: cargo clippy --features host, host tests, sm_100a device build
+        run: modal run modal_app.py::build
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}

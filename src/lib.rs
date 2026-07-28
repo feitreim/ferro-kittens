@@ -15,6 +15,11 @@
 //! cuda-oxide b099f64. Software approximations remain where their lowering is
 //! a measured kernel optimization rather than an artifact-path workaround.
 //!
+// `global`'s types are all `feature = "host"`, and docs across the crate link
+// to them. Off that feature they are not compiled, so the links have nothing
+// to resolve to; the host build is where they are checked.
+#![cfg_attr(not(feature = "host"), allow(rustdoc::broken_intra_doc_links))]
+
 pub mod global;
 pub mod ldst;
 pub mod mma;

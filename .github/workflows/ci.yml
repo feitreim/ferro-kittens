@@ -1,0 +1,83 @@
+# Tier 1 — the device surface. No CUDA toolkit, no GPU, no secrets.
+#
+# The library's default feature set is device-only and `cuda-device` is
+# ordinary Rust, so the whole of it checks, tests, lints and documents on a
+# stock runner. This is *the* gate: it runs on every push to main and every
+# pull request, forks included, and nothing in it can be skipped for want of a
+# credential.
+#
+# Cost: a few minutes of `ubuntu-latest`. Free on a public repo.
+#
+# What is deliberately absent: `--features host`, `device-tests/`, and
+# `examples/`. All three reach `cuda-core` -> `cuda-bindings`, whose build
+# script wants `cuda.h` and fails without a toolkit. Their compilation lives in
+# cuda.yml (tier 2); what *can* be checked of them without a toolkit — their
+# formatting and their lockfiles — is checked here, because it is free.
+#
+# See CI.md for the tier-by-tier policy.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  device-surface:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # No toolchain is named here on purpose. `rust-toolchain.toml` pins the
+      # nightly and its components, rustup on the runner honours it, and a
+      # second copy of the version string in this file is how the pin drifts.
+      - name: Toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+
+      # The cuda-oxide git dependency is pinned to one revision and is most of
+      # the build. Keyed on the lockfiles, it is fetched and compiled once and
+      # restored until the pin moves.
+      - uses: Swatinem/rust-cache@v2
+
+      # Parsing needs no dependencies, so the two kernel crates get this one
+      # for free even though nothing else here can touch them.
+      - name: Formatting, all three crates
+        run: |
+          cargo fmt --check
+          cargo fmt --check --manifest-path device-tests/Cargo.toml
+          cargo fmt --check --manifest-path examples/Cargo.toml
+
+      # Resolution needs no `cuda.h` either — only compilation does. This
+      # catches a lockfile left behind by a manifest edit in any of the three
+      # crates, which would otherwise surface as a surprise dependency bump in
+      # a Modal job that costs real money.
+      - name: Lockfiles are current, all three crates
+        run: |
+          cargo metadata --locked --format-version 1 > /dev/null
+          cargo metadata --locked --format-version 1 --manifest-path device-tests/Cargo.toml > /dev/null
+          cargo metadata --locked --format-version 1 --manifest-path examples/Cargo.toml > /dev/null
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+      # `--no-deps` so only this crate's docs are linted. The `host`-gated
+      # links in `global` are allowed off that feature (see lib.rs) and are
+      # checked for real by tier 2's `cargo doc --features host`.
+      - name: Docs
+        run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings

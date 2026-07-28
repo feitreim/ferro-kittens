@@ -49,6 +49,11 @@ in `cuda-core`; it is off by default so the device-only surface can be
 The toolchain is pinned in `rust-toolchain.toml` — cuda-oxide's proc macros need
 nightly features and the codegen backend is built against exactly that nightly.
 
+Everything the device-only surface can be held to runs on every pull request
+with no toolkit and no credential; the host feature, a real `sm_100a` codegen,
+and the B200 harness are progressively more expensive tiers with their own
+triggers. `CI.md` has the policy, the costs, and how to ask for a GPU run.
+
 ## Examples
 
 `examples/` holds real kernels — a cluster GEMM, flash-attention forward,

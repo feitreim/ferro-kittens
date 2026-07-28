@@ -138,6 +138,13 @@ image = (
         str(Path(__file__).parent / "device-tests/Cargo.toml"),
         f"{PROJECT_DIR}/device-tests/Cargo.toml",
     )
+    # Its lockfile too. Without it cargo re-resolves against crates.io on every
+    # run, so this build tests a dependency set nothing in the repo pins and an
+    # upstream release can break it with no change of ours.
+    .add_local_file(
+        str(Path(__file__).parent / "device-tests/Cargo.lock"),
+        f"{PROJECT_DIR}/device-tests/Cargo.lock",
+    )
     # The examples crate: also standalone, also path-depends on the library.
     .add_local_dir(
         str(Path(__file__).parent / "examples/src"),
@@ -146,6 +153,10 @@ image = (
     .add_local_file(
         str(Path(__file__).parent / "examples/Cargo.toml"),
         f"{PROJECT_DIR}/examples/Cargo.toml",
+    )
+    .add_local_file(
+        str(Path(__file__).parent / "examples/Cargo.lock"),
+        f"{PROJECT_DIR}/examples/Cargo.lock",
     )
     .add_local_file(
         str(Path(__file__).parent / "rust-toolchain.toml"),
@@ -174,6 +185,14 @@ def build() -> None:
     here; the B200 function is for running, not for finding typos."""
     _run(["cargo", "clippy", "--features", "host", "--all-targets"], cwd=PROJECT_DIR)
     _run(["cargo", "test", "--features", "host"], cwd=PROJECT_DIR)
+    # Docs link to `global`'s types from all over the crate, and those types
+    # exist only under `host`. CI's device-only `cargo doc` allows the dangling
+    # links (see lib.rs); this is the build where they must actually resolve.
+    _run(
+        ["env", "RUSTDOCFLAGS=-D warnings",
+         "cargo", "doc", "--no-deps", "--features", "host"],
+        cwd=PROJECT_DIR,
+    )
     # The harness only typechecks where cuda.h is, so its lints live here too.
     _run(["cargo", "clippy", "--all-targets"], cwd=HARNESS_DIR)
     # `build` (unlike `run`) does not auto-detect the GPU arch, and tcgen05

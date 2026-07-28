@@ -7,9 +7,9 @@
 //! dimension 0 the contiguous one — and nothing about the transfer. The box
 //! comes from the [`crate::shared::SharedTile`] the map is paired with, so
 //! descriptor and tile agree by construction rather than by convention: one
-//! box per subtile, [`SharedTile::SUBTILE_COLS`] wide and `R` rows tall, in
-//! the tile's own swizzle mode and element type. A layout paired with the
-//! wrong element does not typecheck.
+//! box per subtile, [`crate::shared::SharedTile::SUBTILE_COLS`] wide and `R`
+//! rows tall, in the tile's own swizzle mode and element type. A layout paired
+//! with the wrong element does not typecheck.
 //!
 //! Only the *rank* is a type parameter. Extents and strides are runtime
 //! values because every buffer a kernel here maps has a runtime shape — a
@@ -92,7 +92,7 @@ mod host {
 
     /// A vector is one unswizzled box `N` elements wide and one row tall. The
     /// row count is what lets a rank-1 layout describe it at all
-    /// ([`GlobalLayout::descriptor_shape`] asserts exactly that), and the
+    /// (`GlobalLayout::descriptor_shape` asserts exactly that), and the
     /// width is `N` itself rather than a constant of a swizzle mode — the
     /// difference from the tile impl, and the reason `Swizzle` is not in the
     /// picture.

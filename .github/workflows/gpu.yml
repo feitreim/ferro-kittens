@@ -1,0 +1,95 @@
+# Tier 3 — the device-test harness, on a real B200.
+#
+# COST. This job allocates an NVIDIA B200. `modal_app.py::device_tests` runs
+# its ~20 cases in about 1.5 minutes of GPU time, but the billed window is the
+# whole container: image pull, the harness build, and the run. Budget on the
+# order of ten GPU-minutes per invocation. That is dollars, not cents, and it
+# is why this workflow does NOT run on every push.
+#
+# WHEN IT RUNS
+#
+#   * push to main touching `src/**` or `device-tests/**` — main is where a
+#     silent on-device regression is most expensive to discover late, and
+#     merges are rare enough to bound the bill.
+#   * a pull request labelled `gpu-ci`, and every later push to that PR while
+#     the label is on. Labelling is the deliberate act; removing it stops the
+#     spend.
+#   * `workflow_dispatch`, with an explicit ref. This is the only route for a
+#     fork's pull request, which has no access to the Modal credential.
+#
+# TRIGGERING IT BY HAND
+#
+#     gh workflow run gpu.yml -f ref=refs/pull/<N>/merge
+#
+# The workflow definition comes from the default branch; only the checked-out
+# tree comes from the ref. Dispatching against a fork's merge ref therefore
+# compiles and runs that fork's code on our GPU with our credential in the
+# environment — read the diff first. That manual step is the whole security
+# boundary, which is why `pull_request_target` is not used anywhere here.
+
+name: gpu
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "device-tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  pull_request:
+    types: [labeled, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ref to check out (e.g. refs/pull/17/merge). Defaults to this workflow's ref."
+        required: false
+        type: string
+
+# One B200 at a time per ref. A superseded run is wasted money, so cancel it.
+concurrency:
+  group: gpu-${{ github.event.inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  device-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # On a pull request: only with the label, and only from a branch in this
+    # repo, since a fork gets no secrets. Everything else (push, dispatch)
+    # passes through.
+    if: >-
+      github.event_name != 'pull_request' || (
+        contains(github.event.pull_request.labels.*.name, 'gpu-ci') &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    steps:
+      # Before anything is allocated. The `secrets` context is not readable
+      # from a job-level `if`, so an unconfigured repo cannot be a skip; make
+      # it a legible failure rather than a Modal auth traceback.
+      - name: Modal credential is configured
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "::error::MODAL_TOKEN_ID / MODAL_TOKEN_SECRET are not set on this repository, so tier 3 cannot run. Get them from \`modal token new\`. See CI.md."
+            exit 1
+          fi
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - run: pip install modal
+
+      - name: device-tests on a B200
+        run: modal run modal_app.py::device_tests
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
