@@ -1,52 +1,52 @@
 //! # Layernorm over a tile, and the whole-tile reduction next to it
 //!
-//! **Status: aspirational.** Excluded from the default build; read its gap
-//! list with `cargo check --features layernorm`.
+//! **Status: [`kernels::layernorm_rows`] compiles** and is in the default
+//! build; [`kernels::groupnorm_tile`] beside it is still aspirational and sits
+//! behind `--features layernorm`. The two kernels differ in exactly one thing —
+//! the axis their statistic is taken over — and that is what separated them.
 //!
-//! Both kernels here end the way softmax does, and that ending is now real:
-//! `tma_store` + `tma_store_commit` + `tma_store_wait::<0>()` (#9). What keeps
-//! this file aspirational is everything in front of it.
+//! `layernorm_rows` was blocked on **#13**: `gamma`/`beta` are parameters, not
+//! activations. They are loaded once, shared by every row, and belong in shared
+//! memory, so with no `SharedVec` every thread would have re-read them from
+//! global. [`kittens::shared::SharedVec`] is now that type — one flat run of
+//! elements with its own single-box TMA path, unswizzled because a swizzle
+//! atom is a statement about a tile's *rows* and a vector has one — and
+//! [`kittens::ldst::load_vec`] broadcasts it into the `ColVec` `mul_col`
+//! consumes. Nothing in this kernel is a workaround any more.
 //!
-//! Layernorm was softmax's gaps plus two about *vectors* rather than tiles.
-//! One of them is closed: [`kittens::reg::ColVec`] exists (#5) and
-//! [`kittens::reg::RegTile::col_reduce`] now fills it (#6), folding a column's
-//! values across the 8 lanes that share `lane % 4` — the stride-4/8/16
-//! butterfly, which is a different shuffle from the quad reduction a row
-//! statistic uses, not a reparameterization of it. The other is still open:
+//! [`kernels::groupnorm_tile`] normalizes over the *whole* tile rather than per
+//! row, and that is the one place a landed #6 does not reach.
+//! `RegTile::tile_sum` is warp scope: it folds a warp's own band across all 32
+//! lanes and stops. A `[128, COLUMNS]` tile is four warps' bands, so the warps
+//! have to agree, and that needs a shared staging buffer and a block barrier —
+//! storage, not a shuffle. **#3**'s `Scope` (`WARPS`, `THREADS`, `rank`,
+//! `sync`) supplies none of it.
 //!
-//! - **shared vectors (#13).** `gamma`/`beta` are parameters, not activations:
-//!   they are loaded once, shared by every row, and belong in shared memory.
-//!   With no `SharedVec` they would be re-read from global by every thread.
+//! What #13 changed for that kernel is the *shape of the answer*, not its
+//! status. The open question on #3 was whether a block reduction takes a
+//! scratch pointer or a shared vector; a `SharedVec<F32, WARPS>` is now a type
+//! a signature can name, and `set(warp, partial)` / `get(w)` is exactly the
+//! access a fold over four partials needs. Two things are still missing and
+//! both belong to #3: the reduction itself (`sync::block_reduce_sum`), and an
+//! `impl Element for F32` (**#2**) without which the partials cannot be fp32.
+//! The `partials` pointer below is this kernel guessing at both.
 //!
-//! Blocked on: **#13** (`SharedVec` and its TMA path), and — for
-//! [`kernels::groupnorm_tile`] only — **#3**, discussed below.
-//!
-//! Nothing arithmetic is left. The scalar broadcasts this file used to name as
-//! a gap — `scale`/`shift` on a tile or a vector, and a free `rsqrt(f32)` for
-//! a variance that is already one `f32` — landed with **#38**, so both kernels
-//! below spell their normalization in the real API and every remaining `WANT`
-//! is a mover or a scope.
-//!
-//! The second kernel here, [`kernels::groupnorm_tile`], normalizes over the
-//! *whole* tile rather than per row, and that is the one place a landed #6
-//! does not reach. `RegTile::tile_sum` is warp scope: it folds a warp's own
-//! band across all 32 lanes and stops. A `[128, COLUMNS]` tile is four warps'
-//! bands, so the warps have to agree, and that needs a shared staging buffer
-//! and a block barrier — storage, not a shuffle. **#3**'s `Scope` (`WARPS`,
-//! `THREADS`, `rank`, `sync`) supplies neither, which is why #6 stopped at the
-//! warp: the block form is **#3** and **#13** meeting, and it is the first
-//! place in these four kernels where the missing piece is structural rather
-//! than an op.
+//! Blocked on: **#3** (and, under it, #2) — for [`kernels::groupnorm_tile`]
+//! only.
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, thread, warp};
 
-use kittens::ldst::{load_tile, store_tile};
-use kittens::reg::{BaseLdtm, ColVec, RegTile, rsqrt};
+use kittens::ldst::{load_tile, load_vec, store_tile};
+#[cfg(feature = "layernorm")]
+use kittens::reg::rsqrt;
+use kittens::reg::{BaseLdtm, ColVec, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedVec, Swizzle128B, tma_store_commit, tma_store_wait};
-use kittens::sync::{Semaphore, block_reduce_sum};
+use kittens::sync::Semaphore;
+#[cfg(feature = "layernorm")]
+use kittens::sync::block_reduce_sum;
 
 const ROWS: usize = 128;
 const COLUMNS: usize = 128;
@@ -57,7 +57,9 @@ type Band = RegTile<32, COLUMNS, BaseLdtm>;
 /// A per-column statistic or parameter — one value per logical column,
 /// replicated across the lanes that hold that column.
 type Columns = ColVec<COLUMNS, BaseLdtm>;
-/// `gamma` and `beta`, staged once per CTA.
+/// `gamma` and `beta`, staged once per CTA. `COLUMNS` bf16 is 256 bytes: the
+/// vector's own length, where a one-row `SharedTile` would have spent a whole
+/// 128-byte swizzle atom to hold 64 of them.
 type Parameters = SharedVec<Bf16, COLUMNS>;
 
 pub const SHARED_BYTES: usize = Tile::BYTES + 2 * Parameters::BYTES + 64;
@@ -68,6 +70,15 @@ pub mod kernels {
     use super::*;
 
     /// `y = gamma ⊙ (x - mean(x)) / sqrt(var(x) + eps) + beta`, per row.
+    ///
+    /// # Safety
+    ///
+    /// Launch with [`THREADS`] threads and [`SHARED_BYTES`] dynamic shared
+    /// memory, 128-byte aligned. `source` and `destination` must describe live
+    /// `[ROWS * gridDim.x, COLUMNS]` bf16 buffers through a map paired with
+    /// [`Tile`]; `gamma_map` and `beta_map` live `[COLUMNS]` buffers through
+    /// one paired with [`Parameters`]. A CTA takes its row range from
+    /// `blockIdx.x` and never bounds-checks it.
     #[kernel]
     pub unsafe fn layernorm_rows(
         source: *const TmaDescriptor,
@@ -95,9 +106,9 @@ pub mod kernels {
             thread::sync_threads();
             if thread::threadIdx_x() == 0 {
                 tile.tma_load(source, row, 0, loaded);
-                // WANT (#13): a vector's own TMA path. A `[1, COLUMNS]`
-                // box is not a tile, and forcing it to be one wastes a whole
-                // swizzle atom per row of padding.
+                // One instruction each, against a rank-1 map: an unswizzled
+                // box has no atom to be cut into, so a vector never walks
+                // stacked subtiles the way the tile above does.
                 gamma.tma_load(gamma_map, 0, loaded);
                 beta.tma_load(beta_map, 0, loaded);
                 loaded.expect_tx((Tile::BYTES + 2 * Parameters::BYTES) as u32);
@@ -105,10 +116,12 @@ pub mod kernels {
             loaded.wait(0);
             thread::sync_threads();
 
-            // WANT (#13): shared → register for a vector, into the
-            // column-indexed register vector `mul_col` consumes.
-            let g: Columns = gamma.to_registers(lane);
-            let b: Columns = beta.to_registers(lane);
+            // Every lane reads the columns its fragment owns. The 8 lanes of a
+            // column group ask for the same address and shared memory answers
+            // them together, which is the access pattern a swizzle would have
+            // been spreading for nothing.
+            let g: Columns = load_vec(gamma, lane);
+            let b: Columns = load_vec(beta, lane);
 
             let x: Band = load_tile(tile.chunk_writer(), row_base, 0, lane);
 
@@ -140,6 +153,11 @@ pub mod kernels {
 
     /// The same normalization over the whole tile instead of per row — group
     /// norm's statistic, and the one that needs the four warps to agree.
+    ///
+    /// # Safety
+    ///
+    /// As [`layernorm_rows`], minus the parameter vectors.
+    #[cfg(feature = "layernorm")]
     #[kernel]
     pub unsafe fn groupnorm_tile(
         source: *const TmaDescriptor,
@@ -173,12 +191,13 @@ pub mod kernels {
 
             // `tile_sum` (#6) folds this warp's band to one f32, warp-uniform.
             //
-            // WANT (#3, #13): and then the four warps have to agree. That step
-            // is not a wider shuffle — it is a shared staging buffer plus a
-            // block barrier, so #3's `Scope` (`WARPS`, `THREADS`, `rank`,
-            // `sync`) does not by itself express it: something has to say
-            // where the partials live, and `partials` below is this kernel
-            // guessing. Every kernel that needs one writes this by hand today.
+            // WANT (#3): and then the four warps have to agree. #13 supplied
+            // the storage half — `SharedVec<F32, 4>` is a type this signature
+            // could take, and `set(warp, partial)` writes one element without
+            // touching its neighbours, which is why the vector's scalar access
+            // is per element and not per packed word. What is still missing is
+            // the fold itself, and an `Element` impl for fp32 (#2) to hold it.
+            // `partials` below is this kernel guessing at both.
             let mean = block_reduce_sum(partials, x.tile_sum()) * scale;
             // `shift`/`scale` against a warp-uniform `f32` (#38), and the free
             // `rsqrt` beside them: this statistic never becomes a vector, so
