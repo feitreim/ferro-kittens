@@ -202,13 +202,22 @@ const REDUCTION_COLUMNS: usize = COLUMNS / 4;
 /// band's max and the narrow band's sum.
 const REDUCTION_STRIDE: usize = REDUCTION_ROWS + REDUCTION_COLUMNS + 2;
 
-/// Which spelling of the online-softmax correction [`kernels::softmax_probe`]
+/// Which spelling of the online-softmax step [`kernels::softmax_probe`]
 /// compiles. Only the codegen probe reads these; see its doc comment.
 const HAND_WRITTEN: u32 = 0;
 /// [`online_rescale`], the deliberately fused form.
 const FUSED: u32 = 1;
 /// [`HAND_WRITTEN`] with the generic `row_map::<Mul>` in place of `scale_rows`.
 const ROW_MAP: u32 = 2;
+/// [`HAND_WRITTEN`] with `mul_row_assign` — #31's in-place row map — in place
+/// of `scale_rows`. The pair `ROW_MAP` / this one is the whole of #31's
+/// headline claim: same op, same operand, by value against in place.
+const ROW_MAP_ASSIGN: u32 = 3;
+/// [`HAND_WRITTEN`] with `out_acc.add_assign(p)` for `out_acc = out_acc.add(p)`
+/// — the accumulate `flash_forward` was blocked on. Its by-value twin rebinds
+/// its input, so under #38's liveness reading this pair should *not* differ,
+/// which is the prediction it is here to test.
+const ADD_ASSIGN: u32 = 4;
 
 /// How [`kernels::scalar_map_probe`] spells its two scalar multiplies. The
 /// pre-#38 spelling: `bin_map::<Mul>(splat(k))`, the scalar widened into a
@@ -218,8 +227,23 @@ const SPLATTED: u32 = 0;
 /// `RegTile::scale` — the same `Mul` with the operand left in a register.
 const SCALED: u32 = 1;
 /// Neither: both multiplies written through `set`, mutating in place. #31's
-/// shape, and nothing in `kittens` spells it; it is here as the floor.
+/// shape, hand-written; the floor the library form has to reach.
 const IN_PLACE: u32 = 2;
+/// `RegTile::scale_assign` — #31's in-place scalar map, which is [`IN_PLACE`]
+/// spelled as library API. The pair `IN_PLACE` / this one is what says the API
+/// costs nothing over the loop it replaces.
+const SCALE_ASSIGN: u32 = 3;
+/// [`SCALED`] with the scaled block chained into the accumulate rather than
+/// rebound — `out_acc.add(block.scale(k))`, so `block` and its scaled copy are
+/// both live where the rebinding form has only one. #38 measured this at 84
+/// bytes of spill from a probe edit that was never committed, and it is the
+/// evidence the whole peak-liveness reading of #31 rests on; it is a standing
+/// form now.
+const CHAINED: u32 = 4;
+/// The same step as one expression — `out_acc.scale(k).add(block.scale(k))`,
+/// nothing rebound at all, which under the liveness reading should be the
+/// most expensive form here.
+const ONE_EXPRESSION: u32 = 5;
 
 /// How [`kernels::mask_probe`] masks its score band — issue #7. The three
 /// compute the same tile, so a difference in the `regcount` table is the
@@ -1119,18 +1143,40 @@ pub mod kernels {
     /// one `[32, N]` score block per step, a `RegVec` running maximum and sum,
     /// and a `RegTile<32, N, BaseLdtm>` accumulator rescaled into each new
     /// reference — the pattern `online_rescale` and the hand-written `RegVec`
-    /// ops were extracted from. `RESCALE` picks which spelling of the
-    /// correction is compiled and nothing else changes, so the three forms are
-    /// comparable line for line:
+    /// ops were extracted from. `FORM` picks which spelling of the correction
+    /// and the accumulate is compiled and nothing else changes, so the five
+    /// forms are comparable line for line:
     ///
     /// - [`HAND_WRITTEN`]: `max`/`sub`/`exp2`/`mul_assign` and `scale_rows`
     /// - [`FUSED`]: [`online_rescale`], one scalar factor live at a time
     /// - [`ROW_MAP`]: [`HAND_WRITTEN`] with `row_map::<Mul>` for `scale_rows`
+    /// - [`ROW_MAP_ASSIGN`]: with `mul_row_assign`, #31's in-place form
+    /// - [`ADD_ASSIGN`]: [`HAND_WRITTEN`] with the accumulate in place too
+    ///
+    /// **What it measured** (`regcount`, sm_100a, no spills in any form):
+    ///
+    /// ```text
+    ///                    32 columns          128 columns
+    ///                    regs   stack        regs   stack
+    ///  hand_written        64     256         168    3072
+    ///  fused               56     416         168    3104
+    ///  row_map             64     256         255    2560
+    ///  row_map_assign      64     256         168    3072
+    ///  add_assign          64     256         168    2560
+    /// ```
+    ///
+    /// #31's claim, and its correction. `row_map` costs 87 registers/thread at
+    /// 128 columns and `row_map_assign` costs none — the in-place form reaches
+    /// the hand-written loop exactly, at both widths, which is what let
+    /// `scale_rows` become a wrapper over it. `add_assign` does *not* buy
+    /// registers over the by-value `add` it replaces, because that call site
+    /// rebinds and its input is already dead; what it buys there is 512 bytes
+    /// of stack frame and a line that says what it means.
     ///
     /// `steps` is a runtime bound so the accumulators stay live across
     /// iterations rather than unrolling into one straight-line block.
     #[inline(always)]
-    unsafe fn softmax_probe<const N: usize, const RESCALE: u32>(
+    unsafe fn softmax_probe<const N: usize, const FORM: u32>(
         scores: &[f32],
         steps: u32,
         out: &mut DisjointSlice<f32>,
@@ -1163,15 +1209,17 @@ pub mod kernels {
                 }
 
                 let row_max = block.row_max();
-                if RESCALE == FUSED {
+                if FORM == FUSED {
                     online_rescale(&mut m_ref, row_max, &mut running_sum, &mut out_acc);
                 } else {
                     let next = m_ref.max(row_max);
                     let factor = m_ref.sub(next).exp2();
                     m_ref = next;
                     running_sum.mul_assign(factor);
-                    if RESCALE == ROW_MAP {
+                    if FORM == ROW_MAP {
                         out_acc = out_acc.row_map::<Mul>(factor);
+                    } else if FORM == ROW_MAP_ASSIGN {
+                        out_acc.mul_row_assign(factor);
                     } else {
                         out_acc.scale_rows(factor);
                     }
@@ -1179,7 +1227,11 @@ pub mod kernels {
 
                 let probabilities = block.sub_row(m_ref).exp2();
                 running_sum.add_assign(probabilities.row_sum());
-                out_acc = out_acc.add(probabilities);
+                if FORM == ADD_ASSIGN {
+                    out_acc.add_assign(probabilities);
+                } else {
+                    out_acc = out_acc.add(probabilities);
+                }
                 step += 1;
             }
 
@@ -1228,6 +1280,26 @@ pub mod kernels {
         unsafe { softmax_probe::<32, ROW_MAP>(scores, steps, &mut out) }
     }
 
+    /// [`softmax_probe`] at 32 wide, `mul_row_assign` for `scale_rows`.
+    #[kernel]
+    pub unsafe fn softmax_probe_32_row_map_assign(
+        scores: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { softmax_probe::<32, ROW_MAP_ASSIGN>(scores, steps, &mut out) }
+    }
+
+    /// [`softmax_probe`] at 32 wide, `add_assign` for the accumulate.
+    #[kernel]
+    pub unsafe fn softmax_probe_32_add_assign(
+        scores: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { softmax_probe::<32, ADD_ASSIGN>(scores, steps, &mut out) }
+    }
+
     /// [`softmax_probe`] at the flash accumulator's 128 columns — 32 values a
     /// thread on top of the score block, which is where register pressure
     /// stops being theoretical.
@@ -1256,6 +1328,28 @@ pub mod kernels {
         unsafe { softmax_probe::<128, ROW_MAP>(scores, steps, &mut out) }
     }
 
+    /// [`softmax_probe`] at 128 wide, `mul_row_assign` for `scale_rows` — the
+    /// pair against `softmax_probe_128_row_map` that #31 is scored on.
+    #[kernel]
+    pub unsafe fn softmax_probe_128_row_map_assign(
+        scores: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { softmax_probe::<128, ROW_MAP_ASSIGN>(scores, steps, &mut out) }
+    }
+
+    /// [`softmax_probe`] at 128 wide, `add_assign` for the accumulate — the
+    /// call site `flash_forward` wanted.
+    #[kernel]
+    pub unsafe fn softmax_probe_128_add_assign(
+        scores: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { softmax_probe::<128, ADD_ASSIGN>(scores, steps, &mut out) }
+    }
+
     /// **A codegen probe, not a test.** The scalar-operand half of
     /// [`softmax_probe`]'s question (#38), in the flash inner loop's shape: a
     /// `[32, N]` block per step, scaled and folded into an accumulator that is
@@ -1269,10 +1363,43 @@ pub mod kernels {
     ///   scalar widened into a whole second tile
     /// - [`SCALED`]: `scale(k)`, the same `Mul` with the operand in a register
     /// - [`IN_PLACE`]: neither, both multiplies written through `set`
+    /// - [`SCALE_ASSIGN`]: [`IN_PLACE`] as library API (#31)
+    /// - [`CHAINED`]: [`SCALED`], but the block's scaled copy chained into the
+    ///   accumulate instead of rebound, so both bands are live at the peak
+    /// - [`ONE_EXPRESSION`]: neither multiply rebound, the whole step chained
     ///
-    /// The first pair is #38's own question. The third is #31's, and is here
-    /// because a by-value map at this width is exactly what #31 was filed
-    /// about.
+    /// The first pair is #38's own question. [`IN_PLACE`] and
+    /// [`SCALE_ASSIGN`] are #31's. The last two are the control that separates
+    /// the two readings of all of it: [`CHAINED`] differs from [`SCALED`] in
+    /// liveness alone, and [`ONE_EXPRESSION`] pushes that difference as far as
+    /// the probe can.
+    ///
+    /// **What it measured** (`regcount`, sm_100a; every 32-column form is 48
+    /// registers with no spill and no stack, so only 128 is tabulated):
+    ///
+    /// ```text
+    ///                  regs   spill   stack
+    ///  splatted         255     124    2648
+    ///  scaled           255      60    2624
+    ///  chained          255     108    2672
+    ///  in_place         252       0    2560
+    ///  scale_assign     252       0    2560
+    ///  one_expression   168       0    2560
+    /// ```
+    ///
+    /// Three things, and the third is not what #31 or #38 predicted.
+    /// `scale_assign` reaches the hand-written in-place floor exactly, which
+    /// is #31 delivering what it was filed for. [`CHAINED`] is worse than the
+    /// [`SCALED`] it differs from by one rebinding, which is #38's 84-byte
+    /// result reproduced (108 bytes here, on a probe that scales twice). And
+    /// [`ONE_EXPRESSION`] — *strictly more* chained than [`CHAINED`], and so
+    /// the most expensive form under the liveness reading — is the cheapest
+    /// form in the table by 84 registers, and the only one under the cliff at
+    /// all. Peak liveness does not order these. What does, across all six, is
+    /// how many whole-tile temporaries have to be *materialized between
+    /// statements*: one expression fuses into a single pass over the band and
+    /// materializes none, the in-place forms materialize none but make two
+    /// passes, and every rebinding form materializes one per statement.
     #[inline(always)]
     unsafe fn scalar_map_probe<const N: usize, const FORM: u32>(
         scores: &[f32],
@@ -1305,38 +1432,55 @@ pub mod kernels {
                     slot += 1;
                 }
 
-                if FORM == SCALED {
-                    block = block.scale(k);
+                if FORM == ONE_EXPRESSION {
+                    // Neither multiply rebinds its input: both scaled copies
+                    // stay live beside the bands they came from until the add
+                    // consumes them.
+                    out_acc = out_acc.scale(k).add(block.scale(k));
+                } else if FORM == CHAINED {
+                    // [`SCALED`] with one line changed — the block's scale
+                    // chained into the add instead of rebound, which is #38's
+                    // own comparison and the only difference between the two
+                    // forms.
                     out_acc = out_acc.scale(k);
-                } else if FORM == SPLATTED {
-                    let widened = RegTile::<32, N, BaseLdtm>::splat(k);
-                    block = block.bin_map::<Mul>(widened);
-                    out_acc = out_acc.bin_map::<Mul>(widened);
+                    out_acc = out_acc.add(block.scale(k));
                 } else {
-                    // Two passes, not one fused pass: the by-value forms above
-                    // are two maps, and a floor that fuses them would be
-                    // measuring the fusion instead of the operand.
-                    let mut slot = 0usize;
-                    while slot < slots {
-                        let mut value = 0usize;
-                        while value < values {
-                            block.set(slot, value, block.get(slot, value) * k);
-                            value += 1;
+                    if FORM == SCALED {
+                        block = block.scale(k);
+                        out_acc = out_acc.scale(k);
+                    } else if FORM == SPLATTED {
+                        let widened = RegTile::<32, N, BaseLdtm>::splat(k);
+                        block = block.bin_map::<Mul>(widened);
+                        out_acc = out_acc.bin_map::<Mul>(widened);
+                    } else if FORM == SCALE_ASSIGN {
+                        block.scale_assign(k);
+                        out_acc.scale_assign(k);
+                    } else {
+                        // Two passes, not one fused pass: the by-value forms
+                        // above are two maps, and a floor that fuses them
+                        // would be measuring the fusion instead of the
+                        // operand.
+                        let mut slot = 0usize;
+                        while slot < slots {
+                            let mut value = 0usize;
+                            while value < values {
+                                block.set(slot, value, block.get(slot, value) * k);
+                                value += 1;
+                            }
+                            slot += 1;
                         }
-                        slot += 1;
-                    }
-                    let mut slot = 0usize;
-                    while slot < slots {
-                        let mut value = 0usize;
-                        while value < values {
-                            out_acc.set(slot, value, out_acc.get(slot, value) * k);
-                            value += 1;
+                        let mut slot = 0usize;
+                        while slot < slots {
+                            let mut value = 0usize;
+                            while value < values {
+                                out_acc.set(slot, value, out_acc.get(slot, value) * k);
+                                value += 1;
+                            }
+                            slot += 1;
                         }
-                        slot += 1;
                     }
+                    out_acc = out_acc.add(block);
                 }
-
-                out_acc = out_acc.add(block);
                 step += 1;
             }
 
@@ -1386,6 +1530,40 @@ pub mod kernels {
         unsafe { scalar_map_probe::<32, IN_PLACE>(scores, steps, k, &mut out) }
     }
 
+    /// [`scalar_map_probe`] at a 32-wide block, `RegTile::scale_assign`.
+    #[kernel]
+    pub unsafe fn scalar_map_probe_32_scale_assign(
+        scores: &[f32],
+        steps: u32,
+        k: f32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { scalar_map_probe::<32, SCALE_ASSIGN>(scores, steps, k, &mut out) }
+    }
+
+    /// [`scalar_map_probe`] at a 32-wide block, the chained spelling.
+    #[kernel]
+    pub unsafe fn scalar_map_probe_32_chained(
+        scores: &[f32],
+        steps: u32,
+        k: f32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { scalar_map_probe::<32, CHAINED>(scores, steps, k, &mut out) }
+    }
+
+    /// [`scalar_map_probe`] at a 32-wide block, the whole step as one
+    /// expression.
+    #[kernel]
+    pub unsafe fn scalar_map_probe_32_one_expression(
+        scores: &[f32],
+        steps: u32,
+        k: f32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { scalar_map_probe::<32, ONE_EXPRESSION>(scores, steps, k, &mut out) }
+    }
+
     /// [`scalar_map_probe`] with the pre-#38 splatted operand at the flash
     /// accumulator's 128 columns — 32 values a thread, the width
     /// `row_map::<Mul>` failed at.
@@ -1419,6 +1597,41 @@ pub mod kernels {
         mut out: DisjointSlice<f32>,
     ) {
         unsafe { scalar_map_probe::<128, IN_PLACE>(scores, steps, k, &mut out) }
+    }
+
+    /// [`scalar_map_probe`] at 128 wide, `RegTile::scale_assign` — the library
+    /// form of the line above it, and the pair #31 is scored on.
+    #[kernel]
+    pub unsafe fn scalar_map_probe_128_scale_assign(
+        scores: &[f32],
+        steps: u32,
+        k: f32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { scalar_map_probe::<128, SCALE_ASSIGN>(scores, steps, k, &mut out) }
+    }
+
+    /// [`scalar_map_probe`] at 128 wide, chained — #38's 84-byte spill, as a
+    /// form that lives in the tree.
+    #[kernel]
+    pub unsafe fn scalar_map_probe_128_chained(
+        scores: &[f32],
+        steps: u32,
+        k: f32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { scalar_map_probe::<128, CHAINED>(scores, steps, k, &mut out) }
+    }
+
+    /// [`scalar_map_probe`] at 128 wide, the whole step as one expression.
+    #[kernel]
+    pub unsafe fn scalar_map_probe_128_one_expression(
+        scores: &[f32],
+        steps: u32,
+        k: f32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { scalar_map_probe::<128, ONE_EXPRESSION>(scores, steps, k, &mut out) }
     }
 
     /// **A codegen probe, not a test.** Masking is pure lane-local coordinate

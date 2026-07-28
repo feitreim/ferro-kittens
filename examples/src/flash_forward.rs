@@ -8,13 +8,16 @@
 //! - **#11** (global ↔ register) — the epilogue writes fp32 out of registers.
 //!   Today that means packing to bf16, `stmatrix` into a shared tile, and a
 //!   TMA store (#9): a precision loss the epilogue never asked for.
-//! - **#31** — `RegTile::add_assign`. `RegTile` has the by-value `add` and no
-//!   in-place form, and this kernel's `[32, 128]` output accumulator is
-//!   exactly the shape the by-value cost was measured on. #38 measured the
-//!   same thing for a scalar operand and got the same direction: at 128
-//!   columns the by-value spelling spills where the in-place one does not.
-//!   The scalar broadcast `scale` that used to share this entry landed with
-//!   #38 and is the real API below.
+//!
+//! **#31 has landed**, and it is the last arithmetic entry this file had.
+//! `RegTile::add_assign` is the accumulate below; every by-value map now has
+//! an in-place twin generated from the same `op_methods!` table. What #31
+//! measured on the way is worth carrying: at this kernel's `[32, 128]`
+//! accumulator the in-place *accumulate* is not cheaper in registers than the
+//! by-value one, because that call site rebinds and its input is already
+//! dead. The place the in-place form is worth 87 registers/thread is the
+//! rescale — `row_map::<Mul>` against `scale_rows`, which is now
+//! `row_map_assign::<Mul>` and reaches the hand-written number exactly.
 //!
 //! **#23 and #7 have landed**, together, because they were the same blocker
 //! from two sides: this kernel could not name its `[32, 64]` score band, and
@@ -30,10 +33,9 @@
 //! the swizzled `P` staging tile, and [`online_rescale`] — the fused
 //! running-max correction, the one genuinely subtle piece of flash — are all
 //! first-class. And the whole register-side body — drain, mask, scale,
-//! row-reduce, correct, restage — is now the library's own API, line for
-//! line, with no index arithmetic left in this file. What remains is at the
-//! two ends: how the output leaves registers (#11), and one in-place form
-//! (#31).
+//! row-reduce, correct, accumulate, restage — is now the library's own API,
+//! line for line, with no index arithmetic left in this file. What remains is
+//! at one end only: how the output leaves registers (#11).
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
@@ -215,12 +217,13 @@ pub mod kernels {
                 accumulated.wait(block & 1);
 
                 let contribution: OutBand = output.tile(32 * warp_id, 0);
-                // WANT (#31): `RegTile` has the by-value `add` but no
-                // in-place form, and this is the accumulator #31 measured —
-                // at 128 columns the by-value spelling cost 87 registers.
-                // `RegVec` has had `add_assign` since #5; #38 deliberately did
-                // not add the tile's, so that #31 lands every in-place form at
-                // once rather than unifying a one-off later.
+                // The accumulate, in place (#31). `out_acc = out_acc.add(c)`
+                // costs the same registers at this width — its input is dead
+                // at the rebinding, which is the case #38 predicted would be
+                // free — and 512 more bytes of stack frame
+                // (`softmax_probe_128_add_assign`, 168 regs / 2560 B against
+                // 168 / 3072). The reason to write it this way is that the
+                // accumulator's input *is* its output.
                 out_acc.add_assign(contribution);
                 if leader {
                     free.sem(block).arrive();
