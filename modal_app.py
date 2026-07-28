@@ -14,6 +14,9 @@ Local usage:
     modal run modal_app.py            # the device tests, on a B200
     modal run modal_app.py::examples  # the examples crate's kernels, on a B200
     modal run modal_app.py::bench     # those kernels timed at several sizes
+    modal run modal_app.py::ladder_bench
+                                      # four rungs of that ladder on a clock:
+                                      # is a streamed band actually slower?
     modal run modal_app.py::doctor    # env / GPU sanity check
 """
 
@@ -278,6 +281,46 @@ def bench() -> None:
     _run(["cargo", "oxide", "run", "kittens-examples", "--", "bench"], cwd=EXAMPLES_DIR)
 
 
+# `cpu=8` because on a cold container the *build* is a long pole in its own
+# right — the harness' dependency tree is ten-odd minutes of compilation and
+# the B200 is billed through all of it. The timeout covers that plus the sweep:
+# twenty rungs, each verified at three configurations and then timed in five
+# rounds at two grids, is a further half hour. 1800 s does not fit it, and a
+# run that dies between the third shape and the fourth has spent the GPU and
+# answered three quarters of the question.
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=5400)
+def ladder_bench() -> None:
+    """Four rungs of #60's register ladder, with a clock on them — issue #63.
+
+    The ladder found the in-place spellings 81 to 130 registers *under* the
+    fused one at three shapes, on a stack frame at least as large as the form
+    they beat: `ptxas` had decided the band did not fit and left it in local
+    memory, streaming it. `ptxas -v` reports what was allocated and never what
+    it cost, so this is the first thing in the repo to time a register claim
+    rather than count it.
+
+    `[32, 96]`, `[48, 64]` and `[64, 64]` are where the effect is largest;
+    `[32, 128]` is the control, where `fused` wins on both static counters and
+    ought therefore to win on the clock. Each of the five spellings is checked
+    against a CPU reference at every grid and step count it is timed at, timed
+    in repeated rounds so the table can state its own noise floor, and reported
+    beside the driver's register count, local frame and occupancy.
+
+    This one genuinely needs the GPU. Everything static about it — that the
+    timed rungs compile, and that they price identically to the ladder rungs
+    they are twins of — is in `::regcount`, which is CPU-only; run that first.
+    """
+    _run(
+        [
+            "nvidia-smi",
+            "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
+            "--format=csv",
+        ],
+        cwd="/",
+    )
+    _run(["cargo", "oxide", "run", "device-tests", "--", "bench-ladder"], cwd=HARNESS_DIR)
+
+
 @app.function(gpu=DEFAULT_GPU, timeout=600)
 def doctor() -> None:
     _run(["nvidia-smi"], cwd="/")
@@ -388,6 +431,11 @@ LADDER_SHAPES = (
 )  # fmt: skip
 LADDER_SPELLINGS = ("fused", "assign", "open_coded", "rebound", "all_in_place")
 
+# The four rungs `::ladder_bench` puts a clock on (#63) — three where in-place
+# appears to win by 81-130 registers on a frame no smaller, and `[32, 128]` as
+# the control where `fused` wins on both counters. Mirrors `timed_ladder!(..)`.
+BENCH_SHAPES = ((32, 96), (48, 64), (64, 64), (32, 128))
+
 
 def _ladder_pressure(shape: tuple[int, int]) -> int:
     """fp32 values one thread of an `[M, N]` warp tile holds — `SLOTS * VALUES`.
@@ -488,6 +536,56 @@ def _print_ladder(measured: dict[tuple[str, str], dict[str, int]]) -> None:
             print(f"    {spelling:<14}first spills at {answer}")
 
 
+def _print_timed_twins(measured: dict[tuple[str, str], dict[str, int]]) -> None:
+    """`ladder_probe_*` against `ladder_timed_*`, rung by rung — issue #63.
+
+    `::ladder_bench` times the `ladder_timed_*` kernels and reports what they
+    cost; the ladder table above prices the `ladder_probe_*` ones. Those are
+    only the same claim if the two compile the same, and they are the same
+    source: one `#[inline(always)]` body at the same `(M, N, FORM)`, differing
+    in a `const STRIDED: bool` that moves the *final* dump to a per-block
+    band so a grid may run it at all. That should cost nothing in the loop
+    under test, which is a prediction and therefore something to check rather
+    than assert — and to raise on, like the determinism control, because a
+    timing printed beside a register count that belongs to a different compiled
+    kernel is worse than no timing."""
+    by_kernel = {name: counts for (_, name), counts in measured.items()}
+    counted = ("registers", "spill_stores", "spill_loads", "stack")
+
+    def cell(counts: dict[str, int] | None) -> str:
+        if counts is None:
+            return "not built"
+        return f"{counts['registers']}/{counts['spill_stores']}/{counts['stack']}"
+
+    rows, disagreements = [], 0
+    for shape in BENCH_SHAPES:
+        for spelling in LADDER_SPELLINGS:
+            suffix = f"{shape[0]}x{shape[1]}_{spelling}"
+            priced = by_kernel.get(f"ladder_probe_{suffix}")
+            timed = by_kernel.get(f"ladder_timed_{suffix}")
+            same = (
+                priced is not None
+                and timed is not None
+                and all(priced[field] == timed[field] for field in counted)
+            )
+            disagreements += not same
+            rows.append((suffix, cell(priced), cell(timed), "same" if same else "DIFFERS"))
+
+    print("\n  the timed twins (#63) — regs/spill/frame of the rung `regcount`")
+    print("  prices, beside the rung `::ladder_bench` runs:")
+    print(f"    {'rung':<26}{'ladder_probe':>18}{'ladder_timed':>18}{'':>10}")
+    for name, priced, timed, verdict in rows:
+        print(f"    {name:<26}{priced:>18}{timed:>18}{verdict:>10}")
+    if disagreements:
+        raise RuntimeError(
+            f"{disagreements} of {len(rows)} timed rungs do not price like the ladder rung "
+            "they stand in for, so `::ladder_bench` would be timing a kernel the ladder "
+            "table above does not describe. Fix the divergence, or say in the bench which "
+            "kernel its numbers belong to."
+        )
+    print(f"\n  identical at all {len(rows)} rungs, every counter.")
+
+
 @app.function(cpu=8, timeout=1800)
 def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) -> None:
     """Register pressure of every kernel the harness and the examples emit,
@@ -513,6 +611,11 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     the second table below is that sweep with the cliff located — the widths
     and *row extents* at which each spelling of the same step starts to spill.
 
+    The third table is #63's: the four rungs `::ladder_bench` puts a clock on,
+    each beside the ladder rung it stands in for. A timing only belongs next to
+    a register count if the two describe the same compiled kernel, and that is
+    a thing to check here, on CPU, before spending a B200 on it.
+
     `--determinism` measures the same tree twice, with both crates' artifacts
     thrown away in between, and asserts the two tables are identical. It is not
     ceremony: a diff of this table is only evidence if the table is a function
@@ -525,6 +628,7 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     print(f"\nregisters per thread, {arch}" + (f" — {label}" if label else ""))
     _print_kernels(measured)
     _print_ladder(measured)
+    _print_timed_twins(measured)
 
     if not determinism:
         return

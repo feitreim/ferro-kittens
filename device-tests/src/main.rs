@@ -65,6 +65,8 @@ use kittens::shared::{
 use kittens::sync::Semaphore;
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block, store_wait};
 
+mod ladder_bench;
+
 /// Edge of the square tiles the swizzle and `stmatrix` cases use: 64 bf16
 /// columns is exactly one 128-byte swizzle atom per row, so these tiles are a
 /// single subtile and their cursor never leaves it. Every case below runs at
@@ -1980,6 +1982,18 @@ pub mod kernels {
     /// band costs is local-memory *traffic*, which `ptxas -v` does not report
     /// and only a timed kernel can price.
     ///
+    /// **One has now priced it, and the answer is that this table does not
+    /// order time** — see [`crate::ladder_bench`], which times four of these
+    /// rungs on a B200. On that probe a streamed band is not slower at all:
+    /// `all_in_place` is the fastest spelling at all four shapes on both a
+    /// single warp and a full device, and at `[32, 128]` — the rung where
+    /// `fused` wins on both static counters — `fused` is the *slower* of the
+    /// two. On `softmax` the same phenomenon cost 2.6x (#47), because there
+    /// shared memory caps occupancy either way and the freed registers buy
+    /// nothing. Registers, frame and occupancy each order part of the timing
+    /// and none of them orders it all. Read the rows below as what they are, a
+    /// record of what `ptxas` allocated, and not as a ranking.
+    ///
     /// The cliff, for the record: `rebound` first spills at 128 values a
     /// thread (128 columns at 32 rows), the other three at
     /// 192, and `all_in_place` at no rung on this ladder. Nothing at all is
@@ -1987,8 +2001,18 @@ pub mod kernels {
     /// `[32, 16]`, `[32, 32]` and `[32, 48]`, which is why a 32-wide probe
     /// could sit through a change worth 87 registers at 128 (#5) and report
     /// nothing.
+    ///
+    /// `STRIDED` is the one thing here that is not about registers, and it
+    /// exists so that #63 can put a clock on the rows above. The step and the
+    /// two bands are identical either way; all it changes is where the *final*
+    /// dump lands — at `false` every block writes the same `M * N` elements,
+    /// which is fine for one block and an aliasing violation for a grid, and
+    /// at `true` each block gets its own band. A timed rung has to be able to
+    /// fill the device, so it needs the second; the register ladder is priced
+    /// on the first and must keep exactly the numbers recorded above, which
+    /// `regcount`'s twin table checks rung by rung.
     #[inline(always)]
-    unsafe fn ladder_probe<const M: usize, const N: usize, const FORM: u32>(
+    unsafe fn ladder_probe<const M: usize, const N: usize, const FORM: u32, const STRIDED: bool>(
         scores: &[f32],
         steps: u32,
         k: f32,
@@ -2065,7 +2089,12 @@ pub mod kernels {
 
             // The accumulator has to reach memory or the loop above is dead
             // and the register counts describe nothing.
-            let base = lane as usize * slots * values;
+            let block_base = if STRIDED {
+                thread::blockIdx_x() as usize * M * N
+            } else {
+                0
+            };
+            let base = block_base + lane as usize * slots * values;
             let mut slot = 0usize;
             while slot < slots {
                 let mut value = 0usize;
@@ -2093,7 +2122,7 @@ pub mod kernels {
                 k: f32,
                 mut out: DisjointSlice<f32>,
             ) {
-                unsafe { ladder_probe::<$m, $n, $form>(scores, steps, k, &mut out) }
+                unsafe { ladder_probe::<$m, $n, $form, false>(scores, steps, k, &mut out) }
             }
         };
     }
@@ -2132,6 +2161,45 @@ pub mod kernels {
         (48, 128),
         (64, 128),
     );
+
+    /// One rung of the *timed* ladder: [`ladder_probe`] again, at `STRIDED =
+    /// true` so a grid of blocks may run it — issue #63.
+    ///
+    /// The name is the only thing that separates these from the rungs above.
+    /// They call the same `#[inline(always)]` body at the same `(M, N, FORM)`,
+    /// so `regcount`'s twin table is entitled to expect the same registers,
+    /// the same spill and the same frame, and prints both side by side rather
+    /// than asking anyone to take it on trust.
+    macro_rules! timed_rung {
+        ($m:literal, $n:literal, $spelling:ident, $form:ident) => {
+            #[kernel]
+            pub unsafe fn ${concat(ladder_timed_, $m, x, $n, _, $spelling)}(
+                scores: &[f32],
+                steps: u32,
+                k: f32,
+                mut out: DisjointSlice<f32>,
+            ) {
+                unsafe { ladder_probe::<$m, $n, $form, true>(scores, steps, k, &mut out) }
+            }
+        };
+    }
+
+    /// The four shapes #63 asks for, and only four: three where the in-place
+    /// spellings come in 81 to 130 registers under `fused` on a frame no
+    /// smaller — the streamed rungs — and `[32, 128]` as the control, where
+    /// `fused` wins on both counters (168/0 against 252/0) and a timing that
+    /// did *not* favour it would mean the harness, not the shape.
+    macro_rules! timed_ladder {
+        ($(($m:literal, $n:literal)),* $(,)?) => {$(
+            timed_rung!($m, $n, fused, LADDER_FUSED);
+            timed_rung!($m, $n, assign, LADDER_ASSIGN);
+            timed_rung!($m, $n, rebound, LADDER_REBOUND);
+            timed_rung!($m, $n, open_coded, LADDER_OPEN_CODED);
+            timed_rung!($m, $n, all_in_place, LADDER_ALL_IN_PLACE);
+        )*};
+    }
+
+    timed_ladder!((32, 96), (48, 64), (64, 64), (32, 128));
 
     /// **A codegen probe, not a test.** Masking is pure lane-local coordinate
     /// arithmetic and is checked exhaustively on the host, across all 32
@@ -3679,6 +3747,13 @@ fn observed_map(observed: &[f32], slots: usize, values: usize) -> String {
 }
 
 fn main() -> ExitCode {
+    // `cargo oxide run device-tests -- bench-ladder` (#63): the ladder's own
+    // rungs, checked and then *timed*, so a register claim can be compared
+    // against a clock. Behind an argument because it needs minutes of a B200
+    // where the correctness run needs seconds.
+    if std::env::args().nth(1).as_deref() == Some("bench-ladder") {
+        return ladder_bench::main();
+    }
     match run() {
         Ok(0) => ExitCode::SUCCESS,
         Ok(failures) => {

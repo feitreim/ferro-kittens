@@ -320,7 +320,33 @@ Missing from `prototype/`:
   at all. And what it found is that the shape response is not smooth — the
   in-place spellings drop 200 registers at some shapes by leaving the band in
   local memory, so a register count on its own no longer settles a comparison.
-  Whether that trade is faster is not a `ptxas` question; nothing here times it.
+- **And a register count does not settle it on the clock either** (#63). `modal
+  run modal_app.py::ladder_bench` is the first thing in this repo to *time* a
+  register claim rather than count it: four of the ladder's rungs on a B200,
+  each spelling verified against a CPU reference at every grid and step count it
+  is timed at, timed in repeated rounds so the table states its own noise floor
+  (0.8% worst case), with a `t(2S)/t(S)` control that says the loop under test
+  was not hoisted. On that probe the streamed band #60 flagged is **not**
+  slower: the fully in-place spelling — 32 registers, band in local memory — is
+  the fastest form at all four shapes, 6–10% per warp and 25–42% across a full
+  device, and the control shape `[32, 128]`, where `fused` wins on both static
+  counters, is one where `fused` *loses* on time. Registers, stack frame and
+  occupancy each order part of that table and none of them orders all of it, so
+  `ptxas -v` is a record of what was allocated and not a ranking.
+- **Put beside #47, that becomes a rule rather than a curiosity.** #47 timed the
+  same phenomenon on `softmax` — a `[32, 128]` band at 39 registers on a 1024 B
+  frame against a `[32, 32]` band at 66 registers on 256 B — and the streamed
+  one cost **2.6×**. Opposite sign, same mechanism, and the difference is what
+  the freed registers were able to buy: `softmax` is shared-memory capped at 6
+  blocks an SM either way, so streaming bought it nothing and the local traffic
+  showed undiluted, where the ladder probe uses no shared memory at all and
+  streaming bought it 2–4× the resident warps. So: **a streamed band costs real
+  time, and whether it is worth paying is a question about which resource is
+  binding in that kernel**, which is why `regcount` now prices the examples
+  crate and `kittens-examples` prints occupancy per kernel. Two caveats stay
+  attached: the ladder probe is one load-heavy op at one arithmetic intensity,
+  and local-memory *traffic* was measured on neither side — no profiler was run,
+  so "the band is streamed" is still read off the frame and the register count.
 
 ---
 

@@ -252,6 +252,13 @@ accumulator case, where the input is the output and no single expression
 exists. That is what #31 shipped, and the reason it is worth having is
 narrower and better founded than the reason it was filed.
 
+> Read on before taking that rule away with you. #60 swept it over fourteen
+> shapes and found the register table did not order them; #63 and #47 then put
+> a clock on it and found the register table does not order *time* either, in
+> either direction — and that where a band lives matters far more than how the
+> step is spelled. All three are below; the advice that stands is § "the two
+> timed results disagree", which reads #63 and #47 against each other.
+
 Two caveats that belong with the numbers. The 128-column register column sits
 on the cliff for four of the six forms above, so at 252–255 the spill bytes
 carry the signal and the register count carries almost none; the 168 is well
@@ -315,12 +322,129 @@ every rung but `[16, 64]`, where it wins by a single register. What it does not
 do is order the whole table, because whether the band reaches registers at all
 switches on shape, and where the two disagree the shape effect is bigger.
 
-Which leaves the rule above intact but narrower: *say the step in one
-expression where you can, and write it in place where you cannot* is still the
-advice, and at the one shape flash actually uses (`[32, 128]`) it is still
-worth 84 registers. It is advice about a shape, though, and not a law — and
-whether an in-place form that trades 220 registers for a local-memory band is
-faster is a question `ptxas` cannot answer and a timed kernel can.
+Which leaves the rule above narrower than it was: *say the step in one
+expression where you can, and write it in place where you cannot*. It is advice
+about a shape and not a law — and whether an in-place form that trades 220
+registers for a local-memory band is faster is a question `ptxas` cannot answer
+and a timed kernel can. One has now been run.
+
+#### with a clock on it — #63
+
+Everything above this line is `ptxas -v`, which reports what was **allocated**
+and never what it **cost**. `modal run modal_app.py::ladder_bench` times four of
+those rungs on a B200: the three where in-place appears to win by 81–130
+registers, and `[32, 128]` as a control where `fused` wins on both static
+counters. Same probe body, each block dumping into its own band so a grid can
+run it; `regcount` prints the timed rungs beside the ladder rungs and they price
+identically at all twenty. Kernel time per band element per step, `x` against
+the `fused` row of the same shape:
+
+| | regs | frame | warps/SM | 1 warp ns | ×fused | device ps | ×fused |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `[32, 96]` fused | 128 | 1536 | 16 | 4.703 | 1.00 | 8.6 | 1.00 |
+| `assign` | 47 | 1920 | 32 | 4.654 | 0.99 | 8.5 | 0.99 |
+| `rebound` | 251 | 1536 | 8 | 4.772 | 1.01 | 10.3 | 1.20 |
+| `all in place` | 32 | 1152 | 32 | **4.400** | **0.94** | **6.4** | **0.75** |
+| `[48, 64]` fused | 128 | 1536 | 16 | 4.756 | 1.00 | 8.8 | 1.00 |
+| `assign` | 40 | 1920 | 32 | 4.538 | 0.95 | 9.3 | 1.05 |
+| `rebound` | 202 | 1536 | 8 | 4.839 | 1.02 | 10.6 | 1.19 |
+| `all in place` | 32 | 1152 | 32 | **4.349** | **0.91** | **6.6** | **0.74** |
+| `[64, 64]` fused | 162 | 2560 | 12 | 5.117 | 1.00 | 12.4 | 1.00 |
+| `assign` | 32 | 2560 | 32 | 4.816 | 0.94 | 10.2 | 0.82 |
+| `rebound` | 168 | 2560 | 12 | 5.249 | 1.03 | 10.8 | 0.88 |
+| `all in place` | 32 | 1536 | 32 | **4.614** | **0.90** | **7.2** | **0.58** |
+| `[32, 128]` fused | 168 | 2560 | 12 | 4.798 | 1.00 | 10.6 | 1.00 |
+| `assign` | 252 | 2560 | 8 | 4.526 | 0.94 | 8.9 | 0.85 |
+| `rebound` | 255 | 2624 | 8 | 4.950 | 1.03 | 11.7 | 1.10 |
+| `all in place` | 32 | 1536 | 32 | **4.355** | **0.91** | **6.5** | **0.62** |
+
+`open_coded` is omitted only because it lands within 0.1% of `assign` at every
+shape, as it lands on the byte at every static counter. The noise floor is
+**0.8%** — the widest round-to-round spread over all twenty rungs and both
+grids, most cells 0.1–0.6% — so a ratio inside 1 ± 0.008 is not a difference
+this run can see. Every rung's `t(2S)/t(S)` is within 0.010 of 2.00, so nothing
+was hoisted, and every launch matched an `f64` reference to 1.4e-4 against a
+0.02 tolerance before it was timed at all.
+
+**On this probe, a streamed band is not slower.** #63 was filed on the worry
+that it might be serializing the inner loop, and here it is the other way round:
+the *most* streamed spelling — 32 registers, the whole band left in local
+memory — is the fastest at every shape on both grids, by 6–10% per warp and
+25–42% across the device. Whatever the local traffic costs, on this kernel it is
+less than what the freed registers buy. Hold "on this kernel" — the section
+after next is the same phenomenon costing 2.6× on a different one, and the two
+together are the actual result.
+
+**And the control comes out backwards.** `[32, 128]` was chosen because it is
+the cleanest cell in the whole ladder for "fused wins": 168 registers, no spill,
+against `assign`'s 252. On the clock `assign` is 6% faster per warp and 15%
+faster across the device. The one shape where the counters agreed is the shape
+where they were wrong.
+
+**So the register column does not order time, in either direction.** `assign` is
+47 registers at `[32, 96]` and 252 at `[32, 128]`, and it is 0.99× and 0.85×
+fused respectively — the *cheaper* of the two being the one that fails to win.
+The frame does not order it either. Occupancy is the one with a real mechanism
+and it explains more of the device column than anything else, but not all of it:
+at `[32, 128]` `assign` runs 8 warps/SM against `fused`'s 12 and is faster
+anyway, and at `[48, 64]` it runs 32 against 16 and is 5% slower.
+
+Two things do survive. `assign` and `open_coded` are indistinguishable on the
+clock as well as on every static counter, which is the strongest form of #31's
+claim yet. And `rebound` is the slowest spelling per warp at every shape by
+1–3%, three to five times the noise floor: materialization between statements
+is real, and it is the only part of the model that a clock confirms.
+
+#### the two timed results disagree — read #47 below with #63 above
+
+Read the next section before taking any of this to a kernel. **#47 timed a
+streamed band on `softmax` and found it cost 2.6×** — the same phenomenon, the
+opposite sign, on a kernel rather than a probe. Both numbers are right and the
+gap between them is the useful part.
+
+What differs is not the band. It is **what the freed registers are able to buy**.
+
+- `softmax` is **shared-memory capped**: `cuOccupancyMaxActiveBlocksPerMultiprocessor`
+  says 6 blocks an SM at 39 registers a thread and 6 at 66, because shared memory
+  binds either way. Streaming the band buys it *nothing*, so the local traffic
+  shows up undiluted — 2.6×.
+- The ladder probe uses **no shared memory at all**, so registers are the only
+  constraint and the occupancy column moves with them: 8 warps an SM at 251
+  registers, 32 at 32. Streaming buys 2–4× the resident warps, and that is what
+  pays for it.
+
+So the honest statement is neither "streaming is free" nor "streaming is
+expensive". It is: **a streamed band costs real time, and whether it is worth
+paying depends on whether the registers it frees are the constraint that is
+actually binding.** The probe's own table shows the price when the payment falls
+short — at `[48, 64]` `assign` runs 32 warps an SM against `fused`'s 16 and is
+still 5% *slower* across the device. Twice the warps did not quite cover it.
+
+**So the advice.** Do not read a register count as a speed. Read it with the
+occupancy beside it — `regcount` prices both kernel crates now, and
+`kittens-examples`' own status table prints
+`cuOccupancyMaxActiveBlocksPerMultiprocessor` per kernel (#47) — and ask the one
+question that matters: *does this kernel get more warps if the band leaves the
+register file?* If shared memory or the launch geometry caps it anyway, keep the
+band in registers and walk the tile in narrower chunks, which is exactly what
+#47 did and what bought 2.6×. If registers are the binding constraint, the
+in-place spellings that let `ptxas` stream are the fastest thing measured here
+and the register table's "failure" is a win.
+
+Within a spelling choice at fixed shape, the ordering is small and stable:
+fully in place is fastest, one fused expression next, rebinding last. That
+ordering is worth 1–3% per warp. Which side of the streaming cliff the shape
+sits on is worth 25–160%. Pick the shape first.
+
+Two limits on how far to carry the probe's half of this. It reads `M·N/32` fp32
+a thread per step and does about three flops on each, so it is a load-heavy loop
+with a long serial dependence, and at one warp a B200 SM is issue- and
+latency-bound rather than short of registers — visible in the per-warp column
+being nearly flat, 4.35–5.25 ns across every spelling and shape. A compute-dense
+inner loop could price a streamed band differently. And local-memory *traffic*
+was not measured on either side: that the band is in local memory is read off
+the frame and the register count, and no profiler was run. What was measured is
+time.
 
 #### the timed kernel answered it — #47
 
