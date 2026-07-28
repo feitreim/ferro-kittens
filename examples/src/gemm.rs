@@ -50,6 +50,12 @@
 //! completes there (#50). The charge stays the leader's, and is its own charge
 //! `RANKS` times over — `sync.rs`'s module docs carry the argument for why the
 //! byte accounting can only sit at the barrier and not travel with the loads.
+//!
+//! What the leader's own charge *is* it no longer says: the two loads hand it
+//! back, and `across_ranks` is the only arithmetic left (#29). This was the
+//! producer with the most to lose from a hand-written total, since a stage
+//! here is four tiles issued by two CTAs and the number covering them was
+//! written once, in the CTA that issues half of them.
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::cluster;
@@ -205,26 +211,31 @@ pub mod kernels {
                 // stage is present. Only the leader charges, and it charges
                 // the whole stage: `expect_tx` is `.shared::cta`, so a peer
                 // could not charge this barrier even holding its address.
-                // Nothing orders the two, and nothing has to — the transaction
-                // count is a signed accumulator and only the totals must
-                // agree.
+                //
+                // Every rank derives the same half-stage charge from the loads
+                // it just issued, because a cluster stage is symmetric; the
+                // leader scales its own by `RANKS` to cover the peer's, and
+                // the peer drops it. Nothing orders the charge and the loads,
+                // and nothing has to — the transaction count is a signed
+                // accumulator and only the totals must agree, which is what
+                // lets the charge follow the calls it is derived from.
                 let a_row = (2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * rank) as i32;
                 let b_row = (BLOCK_N as u32 * tile_n + HALF_N as u32 * rank) as i32;
                 let mut k = 0u32;
                 while k < k_blocks {
                     free.wait_recycled(k);
-                    if rank == LEADER {
-                        load.sem(k)
-                            .expect_tx(RANKS * (ATile::BYTES + BTile::BYTES) as u32);
-                    }
                     let stage = load.sem(k).at_rank(LEADER);
                     let column = (BLOCK_K as u32 * k) as i32;
-                    a_ring
+                    let a_bytes = a_ring
                         .tile(k)
                         .tma_load_2d_arriving_at(a_map, column, a_row, stage);
-                    b_ring
+                    let b_bytes = b_ring
                         .tile(k)
                         .tma_load_2d_arriving_at(b_map, column, b_row, stage);
+                    if rank == LEADER {
+                        load.sem(k)
+                            .expect_tx((a_bytes + b_bytes).across_ranks(RANKS));
+                    }
                     k += 1;
                 }
             }

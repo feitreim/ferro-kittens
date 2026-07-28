@@ -37,7 +37,7 @@ use cuda_device::tma::{
     cp_async_bulk_wait_group_read,
 };
 
-use crate::sync::{ClusterSemaphore, Semaphore};
+use crate::sync::{ClusterSemaphore, Semaphore, TransactionBytes};
 
 /// Element marker for tile types: the byte width every shape constant derives
 /// from, plus how fp32 register values pack into the 32-bit words device code
@@ -322,9 +322,18 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     pub const SUBTILES: usize = C / Self::SUBTILE_COLS;
     /// Bytes of one `[R, SUBTILE_COLS]` subtile.
     pub const SUBTILE_BYTES: usize = R * S::ATOM_BYTES;
-    /// Bytes of the whole tile — what a TMA load of it must charge via
-    /// [`Semaphore::expect_tx`].
+    /// Bytes of the whole tile — the shared-memory footprint, and what a TMA
+    /// load of it charges.
     pub const BYTES: usize = R * C * E::BYTES;
+
+    /// What a TMA load of the whole tile charges its barrier, as the receipt
+    /// [`Semaphore::expect_tx`] takes: one box per subtile, `R` rows each.
+    /// Equal to [`Self::BYTES`], counted the way the load loop issues it.
+    ///
+    /// Crate-private, because a kernel able to name a charge without issuing
+    /// the load is back to writing the number down.
+    pub(crate) const CHARGE: TransactionBytes =
+        TransactionBytes::new(Self::SUBTILES * R * S::ATOM_BYTES);
 
     const WIDTH_OK: () = assert!(
         C.is_multiple_of(S::ATOM_BYTES / E::BYTES),
@@ -367,16 +376,23 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     /// TMA the tile from a [`crate::global`] panel map: one box per subtile,
     /// the leading (column) coordinate lifted by `SUBTILE_COLS` per stack
     /// level, `row` selecting the global row range and `plane` the panel.
-    /// Completion lands on `sem`; the caller charges [`Self::BYTES`] (once
-    /// per tile, however many boxes) via [`Semaphore::expect_tx`].
+    /// Completion lands on `sem`, and the call hands back the charge for it —
+    /// once per tile, however many boxes — to be summed into that barrier's
+    /// [`Semaphore::expect_tx`].
     ///
     /// # Safety
     ///
     /// `map` must describe a live global buffer whose box shape matches
     /// `[R, SUBTILE_COLS]`, and `sem` must be an initialized TMA barrier.
     #[inline(always)]
-    pub unsafe fn tma_load(self, map: *const TmaDescriptor, row: i32, plane: i32, sem: Semaphore) {
-        unsafe { self.tma_load_at(map, 0, row, plane, sem) }
+    pub unsafe fn tma_load(
+        self,
+        map: *const TmaDescriptor,
+        row: i32,
+        plane: i32,
+        sem: Semaphore,
+    ) -> TransactionBytes {
+        unsafe { self.tma_load_at::<R>(map, 0, row, plane, sem) }
     }
 
     /// [`Self::tma_load`] landing at subtile row `dst_row` instead of the top —
@@ -387,22 +403,35 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     /// The stacking is layout-free precisely because a box height is a whole
     /// number of swizzle periods (8 rows of 128 bytes): landing a box at row
     /// 64 of a subtile reproduces exactly the swizzle rows 64.. of one tall
-    /// tile would have had. The caller charges the bytes actually in flight —
-    /// `box_rows * C * E::BYTES` per call, not [`Self::BYTES`].
+    /// tile would have had.
+    ///
+    /// `BOX_ROWS` is the *map's* box height and so cannot be read off this
+    /// tile — a 128-row operand built this way is paired with a 64-row map —
+    /// which is why it is a parameter rather than `R`. It is a const one
+    /// because the charge handed back is derived from it: this call brings in
+    /// `SUBTILES` boxes of `BOX_ROWS` rows, not a whole [`Self::BYTES`], and
+    /// that used to be a sentence asking the caller to do the multiplication.
     ///
     /// # Safety
     ///
-    /// As [`Self::tma_load`], plus `dst_row + box_rows <= R` and `dst_row` a
-    /// multiple of the 8-row swizzle period.
+    /// As [`Self::tma_load`], plus `map`'s box being `BOX_ROWS` tall,
+    /// `dst_row + BOX_ROWS <= R`, and `dst_row` a multiple of the 8-row
+    /// swizzle period.
     #[inline(always)]
-    pub unsafe fn tma_load_at(
+    pub unsafe fn tma_load_at<const BOX_ROWS: usize>(
         self,
         map: *const TmaDescriptor,
         dst_row: usize,
         row: i32,
         plane: i32,
         sem: Semaphore,
-    ) {
+    ) -> TransactionBytes {
+        const {
+            assert!(
+                BOX_ROWS <= R,
+                "a box taller than the tile cannot land in it"
+            )
+        };
         unsafe {
             let mut i = 0usize;
             while i < Self::SUBTILES {
@@ -417,6 +446,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
                 i += 1;
             }
         }
+        TransactionBytes::new(Self::SUBTILES * BOX_ROWS * S::ATOM_BYTES)
     }
 
     /// TMA the tile from a 2d tensor map: one box per subtile, the leading
@@ -437,7 +467,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
         leading: i32,
         minor: i32,
         sem: Semaphore,
-    ) {
+    ) -> TransactionBytes {
         unsafe {
             let mut i = 0usize;
             while i < Self::SUBTILES {
@@ -451,6 +481,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
                 i += 1;
             }
         }
+        Self::CHARGE
     }
 
     /// [`Self::tma_load_2d`] completing on another CTA's barrier: the boxes
@@ -479,7 +510,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
         leading: i32,
         minor: i32,
         sem: ClusterSemaphore,
-    ) {
+    ) -> TransactionBytes {
         unsafe {
             self.tma_load_2d_multicast_cg2(map, leading, minor, sem, 1 << cluster::block_rank())
         }
@@ -491,6 +522,14 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     /// CTAs — which is why the mask is the caller's; a load that replicates
     /// nothing and only wants the barrier's address space is
     /// [`Self::tma_load_2d_arriving_at`].
+    ///
+    /// The charge handed back is one tile — what a single destination
+    /// receives, which is the whole of it for the own-bit mask that
+    /// [`Self::tma_load_2d_arriving_at`] passes and the only mask any kernel
+    /// here uses. A caller replicating into several CTAs owns the question of
+    /// whether the one barrier it named sees that once or once per
+    /// destination, and #49 is where that gets answered against hardware
+    /// rather than guessed at here.
     ///
     /// # Safety
     ///
@@ -504,7 +543,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
         minor: i32,
         sem: ClusterSemaphore,
         cta_mask: u16,
-    ) {
+    ) -> TransactionBytes {
         unsafe {
             let mut i = 0usize;
             while i < Self::SUBTILES {
@@ -519,6 +558,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
                 i += 1;
             }
         }
+        Self::CHARGE
     }
 
     /// TMA the tile out to a [`crate::global`] panel map: one box per subtile,
@@ -895,10 +935,13 @@ impl<E: Element, const N: usize> Clone for SharedVec<E, N> {
 impl<E: Element, const N: usize> Copy for SharedVec<E, N> {}
 
 impl<E: Element, const N: usize> SharedVec<E, N> {
-    /// Bytes of the whole vector — what a TMA load of it charges via
-    /// [`Semaphore::expect_tx`], and the stride to the next object in a
-    /// kernel's shared plan.
+    /// Bytes of the whole vector — what a TMA load of it charges, and the
+    /// stride to the next object in a kernel's shared plan.
     pub const BYTES: usize = N * E::BYTES;
+
+    /// What a TMA load of the vector charges its barrier: one box, the whole
+    /// of it. Crate-private for the reason [`SharedTile::CHARGE`] is.
+    pub(crate) const CHARGE: TransactionBytes = TransactionBytes::new(Self::BYTES);
 
     /// An unswizzled TMA box's innermost dimension is measured in bytes and
     /// must be a whole number of 16-byte lines; there is no swizzle atom to
@@ -1002,7 +1045,8 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
 
     /// TMA the vector from a rank-1 [`crate::global::GlobalLayout`]: one box,
     /// `N` elements wide, starting at element `start`. Completion lands on
-    /// `sem`; the caller charges [`Self::BYTES`] via [`Semaphore::expect_tx`].
+    /// `sem`, and the call hands back the charge for it, to be summed into
+    /// that barrier's [`Semaphore::expect_tx`].
     ///
     /// One instruction, unlike [`SharedTile::tma_load`]'s one per subtile —
     /// an unswizzled box has no atom to be cut into.
@@ -1016,10 +1060,16 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     /// `sem` must be an initialized TMA barrier, and the vector must be
     /// 128-byte aligned.
     #[inline(always)]
-    pub unsafe fn tma_load(self, map: *const TmaDescriptor, start: i32, sem: Semaphore) {
+    pub unsafe fn tma_load(
+        self,
+        map: *const TmaDescriptor,
+        start: i32,
+        sem: Semaphore,
+    ) -> TransactionBytes {
         #[allow(clippy::let_unit_value)]
         let _ = Self::TMA_OK;
         unsafe { cp_async_bulk_tensor_1d_g2s(self.base, map, start, sem.raw()) }
+        Self::CHARGE
     }
 
     /// [`Self::tma_load`] against a rank-2 map — one *row* of a `[N, rows]`
@@ -1037,10 +1087,11 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
         start: i32,
         minor: i32,
         sem: Semaphore,
-    ) {
+    ) -> TransactionBytes {
         #[allow(clippy::let_unit_value)]
         let _ = Self::TMA_OK;
         unsafe { cp_async_bulk_tensor_2d_g2s(self.base, map, start, minor, sem.raw()) }
+        Self::CHARGE
     }
 
     /// TMA the vector out to a rank-1 map, the coordinate read the way
@@ -1481,6 +1532,64 @@ mod tests {
             let value = unsafe { vec.get(index) };
             assert_eq!(value.to_bits(), (0x4000u32 | index as u32) << 16);
         }
+    }
+
+    #[test]
+    fn a_tiles_charge_is_the_boxes_its_load_issues() {
+        // `CHARGE` counts what the load loop actually does — one box per
+        // subtile, `R` rows of one swizzle atom each — and `BYTES` counts the
+        // tile. They are the same number for every shape, and that identity is
+        // the whole reason a derived charge can replace a hand-written one. A
+        // width that stopped being a whole number of subtiles would break it,
+        // and `WIDTH_OK` rejects those first.
+        assert_eq!(Panel::CHARGE.bytes(), Panel::BYTES as u32);
+        assert_eq!(PTile::CHARGE.bytes(), PTile::BYTES as u32);
+        assert_eq!(Paired::CHARGE.bytes(), Paired::BYTES as u32);
+        assert_eq!(Params::CHARGE.bytes(), Params::BYTES as u32);
+        // A partial load — `tma_load_at::<BOX_ROWS>` — charges its boxes and
+        // not the tile, which is the case the old prose asked callers to do by
+        // hand. Half the rows, half the bytes.
+        let half = || TransactionBytes::new(Paired::SUBTILES * 64 * Swizzle128B::ATOM_BYTES);
+        assert_eq!(half().bytes(), Paired::BYTES as u32 / 2);
+        assert_eq!((half() + half()).bytes(), Paired::CHARGE.bytes());
+    }
+
+    #[test]
+    fn every_producers_derived_charge_is_the_sum_it_used_to_write_down() {
+        // One case per `expect_tx` in `examples/`, with the tile types the
+        // kernel declares and the literal byte count its hand-sum came to.
+        // Both sides are spelled out: a derivation that agreed with a hand-sum
+        // only because both were computed from the same expression would be
+        // testing nothing.
+        type GemmA = SharedTile<Bf16, 128, 64, Swizzle128B>;
+        type GemmB = SharedTile<Bf16, 64, 64, Swizzle128B>;
+        // gemm — `RANKS * (ATile::BYTES + BTile::BYTES)`, the one charge that
+        // covers bytes the charging CTA does not issue.
+        let stage = GemmA::CHARGE + GemmB::CHARGE;
+        assert_eq!(stage.bytes(), 24576);
+        assert_eq!(stage.across_ranks(2).bytes(), 49152);
+
+        type Q = SharedTile<Bf16, 128, 128, Swizzle128B>;
+        type KV = SharedTile<Bf16, 64, 128, Swizzle128B>;
+        // flash_forward — one `QTile::BYTES` up front, then
+        // `KTile::BYTES + VTile::BYTES` per key block.
+        assert_eq!(Q::CHARGE.bytes(), 32768);
+        assert_eq!((KV::CHARGE + KV::CHARGE).bytes(), 32768);
+
+        // softmax, and groupnorm's second kernel — a lone `Tile::BYTES`.
+        type Rows = SharedTile<Bf16, 128, 128, Swizzle128B>;
+        assert_eq!(Rows::CHARGE.bytes(), 32768);
+
+        // layernorm — `Tile::BYTES + 2 * Parameters::BYTES`, the producer
+        // whose sum mixes a tile with two vectors and so was the easiest to
+        // get wrong: a missed `2 *` under-charges by 256 bytes and the tile is
+        // read while beta is still in flight.
+        type Gamma = SharedVec<Bf16, 128>;
+        assert_eq!(Gamma::CHARGE.bytes(), 256);
+        assert_eq!(
+            (Rows::CHARGE + Gamma::CHARGE + Gamma::CHARGE).bytes(),
+            33280
+        );
     }
 
     #[test]

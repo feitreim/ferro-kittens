@@ -163,12 +163,14 @@ const STAGES: usize = 3;
 const LOG2E: f32 = core::f32::consts::LOG2_E;
 
 type QTile = SharedTile<Bf16, QUERIES, HEAD, Swizzle128B>;
-type KTile = SharedTile<Bf16, KEYS, HEAD, Swizzle128B>;
-type VTile = SharedTile<Bf16, KEYS, HEAD, Swizzle128B>;
 /// The probabilities, staged back to shared as the `A` operand of `O = P·V`.
 /// Exactly one swizzle atom wide, which is what the `stmatrix` store path
 /// needs.
 type PTile = SharedTile<Bf16, QUERIES, KEYS, Swizzle128B>;
+/// `KTile` and `VTile` used to sit beside these, and #29 is what retired them:
+/// their only remaining use was the `KTile::BYTES + VTile::BYTES` this kernel
+/// charged its stage barrier, and the loads hand that back themselves now. A
+/// stage's tile is `k_ring.tile(block)`, which is where its shape already was.
 type KRing = SharedTileRing<Bf16, KEYS, HEAD, Swizzle128B, STAGES>;
 type VRing = SharedTileRing<Bf16, KEYS, HEAD, Swizzle128B, STAGES>;
 
@@ -268,8 +270,7 @@ pub mod kernels {
             let output: Output = scores.split_columns();
 
             if leader {
-                q.tma_load(q_map, query_base as i32, head, q_loaded);
-                q_loaded.expect_tx(QTile::BYTES as u32);
+                q_loaded.expect_tx(q.tma_load(q_map, query_base as i32, head, q_loaded));
             }
 
             // Only the accumulator bands' shapes: `mm_abt`/`mm_ab` each carry
@@ -289,14 +290,15 @@ pub mod kernels {
 
                 if leader {
                     free.wait_recycled(block);
-                    k_ring
-                        .tile(block)
-                        .tma_load(k_map, key_base as i32, head, load.sem(block));
-                    v_ring
-                        .tile(block)
-                        .tma_load(v_map, key_base as i32, head, load.sem(block));
-                    load.sem(block)
-                        .expect_tx((KTile::BYTES + VTile::BYTES) as u32);
+                    let keys =
+                        k_ring
+                            .tile(block)
+                            .tma_load(k_map, key_base as i32, head, load.sem(block));
+                    let values =
+                        v_ring
+                            .tile(block)
+                            .tma_load(v_map, key_base as i32, head, load.sem(block));
+                    load.sem(block).expect_tx(keys + values);
                 }
                 load.wait(block);
                 thread::sync_threads();

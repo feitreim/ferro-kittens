@@ -64,6 +64,53 @@
 //! them — only the totals have to agree. No sync sits between them in the
 //! GEMM and none is owed.
 //!
+//! # Where the transaction count comes from
+//!
+//! [`Semaphore::expect_tx`] takes a [`TransactionBytes`] and nothing else, and
+//! the only way to obtain one is to issue the load that will deliver it. A
+//! stage's charge is the sum of the calls that were made:
+//!
+//! ```ignore
+//! let stage = k_ring.tile(i).tma_load(k_map, base, head, load.sem(i))
+//!     + v_ring.tile(i).tma_load(v_map, base, head, load.sem(i));
+//! load.sem(i).expect_tx(stage);
+//! ```
+//!
+//! Every producer used to write that total by hand — `(KTile::BYTES +
+//! VTile::BYTES) as u32` — and keep it in step with the loads above it by
+//! reading both. Under-charging flips the barrier before the last bytes land
+//! and the consumer reads a half-written tile, with no fault and no
+//! diagnostic; over-charging hangs the block. Adding a load and forgetting the
+//! sum is one edit, and nothing was watching for it.
+//!
+//! The lighter fix — an `expect_tiles(&[…])` taking the tile types — was
+//! rejected because it is the same fact stated twice with nicer syntax. A list
+//! can omit a tile exactly as a sum can omit a term. What has to agree with
+//! the charge is the *set of loads issued*, so the charge has to come from
+//! them and not from anything that restates them.
+//!
+//! Two things that fall out, and are the point:
+//!
+//! - **Writing a wrong number is not expressible.** [`TransactionBytes`] has
+//!   no public constructor and is not an integer, so there is nothing to
+//!   mistype.
+//! - **Issuing a load and dropping its charge is a compile error.** The type
+//!   is `#[must_use]`, so `tile.tma_load(…);` as a statement fails under
+//!   `-D warnings`, and a charge bound to a name that never reaches an
+//!   `expect_tx` fails as an unused binding. It is also not `Copy`, so
+//!   charging the same bytes to two barriers is a use of a moved value.
+//!
+//! What the type does not catch, stated plainly: it says how many bytes, never
+//! which barrier. A load aimed at one semaphore whose charge is paid to
+//! another still type-checks — and has to, because that is exactly what a
+//! cluster stage does. The peers aim their loads at the leader through
+//! [`Semaphore::at_rank`] and the leader charges its own barrier for all of
+//! them, which is [`TransactionBytes::across_ranks`]: the local charge, from
+//! each of the ranks staging into the barrier. It is the `RANKS *` of the
+//! shape-(1) argument above, and it is derived from the loads this CTA issued
+//! rather than written down, because a cluster stage is symmetric — that is
+//! the same symmetry the MMA descriptor reads across the pair on.
+//!
 //! [`block_reduce`] is the other thing a kernel needs the block to agree on,
 //! and it is not a barrier idiom but a *collective*: warps cannot shuffle to
 //! each other, so a statistic spanning them is staged through shared memory
@@ -82,6 +129,59 @@ use cuda_device::{thread, warp};
 
 use crate::reg::{Add, ReduceOp};
 use crate::shared::{F32, SharedVec};
+
+/// Transaction bytes owed to an mbarrier, and the only thing
+/// [`Semaphore::expect_tx`] will take.
+///
+/// Handed back by every TMA load in [`crate::shared`] and constructible no
+/// other way, so a charge is a receipt for transfers that were issued rather
+/// than a claim about them. `+` sums the loads of one stage;
+/// [`Self::across_ranks`] scales a symmetric cluster stage. The module docs
+/// carry the argument for why this is a type and not a `u32`.
+///
+/// Deliberately neither `Copy` nor droppable-in-silence: the lints are half of
+/// what it is for.
+#[must_use = "a load's transaction bytes must reach an expect_tx or its barrier never completes"]
+pub struct TransactionBytes(u32);
+
+impl TransactionBytes {
+    /// The charge for `bytes` bytes of a transfer being issued now. Private to
+    /// the crate: a kernel that could call this could write down any number,
+    /// which is the whole of what this type exists to prevent.
+    #[inline(always)]
+    pub(crate) const fn new(bytes: usize) -> Self {
+        Self(bytes as u32)
+    }
+
+    /// This charge from each of `ranks` ranks — a cluster stage's whole cost,
+    /// as the one CTA that may charge a barrier has to state it.
+    ///
+    /// Derived and not restated: every rank of a cluster stages the same tile
+    /// types at the same shared offsets, so the stage's total is the local
+    /// total scaled by the rank count. See the module docs for who charges and
+    /// why it cannot be the CTA that issued the bytes.
+    #[inline(always)]
+    pub const fn across_ranks(self, ranks: u32) -> Self {
+        Self(self.0 * ranks)
+    }
+
+    /// The count itself, for tests and for intrinsics below this abstraction.
+    #[inline(always)]
+    pub const fn bytes(&self) -> u32 {
+        self.0
+    }
+}
+
+/// The sum of two stages' loads. Associativity is the transaction counter's,
+/// not this type's: the barrier accumulates whatever order the charges and the
+/// completions reach it in.
+impl core::ops::Add for TransactionBytes {
+    type Output = Self;
+    #[inline(always)]
+    fn add(self, other: Self) -> Self {
+        Self(self.0 + other.0)
+    }
+}
 
 /// One mbarrier, addressed as the 64-bit state word it is. Handles are Copy
 /// and carry no phase: parity comes from the caller's tile index (see
@@ -140,21 +240,26 @@ impl Semaphore {
         }
     }
 
-    /// Count one arrival and register `bytes` of expected TMA transactions —
-    /// the producer side of a `load → wait` handoff. `bytes` is every byte
-    /// that will complete *against this barrier*, which under a cluster is not
-    /// the same set as the bytes the calling CTA issues: a peer's loads
-    /// aimed here through [`Semaphore::at_rank`] are counted here, and the
-    /// module docs say why the charge cannot travel with them.
+    /// Count one arrival and register the TMA transactions of `bytes` — the
+    /// producer side of a `load → wait` handoff, taking the charges the loads
+    /// themselves handed back.
+    ///
+    /// `bytes` is every byte that will complete *against this barrier*, which
+    /// under a cluster is not the set the calling CTA issued: a peer's loads
+    /// aimed here through [`Semaphore::at_rank`] are counted here, which is
+    /// what [`TransactionBytes::across_ranks`] states and the module docs say
+    /// why the charge cannot travel with them.
     ///
     /// # Safety
     ///
-    /// Same contract as [`Semaphore::arrive`]; `bytes` must equal the bytes
-    /// actually in flight or the phase never completes.
+    /// Same contract as [`Semaphore::arrive`]. The charges summed here must be
+    /// exactly those of the loads completing on this barrier — the type makes
+    /// them derived rather than written down, but it does not know which
+    /// barrier a load was aimed at.
     #[inline(always)]
-    pub unsafe fn expect_tx(self, bytes: u32) {
+    pub unsafe fn expect_tx(self, bytes: TransactionBytes) {
         unsafe {
-            mbarrier_arrive_expect_tx(self.bar, 1, bytes);
+            mbarrier_arrive_expect_tx(self.bar, 1, bytes.bytes());
         }
     }
 

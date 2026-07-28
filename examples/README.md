@@ -75,8 +75,9 @@ missing API any more**. All four compile against the real library, and what
 separates the two that *run* from the two that do not is a launcher and a CPU
 reference. What is still open is on the other list, the one that came from
 writing kernels rather than from ThunderKittens' feature set: a cluster
-geometry for multicast, and the `expect_tx` byte accounting. None of them
-blocks a kernel in this directory. The work-item map that knows about clusters
+geometry for multicast. The `expect_tx` byte accounting was the other and is
+closed by #29 — every producer's charge is now derived from the loads it
+issued. None of them blocks a kernel in this directory. The work-item map that knows about clusters
 is closed by #51 — and §7 below is worth reading for the half that is *not* the
 API, since the GEMM adopted the scaffold, computed exactly, and was slower.
 
@@ -1146,6 +1147,11 @@ symmetric by construction. `sync.rs`'s module docs carry the argument, including
 why the per-rank alternative that would have kept the sum local (and pleased
 #29) is not worth a barrier and a spinning thread per rank per stage.
 
+The locality #29 wanted came back anyway, and without the second barrier: under
+#29 each rank derives its own half of the stage from the loads it issued, and
+the leader scales its half by `RANKS`. That is the same `RANKS *` this section
+promised, now with nothing hand-written on either side of it.
+
 The load half is `SharedTile::tma_load_2d_arriving_at`, which owns the
 own-bit mask that used to sit open-coded in `gemm.rs`;
 `tma_load_2d_multicast_cg2` keeps the mask and is now the replication form
@@ -1262,10 +1268,15 @@ actually needs from it is the address space. Filed as a correction on #24.
 
 #### 9. Smaller things, each one line of API
 
-- **`expect_tx` byte accounting is hand-summed.** Every producer writes
-  `(ATile::BYTES + BTile::BYTES) as u32` and has to keep it in step with the
-  loads it issued. A tile knows its own size; `Semaphore::expect_tiles` or a
-  charge returned by `tma_load` would make the two impossible to disagree.
+- **`expect_tx` byte accounting is hand-summed.** *Closed by #29.* Every
+  producer wrote `(ATile::BYTES + BTile::BYTES) as u32` and had to keep it in
+  step with the loads it issued. Both shapes above were on the table and the
+  second one landed: `tma_load` returns a `TransactionBytes`, `expect_tx` takes
+  nothing else, and the total is the sum of the calls that were made.
+  `expect_tiles(&[…])` would have been the same fact stated twice — a list can
+  omit a tile exactly as a sum can omit a term. The cluster case is that total
+  times the ranks staging into the barrier (`across_ranks`), which is the
+  interface #50 promised it. `src/sync.rs`'s module docs carry the argument.
 - **Coordinate-dependent ops need `lane` passed in.** Settled by #27:
   implicit for ops that execute, explicit for pure coordinate queries. The
   masks (#7) take it explicitly, on that rule — `device-tests` and `reg.rs`
