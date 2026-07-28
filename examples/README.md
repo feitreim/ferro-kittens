@@ -20,7 +20,7 @@ target *of the library*.)
 | --- | --- | --- |
 | [`gemm`](src/gemm.rs) | **runs** — exact against a CPU reference | — (two gaps worked around in-file, both marked) |
 | [`softmax`](src/softmax.rs) | **runs** — within 2⁻⁸ of a CPU reference | — |
-| [`flash_forward`](src/flash_forward.rs) | aspirational | #11, #31 |
+| [`flash_forward`](src/flash_forward.rs) | aspirational | #11 |
 | [`layernorm`](src/layernorm.rs) | `layernorm_rows` **compiles**; `groupnorm_tile` aspirational | #3 (and #2 under it), for `groupnorm_tile` only |
 
 Two of the four **run** rather than merely compile, which is a strictly stronger
@@ -49,9 +49,10 @@ composition on top of them, in both directions and against both memories, and
 **#13** closed the vector shape of shared memory. **#23 and #7 closed together**
 — flash could not name its `[32, 64]` band, and the unsatisfied bound on that
 band was what kept `make_causal` off the error list, so shipping either alone
-would have left a confusing state. What remains across the four is the global ↔
-register path (#11), one in-place form (#31), and one structural gap (#3,
-layernorm's block-scope statistic).
+would have left a confusing state. **#31** closed the in-place half of the map
+mechanism, which was the last arithmetic entry on any of these lists. What
+remains across the four is the global ↔ register path (#11) and one structural
+gap (#3, layernorm's block-scope statistic) — neither of them arithmetic.
 
 `layernorm` is the first example to be **split** by a landed issue rather than
 promoted whole, and the split is the honest reading of what #13 bought.
@@ -61,10 +62,11 @@ because its statistic spans four warps. The `#[cfg]` sits on the *kernel* — th
 `#[cuda_module]` macro honours it — so the file that documents the gap is the
 file that builds, and one aspirational kernel does not gate a finished one.
 
-The one arithmetic entry still open is `RegTile::add_assign`, and it is **#31**
-rather than a leftover: it is an *in-place* form, and #31 exists to land every
-in-place map variant at once. #38 deliberately did not add a one-off. See §
-"in-place versus by-value" below for what #38 measured about it.
+No arithmetic entry is open any more. `RegTile::add_assign` was the last one
+and **#31** landed it, along with an `_assign` twin for every other map on all
+three register families. What #31 measured on the way is more interesting than
+the API it shipped, and § "in-place versus by-value" below is rewritten around
+it.
 
 ```sh
 cargo oxide build kittens-examples --arch sm_100a   # the default set: gemm, softmax, layernorm_rows
@@ -92,21 +94,22 @@ lists are now short enough to write out. Both are read off
 `modal run modal_app.py::gaps`, which checks each feature on its own so an
 error belongs to a known kernel:
 
-- **`flash_forward`** — `global::store_rows` (#11), `RegTile::add_assign`
-  (#31). Both are at the ends of the kernel; everything between the score band
-  arriving in registers and the probabilities going back to shared is now
-  library API. The list was three errors until #23 landed, and how the third
-  went is worth keeping: `make_causal_at` (#7) was wanted all along and never
-  appeared as its own error, because it is called on the `[32, 64]` band whose
-  `FragmentLayout` bound already failed, and an unsatisfied bound on the
-  receiver suppresses method resolution on it. Counting errors would have said
-  #7 had landed.
+- **`flash_forward`** — `global::store_rows` (#11), and nothing else. One
+  error, at the very end of the kernel: everything from the score band
+  arriving in registers to the accumulated output being divided by the softmax
+  denominator is library API now. The list was three errors until #23 landed
+  and two until #31, and how the third went is worth keeping: `make_causal_at`
+  (#7) was wanted all along and never appeared as its own error, because it is
+  called on the `[32, 64]` band whose `FragmentLayout` bound already failed,
+  and an unsatisfied bound on the receiver suppresses method resolution on it.
+  Counting errors would have said #7 had landed.
 - **`layernorm`** — `sync::block_reduce_sum` (#3), and nothing else. One error,
   in `groupnorm_tile` only; `layernorm_rows` left the feature gate with #13.
   Verified by running the check, not by reading the file.
 
-Nothing named `scale`, `shift` or `rsqrt` is in either list any more (#38), and
-nothing named `FragmentLayout` or `make_causal` (#23 + #7). That last pair is
+Nothing named `scale`, `shift` or `rsqrt` is in either list any more (#38),
+nothing named `add_assign` (#31), and nothing named `FragmentLayout` or
+`make_causal` (#23 + #7). That last pair is
 worth keeping as a note on how to read this section: `make_causal_at` never
 appeared as its own error, because it was called on the `[32, 64]` band whose
 layout bound failed first and an unsatisfied bound on the receiver suppresses
@@ -158,8 +161,9 @@ mechanism and every vector/vector and broadcast form the kernels asked for:
 > Note the asymmetry the examples exposed: `RegVec` already had `exp2`, `max`,
 > `sub`, `add_assign`, `mul_assign`. `RegTile` had none of them. Every op the
 > vector has, the tile wants — which is exactly the argument for the mechanism
-> rather than another round of hand-written methods. It still holds for the
-> in-place forms: the vector has them and the tile does not (#31).
+> rather than another round of hand-written methods. **#31** closed the last of
+> it: the in-place forms are generated from the same `op_methods!` tables, so
+> all three families carry the same names.
 
 **#38 — scalar operands. Landed.** What #5 listed and did not ship, and the
 last arithmetic on any of these lists: `scale`/`shift`/`clamp_min`/`clamp_max`
@@ -177,37 +181,66 @@ op at all.
 
 #### in-place versus by-value
 
-#38's probe (`scalar_map_probe_*` in `device-tests`) prices the same tile-loop
-three ways — the pre-#38 `bin_map::<Mul>(splat(k))`, the new `scale(k)`, and an
-in-place multiply written through `set` — at both probe widths:
+**#31 — in-place maps. Landed.** Every by-value map now has an `_assign` twin
+taking `&mut self`, on `RegTile`, `RegVec` and `ColVec`, generated from the
+same tables as the by-value names. `RegTile::scale_rows` — hand-written since
+#5 precisely to avoid the by-value `mul_row` — is a one-line wrapper over
+`row_map_assign::<Mul>` now, and measures identically to the loop it replaced.
+
+The issue was filed on the claim that `row_map::<Mul>` costs 168 → 255
+registers/thread at 128 columns where `scale_rows` does not. That reproduces
+exactly, and the in-place form closes it (`softmax_probe_*`, `regcount`):
 
 | | 32 columns | 128 columns |
 | --- | --- | --- |
-| `bin_map::<Mul>(splat(k))` | 48 regs, no spill | 255 regs, 124 B spill |
-| `scale(k)` | 48 regs, no spill | 255 regs, 60 B spill |
-| in place, through `set` | 48 regs, no spill | 252 regs, no spill |
+| `scale_rows`, hand-written | 64 regs | 168 regs |
+| `out = out.row_map::<Mul>(f)` | 64 regs | **255 regs** |
+| `out.mul_row_assign(f)` | 64 regs | 168 regs |
+| `out = out.add(p)` | 64 regs | 168 regs, 3072 B stack |
+| `out.add_assign(p)` | 64 regs | 168 regs, 2560 B stack |
 
-Two things follow. `scale` is strictly better than what a kernel had to write
-before it, at every width — half the spill at 128 and free at 32. And the
-by-value/in-place gap #31 was filed about **reproduces for a scalar operand**:
-at 128 columns both by-value forms spill where the in-place one does not. That
-is the argument for #31 covering `scalar_map` alongside `row_map` and
-`add_assign`, rather than the three being separate decisions.
+Two results, pulling opposite ways. The rescale is worth 87 registers/thread
+in place — that is #31's premise, measured, and the reason `scale_rows` may
+now be deleted. The *accumulate* `flash_forward` was blocked on is worth no
+registers at all, because that call site rebinds a dead input; what it buys is
+512 bytes of stack and a line that reads like what it does.
 
-But "by-value costs registers" is probably the wrong lesson, and an
-intermediate form of the same probe says why. Written as
-`out_acc.add(block.scale(k))` — the scaled tile chained inside another map, so
-`block` and its scaled copy are both live at the peak — it took 84 B of spill,
-where the rebinding `block = block.scale(k)` took none. Same op, same width,
-same by-value map; only the peak liveness differs. Read that way, three results
-that look unrelated line up: #5's `row_map` cliff (a second tile live beside
-the accumulator it replaces), the 60 B above (same), and #22's composed movers
-coming out *cheaper* than the loops they replaced (36 against 52 — the
-composed form has one band live where the loop kept a band and a fragment). The
-variable is how many tiles are live at once, not whether a method takes `self`
-by value. If that holds, #31's job is narrower than it looks: in-place forms
-pay only where the input is live across the op, and a by-value map whose input
-dies at the call already costs nothing.
+And the framing both #31 and #38 were argued under does not survive the
+control. #38 read the variable as *peak liveness*, on the strength of an
+uncommitted probe where `out_acc.add(block.scale(k))` spilled 84 bytes and the
+rebinding `block = block.scale(k)` spilled none. That form is in the tree now
+(`scalar_map_probe_*_chained`) and reproduces — 108 bytes here. But so is the
+form one step further along the same axis, `out_acc.scale(k).add(block.scale(k))`,
+where *nothing* is rebound and which peak liveness says should be worst of all:
+
+| 128 columns | regs | spill | stack |
+| --- | --- | --- | --- |
+| `bin_map::<Mul>(splat(k))` | 255 | 124 B | 2648 |
+| `scale(k)`, rebound | 255 | 60 B | 2624 |
+| `add(block.scale(k))`, chained | 255 | 108 B | 2672 |
+| in place, through `set` | 252 | — | 2560 |
+| `scale_assign(k)` (#31) | 252 | — | 2560 |
+| `out.scale(k).add(block.scale(k))` | **168** | — | 2560 |
+
+It is the cheapest form in the table by 84 registers and the only one under
+the cliff. Liveness does not order these; what does is how many whole bands
+have to be **materialized between statements**. One expression fuses into a
+single pass over the band and materializes none. The in-place forms
+materialize none either, but make one pass per op. Every rebinding form
+materializes one band per statement, and that is what spills.
+
+So the rule for a kernel author is *say the whole step in one expression where
+you can, and write it in place where you cannot* — which is exactly the
+accumulator case, where the input is the output and no single expression
+exists. That is what #31 shipped, and the reason it is worth having is
+narrower and better founded than the reason it was filed.
+
+Two caveats that belong with the numbers. The 128-column register column sits
+on the cliff for four of the six forms above, so at 252–255 the spill bytes
+carry the signal and the register count carries almost none; the 168 is well
+clear of it and is the one to trust. And every number in this section is from
+`regcount`, which was confirmed deterministic while #31 was measured — the
+same tree twice gave the same 45 kernels to the byte.
 
 **#6 — reductions. Landed.** `row_reduce`/`col_reduce`/`tile_reduce` over a
 `ReduceOp` (a `BinaryOp` with an identity), with `row_max`/`row_min`/`row_sum`/`row_prod`, the `col_*` mirrors,
