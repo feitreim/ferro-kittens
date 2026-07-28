@@ -15,8 +15,8 @@
 use cuda_device::cusimd::{CuSimd, TmemRegs4};
 use cuda_device::tcgen05::{
     tcgen05_alloc, tcgen05_alloc_cg2, tcgen05_dealloc, tcgen05_dealloc_cg2,
-    tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_relinquish_alloc_permit_cg2,
-    tcgen05_st_16x256b_x1_raw, tcgen05_store_wait,
+    tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_relinquish_alloc_permit,
+    tcgen05_relinquish_alloc_permit_cg2, tcgen05_st_16x256b_x1_raw, tcgen05_store_wait,
 };
 use cuda_device::{cluster, thread, warp};
 
@@ -26,15 +26,35 @@ use crate::reg::{BaseLdtm, Fragment, FragmentLayout, RegTile};
 /// warp 0 allocates `columns` into the shared staging word, a block sync
 /// publishes it, and every thread reads back the address.
 ///
+/// That warp also gives up the CTA's *allocation permit*, which is a
+/// different thing from giving back the columns — those are
+/// [`dealloc_block`]'s. The permit is the right to call the allocator again,
+/// so it goes back beside the alloc rather than beside the dealloc: this
+/// library allocates once per CTA, and holding the right to allocate for the
+/// rest of a CTA's life is what the instruction exists to avoid.
+///
+/// PTX requires the permit back before the CTA exits and does not say what
+/// happens otherwise. #46 predicted a deadlock — the next CTA on that SM
+/// stuck in `tcgen05.alloc` — and on a B200 that is *not* observable: with
+/// this call removed, 4736 CTAs over three launches, each taking all 512
+/// columns, all completed, and a CTA sitting on an unrelinquished permit for
+/// milliseconds did not delay a co-resident CTA's own allocation by a
+/// measurable amount. So this is conformance, not a bug fix, and the hang
+/// that motivated the issue (#40) belongs to the other half of that defect:
+/// a `cta_group::2` dealloc issued by one CTA of the pair leaks *columns*,
+/// and columns do not come back.
+///
 /// # Safety
 ///
-/// Every thread of the block must call this together; `slot` must point to
-/// shared memory (a `SharedArray<u32, 1, 4>` static).
+/// Every thread of the block must call this together, and at most once per
+/// CTA: allocating again after the permit is relinquished is illegal.
+/// `slot` must point to shared memory (a `SharedArray<u32, 1, 4>` static).
 #[inline(always)]
 pub unsafe fn alloc_block(slot: *mut u32, columns: u32) -> u32 {
     unsafe {
         if warp::warp_id() == 0 {
             tcgen05_alloc(slot, columns);
+            tcgen05_relinquish_alloc_permit();
         }
         thread::sync_threads();
         *(slot as *const u32)
