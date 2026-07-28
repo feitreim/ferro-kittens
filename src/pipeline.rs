@@ -51,6 +51,25 @@
 //! retiring the finished item — they are just taken at cluster scope, which is
 //! a superset of the block scope they replace. At `RANKS == 1` the branch folds
 //! away at compile time and `sync_threads` is back.
+//!
+//! # No kernel in this repo runs on it, and the GEMM's reason is a number
+//!
+//! Worth stating plainly rather than leaving to be discovered. `run` had no
+//! caller before #51 and has none after it, but the reason changed: it used to
+//! be that the cluster kernel *could* not use the scaffold, and it is now that
+//! the one that can does not want to. `gemm.rs` was ported to a [`Job`] and ran
+//! **exact** on a B200 — so what is above is verified against silicon and not
+//! only against a compiler — and it was slower than the launch-per-tile grid it
+//! replaced, by 2.07× at 8192³ with a one-wave cap and by roughly 13% with a
+//! two-wave one.
+//!
+//! The cause is not in this file. `lcf` at one item per cluster *is* the
+//! launch-per-tile kernel — same rings, same barriers, drained at the same
+//! points — so a persistent grid changes only how many clusters exist, and
+//! choosing that number is a residency question the occupancy query cannot
+//! answer for a `#[cluster_launch]` kernel. `examples/README.md` §7 has the
+//! table, the controls that isolate the scaffold's own cost at zero, and what
+//! it says about #78.
 
 use cuda_device::barrier::fence_proxy_async_shared_cta;
 use cuda_device::cluster;
