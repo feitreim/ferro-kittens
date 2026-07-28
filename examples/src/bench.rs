@@ -656,7 +656,9 @@ fn compare(case: &Case, baseline: Baseline, rows: &[(Shape, Timings, Timings, St
         baseline.name
     );
     for (shape, _, _, algorithm) in rows {
-        println!("  {shape:<16}{algorithm}");
+        // 18 rather than 16: `16384x16384x16384` is seventeen characters, and
+        // in the table the next column is right-aligned and absorbs it.
+        println!("  {shape:<18}{algorithm}");
     }
 }
 
