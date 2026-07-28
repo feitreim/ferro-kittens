@@ -149,6 +149,21 @@
 //! *before* the item boundary that already exists rather than after it: the
 //! boundary that retires the item is also what says no thread is still reading
 //! the response the next request will land on. It costs no extra barrier.
+//!
+//! # Which item, and which tile: [`grouped`]
+//!
+//! Both loops above answer *which item comes next*. Neither says what an item
+//! **is**, and for a job whose items tile a 2-D output that second map is the
+//! one the memory system sees. [`grouped`] is it: item → `(row, column)`, in
+//! blocks of `group` tile-rows at a time, with `group == 1` the row-major map
+//! it generalizes.
+//!
+//! It sits here rather than in a kernel because it composes with the item
+//! source instead of replacing it. [`run`] and [`run_stealing`] each hand a job
+//! a permutation of `0..items`; [`grouped`] is a bijection of `0..items` onto
+//! the tile grid, and a bijection of a permutation is still every tile exactly
+//! once. So a job that maps its item through it is correct under both loops by
+//! construction, and the swizzle and the scheduler can be swept independently.
 
 use cuda_device::barrier::Barrier;
 use cuda_device::barrier::fence_proxy_async_shared_cta;
@@ -202,6 +217,43 @@ pub trait Job {
     ///
     /// Kernel-specific: whatever the item's barrier protocol requires.
     unsafe fn work(&mut self, item: u32);
+}
+
+/// Map a work item to a `(row, column)` of a `rows`x`columns` tile grid,
+/// walking `group` tile-rows at a time.
+///
+/// `group == 1` is the row-major map `(item / columns, item % columns)`, so the
+/// control a sweep compares against is a parameter value here and not a second
+/// code path. Above 1 the walk fills `group` rows of tiles down the column
+/// before moving right, which is what keeps a row-panel of the left operand
+/// resident across the columns that re-read it.
+///
+/// **What that is worth is a property of the shape, not a constant.** The
+/// clusters resident at one time span `ceil(wave / group)` tile-columns and
+/// `group` tile-rows instead of one long row-major run, and the operand bytes
+/// they collectively touch — the working set an L2 has to hold for the reuse to
+/// land — is minimized where those two are balanced against the tile's own
+/// aspect. `examples/README.md` §7 carries the sweep and the shape it was found
+/// at; a caller should take the width as a parameter and measure, not inherit
+/// one.
+///
+/// The map is a bijection for every `group >= 1`, including one that does not
+/// divide `rows`: the last group is short, and its items are laid out over the
+/// rows it actually has rather than over the rows it would have had. Without
+/// that the tail of the grid would alias, which is a wrong `C` and not a slow
+/// one.
+///
+/// # Panics
+///
+/// Nothing is checked on the device. `group` must be at least 1, `rows` and
+/// `columns` at least 1, and `item` less than `rows * columns`.
+#[inline(always)]
+pub fn grouped(item: u32, rows: u32, columns: u32, group: u32) -> (u32, u32) {
+    let span = group * columns;
+    let first = item / span * group;
+    let height = group.min(rows - first);
+    let within = item % span;
+    (first + within % height, within / height)
 }
 
 /// The item boundary, at the scope the job's barriers live at. A cluster
@@ -458,6 +510,77 @@ pub unsafe fn run_stealing<J: Job>(job: &mut J, queue: ClcQueue) {
 
         if leader {
             queue.disarm();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every tile once, at every width, including the ones that leave a short
+    /// last group.
+    ///
+    /// This is the whole correctness argument for [`grouped`], and it is worth
+    /// saying why it is stated as a bijection rather than as a formula. The
+    /// device checks nothing, both item loops hand out a *permutation* of
+    /// `0..items`, and the two ways this map can be wrong — a tile computed
+    /// twice and a tile computed by nobody — are the same failure seen from
+    /// either end. `covered` counting to exactly one everywhere is both claims
+    /// at once, and it is what a ragged last group breaks first.
+    #[test]
+    fn grouped_covers_every_tile_exactly_once() {
+        for rows in 1..=17u32 {
+            for columns in 1..=17u32 {
+                for group in 1..=19u32 {
+                    let mut covered = vec![0u32; (rows * columns) as usize];
+                    for item in 0..rows * columns {
+                        let (row, column) = grouped(item, rows, columns, group);
+                        assert!(row < rows && column < columns, "{rows}x{columns} @ {group}");
+                        covered[(row * columns + column) as usize] += 1;
+                    }
+                    assert!(
+                        covered.iter().all(|&hits| hits == 1),
+                        "{rows}x{columns} @ {group}: {covered:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Width 1 is the row-major map it generalizes, so a sweep's control row is
+    /// the traversal the kernel had before there was a parameter.
+    #[test]
+    fn width_one_is_row_major() {
+        for rows in 1..=9u32 {
+            for columns in 1..=9u32 {
+                for item in 0..rows * columns {
+                    assert_eq!(
+                        grouped(item, rows, columns, 1),
+                        (item / columns, item % columns)
+                    );
+                }
+            }
+        }
+    }
+
+    /// A width at or past the tile grid's height is the fully column-major
+    /// walk, whatever it is nominally set to — which is what makes an
+    /// over-large width a saturating parameter rather than an illegal one, and
+    /// is why a sweep may carry widths taller than some of its shapes.
+    #[test]
+    fn width_past_the_grid_saturates_to_column_major() {
+        for rows in 1..=9u32 {
+            for columns in 1..=9u32 {
+                for group in rows..rows + 5 {
+                    for item in 0..rows * columns {
+                        assert_eq!(
+                            grouped(item, rows, columns, group),
+                            (item % rows, item / rows)
+                        );
+                    }
+                }
+            }
         }
     }
 }
