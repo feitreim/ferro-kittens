@@ -231,14 +231,22 @@ def build() -> None:
 # whenever the next aspirational kernel is written.
 
 
-@app.function(gpu=DEFAULT_GPU, timeout=1800)
+# `cpu=8` for the same reason `build` has it, and it costs more to omit here
+# than there. `cargo oxide run` compiles the crate before it launches anything,
+# which `build`'s own comment prices at ten-odd minutes; on Modal's fractional
+# default it is closer to forty. A GPU function is billed for the whole
+# container, so those minutes are billed at **B200 rates to run a Rust
+# compiler** -- the worst ratio in this file, and paid on the two gates every
+# change runs. `bench`, `ladder_bench` and `profile` already say it; these two
+# were simply missed.
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=5400)
 def device_tests() -> None:
     """The harness itself. One binary, every case, non-zero exit on failure."""
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
     _run(["cargo", "oxide", "run", "device-tests"], cwd=HARNESS_DIR)
 
 
-@app.function(gpu=DEFAULT_GPU, timeout=1800)
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=5400)
 def examples() -> None:
     """The examples crate's own launchers. Prints the status table, then runs
     every kernel that has one against its CPU reference; non-zero on a wrong
