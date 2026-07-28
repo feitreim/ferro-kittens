@@ -52,10 +52,18 @@ struct Example {
     status: &'static str,
     threads: u32,
     shared_bytes: usize,
-    /// The PTX entry name, for the occupancy query — `None` for a kernel the
-    /// query cannot describe. `cuOccupancyMaxActiveBlocksPerMultiprocessor`
-    /// takes a block shape and no cluster, so a `#[cluster_launch]` kernel
-    /// would get an answer about a launch it never performs.
+    /// The PTX entry name, for the occupancy query — `None` where
+    /// `cuOccupancyMaxActiveBlocksPerMultiprocessor` is the wrong question to
+    /// ask. It takes a block shape and no cluster, so a `#[cluster_launch]`
+    /// kernel would get an answer about a launch it never performs.
+    ///
+    /// That is a limit of *that function*, not of the question.
+    /// `cuOccupancyMaxActiveClusters` does take a cluster shape and does
+    /// describe such a kernel: `device-tests`' `tmem residency census` (#78)
+    /// calls it, and on a cluster launch with no allocator in it the answer
+    /// matches a counted census exactly. So `None` here marks a query nobody
+    /// has wired into this table, not a residency nothing can reach — and the
+    /// counted figure for `gemm` is on `gemm::CTAS_PER_SM`.
     entry: Option<&'static str>,
 }
 

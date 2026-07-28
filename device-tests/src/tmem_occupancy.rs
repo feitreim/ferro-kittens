@@ -1,5 +1,26 @@
-//! Does holding a tcgen05 allocation cost occupancy, and does the size of it
-//! matter? (#74)
+//! What does the occupancy *query* say about a tcgen05 kernel? (#74)
+//!
+//! # Read this first: the query's answer is not residency (#78)
+//!
+//! Everything below is sound and every number in it reproduces. What it
+//! measures is **`cuOccupancyMaxActiveBlocksPerMultiprocessor`**, and that
+//! query is now known to be wrong for this class of kernel. `tmem_residency`
+//! counts the CTAs an SM actually holds, by `%smid` and `%globaltimer` rather
+//! than by asking, and gets `512 / columns` at every rung — 2 at
+//! `flash_forward`'s 256 columns, 4 at `gemm`'s 128 — where this ladder's query
+//! answers 1 at all of them.
+//!
+//! So the conclusion this file used to draw from its own table, that the column
+//! count is not a lever and warps per CTA is all that is left, was an
+//! over-reading of a driver answer. **The column count is the lever.** The
+//! ladder is kept, and still asserted, because the query's behaviour is worth
+//! pinning: it is flat at 1 for any kernel *containing* a `tcgen05.alloc`, and
+//! `tmem_residency`'s allocate-and-release rung shows it stays 1 even when the
+//! columns have already been given back before any work happens. That is a
+//! property of the query, not of the hardware, and the two files together are
+//! what says so.
+//!
+//! ---
 //!
 //! `flash_forward` answers **1 block/SM** at 147536 B of dynamic shared memory,
 //! at zero bytes, and at block widths of 32, 64, 128 and 256, while `softmax`
@@ -194,13 +215,13 @@ fn launched_address(
 
 /// The shape #74 measured, asserted rather than merely printed.
 ///
-/// A ladder that only reports is a thing someone has to read. The two claims
-/// below are what `flash_forward`'s module doc and `examples/README.md` now
-/// say in prose, so they are the two the harness holds:
+/// A ladder that only reports is a thing someone has to read. Both claims are
+/// about the *query*, which is all this file measures:
 ///
 /// 1. **Every** allocating rung is 1 block/SM at every block width. If a rung
-///    ever tracks its column count, the "shrinking the allocation buys nothing"
-///    advice is wrong and the docs are stale.
+///    ever tracks its column count, the driver has started modelling tensor
+///    memory as the divisible resource `tmem_residency` shows it to be, and
+///    every "the query cannot see residency" caveat in this repo can come out.
 /// 2. The control is well above 1. Without it, rule 1 is satisfied by an SM
 ///    that admits one CTA of anything, and the ladder would be attributing to
 ///    tcgen05 something it had not shown tcgen05 causes.
@@ -238,11 +259,11 @@ fn verdict(measured: &[Measured]) -> Result<String, Box<dyn Error>> {
     }
 
     Ok(format!(
-        "TMEM confirmed and the column count is not the lever: every allocation from 32 to \
-         512 columns is 1 block/SM at every width, where the same kernel without tcgen05 \
-         holds {} to {control_floor}. A CTA is charged the SM's whole tensor memory the \
-         moment it touches the allocator, so shrinking flash_forward's 192 buys nothing — \
-         warps per CTA is what is left.",
+        "the query is flat at 1 for every allocation from 32 to 512 columns and at every \
+         width, where the same kernel without tcgen05 answers {} to {control_floor}. That is \
+         the query's behaviour, not the SM's: `tmem residency census` counts 512/columns CTAs \
+         actually holding tensor memory, so read this table as what the driver says and that \
+         one as what the hardware did.",
         control.blocks[0]
     ))
 }

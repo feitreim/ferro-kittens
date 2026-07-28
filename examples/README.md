@@ -511,13 +511,16 @@ allocator's operand. Blocks/SM on a B200 at zero dynamic shared:
 | `alloc` | 256 | 10 | none | 1 | 1 | 1 | 1 |
 | `alloc` | 512 | 10 | none | 1 | 1 | 1 | 1 |
 
-**TMEM confirmed, and the fix everyone reached for refuted in the same table.**
-The control sits at the hardware's own warp ceiling — 2048 threads an SM, so
-32/32/16/8 — because at 10 registers and 32 bytes nothing else is binding. Add
-one `tcgen05.alloc` and it is 1, at *every* block width and at *every* legal
-column count. A CTA that touches the allocator is charged the SM's entire
-tensor memory, and the allocator's smallest unit costs exactly what all 512
-columns cost.
+**TMEM confirmed.** The control sits at the hardware's own warp ceiling — 2048
+threads an SM, so 32/32/16/8 — because at 10 registers and 32 bytes nothing
+else is binding. Add one `tcgen05.alloc` and it is 1, at *every* block width
+and at *every* legal column count.
+
+**That last sentence is a fact about the query, and the next section is where
+it stops being a fact about the SM.** Read on before acting on it: the reading
+this table was given — that a CTA touching the allocator is charged the SM's
+entire tensor memory, so the allocator's smallest unit costs what all 512
+columns cost — has since been measured directly and is false.
 
 Two things that table rules out, which a flat ladder alone could not. The 192
 rung takes its column count as a **kernel argument**, so there is no constant
@@ -529,21 +532,114 @@ launch geometry the kernel never declares.
 `flash_forward` confirms it directly: cut from 192 columns to 32 and
 re-queried, it still answers 1 block/SM.
 
-So the 1 is not a defect in that kernel, and none of shared memory, registers,
-TMEM columns or cluster shape is the lever. **What is left is warps per CTA.**
-At 1 block/SM the CTA's own width *is* the SM's occupancy, and `flash_forward`
-is 128 threads — 4 warps, against its own `max_threads_per_block` of 512 and
-the control's 32. Those 4 warps are `QUERIES / 32`, one per 32 accumulator
-rows, so widening the CTA is a different decomposition rather than a constant
-to raise: warps dedicated to the TMA and to the MMA issue, which is the shape a
-tcgen05 kernel wants anyway. That is a design to price, and pricing it needs
-the launcher and the CPU reference `flash_forward` still does not have.
+So the 1 is not a defect in that kernel. What it also is not, and what the two
+paragraphs that used to stand here concluded, is the SM's actual residency.
 
-This is also the general statement, not a fact about flash: **every** tcgen05
-kernel in this repo is 1 CTA/SM, and for a Blackwell tile library that is the
-occupancy model rather than a bug to fix. `gemm` pays it too — the occupancy
-column prints `cluster` for it because the query cannot describe a
-`#[cluster_launch]` kernel, not because it is exempt.
+#### and the 1 is the query, not the SM (#78)
+
+The reading above — every tcgen05 kernel pinned at 1 CTA/SM, warps per CTA the
+only remaining lever — was drawn from a driver's answer, and #51 immediately
+contradicted it by measuring `gemm` losing **2.07×** to a one-cluster-per-SM
+grid cap. A cap cannot cost anything if it is already the ceiling. So the query
+had to be checked against the hardware rather than trusted, and the instrument
+for that is not another query and not a throughput curve: `%smid` names the SM
+a CTA is running on and `%globaltimer` is a device-wide nanosecond clock, so a
+CTA can simply **write down where it ran and when**. `device-tests`'
+`tmem residency census` sweeps those intervals per SM and takes the most that
+were ever open at once.
+
+Peak CTAs counted on one SM, B200, 4736 one-warp CTAs over 148 SMs, 100 µs
+each, against 233472 B of shared memory per SM:
+
+| rung | columns | shared B | budget | resident | holding | driver says |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| no tcgen05 | — | 32 | — | 32 | **32** | 32 |
+| `alloc` | 32 | 32 | 16 | 17 | **16** | 1 |
+| `alloc` | 64 | 32 | 8 | 9 | **8** | 1 |
+| `alloc` | 128 | 32 | 4 | 5 | **4** | 1 |
+| `alloc` | 256 | 32 | 2 | 3 | **2** | 1 |
+| `alloc` | 512 | 32 | 1 | 2 | **1** | 1 |
+| `alloc` 512 then free | (512) | 32 | — | 27 | **25** | 1 |
+| `alloc_cluster` none | — | 32 | — | 8 | **8** | 8 |
+| `alloc_cluster` | 128 | 32 | 4 | 5 | **4** | 1 |
+| `alloc_cluster` | 512 | 32 | 1 | 2 | **1** | 1 |
+| flash's plan, no tcgen05 | — | 147536 | 1 | 1 | **1** | 1 |
+| `alloc` + half that plan | 256 | 73768 | 2 | 3 | **2** | 1 |
+| **`flash_forward`'s envelope** | 256 | 147536 | 1 | 1 | **1** | 1 |
+| **`gemm`'s envelope (cg2)** | 128 | 73792 | 3 | 3 | **3** | 1 |
+
+`holding` counts CTAs whose columns were outstanding at the same instant, and
+`budget` is `min(512 / columns, shared per SM / plan)` — the two per-CTA
+resources an SM divides, whichever is tighter. **Holding equals budget at every
+one of the fourteen rungs.** That is the whole model, and it is exact.
+
+Two of those rows are the answer to #78, and they do not agree with each other's
+headline:
+
+- **`gemm`'s envelope counts 3**, which is precisely the residency #83 bisected
+  out of a grid cap on a clock. Two instruments with nothing in common agreeing
+  on one integer is the strongest thing in this section. Its 128 columns would
+  allow 4; its 73792 B of shared memory allows 3; the smaller wins.
+- **`flash_forward`'s envelope counts 1, so its 1 CTA/SM is REAL** — and
+  tcgen05 is not what causes it. Its 256 columns allow 2. Its 147536 B shared
+  plan allows 1, *with no allocator in the kernel at all* (the row above it).
+  Shared memory is the only thing capping that kernel.
+
+Three things fall out of the table that no column sweep alone could give:
+
+- **`cta_group::2` is charged identically.** `alloc_cluster` at 128 columns
+  admits four CTAs an SM, exactly as `alloc_block` at 128 does. The pair does
+  not split one SM's tensor memory between its ranks; each rank pays its full
+  count against its own SM. That was the leading hypothesis for why `gemm` and
+  `flash_forward` might genuinely differ, and it is refuted.
+- **The query is reacting to the instruction, not to a held resource.** The
+  allocate-and-release rung takes all 512 columns and gives them straight back
+  before doing anything, and still runs 25 CTAs an SM — while the query goes on
+  answering 1 for it, because a `tcgen05.alloc` is present in the code.
+- **The queries are otherwise accurate**, which is what made the 1 easy to
+  believe: 32 predicted and 32 counted for the plain control, 8 and 8 for the
+  cluster control. And `cuOccupancyMaxActiveClusters` **can** describe a
+  `#[cluster_launch]` kernel — the honest `cluster` placeholder in the occupancy
+  column below, and #51's note that the GEMM's residency "cannot currently be
+  answered", both predate anyone calling it.
+
+`resident` runs exactly one above `holding` wherever tensor memory is what
+binds. That extra CTA is admitted to the SM and parked inside `tcgen05.alloc`,
+which blocks until the columns free up: it occupies a slot and makes no
+progress. Neither the occupancy query nor a grid-cap throughput sweep can tell
+that apart from not being resident at all, which is why the census timestamps
+entry and allocation separately. Where shared memory binds instead, `resident`
+and `holding` are equal and the wait column collapses to a fraction of a
+microsecond — nobody is queuing, because the CTA that would have queued was
+never admitted.
+
+##### what this leaves `flash_forward`, which is not what #74 or #70 concluded
+
+Both of the two levers those issues considered were assessed through the query,
+and the query was pinned at 1 by the allocator in every one of those readings.
+Corrected:
+
+- **Shrinking the TMEM allocation is a real lever in general** — halving columns
+  to the next legal power of two doubles the CTAs tensor memory holds, for
+  nothing but arithmetic — and it is **worth nothing to `flash_forward` today**,
+  because shared memory already caps it below what its columns allow. #74 got
+  the right advice for this kernel from an argument that does not hold.
+- **Shrinking the shared plan is the lever**, and #70 ruled it out. 147536 B
+  admits one CTA an SM. Two would need the plan under **116736 B** — half of the
+  SM's 233472 — which is a K/V ring stage or a `PTile` away. That threshold is
+  arithmetic and *not* measured: the census brackets it at 73768 B (which counts
+  2) and 147536 B (which counts 1) and does not locate it between them. The
+  measured claim is the weaker and sufficient one: the plan alone sets this
+  kernel's residency, with no allocator anywhere in the kernel.
+- Warps per CTA is still worth pricing — `flash_forward` runs 4 against its own
+  `max_threads_per_block` of 512 — but it was never the only thing left, and the
+  argument that it was rested on a query that a clock has now contradicted twice
+  (#83, and the table above).
+
+None of that is a change anyone should make blind: `flash_forward` still has no
+launcher and no CPU reference, so a decomposition that shrinks the ring cannot
+be checked for correctness, let alone timed. That prerequisite is the follow-up,
+not this table.
 
 Within a spelling choice at fixed shape, the ordering is small and stable:
 fully in place is fastest, one fused expression next, rebinding last. That
@@ -1241,8 +1337,31 @@ much as the number:
 This is the evidence **#78** asked for in its step one, which is whether the
 GEMM is pinned at 1 CTA/SM like `flash_forward`. It is not, by a factor of
 three, and the method is worth as much as the result: for a `#[cluster_launch]`
-kernel a timing sweep over the persistent grid's cap is a residency probe, and
-currently the only one available.
+kernel a timing sweep over the persistent grid's cap is a residency probe.
+
+##### and the 3 has a mechanism, from a second instrument (#78)
+
+Two things above have since been sharpened rather than corrected. The sweep was
+**not** the only probe available: `cuOccupancyMaxActiveClusters` takes the
+cluster shape the block query has no argument for, and `device-tests`'
+`tmem residency census` counts CTAs outright — every CTA records its `%smid` and
+timestamps both ends of its TMEM allocation off `%globaltimer`, and the host
+sweeps those intervals for the most ever open at once on one SM.
+
+Run at this kernel's own envelope — `cta_group::2`, 128 columns, 73792 B of
+shared — the census counts **3**, agreeing with the clock exactly. And it says
+which resource that 3 is: the 128 columns admit **4** CTAs an SM on their own,
+73792 B of shared memory admits **3**, and the smaller binds. **Shared memory is
+what caps this kernel and tensor memory is not**, which is what the 228 KiB /
+72 KiB arithmetic above guessed and now has a direct measurement behind it.
+
+The census also priced `alloc_cluster` against `alloc_block` at equal column
+counts and found them **identical** — 4 CTAs an SM at 128 columns either way, 1
+at 512. A `cta_group::2` allocation is not split across the pair; each rank pays
+its full count against its own SM. So nothing about this kernel's residency is a
+cluster effect, and #78's leading hypothesis for why the GEMM and
+`flash_forward` differ is refuted. What actually differs is their shared plans:
+73792 B here against `flash_forward`'s 147536 B, which admits one.
 
 ##### What is still on the table
 

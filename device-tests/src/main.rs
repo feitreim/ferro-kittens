@@ -68,7 +68,7 @@ use cuda_device::DisjointSlice;
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
-use cuda_device::{cuda_module, kernel, thread, warp};
+use cuda_device::{cluster, cluster_launch, cuda_module, debug, kernel, thread, warp};
 
 use kittens::global::{GlobalLayout, GlobalRows, encode_bf16_panels, load_rows, store_rows};
 use kittens::ldst::{load_fragment, load_tile, load_vec, store_fragment, store_tile};
@@ -82,10 +82,13 @@ use kittens::shared::{
     tma_store_wait_read,
 };
 use kittens::sync::{Semaphore, block_reduce, block_reduce_sum};
-use kittens::tmem::{TmemTile, alloc_block, dealloc_block, store_wait};
+use kittens::tmem::{
+    TmemTile, alloc_block, alloc_cluster, dealloc_block, dealloc_cluster, store_wait,
+};
 
 mod ladder_bench;
 mod tmem_occupancy;
+mod tmem_residency;
 
 /// Edge of the square tiles the swizzle and `stmatrix` cases use: 64 bf16
 /// columns is exactly one 128-byte swizzle atom per row, so these tiles are a
@@ -212,6 +215,20 @@ const RELAUNCH_BLOCKS: u32 = 296;
 /// allocator would have left an address. Any value distinguishable from a TMEM
 /// address will do; this one is a recognisable non-address.
 const TMEM_LADDER_SENTINEL: u32 = 0x7be5_0000;
+
+/// Words each residency census CTA writes: `[smid, entered, allocated, left]`.
+/// See [`tmem_residency`], which is the whole argument for why those four.
+const CENSUS_FIELDS: usize = 4;
+
+/// Iterations [`kernels::census_spin`] runs before giving up on the clock.
+///
+/// The spin's real exit is `%globaltimer` passing a deadline, and a loop whose
+/// only exit is an intrinsic the compiler might hoist would hang a device that
+/// costs money. This bounds it at roughly a millisecond of empty iterations on
+/// any plausible clock, against the ~10⁴ iterations a working spin needs — and
+/// the host checks the *achieved* hold against the requested one, so a spin
+/// that ended on the guard is reported rather than quietly believed.
+const CENSUS_SPIN_GUARD: u64 = 2_000_000;
 
 /// Launches of it in one process. The class of failure this case exists for
 /// is invisible to the first launch by construction, so one launch is not a
@@ -1295,6 +1312,227 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn tmem_ladder_runtime(columns: u32, mut out: DisjointSlice<u32>) {
         unsafe { tmem_ladder_probe(columns, &mut out) }
+    }
+
+    /// Occupy this CTA's SM until the device's global nanosecond timer passes
+    /// `deadline`, and return the time it actually stopped at.
+    ///
+    /// A *wall-clock* hold rather than a fixed amount of work, which is what
+    /// makes the census readable: every CTA occupies its SM for the same
+    /// interval no matter how many co-residents are competing with it, so
+    /// overlapping intervals count residency and not contention.
+    ///
+    /// [`CENSUS_SPIN_GUARD`] bounds the loop. `%globaltimer` is an intrinsic
+    /// read and a spin whose only exit is a value the compiler might hoist
+    /// would hang a device that costs money; the guard makes it terminate on
+    /// any hardware, and a CTA that ended on it reports a short interval the
+    /// host is required to notice.
+    #[inline(always)]
+    fn census_spin(deadline: u64) -> u64 {
+        let mut guard = 0u64;
+        let mut now = debug::globaltimer();
+        while now < deadline && guard < CENSUS_SPIN_GUARD {
+            guard += 1;
+            now = debug::globaltimer();
+        }
+        now
+    }
+
+    /// Publish one CTA's census row: which SM it ran on, and the three times
+    /// that bound its residency and its hold on tensor memory.
+    #[inline(always)]
+    unsafe fn census_record(
+        sm: u32,
+        entered: u64,
+        allocated: u64,
+        left: u64,
+        out: &mut DisjointSlice<u64>,
+    ) {
+        unsafe {
+            if thread::threadIdx_x() == 0 {
+                let base = CENSUS_FIELDS * thread::blockIdx_x() as usize;
+                *out.get_unchecked_mut(base) = sm as u64;
+                *out.get_unchecked_mut(base + 1) = entered;
+                *out.get_unchecked_mut(base + 2) = allocated;
+                *out.get_unchecked_mut(base + 3) = left;
+            }
+        }
+    }
+
+    /// One rung of the residency census (#78): hold `columns` of tensor memory
+    /// for `hold_ns` nanoseconds and timestamp both ends of it, along with the
+    /// SM the CTA landed on.
+    ///
+    /// `entered` is read *before* the allocator and `allocated` after it, so
+    /// the two intervals a row carries answer two different questions.
+    /// `[entered, left]` is how long the CTA held a slot on that SM, whatever
+    /// it was doing with it; `[allocated, left]` is how long it held tensor
+    /// memory. A CTA that is resident but parked inside a blocking
+    /// `tcgen05.alloc` waiting for a peer to give columns back has a long
+    /// first interval and a short second one, which is the one reading a
+    /// throughput curve alone cannot distinguish from not being resident at
+    /// all.
+    #[inline(always)]
+    unsafe fn census_probe(columns: u32, hold_ns: u64, out: &mut DisjointSlice<u64>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let sm = thread::smid();
+            let entered = debug::globaltimer();
+            let tmem = alloc_block(smem as *mut u32, columns);
+            let allocated = debug::globaltimer();
+            let left = census_spin(allocated + hold_ns);
+            thread::sync_threads();
+            dealloc_block(tmem, columns);
+            census_record(sm, entered, allocated, left, out);
+        }
+    }
+
+    /// The census control: [`census_probe`]'s shape with the allocator removed,
+    /// as [`tmem_ladder_none`] is the occupancy ladder's.
+    ///
+    /// Whatever this answers is what an SM will admit of a kernel this size
+    /// *without* tcgen05, so the gap between it and the rungs above is
+    /// attributable to the allocator alone.
+    #[kernel]
+    pub unsafe fn residency_census_none(hold_ns: u64, mut out: DisjointSlice<u64>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let sm = thread::smid();
+            let entered = debug::globaltimer();
+            if warp::warp_id() == 0 {
+                *(smem as *mut u32) = TMEM_LADDER_SENTINEL;
+            }
+            thread::sync_threads();
+            let allocated = debug::globaltimer();
+            let left = census_spin(allocated + hold_ns);
+            thread::sync_threads();
+            census_record(sm, entered, allocated, left, &mut out);
+        }
+    }
+
+    /// [`census_probe`] at the allocator's smallest unit — 16 of these fit the
+    /// SM's 512 columns.
+    #[kernel]
+    pub unsafe fn residency_census_32(hold_ns: u64, mut out: DisjointSlice<u64>) {
+        unsafe { census_probe(32, hold_ns, &mut out) }
+    }
+
+    /// [`census_probe`] at 64 columns; eight fit.
+    #[kernel]
+    pub unsafe fn residency_census_64(hold_ns: u64, mut out: DisjointSlice<u64>) {
+        unsafe { census_probe(64, hold_ns, &mut out) }
+    }
+
+    /// [`census_probe`] at **`gemm`'s** column count. Four fit, and #51 timed
+    /// that kernel above two clusters an SM.
+    #[kernel]
+    pub unsafe fn residency_census_128(hold_ns: u64, mut out: DisjointSlice<u64>) {
+        unsafe { census_probe(128, hold_ns, &mut out) }
+    }
+
+    /// [`census_probe`] at **`flash_forward`'s** column count. Two fit, which
+    /// is the number #78 exists to confirm or refute.
+    #[kernel]
+    pub unsafe fn residency_census_256(hold_ns: u64, mut out: DisjointSlice<u64>) {
+        unsafe { census_probe(256, hold_ns, &mut out) }
+    }
+
+    /// [`census_probe`] at the whole SM's tensor memory — the rung where one
+    /// CTA an SM is *arithmetically* forced, and therefore the census's own
+    /// positive control.
+    #[kernel]
+    pub unsafe fn residency_census_512(hold_ns: u64, mut out: DisjointSlice<u64>) {
+        unsafe { census_probe(512, hold_ns, &mut out) }
+    }
+
+    /// The rung that separates a driver's admission decision from the
+    /// hardware's allocator: take all 512 columns, give them straight back,
+    /// and only then hold the SM.
+    ///
+    /// The kernel still *contains* a `tcgen05.alloc`, so
+    /// `cuOccupancyMaxActiveBlocksPerMultiprocessor` answers 1 for it exactly
+    /// as it does for every other rung (#77). Nothing is held during the
+    /// interval that gets counted. If the 1 is a static reservation made when
+    /// the CTA is admitted, this rung is pinned at 1 like [`residency_census_512`];
+    /// if it is the dynamic cost of holding columns, this rung is free like the
+    /// control. Those are different mechanisms and no column sweep can tell
+    /// them apart.
+    #[kernel]
+    pub unsafe fn residency_census_free(hold_ns: u64, mut out: DisjointSlice<u64>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let sm = thread::smid();
+            let entered = debug::globaltimer();
+            let tmem = alloc_block(smem as *mut u32, 512);
+            thread::sync_threads();
+            dealloc_block(tmem, 512);
+            thread::sync_threads();
+            let allocated = debug::globaltimer();
+            let left = census_spin(allocated + hold_ns);
+            census_record(sm, entered, allocated, left, &mut out);
+        }
+    }
+
+    /// [`census_probe`]'s `cta_group::2` twin: the same census under
+    /// [`alloc_cluster`], which is the allocation `gemm` actually issues and
+    /// the one #77's control never covered.
+    ///
+    /// The pair's two CTAs land on two different SMs, so counting overlap per
+    /// `%smid` still counts CTAs an SM — the census needs no special case for
+    /// a cluster, only a grid that is a multiple of the cluster size.
+    #[inline(always)]
+    unsafe fn census_cluster_probe(columns: u32, hold_ns: u64, out: &mut DisjointSlice<u64>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let sm = thread::smid();
+            let entered = debug::globaltimer();
+            let tmem = alloc_cluster(smem as *mut u32, columns);
+            let allocated = debug::globaltimer();
+            let left = census_spin(allocated + hold_ns);
+            thread::sync_threads();
+            cluster::cluster_sync();
+            dealloc_cluster(tmem, columns);
+            census_record(sm, entered, allocated, left, out);
+        }
+    }
+
+    /// [`census_cluster_probe`] at `gemm`'s own 128 columns.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    pub unsafe fn residency_census_cluster_128(hold_ns: u64, mut out: DisjointSlice<u64>) {
+        unsafe { census_cluster_probe(128, hold_ns, &mut out) }
+    }
+
+    /// [`census_cluster_probe`] at the whole SM's tensor memory — the cluster
+    /// side's positive control, and the rung that says whether a `cta_group::2`
+    /// allocation is charged to each rank or split across the pair.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    pub unsafe fn residency_census_cluster_512(hold_ns: u64, mut out: DisjointSlice<u64>) {
+        unsafe { census_cluster_probe(512, hold_ns, &mut out) }
+    }
+
+    /// A cluster launch with no allocator in it at all — the control for the
+    /// two rungs above, so that whatever they cost is attributable to
+    /// `tcgen05.alloc.cg2` rather than to being a cluster.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    pub unsafe fn residency_census_cluster_none(hold_ns: u64, mut out: DisjointSlice<u64>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let sm = thread::smid();
+            let entered = debug::globaltimer();
+            if warp::warp_id() == 0 {
+                *(smem as *mut u32) = TMEM_LADDER_SENTINEL;
+            }
+            thread::sync_threads();
+            cluster::cluster_sync();
+            let allocated = debug::globaltimer();
+            let left = census_spin(allocated + hold_ns);
+            thread::sync_threads();
+            cluster::cluster_sync();
+            census_record(sm, entered, allocated, left, &mut out);
+        }
     }
 
     /// The fragment ownership probe, shared by every layout shape.
@@ -4746,6 +4984,14 @@ fn run() -> Result<usize, Box<dyn Error>> {
     cases.push((
         "tmem occupancy ladder",
         Box::new(|| tmem_occupancy::check(stream, module)),
+    ));
+    // And what the SM *actually* holds (#78), which the case above cannot say:
+    // it reports the driver's answer, and #51 showed that answer failing to
+    // predict `gemm`'s residency by a factor of two. This one counts CTAs by
+    // `%smid` and `%globaltimer` instead of asking.
+    cases.push((
+        "tmem residency census",
+        Box::new(|| tmem_residency::check(stream, module)),
     ));
     // Last, and not because it is the least interesting: it is the only case
     // that can take the process down (see `finish_or_abort`), so everything
