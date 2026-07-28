@@ -172,15 +172,15 @@ const _: () = assert!(THREADS == 128 && SHARED_BYTES == 73_792);
 /// SMs on the device this project targets and measures on — a B200, as
 /// `modal run modal_app.py::bench` prints in its header.
 const SMS: u32 = 148;
-/// CTAs of this kernel one SM holds at once — **measured on a clock, because
-/// nothing else here can see it.**
+/// CTAs of this kernel one SM holds at once — **measured, first on a clock and
+/// since confirmed by counting.**
 ///
 /// `cuOccupancyMaxActiveBlocksPerMultiprocessor` takes a block shape and no
-/// cluster, so it cannot answer about a `#[cluster_launch]` kernel at all;
-/// `main.rs` prints `cluster` in this kernel's row for exactly that reason. The
-/// one figure the repo does have is #77's, and extrapolating it here would give
-/// **1**: a CTA that touches `tcgen05.alloc` is charged the SM's whole tensor
-/// memory, and this kernel allocates.
+/// cluster, so it cannot answer about a `#[cluster_launch]` kernel; `main.rs`
+/// prints `cluster` in this kernel's row for exactly that reason. The one
+/// figure it does give is #77's, and extrapolating that here would say **1**: a
+/// CTA that touches `tcgen05.alloc` is charged the SM's whole tensor memory,
+/// and this kernel allocates.
 ///
 /// That extrapolation is false, and the cap sweep in `examples/README.md` §7 is
 /// what refutes it. Capping the grid at one CTA per SM makes 8192³ take 2.1036
@@ -190,6 +190,23 @@ const SMS: u32 = 148;
 /// dead heat, and where the curve stops. So the residency is three, it was
 /// arrived at by bisection rather than by asking, and it is the reason a
 /// persistent grid costs nothing here rather than 2×.
+///
+/// **A second instrument agrees, and it names the resource.** #78's
+/// `tmem residency census` counts CTAs per SM outright — every CTA records its
+/// `%smid` and timestamps both ends of its allocation off `%globaltimer`, and
+/// the host sweeps those intervals for the most ever open at once. At this
+/// kernel's own envelope it counts **3**. Two methods sharing nothing, a
+/// throughput curve on a real GEMM and timestamps from a nine-register probe,
+/// landing on one integer is much stronger evidence than either alone.
+///
+/// The census also says *which* resource sets it, which the bisection could
+/// not: 128 columns of tensor memory would admit 4 CTAs an SM and this
+/// kernel's 73792 B shared plan admits 3, so **shared memory caps this kernel
+/// and `tcgen05` does not**. It priced `alloc_cluster` against `alloc_block` at
+/// equal columns too and found them identical, so none of this is a cluster
+/// effect. And a query *can* describe a cluster launch —
+/// `cuOccupancyMaxActiveClusters` takes the shape the block query has no
+/// argument for. It was never called here; it is not that nothing could answer.
 const CTAS_PER_SM: u32 = 3;
 /// Clusters the persistent grid launches at most, past which a cluster takes a
 /// second work item rather than the scheduler holding a pair back.
