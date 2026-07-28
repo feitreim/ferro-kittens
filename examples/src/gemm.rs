@@ -513,6 +513,7 @@ pub mod kernels {
     /// buffers covering `k_blocks * BLOCK_K` along K and the full extent the
     /// item loop walks, and `c` must hold `ldc` columns for every row of it.
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn attach(
         a_map: *const TmaDescriptor,
         b_map: *const TmaDescriptor,
@@ -578,12 +579,18 @@ pub mod kernels {
     ///
     /// The grid is persistent and the item map is [`pipeline::run`]'s: a
     /// *cluster* takes item `%clusterid` and steps by `%nclusterid` until the
-    /// `tiles` are gone, and `cluster::block_rank()` says which half of the
+    /// tiles are gone, and `cluster::block_rank()` says which half of the
     /// pair this CTA owns. `a_map` describes `A` as `[rows, K]` bf16, `b_map`
     /// describes `B` as `[columns, K]`. Both come from a rank-2
     /// [`kittens::global::GlobalLayout`] paired with the tile it feeds, so
     /// their `[R, 64]` boxes are `ATile`'s and `BTile`'s own constants and not
     /// numbers [`check`] wrote down.
+    ///
+    /// **The separate `tiles` argument is gone**, and #89 is why. A grouped
+    /// item map has to know how many tile-*rows* there are, to short the last
+    /// group when the width does not divide them — so `tiles_m` is now a
+    /// parameter, `tiles_m * tiles_n` is the item count, and the launcher no
+    /// longer passes a total it had already told the kernel twice over.
     ///
     /// Everything outside the item loop is `attach` and `release`; what is
     /// left here is the schedule.
@@ -591,8 +598,8 @@ pub mod kernels {
     /// # Safety
     ///
     /// `attach`'s, plus: the grid must be a whole number of clusters and
-    /// `tiles` the item count they are to cover — see [`grid`], which is what
-    /// the launcher below sizes both from.
+    /// `tiles_m * tiles_n` the item count they are to cover — see [`grid`],
+    /// which is what the launcher below sizes both from.
     #[kernel]
     #[cluster_launch(2, 1, 1)]
     #[launch_contract(
@@ -601,10 +608,10 @@ pub mod kernels {
         dynamic_shared = 73_816,
         dynamic_shared_alignment = 128
     )]
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemm_cg2(
         a_map: *const TmaDescriptor,
         b_map: *const TmaDescriptor,
-        tiles: u32,
         tiles_m: u32,
         tiles_n: u32,
         group: u32,
@@ -615,7 +622,7 @@ pub mod kernels {
         unsafe {
             let (mut tile, _) =
                 attach(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
-            pipeline::run(&mut tile, tiles);
+            pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }
     }
@@ -625,11 +632,17 @@ pub mod kernels {
     /// rest are cancelled out from under the scheduler by clusters that have
     /// finished — [`pipeline::run_stealing`].
     ///
-    /// **There is no `tiles` argument, and that absence is the feature.** The
-    /// static entry point above needs the item count because its grid is capped
-    /// at a constant that had to be measured on one device (#84). Here the grid
-    /// *is* the item count, and neither [`SMS`] nor [`CTAS_PER_SM`] appears
-    /// anywhere on the path.
+    /// **Neither [`SMS`] nor [`CTAS_PER_SM`] appears anywhere on this path, and
+    /// that absence is the feature.** The static entry point above sizes its
+    /// grid from a constant that had to be measured on one device (#84); here
+    /// the grid *is* the tile count and the residency is the scheduler's
+    /// business.
+    ///
+    /// Through #97 the visible marker of that was this entry point taking no
+    /// `tiles`. It is not any more — #89 made `tiles_m` a parameter of the item
+    /// map, so *both* entry points now take the tile grid and derive the count.
+    /// The difference was never the argument list; it is [`grid_for`], where
+    /// one branch reads a measured constant and the other reads the problem.
     ///
     /// # Safety
     ///
@@ -643,6 +656,7 @@ pub mod kernels {
         dynamic_shared = 73_816,
         dynamic_shared_alignment = 128
     )]
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemm_cg2_clc(
         a_map: *const TmaDescriptor,
         b_map: *const TmaDescriptor,
@@ -969,7 +983,6 @@ fn run<T>(
                     &static_launch,
                     a_map.as_ptr(),
                     b_map.as_ptr(),
-                    tiles(m, n),
                     tiles_m,
                     tiles_n,
                     plan.group,
