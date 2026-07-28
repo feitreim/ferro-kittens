@@ -190,6 +190,24 @@ def build() -> None:
          cwd=EXAMPLES_DIR)
 
 
+@app.function(cpu=8, timeout=1800)
+def gaps() -> None:
+    """The aspirational examples' gap lists, as compiler errors.
+
+    `examples/README.md` claims each aspirational kernel's remaining errors by
+    name, and that claim is only worth anything if it is read off a compiler
+    rather than off the last person's memory. Each feature is checked on its
+    own so an error belongs to a known kernel; a non-zero exit is the expected
+    outcome and is reported rather than raised."""
+    for feature in ("flash", "layernorm"):
+        print(f"\n=== cargo check --features {feature} ===", flush=True)
+        checked = subprocess.run(
+            ["cargo", "check", "--features", feature, "--message-format", "short"],
+            cwd=EXAMPLES_DIR,
+        )
+        print(f"=== exit {checked.returncode} ===", flush=True)
+
+
 @app.function(gpu=DEFAULT_GPU, timeout=1800)
 def device_tests() -> None:
     """The harness itself. One binary, every case, non-zero exit on failure."""

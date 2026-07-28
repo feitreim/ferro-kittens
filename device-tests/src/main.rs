@@ -196,6 +196,18 @@ const SCALED: u32 = 1;
 /// shape, and nothing in `kittens` spells it; it is here as the floor.
 const IN_PLACE: u32 = 2;
 
+/// How [`kernels::mask_probe`] masks its score band — issue #7. The three
+/// compute the same tile, so a difference in the `regcount` table is the
+/// spelling and nothing else.
+///
+/// No mask at all: what the loop costs before masking enters it.
+const UNMASKED: u32 = 0;
+/// `RegTile::make_causal_at`, the API.
+const CAUSAL: u32 = 1;
+/// The same mask open-coded against `RegTile::coordinate`, which is what a
+/// kernel writes without #7 — and what `flash_forward`'s gap note describes.
+const BY_HAND: u32 = 2;
+
 /// Which lane-passing convention [`kernels::lane_probe`] compiles — issue #27.
 /// Today's convention: `warp::lane_id()` read once by the caller and threaded
 /// into every coordinate-dependent op.
@@ -1382,6 +1394,175 @@ pub mod kernels {
         mut out: DisjointSlice<f32>,
     ) {
         unsafe { scalar_map_probe::<128, IN_PLACE>(scores, steps, k, &mut out) }
+    }
+
+    /// **A codegen probe, not a test.** Masking is pure lane-local coordinate
+    /// arithmetic and is checked exhaustively on the host, across all 32
+    /// lanes, in `reg.rs`; what only silicon's compiler can answer is what it
+    /// costs, and #7's op sits in flash's innermost loop.
+    ///
+    /// The shape is that loop: a `[32, N]` score band per step, masked, then
+    /// exponentiated and folded into an accumulator that stays live across a
+    /// runtime-bounded loop. `FORM` picks [`UNMASKED`], [`CAUSAL`] or
+    /// [`BY_HAND`] and nothing else changes. The diagonal moves with the step
+    /// so it cannot be folded into the coordinate map.
+    ///
+    /// **What it measured** (`regcount`, sm_100a, no spills anywhere):
+    ///
+    /// ```text
+    ///                        regs   stack
+    ///  32 unmasked             31     256
+    ///  32 causal               32     256
+    ///  32 by hand              32     256
+    /// 128 unmasked            157    1536
+    /// 128 causal               71    1536
+    /// 128 by hand              71    1536
+    /// ```
+    ///
+    /// The claim this probe exists for is the middle pair against the last:
+    /// `make_causal_at` and the loop it replaces compile to the same register
+    /// count at both widths, so the op costs nothing over the index math it
+    /// deletes. Against no mask at all it is one register at 32 — consistent
+    /// with #38's peak-liveness reading, since `mask` takes `&mut self` and
+    /// adds one `i32` per slot rather than a second band.
+    ///
+    /// [`UNMASKED`] is *not* a lower bound at 128, and the 86-register gap is
+    /// the probe rather than the op: with no mask pass between them the load
+    /// loop and the exponential fuse into one wide batch and ptxas holds more
+    /// of the band live at once. Same reading as #27's — where the values are
+    /// defined, not how many there are.
+    #[inline(always)]
+    unsafe fn mask_probe<const N: usize, const FORM: u32>(
+        scores: &[f32],
+        steps: u32,
+        query_base: u32,
+        out: &mut DisjointSlice<f32>,
+    ) where
+        BaseLdtm: FragmentLayout<32, N>,
+    {
+        unsafe {
+            let slots = RegTile::<32, N, BaseLdtm>::SLOTS;
+            let values = RegTile::<32, N, BaseLdtm>::VALUES;
+            let lane = warp::lane_id();
+
+            // A row vector and not a second tile, for `lane_probe`'s reason: a
+            // `[32, 128]` accumulator beside the score band puts the probe on
+            // the 255-register ceiling, where every form reads alike by force
+            // and a null result would mean nothing.
+            let mut acc = RegVec::<32, BaseLdtm>::splat(0.0);
+            let mut step = 0u32;
+            while step < steps {
+                let mut block = RegTile::<32, N, BaseLdtm>::zero();
+                let mut slot = 0usize;
+                while slot < slots {
+                    let mut value = 0usize;
+                    while value < values {
+                        let (row, column) =
+                            RegTile::<32, N, BaseLdtm>::coordinate(lane, slot, value);
+                        let index = step as usize * 32 * N + row as usize * N + column as usize;
+                        block.set(slot, value, *scores.get_unchecked(index));
+                        value += 1;
+                    }
+                    slot += 1;
+                }
+
+                let key_base = N as u32 * step;
+                if FORM == CAUSAL {
+                    block.make_causal_at(lane, query_base, key_base, f32::NEG_INFINITY);
+                } else if FORM == BY_HAND {
+                    let diagonal = query_base as i32 - key_base as i32;
+                    let mut slot = 0usize;
+                    while slot < slots {
+                        let mut value = 0usize;
+                        while value < values {
+                            let (row, column) =
+                                RegTile::<32, N, BaseLdtm>::coordinate(lane, slot, value);
+                            if column as i32 - row as i32 > diagonal {
+                                block.set(slot, value, f32::NEG_INFINITY);
+                            }
+                            value += 1;
+                        }
+                        slot += 1;
+                    }
+                }
+
+                acc.add_assign(block.exp2().row_sum());
+                step += 1;
+            }
+
+            let base = lane as usize * slots;
+            let mut slot = 0usize;
+            while slot < slots {
+                *out.get_unchecked_mut(base + slot) = acc.get(slot);
+                slot += 1;
+            }
+        }
+    }
+
+    /// [`mask_probe`] at a 32-wide band, no mask — the floor.
+    #[kernel]
+    pub unsafe fn mask_probe_32_unmasked(
+        scores: &[f32],
+        steps: u32,
+        query_base: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { mask_probe::<32, UNMASKED>(scores, steps, query_base, &mut out) }
+    }
+
+    /// [`mask_probe`] at 32 wide, `make_causal_at`.
+    #[kernel]
+    pub unsafe fn mask_probe_32_causal(
+        scores: &[f32],
+        steps: u32,
+        query_base: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { mask_probe::<32, CAUSAL>(scores, steps, query_base, &mut out) }
+    }
+
+    /// [`mask_probe`] at 32 wide, the open-coded mask.
+    #[kernel]
+    pub unsafe fn mask_probe_32_by_hand(
+        scores: &[f32],
+        steps: u32,
+        query_base: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { mask_probe::<32, BY_HAND>(scores, steps, query_base, &mut out) }
+    }
+
+    /// [`mask_probe`] at the flash accumulator's 128 columns, no mask.
+    #[kernel]
+    pub unsafe fn mask_probe_128_unmasked(
+        scores: &[f32],
+        steps: u32,
+        query_base: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { mask_probe::<128, UNMASKED>(scores, steps, query_base, &mut out) }
+    }
+
+    /// [`mask_probe`] at 128 wide, `make_causal_at`.
+    #[kernel]
+    pub unsafe fn mask_probe_128_causal(
+        scores: &[f32],
+        steps: u32,
+        query_base: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { mask_probe::<128, CAUSAL>(scores, steps, query_base, &mut out) }
+    }
+
+    /// [`mask_probe`] at 128 wide, the open-coded mask.
+    #[kernel]
+    pub unsafe fn mask_probe_128_by_hand(
+        scores: &[f32],
+        steps: u32,
+        query_base: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { mask_probe::<128, BY_HAND>(scores, steps, query_base, &mut out) }
     }
 
     /// The lane an op sees under `CONVENTION`: the caller's already-`hoisted`

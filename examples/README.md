@@ -20,7 +20,7 @@ target *of the library*.)
 | --- | --- | --- |
 | [`gemm`](src/gemm.rs) | **runs** — exact against a CPU reference | — (two gaps worked around in-file, both marked) |
 | [`softmax`](src/softmax.rs) | **runs** — within 2⁻⁸ of a CPU reference | — |
-| [`flash_forward`](src/flash_forward.rs) | aspirational | #7, #11, #23, #31 |
+| [`flash_forward`](src/flash_forward.rs) | aspirational | #11, #31 |
 | [`layernorm`](src/layernorm.rs) | aspirational | #3, #13 |
 
 Two of the four **run** rather than merely compile, which is a strictly stronger
@@ -45,10 +45,12 @@ Nothing on the remaining lists is arithmetic, and nothing on them is a mover.
 #5 and #6 between them closed every elementwise op and every reduction the four
 kernels asked for and **#38** closed the scalar-operand forms they left behind;
 #21 and #25 closed both halves of the shared ↔ register path, and #22 closed the
-composition on top of them, in both directions and against both memories. What
-remains across the four is masking (#7), the global ↔ register path (#11), the
-closed shape set (#23), and one structural gap (#3 + #13, layernorm's
-block-scope statistic).
+composition on top of them, in both directions and against both memories.
+**#23 and #7 closed together** — flash could not name its `[32, 64]` band, and
+the unsatisfied bound on that band was what kept `make_causal` off the error
+list, so shipping either alone would have left a confusing state. What remains
+across the four is the global ↔ register path (#11), one in-place form (#31),
+and one structural gap (#3 + #13, layernorm's block-scope statistic).
 
 The one arithmetic entry still open is `RegTile::add_assign`, and it is **#31**
 rather than a leftover: it is an *in-place* form, and #31 exists to land every
@@ -73,19 +75,24 @@ error is `unresolved import`, `no method named`, or an unsatisfied
 `FragmentLayout` bound — there is nothing in these files that fails for any
 reason other than the API not existing.
 
-Only two kernels are still behind a feature, and their error lists are now short
-enough to write out:
+Only two kernels are still behind a feature, and their error lists are now two
+errors each — read off `modal run modal_app.py::gaps`, which checks each
+feature on its own so an error belongs to a known kernel:
 
-- **`flash_forward`** — `FragmentLayout<32, 64>` (#23), `global::store_rows`
-  (#11), `RegTile::add_assign` (#31). **`make_causal_at` (#7) is wanted too and
-  does not appear as its own error** — it is called on the `[32, 64]` band
-  whose layout bound already failed, and an unsatisfied bound on the receiver
-  suppresses method resolution on it. Closing #23 would make #7 surface, not
-  disappear; a reader who counts errors will otherwise conclude #7 has landed.
+- **`flash_forward`** — `global::store_rows` (#11), `RegTile::add_assign`
+  (#31). Both are at the ends of the kernel; everything between the score
+  band arriving in registers and the probabilities going back to shared is now
+  library API.
 - **`layernorm`** — `SharedVec` (#13), and `sync::block_reduce_sum` (#3), the
   latter only in `groupnorm_tile`.
 
-Nothing named `scale`, `shift` or `rsqrt` is in either list any more (#38).
+Nothing named `scale`, `shift` or `rsqrt` is in either list any more (#38), and
+nothing named `FragmentLayout` or `make_causal` (#23 + #7). That last pair is
+worth keeping as a note on how to read this section: `make_causal_at` never
+appeared as its own error, because it was called on the `[32, 64]` band whose
+layout bound failed first and an unsatisfied bound on the receiver suppresses
+method resolution on it. Counting errors would have said #7 was already
+closed. Closing #23 is what made #7 surface.
 
 `softmax` **runs** too, and what its check can claim is different from the
 GEMM's in a way worth writing down. A softmax has an `exp2` and a divide in it,
@@ -195,12 +202,27 @@ All of it is **warp scope**. `tile_sum` folds one warp's band; layernorm's
 group-norm statistic spans four warps' bands and still needs them to agree,
 which is the #3 + #13 entry below.
 
-**#7 — masking.** `make_causal`, for flash. One correction to the issue as
-filed: it describes ThunderKittens' signature, which takes no coordinate origin.
-A flash kernel masks a `[queries, keys]` band whose diagonal sits at
-`query_base - key_base`, so the op it needs is
-`make_causal_at(lane, query_base, key_base, fill)`. Without the origin the op
-is unusable for anything but a single-block attention.
+**#7 — masking. Landed**, with the correction the examples surfaced. The issue
+as filed describes ThunderKittens' signature, which takes no coordinate origin;
+a flash kernel masks a `[queries, keys]` band whose diagonal sits at
+`query_base - key_base`, and without the origin the op is unusable for anything
+but a single-block attention. What shipped is `RegTile::make_causal(lane,
+diagonal, fill)` with `tril`/`triu` on the same parameter, the four fills
+(`left`/`right`/`upper`/`lower`) on a signed index for the same reason, and
+`mask(lane, fill, keep)` underneath them all — a select at the layout's own
+`(row, column)`, in place.
+
+`make_causal_at(lane, query_base, key_base, fill)` is the spelling flash uses,
+and taking the two origins rather than their difference is not sugar: the
+difference is *negative* for every band above the diagonal, both bases are
+`u32` at the call site, and `query_base - key_base` written there wraps to
++4 billion and masks nothing. The host tests carry that case, along with bands
+wholly above and wholly below the diagonal — the two the origin-free form gets
+silently wrong.
+
+Not landed, as the issue's own sequencing asked: `transpose`, `swap_layout`,
+`copy` between layouts. All three need a second `FragmentLayout` to mean
+anything, and `BaseLdtm` is still the only one in tree.
 
 **#9 — TMA store. Landed**, and it is what promoted `softmax` to **runs**.
 `SharedTile::tma_store` / `tma_store_2d` mirror the load paths box for box;
@@ -265,7 +287,7 @@ result: the MMA layer is the part of this library that is finished.
 
 The most valuable output here. Ordered by how badly it hurts. Items 1–6 were
 filed as **#21**, **#22**, **#25**, **#23** and **#24** (which covers both
-cluster-scope entries); **1, 2, 3 and 5 have since shipped**. The numbers are noted
+cluster-scope entries); **1, 2, 3, 4 and 5 have since shipped**. The numbers are noted
 inline and the prose is kept as written, because it is the argument rather than
 the ticket.
 
@@ -331,18 +353,30 @@ all. Checked against silicon at width by the `swizzle/stmatrix/ldmatrix … wide
 device cases, and by a 4-row tile whose second subtile starts mid-period —
 which is the only shape where an absolute phase and a per-subtile one differ.
 
-#### 4. The `RegTile` shape set is closed by the library (#23)
+#### 4. ~~The `RegTile` shape set is closed by the library~~ — **closed by #23**
 
-`BaseLdtm` implements `FragmentLayout` for `(16,16)`, `(32,32)` and `(32,128)` —
-because each shape is a line of `base_ldtm_shapes!` *inside* `src/reg.rs`. Flash
-wants a `[32, 64]` score band, and an out-of-tree kernel cannot add it: the
-macro is not exported and the trait cannot be implemented for a foreign type.
-Dodging `generic_const_exprs` with an associated type is the right call; making
-the set of expressible tiles a closed library decision is a side effect nobody
-chose.
+`BaseLdtm` implemented `FragmentLayout` for `(16,16)`, `(32,32)` and `(32,128)`
+and nothing else, because each shape was a line of `base_ldtm_shapes!` *inside*
+`src/reg.rs`. Flash wants a `[32, 64]` score band and could not add one.
 
-Wanted: export the macro, or a blanket impl over the shapes the layout actually
-supports.
+The issue's cheap option — export the macro — is **not available**, and the
+orphan rules are what decide it: `impl FragmentLayout<32, 64> for BaseLdtm`
+from another crate is E0117 whatever macro writes it, since `FragmentLayout`
+takes only *const* parameters and so no local type can ever appear in the impl
+header. Confirmed by compiling it, not by reading the reference.
+
+What landed is the issue's third option, in its trait-projection form.
+`RowLayout::Slots<T>` is generic in the element, so a tile's storage is a row
+array *of* a column array and `FragmentLayout` is a **blanket impl** over
+`RowLayout<M> + ColLayout<N>` — no `(M, N)` needs an impl, no array length is
+computed from `M` and `N`, and `generic_const_exprs` stays out of it. The shape
+set is the product of the two extent lists, which now run to every multiple of
+16 up to 512: 1024 shapes out of 64 impls, and every shape that fits in a
+thread's registers at all, since `M * N / 32` is already 256 at the corner.
+
+The blanket impl is also what makes the trait genuinely open: a *layout*
+defined out of tree gets `FragmentLayout` for free the moment it has both
+halves, which is the one thing orphan rules do allow.
 
 #### 5. ~~No cluster-scope TMEM allocation~~ (#24) — **closed by #46**
 
@@ -415,12 +449,12 @@ actually needs from it is the address space. Filed as a correction on #24.
   `(ATile::BYTES + BTile::BYTES) as u32` and has to keep it in step with the
   loads it issued. A tile knows its own size; `Semaphore::expect_tiles` or a
   charge returned by `tma_load` would make the two impossible to disagree.
-- **Coordinate-dependent ops need `lane` passed in.** `store_fragment` and
-  `RegTile::coordinate` take it explicitly, so `ldst::load_tile`/`store_tile`
-  do too, and so would the invented `make_causal_at`. Consistent, but every call site writes
-  `warp::lane_id()` into a variable that the op could have read itself. Worth
-  settling deliberately when #5 lands, since it fixes the convention for
-  thirty functions at once.
+- **Coordinate-dependent ops need `lane` passed in.** Settled by #27:
+  implicit for ops that execute, explicit for pure coordinate queries. The
+  masks (#7) take it explicitly, on that rule — `device-tests` and `reg.rs`
+  build their expectations by calling the map across all 32 lanes on the
+  **host**, where `warp::lane_id()` does not exist, and that is what makes the
+  mask's own test non-vacuous rather than a restatement of the kernel.
 
 ---
 

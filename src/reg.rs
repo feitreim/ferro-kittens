@@ -30,6 +30,15 @@
 //! has nowhere to keep a `k`. The consequence is that every tile-against-scalar
 //! form the op set can express is reachable without a new op.
 //!
+//! Masking ([`RegTile::make_causal`], `tril`/`triu`, the fills) is the other
+//! use of the ownership map: a select at each value's logical `(row, column)`,
+//! in place, with no lane learning anything from another. Every one of them
+//! takes a **coordinate origin** — a `diagonal`, or a fill index — because the
+//! tile being masked is a sub-block of a much larger score matrix and its
+//! diagonal sits at `query_base - key_base`. Masking a tile against its own
+//! `row == column` instead compiles, runs, and is wrong everywhere off the
+//! diagonal block; see [`RegTile::make_causal_at`].
+//!
 //! Reductions take the same [`BinaryOp`] and come in two halves: a thread's own
 //! registers, then a `shuffle_xor` butterfly over the lanes the map spreads the
 //! folded axis across. Which lanes those are is the entire correctness
@@ -296,8 +305,14 @@ scalar_ops! { TernaryOp:
 /// without inventing a column count, and so `scale_rows` can check a vector
 /// and a tile against the *same* `M`.
 pub trait RowLayout<const M: usize> {
-    /// Per-thread storage, one `f32` per owned row (`[f32; SLOTS]`).
-    type Slots: Copy;
+    /// Per-thread storage, one `T` per owned row (`[T; SLOTS]`).
+    ///
+    /// Generic in the element, and that is what opens the shape set: a tile's
+    /// storage is this array of a [`ColLayout::Values`], so
+    /// [`FragmentLayout::Storage`] is a *projection* out of the two extents
+    /// rather than an array whose length is `M / 8` — a length no impl can
+    /// compute from a generic `M` without `generic_const_exprs`.
+    type Slots<T: Copy>: Copy;
 
     /// Rows of the `[M, _]` tile one thread owns.
     const SLOTS: usize;
@@ -306,13 +321,14 @@ pub trait RowLayout<const M: usize> {
     fn row_of(lane: u32, slot: usize) -> u32;
 
     /// Every slot set to `value`.
-    fn splat_slots(value: f32) -> Self::Slots;
+    fn splat_slots<T: Copy>(value: T) -> Self::Slots<T>;
 
-    /// The value in `slot`.
-    fn get_slot(slots: &Self::Slots, slot: usize) -> f32;
+    /// The entry in `slot`. By reference so a tile's row — a whole
+    /// [`ColLayout::Values`] — is reached without copying it.
+    fn get_slot<T: Copy>(slots: &Self::Slots<T>, slot: usize) -> &T;
 
-    /// Write `value` into `slot`.
-    fn set_slot(slots: &mut Self::Slots, slot: usize, value: f32);
+    /// The entry in `slot`, to write through; see [`Self::get_slot`].
+    fn get_slot_mut<T: Copy>(slots: &mut Self::Slots<T>, slot: usize) -> &mut T;
 }
 
 /// The column half of a fragment ownership map, mirroring [`RowLayout`]: the
@@ -350,8 +366,10 @@ pub trait ColLayout<const N: usize> {
 ///
 /// The storage is an associated type rather than `[[f32; VALUES]; SLOTS]`
 /// because an array length must be a const expression of the generic
-/// parameters, which would need `generic_const_exprs`. Each implemented
-/// `(M, N)` shape names its own storage instead — one macro line per shape.
+/// parameters, which would need `generic_const_exprs`. It is nevertheless
+/// *derived*: the blanket impl below projects it as `Slots<Values>`, so no
+/// `(M, N)` needs an impl of its own and the shape set is the product of the
+/// two extent sets rather than a list of pairs (#23).
 pub trait FragmentLayout<const M: usize, const N: usize>: RowLayout<M> + ColLayout<N> {
     /// Per-thread storage, `VALUES` values for each of `SLOTS` rows.
     type Storage: Copy;
@@ -364,6 +382,35 @@ pub trait FragmentLayout<const M: usize, const N: usize>: RowLayout<M> + ColLayo
 
     /// Write `x` at `(slot, value)`.
     fn set(values: &mut Self::Storage, slot: usize, value: usize, x: f32);
+}
+
+/// Every [`RowLayout`] × [`ColLayout`] pair *is* a tile layout: a thread's rows
+/// of values are its row array of its column array, which is the same
+/// `[[f32; VALUES]; SLOTS]` a per-shape impl would have written and needs no
+/// arithmetic on `M` and `N` to name.
+///
+/// Blanket, so a shape costs no line anywhere: adding a row extent and a column
+/// extent adds every tile between them, and a layout defined *outside* this
+/// crate is a tile layout as soon as it has both halves — which is the part
+/// orphan rules put out of reach for [`BaseLdtm`] (#23). The consequence is
+/// that `FragmentLayout` is never implemented directly, here or downstream.
+impl<const M: usize, const N: usize, L: RowLayout<M> + ColLayout<N>> FragmentLayout<M, N> for L {
+    type Storage = L::Slots<L::Values>;
+
+    #[inline(always)]
+    fn splat(value: f32) -> Self::Storage {
+        L::splat_slots(L::splat_values(value))
+    }
+
+    #[inline(always)]
+    fn get(values: &Self::Storage, slot: usize, value: usize) -> f32 {
+        L::get_value(L::get_slot(values, slot), value)
+    }
+
+    #[inline(always)]
+    fn set(values: &mut Self::Storage, slot: usize, value: usize, x: f32) {
+        L::set_value(L::get_slot_mut(values, slot), value, x);
+    }
 }
 
 /// The base-LDTM `16x256b` ownership map — the only drain shape the validated
@@ -417,7 +464,7 @@ macro_rules! base_ldtm_rows {
         const _: () = assert!($m % 16 == 0, "BaseLdtm rows come in 16-row blocks");
 
         impl RowLayout<$m> for BaseLdtm {
-            type Slots = [f32; $m / 8];
+            type Slots<T: Copy> = [T; $m / 8];
             const SLOTS: usize = $m / 8;
 
             #[inline(always)]
@@ -426,18 +473,18 @@ macro_rules! base_ldtm_rows {
             }
 
             #[inline(always)]
-            fn splat_slots(value: f32) -> Self::Slots {
+            fn splat_slots<T: Copy>(value: T) -> Self::Slots<T> {
                 [value; $m / 8]
             }
 
             #[inline(always)]
-            fn get_slot(slots: &Self::Slots, slot: usize) -> f32 {
-                slots[slot]
+            fn get_slot<T: Copy>(slots: &Self::Slots<T>, slot: usize) -> &T {
+                &slots[slot]
             }
 
             #[inline(always)]
-            fn set_slot(slots: &mut Self::Slots, slot: usize, value: f32) {
-                slots[slot] = value;
+            fn get_slot_mut<T: Copy>(slots: &mut Self::Slots<T>, slot: usize) -> &mut T {
+                &mut slots[slot]
             }
         }
     )*};
@@ -476,35 +523,23 @@ macro_rules! base_ldtm_cols {
     )*};
 }
 
-/// One [`FragmentLayout`] impl per logical `(M, N)` shape, joining a
-/// [`RowLayout`] to a [`ColLayout`]. Adding a shape is one line — do it when a
-/// call site needs it.
-macro_rules! base_ldtm_shapes {
-    ($(($m:literal, $n:literal)),* $(,)?) => {$(
-        impl FragmentLayout<$m, $n> for BaseLdtm {
-            type Storage = [[f32; $n / 4]; $m / 8];
-
-            #[inline(always)]
-            fn splat(value: f32) -> Self::Storage {
-                [[value; $n / 4]; $m / 8]
-            }
-
-            #[inline(always)]
-            fn get(values: &Self::Storage, slot: usize, value: usize) -> f32 {
-                values[slot][value]
-            }
-
-            #[inline(always)]
-            fn set(values: &mut Self::Storage, slot: usize, value: usize, x: f32) {
-                values[slot][value] = x;
-            }
-        }
-    )*};
-}
-
-base_ldtm_rows!(16, 32);
-base_ldtm_cols!(16, 32, 128);
-base_ldtm_shapes!((16, 16), (32, 32), (32, 128));
+// Every multiple of 16 up to 512, in both extents — 1024 tile shapes out of 64
+// impls, since `FragmentLayout` is the product of the two.
+//
+// The bound is the register file, not a guess at what kernels want: a thread
+// holds `M * N / 32` fp32 values of an `[M, N]` warp tile, so with the other
+// extent at its 16 minimum, 512 is already 256 registers a thread — one past
+// what the hardware has. No shape outside this grid fits in registers at all,
+// which is the sense in which the set is open rather than merely bigger.
+// Unused extents cost nothing: a trait impl no tile names emits no code.
+base_ldtm_rows!(
+    16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 272, 288, 304, 320,
+    336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512,
+);
+base_ldtm_cols!(
+    16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 272, 288, 304, 320,
+    336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512,
+);
 
 /// The named half of the op set: one line per exposed name, so a new op costs
 /// a [`scalar_ops`] line and one of these. `should_implement_trait` is allowed
@@ -631,7 +666,7 @@ macro_rules! scalar_op_methods {
 /// `mul_assign`/`add_assign` were hand-written copies of exactly that loop
 /// until `modal_app.py::regcount` showed the generic maps assemble to the same
 /// registers and spills at both probe shapes; they are the maps now.
-pub struct RegVec<const M: usize, L: RowLayout<M>>(pub L::Slots);
+pub struct RegVec<const M: usize, L: RowLayout<M>>(pub L::Slots<f32>);
 
 impl<const M: usize, L: RowLayout<M>> Clone for RegVec<M, L> {
     fn clone(&self) -> Self {
@@ -647,7 +682,7 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     /// Wrap this thread's slots. Named rather than the tuple constructor
     /// because a type alias (`Fragment`-style) can't spell one.
     #[inline(always)]
-    pub fn from_slots(slots: L::Slots) -> Self {
+    pub fn from_slots(slots: L::Slots<f32>) -> Self {
         Self(slots)
     }
 
@@ -660,13 +695,13 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     /// The statistic of row-slot `slot`.
     #[inline(always)]
     pub fn get(&self, slot: usize) -> f32 {
-        L::get_slot(&self.0, slot)
+        *L::get_slot(&self.0, slot)
     }
 
     /// Write the statistic of row-slot `slot`.
     #[inline(always)]
     pub fn set(&mut self, slot: usize, value: f32) {
-        L::set_slot(&mut self.0, slot, value);
+        *L::get_slot_mut(&mut self.0, slot) = value;
     }
 
     /// The logical row in `0..M` that `lane`'s `slot` holds.
@@ -1044,6 +1079,118 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
         (L::row_of(lane, slot), L::col_of(lane, value))
     }
 
+    /// Replace every value whose logical coordinate `keep` rejects with
+    /// `fill`, in place — the mechanism under the masks and fills below.
+    ///
+    /// Lane-local: the map hands a thread whole `(row, column)` pairs, so a
+    /// mask is a select on registers it already holds and no lane learns
+    /// anything from another. In place because a mask is the innermost thing
+    /// in an attention loop and its input is dead the instant it returns; the
+    /// by-value spelling would put a second band beside the score band at
+    /// exactly the width #5 and #38 measured that to cost.
+    ///
+    /// Coordinates are `i32`, not `u32`: a tiled kernel's bounds are
+    /// differences of block origins and leave `0..M × 0..N` in both
+    /// directions. That is not an edge case — it is how a band wholly above
+    /// the diagonal takes `keep` false everywhere and one wholly below takes
+    /// it true everywhere, which is most of the bands in a causal kernel.
+    #[inline(always)]
+    pub fn mask(&mut self, lane: u32, fill: f32, keep: impl Fn(i32, i32) -> bool) {
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let row = L::row_of(lane, slot) as i32;
+            let mut value = 0;
+            while value < L::VALUES {
+                let column = L::col_of(lane, value) as i32;
+                if !keep(row, column) {
+                    self.set(slot, value, fill);
+                }
+                value += 1;
+            }
+            slot += 1;
+        }
+    }
+
+    /// Keep the lower triangle — `column - row <= diagonal` — and fill the
+    /// rest.
+    ///
+    /// `diagonal` is where the boundary crosses this tile's own `(0, 0)`, so
+    /// a tile that is a sub-block of a larger matrix passes the difference of
+    /// its origins and gets the larger matrix's diagonal. TK's `tril` has no
+    /// such parameter because it masks a tile against itself, which is right
+    /// for exactly one block of a tiled kernel and silently wrong for the
+    /// rest; see [`Self::make_causal_at`].
+    #[inline(always)]
+    pub fn tril(&mut self, lane: u32, diagonal: i32, fill: f32) {
+        self.mask(lane, fill, |row, column| column - row <= diagonal);
+    }
+
+    /// Keep the upper triangle, `column - row >= diagonal`; the mirror of
+    /// [`Self::tril`] and its exact complement at `diagonal + 1`.
+    #[inline(always)]
+    pub fn triu(&mut self, lane: u32, diagonal: i32, fill: f32) {
+        self.mask(lane, fill, |row, column| column - row >= diagonal);
+    }
+
+    /// Causal attention's mask: a query attends to no key after it, so this is
+    /// [`Self::tril`] under the name every attention kernel knows it by, with
+    /// `fill` the pre-softmax sentinel (`f32::NEG_INFINITY`, or a finite
+    /// `-1e30` if the row could be entirely masked).
+    #[inline(always)]
+    pub fn make_causal(&mut self, lane: u32, diagonal: i32, fill: f32) {
+        self.tril(lane, diagonal, fill);
+    }
+
+    /// [`Self::make_causal`] for a transposed score band — `Kᵀ·Q` rather than
+    /// `Q·Kᵀ` — which is [`Self::triu`] about the same diagonal.
+    #[inline(always)]
+    pub fn make_causal_t(&mut self, lane: u32, diagonal: i32, fill: f32) {
+        self.triu(lane, diagonal, fill);
+    }
+
+    /// [`Self::make_causal`] taking the two block origins a flash kernel
+    /// already holds instead of their difference: the band covers queries
+    /// `query_base..query_base + M` against keys `key_base..key_base + N`, and
+    /// its diagonal sits at `query_base - key_base`.
+    ///
+    /// Taking them separately is not sugar. The difference is negative for
+    /// every band above the diagonal — the fully-masked ones — and both
+    /// origins are `u32` at the call site, so `query_base - key_base` written
+    /// there wraps to a huge positive number and masks nothing. This subtracts
+    /// in `i32`.
+    #[inline(always)]
+    pub fn make_causal_at(&mut self, lane: u32, query_base: u32, key_base: u32, fill: f32) {
+        self.make_causal(lane, query_base as i32 - key_base as i32, fill);
+    }
+
+    /// Fill the columns at and right of `column`, keeping the rest — the
+    /// ragged-tail mask, with `column` the number of real keys left at this
+    /// band's origin (`keys - key_base`, which may be negative or past `N`).
+    #[inline(always)]
+    pub fn right_fill(&mut self, lane: u32, column: i32, fill: f32) {
+        self.mask(lane, fill, |_, c| c < column);
+    }
+
+    /// Fill the columns left of `column`; the mirror of [`Self::right_fill`],
+    /// and a sliding window's other edge.
+    #[inline(always)]
+    pub fn left_fill(&mut self, lane: u32, column: i32, fill: f32) {
+        self.mask(lane, fill, |_, c| c >= column);
+    }
+
+    /// Fill the rows above `row` — [`Self::left_fill`] on the query axis.
+    #[inline(always)]
+    pub fn upper_fill(&mut self, lane: u32, row: i32, fill: f32) {
+        self.mask(lane, fill, |r, _| r >= row);
+    }
+
+    /// Fill the rows at and below `row`: [`Self::right_fill`] on the query
+    /// axis, for a band whose last rows run past the sequence.
+    #[inline(always)]
+    pub fn lower_fill(&mut self, lane: u32, row: i32, fill: f32) {
+        self.mask(lane, fill, |r, _| r < row);
+    }
+
     /// Scale every value in row-slot `s` by `factors` slot `s` — the
     /// running-max rescale of an online-softmax accumulator.
     ///
@@ -1388,17 +1535,27 @@ mod tests {
     /// Its column statistics.
     type Cols = ColVec<32, BaseLdtm>;
 
+    /// The flash score band, and the shape #23 was filed about.
+    type Band = RegTile<32, 64, BaseLdtm>;
+
     /// A tile whose value at `(row, column)` names that coordinate exactly, so
     /// a map that reads the wrong operand shows up as a wrong coordinate.
-    fn coordinate_tile(lane: u32) -> Scores {
-        let mut tile = Scores::zero();
-        for slot in 0..Scores::SLOTS {
-            for value in 0..Scores::VALUES {
-                let (row, column) = Scores::coordinate(lane, slot, value);
+    fn indexed<const M: usize, const N: usize, L: FragmentLayout<M, N>>(
+        lane: u32,
+    ) -> RegTile<M, N, L> {
+        let mut tile = RegTile::<M, N, L>::zero();
+        for slot in 0..L::SLOTS {
+            for value in 0..L::VALUES {
+                let (row, column) = RegTile::<M, N, L>::coordinate(lane, slot, value);
                 tile.set(slot, value, (256 * row + column) as f32);
             }
         }
         tile
+    }
+
+    /// [`indexed`] at the shape most of these tests run on.
+    fn coordinate_tile(lane: u32) -> Scores {
+        indexed(lane)
     }
 
     /// The row vector holding each row's own index.
@@ -1525,9 +1682,27 @@ mod tests {
     }
 
     #[test]
+    fn the_shape_set_is_the_product_of_the_extents() {
+        // #23. `FragmentLayout` is a blanket impl over `RowLayout × ColLayout`
+        // now, so a shape costs no line of its own — and the storage it
+        // projects is still exactly the `[[f32; N/4]; M/8]` the per-shape
+        // impls named, which is what says the change is a spelling and not a
+        // representation.
+        assert_eq!(size_of::<Band>(), 32 * 64 / 32 * 4);
+        assert_eq!(size_of::<RegTile<16, 512, BaseLdtm>>(), 16 * 512 / 32 * 4);
+        assert_eq!(size_of::<RegTile<512, 16, BaseLdtm>>(), 512 * 16 / 32 * 4);
+        assert_eq!(size_of::<RegVec<48, BaseLdtm>>(), 48 / 8 * 4);
+        assert_eq!(size_of::<ColVec<80, BaseLdtm>>(), 80 / 4 * 4);
+        // Shapes nothing in this repo names, and a map is still a map on them.
+        covers_each_coordinate_once::<48, 80, BaseLdtm>();
+        covers_each_coordinate_once::<16, 512, BaseLdtm>();
+    }
+
+    #[test]
     fn base_ldtm_covers_each_coordinate_once() {
         covers_each_coordinate_once::<16, 16, BaseLdtm>();
         covers_each_coordinate_once::<32, 32, BaseLdtm>();
+        covers_each_coordinate_once::<32, 64, BaseLdtm>();
         covers_each_coordinate_once::<32, 128, BaseLdtm>();
         // Slots follow the rows a thread owns: two per 16-row block.
         assert_eq!(Fragment::SLOTS, 2);
@@ -1575,6 +1750,7 @@ mod tests {
         }
         composes::<16, 16, BaseLdtm>();
         composes::<32, 32, BaseLdtm>();
+        composes::<32, 64, BaseLdtm>();
         composes::<32, 128, BaseLdtm>();
     }
 
@@ -2046,6 +2222,160 @@ mod tests {
         }
         for value in 0..Cols::VALUES {
             assert_eq!(Cols::splat(1.0).get(value), 1.0);
+        }
+    }
+
+    /// The sentinel a masked score carries into `exp2` — finite, so a fully
+    /// masked row sums to zero rather than to `NaN`.
+    const MASKED: f32 = -1.0e30;
+
+    #[test]
+    fn causal_masks_against_the_bands_global_origin() {
+        // The whole of #7's correction. The band is a [32, 64] sub-block of a
+        // much larger score matrix, so what decides an element is whether its
+        // *global* key index is at or before its global query index — and the
+        // origin-free mask agrees with that only when the two bases are equal,
+        // which is one block of a tiled kernel and no others.
+        for (query_base, key_base) in [(0u32, 0u32), (32, 0), (0, 32), (128, 64), (64, 128)] {
+            for lane in 0..32 {
+                let unmasked: Band = indexed(lane);
+                let mut band = unmasked;
+                band.make_causal_at(lane, query_base, key_base, MASKED);
+                for slot in 0..Band::SLOTS {
+                    for value in 0..Band::VALUES {
+                        let (row, column) = Band::coordinate(lane, slot, value);
+                        let attends = key_base + column <= query_base + row;
+                        assert_eq!(
+                            band.get(slot, value),
+                            if attends {
+                                unmasked.get(slot, value)
+                            } else {
+                                MASKED
+                            },
+                            "({query_base}, {key_base}) lane {lane} at ({row}, {column})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_band_off_the_diagonal_is_all_or_nothing() {
+        // The two common cases in a tiled kernel, and the two the origin-free
+        // signature cannot express at all. `key_base > query_base + M` is
+        // wholly after every query in the band; `query_base > key_base + N`
+        // wholly before every key.
+        for lane in 0..32 {
+            let unmasked: Band = indexed(lane);
+
+            let mut above = unmasked;
+            above.make_causal_at(lane, 0, 1024, MASKED);
+            let mut below = unmasked;
+            below.make_causal_at(lane, 1024, 0, MASKED);
+
+            for slot in 0..Band::SLOTS {
+                for value in 0..Band::VALUES {
+                    assert_eq!(above.get(slot, value), MASKED);
+                    assert_eq!(below.get(slot, value), unmasked.get(slot, value));
+                }
+            }
+        }
+        // And that the origin arrives as a signed difference: the same band
+        // through the `u32` subtraction a call site would write instead
+        // wraps to +4294966272 and masks nothing.
+        let mut wrapped: Band = indexed(0);
+        wrapped.make_causal(0, 0u32.wrapping_sub(1024) as i32, MASKED);
+        assert_eq!(wrapped.get(0, 0), MASKED);
+    }
+
+    #[test]
+    fn tril_and_triu_partition_the_tile() {
+        // Complements about `diagonal`, at every diagonal that crosses the
+        // tile and two that miss it entirely.
+        for lane in 0..32 {
+            for diagonal in [-64, -1, 0, 1, 17, 31, 64] {
+                let full = coordinate_tile(lane);
+                let mut lower = full;
+                lower.tril(lane, diagonal, 0.0);
+                let mut upper = full;
+                upper.triu(lane, diagonal + 1, 0.0);
+                let mut causal = full;
+                causal.make_causal(lane, diagonal, MASKED);
+                let mut transposed = full;
+                transposed.make_causal_t(lane, diagonal, MASKED);
+                let mut mirrored = full;
+                mirrored.triu(lane, diagonal, MASKED);
+
+                for slot in 0..Scores::SLOTS {
+                    for value in 0..Scores::VALUES {
+                        let (row, column) = Scores::coordinate(lane, slot, value);
+                        let below = column as i32 - row as i32 <= diagonal;
+                        let x = full.get(slot, value);
+                        assert_eq!(lower.get(slot, value), if below { x } else { 0.0 });
+                        assert_eq!(upper.get(slot, value), if below { 0.0 } else { x });
+                        assert_eq!(causal.get(slot, value), if below { x } else { MASKED });
+                        assert_eq!(transposed.get(slot, value), mirrored.get(slot, value));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fills_cut_at_their_index_and_saturate_off_the_tile() {
+        // Bounds outside `0..N` are the ragged tail's ordinary case — a band
+        // wholly past the sequence end, or wholly inside it — so they are
+        // asserted alongside the ones that cut.
+        for lane in 0..32 {
+            for bound in [-16, 0, 1, 9, 32, 64, 96] {
+                let full: Band = indexed(lane);
+                let (mut right, mut left, mut upper, mut lower) = (full, full, full, full);
+                right.right_fill(lane, bound, MASKED);
+                left.left_fill(lane, bound, MASKED);
+                upper.upper_fill(lane, bound, MASKED);
+                lower.lower_fill(lane, bound, MASKED);
+
+                for slot in 0..Band::SLOTS {
+                    for value in 0..Band::VALUES {
+                        let (row, column) = Band::coordinate(lane, slot, value);
+                        let (row, column) = (row as i32, column as i32);
+                        let x = full.get(slot, value);
+                        let cut = |keep: bool| if keep { x } else { MASKED };
+                        assert_eq!(right.get(slot, value), cut(column < bound));
+                        assert_eq!(left.get(slot, value), cut(column >= bound));
+                        assert_eq!(upper.get(slot, value), cut(row >= bound));
+                        assert_eq!(lower.get(slot, value), cut(row < bound));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn masks_are_the_predicate_over_the_layouts_coordinates() {
+        // Every mask above is `mask` with a predicate, and `mask` is a select
+        // at the coordinate the *layout* gives — not at `(slot, value)`. A
+        // mask that indexed by storage position instead would pass every test
+        // that only checks the diagonal block, so this checks the mechanism
+        // directly, on a shape whose slots and values are both plural.
+        for lane in 0..32 {
+            let full: Band = indexed(lane);
+            let mut masked = full;
+            masked.mask(lane, MASKED, |row, column| (row + column) % 3 == 0);
+            for slot in 0..Band::SLOTS {
+                for value in 0..Band::VALUES {
+                    let (row, column) = Band::coordinate(lane, slot, value);
+                    assert_eq!(
+                        masked.get(slot, value),
+                        if (row + column) % 3 == 0 {
+                            full.get(slot, value)
+                        } else {
+                            MASKED
+                        }
+                    );
+                }
+            }
         }
     }
 
