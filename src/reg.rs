@@ -353,6 +353,29 @@ pub trait ColLayout<const N: usize> {
     /// Values one thread owns per slot — the columns of `0..N` it holds.
     const VALUES: usize;
 
+    /// How many consecutive values land on consecutive columns, so that a run
+    /// of them is one vector memory access rather than that many scalar ones.
+    ///
+    /// A run starts at every multiple of the constant, and the contract is
+    /// both halves of what a vector access needs — that the addresses are
+    /// adjacent, and that the first of them is aligned for the width:
+    ///
+    /// ```text
+    /// run % CONTIGUOUS_VALUES == 0  ⟹  col_of(lane, run + i) == col_of(lane, run) + i
+    ///                                   for every i < CONTIGUOUS_VALUES,
+    ///                                   and CONTIGUOUS_VALUES divides both
+    ///                                   col_of(lane, run) and VALUES.
+    /// ```
+    ///
+    /// The default is `1` — no two values adjacent — because that is the
+    /// answer that is true of every map, so a layout written later gets scalar
+    /// accesses until it claims otherwise rather than silently inheriting
+    /// [`BaseLdtm`]'s arithmetic (#23, #91). Raising it is a claim about the
+    /// map that [`crate::global::store_rows`] and
+    /// [`crate::global::load_rows`] act on; `base_ldtm_pairs_every_other_value`
+    /// is what checks it for the one layout that does.
+    const CONTIGUOUS_VALUES: usize = 1;
+
     /// The logical column in `0..N` that `lane` holds in `value`.
     fn col_of(lane: u32, value: usize) -> u32;
 
@@ -506,6 +529,10 @@ macro_rules! base_ldtm_cols {
         impl ColLayout<$n> for BaseLdtm {
             type Values = [f32; $n / 4];
             const VALUES: usize = $n / 4;
+            // `{0, 1, 8, 9}` is two adjacent pairs, from an even base
+            // (`2*(lane%4) + 16*(value/4)`). Two and not four: the run breaks
+            // at the `1 -> 8` step.
+            const CONTIGUOUS_VALUES: usize = 2;
 
             #[inline(always)]
             fn col_of(lane: u32, value: usize) -> u32 {
@@ -2029,6 +2056,46 @@ mod tests {
         assert_eq!(Fragment::SLOTS, 2);
         assert_eq!(Fragment::VALUES, 4);
         assert_eq!(RegTile::<32, 128, BaseLdtm>::SLOTS, 4);
+    }
+
+    /// The claim [`ColLayout::CONTIGUOUS_VALUES`] makes, checked as stated
+    /// rather than by re-deriving `{0, 1, 8, 9}`: every run of that many
+    /// values, from a run-aligned start, is a run of consecutive columns from
+    /// a run-aligned column. That is exactly what `store_rows` and `load_rows`
+    /// turn into a vector access, and the reason the constant is a property of
+    /// the map and not of the mover (#91).
+    #[test]
+    fn base_ldtm_pairs_every_other_value() {
+        fn values_run_in_column_order<const N: usize, L: ColLayout<N>>() {
+            let run = L::CONTIGUOUS_VALUES;
+            assert!(L::VALUES.is_multiple_of(run), "a partial run has no home");
+            for lane in 0..32u32 {
+                for start in (0..L::VALUES).step_by(run) {
+                    let base = L::col_of(lane, start);
+                    assert!(
+                        (base as usize).is_multiple_of(run),
+                        "N = {N}, lane {lane}, value {start}: column {base} is not run-aligned"
+                    );
+                    for step in 0..run {
+                        assert_eq!(
+                            L::col_of(lane, start + step),
+                            base + step as u32,
+                            "N = {N}, lane {lane}, value {}",
+                            start + step
+                        );
+                    }
+                }
+            }
+        }
+
+        assert_eq!(<BaseLdtm as ColLayout<128>>::CONTIGUOUS_VALUES, 2);
+        values_run_in_column_order::<16, BaseLdtm>();
+        values_run_in_column_order::<64, BaseLdtm>();
+        values_run_in_column_order::<128, BaseLdtm>();
+        values_run_in_column_order::<512, BaseLdtm>();
+        // And the run stops at two: `{0, 1, 8, 9}` puts values 1 and 2 seven
+        // columns apart, which is why nothing here widens to four.
+        assert_eq!(BaseLdtm::column(0, 2) - BaseLdtm::column(0, 1), 7);
     }
 
     /// A `[16, 16]` drain block's own coordinates, which every composed tile

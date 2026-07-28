@@ -42,9 +42,28 @@
 //! rather than pinned to [`BaseLdtm`](crate::reg::BaseLdtm) — `ldmatrix`,
 //! `stmatrix` and LDTM each fix a lane map in hardware, and a plain
 //! `st.global` fixes nothing.
+//!
+//! # Two values at a time
+//!
+//! A map that gives a thread *adjacent* columns has told the mover something:
+//! those two accesses are one. [`crate::reg::ColLayout::CONTIGUOUS_VALUES`] is
+//! that claim,
+//! and [`store_rows`]/[`load_rows`] spend it on `st.global.v2.f32` and
+//! `ld.global.v2.f32` — half the memory instructions, and, because the two
+//! words of a pair sat in the same 32-byte sector either way, the same
+//! transactions carrying twice the useful bytes (#91).
+//!
+//! It is stated on the layout rather than read off `BaseLdtm`'s arithmetic
+//! because the shape set is open (#23): a layout written later gets the
+//! default `1` and scalar accesses, which is wrong about nothing, until it
+//! claims better. What the mover adds is the half the layout cannot know — a
+//! *vector* access must be aligned to its own width, and a cursor's base,
+//! stride and column origin are runtime numbers. So the pairing is checked
+//! once per call ([`GlobalRows::runs_aligned`]) rather than promised in a
+//! safety contract that an odd leading dimension would quietly break.
 
 use crate::reg::{FragmentLayout, RegTile};
-use cuda_device::DisjointSlice;
+use cuda_device::{DisjointSlice, ptx_asm};
 
 /// A row-major window of global memory: a base address and the elements per
 /// row that separate one row from the next.
@@ -134,6 +153,78 @@ impl GlobalRows {
     pub const unsafe fn at(self, row: u32, column: u32) -> *mut f32 {
         unsafe { self.base.add(self.index(row, column)) }
     }
+
+    /// Whether a `run`-wide fp32 vector access is legally aligned at *every*
+    /// `(row, column + run * k)` this cursor names.
+    ///
+    /// A vector access must be aligned to its whole width, which is the one
+    /// thing a fragment layout cannot promise: it knows `run` divides the
+    /// column it hands out, and nothing about where the buffer starts or how
+    /// far apart its rows are. Three terms have to agree, and only these
+    /// three, because `run * k` is aligned by construction:
+    ///
+    /// - the base address, so element 0 of row 0 is;
+    /// - the column origin the band lands at, which shifts every row equally;
+    /// - the row stride, so that every *other* row is too.
+    ///
+    /// A cursor over a packed buffer at an even leading dimension passes for
+    /// pairs; one at an odd `ldc` does not, and gets scalar accesses instead
+    /// of a misaligned-address fault.
+    #[inline(always)]
+    pub fn runs_aligned(self, column: u32, run: usize) -> bool {
+        let width = run * size_of::<f32>();
+        (self.base as usize + size_of::<f32>() * column as usize).is_multiple_of(width)
+            && (size_of::<f32>() * self.stride).is_multiple_of(width)
+    }
+}
+
+/// `st.global.v2.f32` — the two fp32 at `dest` and `dest + 1` in one
+/// instruction.
+///
+/// Inline PTX for the reason [`crate::ldst::stmatrix_m8n8_x2`] is: the
+/// instruction has to be *asked for*. Widening a pair of adjacent stores is a
+/// transformation ptxas may only make when the address is provably aligned,
+/// and an address built from a runtime leading dimension never is — so the
+/// caller that has actually checked ([`GlobalRows::runs_aligned`]) is the only
+/// one in a position to spell it.
+///
+/// # Safety
+///
+/// `dest` must be 8-byte aligned and name two writable fp32 of a global
+/// buffer.
+#[inline(always)]
+unsafe fn store_pair(dest: *mut f32, first: f32, second: f32) {
+    unsafe {
+        ptx_asm!(
+            "st.global.v2.f32 [%0], {%1, %2};",
+            in("l") dest as u64,
+            in("f") first,
+            in("f") second,
+            clobber("memory"),
+        );
+    }
+}
+
+/// `ld.global.v2.f32` — the read direction of [`store_pair`], under the same
+/// contract.
+///
+/// # Safety
+///
+/// `src` must be 8-byte aligned and name two readable fp32 of a global buffer.
+#[inline(always)]
+unsafe fn load_pair(src: *const f32) -> (f32, f32) {
+    unsafe {
+        let first: f32;
+        let second: f32;
+        ptx_asm!(
+            "ld.global.v2.f32 {%0, %1}, [%2];",
+            out("=f") first,
+            out("=f") second,
+            in("l") src as u64,
+            clobber("memory"),
+        );
+        (first, second)
+    }
 }
 
 /// Write a whole `[M, N]` register tile to `(row, column)` of a row-major
@@ -150,10 +241,16 @@ impl GlobalRows {
 /// A thread's row address is formed once per slot and its values indexed off
 /// it, which is what makes the inner loop a run of offsets from one register
 /// rather than a multiply each. Under [`BaseLdtm`](crate::reg::BaseLdtm) the
-/// four values of a 16-column block sit at column offsets `{0, 1, 8, 9}`, so
-/// they are two adjacent pairs; whether ptxas widens each pair into one
-/// `st.global.v2.f32` is its call, and it can only take it when the row's
-/// alignment is provable — which a runtime stride is not.
+/// four values of a 16-column block sit at column offsets `{0, 1, 8, 9}` — two
+/// adjacent pairs, which the layout states as
+/// `CONTIGUOUS_VALUES = 2` and this mover spends on one `st.global.v2.f32` per
+/// pair when the cursor is aligned for it (#91). A `[128, 128]` accumulator
+/// band is 512 stores a lane scalar and 256 paired, over the same eight
+/// 32-byte sectors a warp touched either way.
+///
+/// The choice is made once per call, not once per value: the two spellings are
+/// separate unrolled loops and the alignment test picks between them, so
+/// neither path carries a branch.
 ///
 /// Nothing here is warp-collective, which is the one way this mover differs
 /// from every other one in the crate: `stmatrix` is one instruction fed by 16
@@ -183,15 +280,68 @@ pub unsafe fn store_rows<const M: usize, const N: usize, L: FragmentLayout<M, N>
     tile: RegTile<M, N, L>,
 ) {
     unsafe {
+        if pairs_are_one_access::<M, N, L>(dest, column) {
+            store_rows_in_runs::<2, M, N, L>(dest, row, column, lane, tile)
+        } else {
+            store_rows_in_runs::<1, M, N, L>(dest, row, column, lane, tile)
+        }
+    }
+}
+
+/// Whether this cursor and this layout together make two consecutive values
+/// one memory access — the whole of the decision [`store_rows`] and
+/// [`load_rows`] take, so they take it the same way.
+///
+/// `2` divides the run rather than equalling it: a layout claiming runs of
+/// four contains two aligned pairs, and one claiming three contains none.
+#[inline(always)]
+fn pairs_are_one_access<const M: usize, const N: usize, L: FragmentLayout<M, N>>(
+    rows: GlobalRows,
+    column: u32,
+) -> bool {
+    const {
+        assert!(
+            L::CONTIGUOUS_VALUES > 0 && L::VALUES % L::CONTIGUOUS_VALUES == 0,
+            "a layout's contiguous run must divide the values it hands out"
+        )
+    };
+    L::CONTIGUOUS_VALUES % 2 == 0 && rows.runs_aligned(column, 2)
+}
+
+/// [`store_rows`] at one access width: `RUN` values per instruction, from a
+/// `RUN`-aligned value index. A const parameter and not an argument because
+/// the width decides which instruction the loop is made of, and a loop that
+/// asked per value would have spent more on the question than on the answer.
+///
+/// # Safety
+///
+/// As [`store_rows`], and `RUN > 1` additionally requires
+/// [`pairs_are_one_access`].
+#[inline(always)]
+unsafe fn store_rows_in_runs<
+    const RUN: usize,
+    const M: usize,
+    const N: usize,
+    L: FragmentLayout<M, N>,
+>(
+    dest: GlobalRows,
+    row: u32,
+    column: u32,
+    lane: u32,
+    tile: RegTile<M, N, L>,
+) {
+    unsafe {
         let mut slot = 0usize;
         while slot < L::SLOTS {
             let start = dest.at(row + L::row_of(lane, slot), column);
             let mut value = 0usize;
             while value < L::VALUES {
-                start
-                    .add(L::col_of(lane, value) as usize)
-                    .write(tile.get(slot, value));
-                value += 1;
+                let at = start.add(L::col_of(lane, value) as usize);
+                match RUN {
+                    2 => store_pair(at, tile.get(slot, value), tile.get(slot, value + 1)),
+                    _ => at.write(tile.get(slot, value)),
+                }
+                value += RUN;
             }
             slot += 1;
         }
@@ -207,6 +357,10 @@ pub unsafe fn store_rows<const M: usize, const N: usize, L: FragmentLayout<M, N>
 /// operand — those come from shared memory, and staging one still means a TMA
 /// or a [`crate::ldst::store_tile`].
 ///
+/// The pairing is the same: the addresses are the same addresses, so a layout
+/// whose values are adjacent reads them with one `ld.global.v2.f32` under the
+/// same alignment test [`store_rows`] applies (#91).
+///
 /// # Safety
 ///
 /// As [`store_rows`], reading instead of writing: the rectangle must lie
@@ -219,18 +373,49 @@ pub unsafe fn load_rows<const M: usize, const N: usize, L: FragmentLayout<M, N>>
     lane: u32,
 ) -> RegTile<M, N, L> {
     unsafe {
+        if pairs_are_one_access::<M, N, L>(src, column) {
+            load_rows_in_runs::<2, M, N, L>(src, row, column, lane)
+        } else {
+            load_rows_in_runs::<1, M, N, L>(src, row, column, lane)
+        }
+    }
+}
+
+/// [`load_rows`] at one access width; see [`store_rows_in_runs`].
+///
+/// # Safety
+///
+/// As [`load_rows`], and `RUN > 1` additionally requires
+/// [`pairs_are_one_access`].
+#[inline(always)]
+unsafe fn load_rows_in_runs<
+    const RUN: usize,
+    const M: usize,
+    const N: usize,
+    L: FragmentLayout<M, N>,
+>(
+    src: GlobalRows,
+    row: u32,
+    column: u32,
+    lane: u32,
+) -> RegTile<M, N, L> {
+    unsafe {
         let mut tile = RegTile::<M, N, L>::zero();
         let mut slot = 0usize;
         while slot < L::SLOTS {
             let start = src.at(row + L::row_of(lane, slot), column);
             let mut value = 0usize;
             while value < L::VALUES {
-                tile.set(
-                    slot,
-                    value,
-                    start.add(L::col_of(lane, value) as usize).read(),
-                );
-                value += 1;
+                let at = start.add(L::col_of(lane, value) as usize);
+                match RUN {
+                    2 => {
+                        let (first, second) = load_pair(at);
+                        tile.set(slot, value, first);
+                        tile.set(slot, value + 1, second);
+                    }
+                    _ => tile.set(slot, value, at.read()),
+                }
+                value += RUN;
             }
             slot += 1;
         }
@@ -318,6 +503,28 @@ mod rows_tests {
                 assert!(touched.contains(&(row * STRIDE + 128 + column)), "right");
             }
         }
+    }
+
+    /// The three terms a vector access needs aligned, one at a time. Each of
+    /// the failures below is a real cursor a caller could build, and each
+    /// costs the pairing rather than faulting on it (#91).
+    #[test]
+    fn a_pair_needs_the_base_the_stride_and_the_column_to_agree() {
+        // 0x7f00_0000 is 8-byte aligned, and an even stride keeps every row so.
+        assert!(cursor(1024).runs_aligned(0, 2));
+        assert!(cursor(1024).runs_aligned(128, 2));
+        // An odd leading dimension flips the parity every row.
+        assert!(!cursor(1023).runs_aligned(0, 2));
+        // An odd column origin shifts every row by one element.
+        assert!(!cursor(1024).runs_aligned(129, 2));
+        // A window starting mid-pair, which is what a `from_raw` on an
+        // interior address gives.
+        let odd_base = unsafe { GlobalRows::from_raw(BASE.add(1), 1024) };
+        assert!(!odd_base.runs_aligned(0, 2));
+        assert!(odd_base.runs_aligned(1, 2));
+        // A run of one is every address, and is what a layout that claims
+        // nothing gets.
+        assert!(cursor(1023).runs_aligned(129, 1));
     }
 
     /// Each thread's values within a slot are a run of offsets from one row
