@@ -5,10 +5,6 @@
 //!
 //! Blocked on:
 //!
-//! - **#7** (masking) — no `make_causal`. And #7 as filed describes TK's
-//!   signature, which takes no coordinate origin. A flash kernel masks a
-//!   `[queries, keys]` band whose diagonal sits at `query_base - key_base`,
-//!   so what it needs is `make_causal_at(lane, query_base, key_base, fill)`.
 //! - **#11** (global ↔ register) — the epilogue writes fp32 out of registers.
 //!   Today that means packing to bf16, `stmatrix` into a shared tile, and a
 //!   TMA store (#9): a precision loss the epilogue never asked for.
@@ -20,13 +16,12 @@
 //!   The scalar broadcast `scale` that used to share this entry landed with
 //!   #38 and is the real API below.
 //!
-//! Plus one thing named at its call site below:
-//!
-//! - **#23, the `RegTile` shape set is closed.** `BaseLdtm` implements
-//!   `FragmentLayout` for `(16,16)`, `(32,32)` and `(32,128)` only, because
-//!   each shape is a line of `base_ldtm_shapes!` *inside* `src/reg.rs`. This
-//!   kernel's score band is `[32, 64]`, and an out-of-tree kernel has no way
-//!   to add it.
+//! **#23 and #7 have landed**, together, because they were the same blocker
+//! from two sides: this kernel could not name its `[32, 64]` score band, and
+//! the unsatisfied layout bound on that band was what kept `make_causal` off
+//! the error list. `FragmentLayout` is now a blanket impl over the row and
+//! column extents, so the band is a type an out-of-tree crate may write, and
+//! the mask takes the coordinate origin a tiled kernel has to give it.
 //!
 //! ## What already works
 //!
@@ -34,9 +29,11 @@
 //! this kernel issues, in the layouts it issues them; the semaphore protocol,
 //! the swizzled `P` staging tile, and [`online_rescale`] — the fused
 //! running-max correction, the one genuinely subtle piece of flash — are all
-//! first-class. The gap is not the hard part of the algorithm. It is that
-//! between `S` arriving in registers and `P` going back to shared, the kernel
-//! has to spell out every elementwise operation by hand.
+//! first-class. And the whole register-side body — drain, mask, scale,
+//! row-reduce, correct, restage — is now the library's own API, line for
+//! line, with no index arithmetic left in this file. What remains is at the
+//! two ends: how the output leaves registers (#11), and one in-place form
+//! (#31).
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
@@ -75,14 +72,8 @@ type VRing = SharedTileRing<Bf16, KEYS, HEAD, Swizzle128B, STAGES>;
 type Scores = TmemTile<QUERIES, KEYS>;
 type Output = TmemTile<QUERIES, HEAD>;
 
-/// One warp's band of the score tile.
-///
-/// GAP (#23): `BaseLdtm` has no `FragmentLayout<32, 64>` impl. The
-/// implemented shapes are a `base_ldtm_shapes!` invocation inside
-/// `src/reg.rs`, so the set of tiles a kernel may hold is fixed by the
-/// library and this line does not compile out of tree. Dodging
-/// `generic_const_exprs` with an associated type is the right call; closing
-/// the shape set over it is not.
+/// One warp's band of the score tile — `[32, 64]`, the shape #23 was filed
+/// about and the reason this line is out of tree at all.
 type ScoreBand = RegTile<32, KEYS, BaseLdtm>;
 /// One warp's band of the output accumulator.
 type OutBand = RegTile<32, HEAD, BaseLdtm>;
@@ -194,10 +185,11 @@ pub mod kernels {
                 // `[16, 16]` blocks LDTM delivers.
                 let mut s: ScoreBand = scores.tile(32 * warp_id, 0);
 
-                // WANT (#7): causal masking against the band's own origin.
-                // Without it this is a loop over `ScoreBand::coordinate`
-                // comparing raw indices — the index math this library exists
-                // to delete, in the one place every attention kernel needs it.
+                // Causal masking against this band's own origin (#7). The two
+                // bases go in separately: their difference is negative for
+                // every band above the diagonal, which is most of them, and
+                // `query_base - key_base` in `u32` at this call site would
+                // wrap and mask nothing.
                 s.make_causal_at(lane, query_base + 32 * warp_id, key_base, f32::NEG_INFINITY);
 
                 // The softmax numerator, in the real API (#5, #6, #38).

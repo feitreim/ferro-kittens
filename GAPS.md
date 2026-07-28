@@ -209,13 +209,17 @@ walk skeleton. **~80 lines for the missing walks.**
 
 ### 3.4 Tile-shape utilities
 
-Absent: `transpose`, `swap_layout`, `tril`/`triu`, `make_causal`/`make_causal_t`,
-`left_fill`/`right_fill`/`upper_fill`/`lower_fill`, `copy` between layouts.
-`broadcast_row`/`broadcast_col` landed with 3.1.
+Landed with #7: `tril`/`triu`, `make_causal`/`make_causal_t`,
+`left_fill`/`right_fill`/`upper_fill`/`lower_fill`, over a `RegTile::mask` that
+selects at the layout's own `(row, column)`. Every one takes a **coordinate
+origin** TK's signatures do not have — a `diagonal`, or a signed fill index —
+because the tile is a sub-block of a larger matrix whose diagonal sits at
+`query_base - key_base`; TK's origin-free form is right only for the diagonal
+block. `broadcast_row`/`broadcast_col` landed with 3.1.
 
-`make_causal` is the notable one — every causal attention kernel needs it, and
-without it the masking is open-coded in the kernel against raw fragment indices,
-which is exactly the index math this library exists to remove. **~100 lines.**
+Absent: `transpose`, `swap_layout`, `copy` between layouts — all three need a
+second `FragmentLayout`, which the crate does not have. **~60 lines**, once one
+exists.
 
 ### 3.5 Warp-level MMA fallbacks **[NON-GOAL]**
 
