@@ -220,6 +220,26 @@ const TMEM_LADDER_SENTINEL: u32 = 0x7be5_0000;
 /// See [`tmem_residency`], which is the whole argument for why those four.
 const CENSUS_FIELDS: usize = 4;
 
+/// Words each CLC probe CTA writes:
+/// `[completed, is_canceled, first_ctaid_x, ctaid_x]`.
+const CLC_FIELDS: usize = 4;
+/// The `try_cancel` response, whose size is the ISA's `.b128` and is also the
+/// transaction count its mbarrier is charged.
+const CLC_RESPONSE_BYTES: usize = 16;
+/// Shared bytes the probe launches with: the response, then its barrier.
+const CLC_SHARED_BYTES: u32 = CLC_RESPONSE_BYTES as u32 + 8;
+/// Clusters the probe launches. Its shared plan is 24 bytes and it holds no
+/// tensor memory, so an SM admits many of it — the grid has to be far larger
+/// than the device can hold at once or there is nothing pending to cancel and
+/// every row comes back `is_canceled = 0`, which would prove only that the
+/// instruction returns.
+const CLC_CLUSTERS: u32 = 4096;
+/// Nanoseconds a rank waits for its copy of the response before writing down
+/// that it never arrived. Generous by three orders of magnitude against a
+/// steal, because the only thing a short deadline could produce is a false
+/// report of the exact failure this case exists to detect.
+const CLC_DEADLINE_NS: u64 = 50_000_000;
+
 /// Iterations [`kernels::census_spin`] runs before giving up on the clock.
 ///
 /// The spin's real exit is `%globaltimer` passing a deadline, and a loop whose
@@ -1356,6 +1376,116 @@ pub mod kernels {
                 *out.get_unchecked_mut(base + 2) = allocated;
                 *out.get_unchecked_mut(base + 3) = left;
             }
+        }
+    }
+
+    /// Mark this CTA as having run at all, before it waits on anything.
+    ///
+    /// Without this the probe cannot state its own result. A cancelled cluster
+    /// is **never launched**, so its rows keep the zeros the buffer was
+    /// allocated with — which is byte-for-byte what a launched rank that never
+    /// saw its response would write. The first read of this case conflated the
+    /// two and reported 3758 of 8192 CTAs as stalled when most of them were
+    /// simply stolen, which is the outcome it was built to observe.
+    #[inline(always)]
+    unsafe fn clc_entered(out: &mut DisjointSlice<u64>) {
+        unsafe {
+            if thread::threadIdx_x() == 0 {
+                *out.get_unchecked_mut(CLC_FIELDS * thread::blockIdx_x() as usize) = 1;
+            }
+        }
+    }
+
+    /// One row of the CLC probe (#88), per CTA:
+    /// `[launched, completed, is_canceled, first_ctaid_x]`.
+    ///
+    /// `completed` is the whole reason this case exists. A steal's response
+    /// arrives on an mbarrier, and `pipeline::run_stealing` has *every* rank
+    /// wait on its own copy — which is only sound if
+    /// `.multicast::cluster::all` really does complete the transaction in every
+    /// CTA of the requesting cluster and not just in the one that issued. If it
+    /// does not, the peer waits forever, and a persistent GEMM built on it
+    /// hangs with no diagnostic at all. So this probe waits on a **deadline**
+    /// rather than on the barrier: a rank whose barrier never flips writes
+    /// `completed = 0` and lives to report it, which turns a deadlock into a
+    /// row of a table.
+    ///
+    /// The other three answer the questions a hang would otherwise hide behind:
+    /// whether the cancelled unit is a cluster or a CTA (`first_ctaid_x` even,
+    /// under a 2-CTA cluster), and whether both ranks of a cluster are told the
+    /// *same* thing — which is what stops #51's split pair coming back.
+    #[inline(always)]
+    unsafe fn clc_record(completed: u64, canceled: u64, first: u64, out: &mut DisjointSlice<u64>) {
+        unsafe {
+            if thread::threadIdx_x() == 0 {
+                let base = CLC_FIELDS * thread::blockIdx_x() as usize;
+                *out.get_unchecked_mut(base + 1) = completed;
+                *out.get_unchecked_mut(base + 2) = canceled;
+                *out.get_unchecked_mut(base + 3) = first;
+            }
+        }
+    }
+
+    /// Ask the hardware for one stolen cluster and write down what came back,
+    /// against a deadline — the instrument behind #88's scheduler.
+    ///
+    /// Deliberately built out of the **raw** `cuda_device::clc` and mbarrier
+    /// intrinsics rather than `kittens::pipeline::ClcQueue`. What is under test
+    /// here is the instruction and its lowering, so putting the library's
+    /// wrapper in the path would make a failure ambiguous between the two.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    pub unsafe fn clc_probe(deadline_ns: u64, mut out: DisjointSlice<u64>) {
+        unsafe {
+            use cuda_device::barrier::{
+                mbarrier_arrive_expect_tx, mbarrier_init, mbarrier_try_wait_parity,
+            };
+            use cuda_device::clc::{
+                clc_query_get_first_ctaid_x, clc_query_is_canceled, clc_try_cancel_multicast,
+            };
+
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let response = smem as *mut u64;
+            let bar = smem.add(CLC_RESPONSE_BYTES) as *mut Barrier;
+            let leader = thread::threadIdx_x() == 0;
+
+            clc_entered(&mut out);
+            if leader {
+                mbarrier_init(bar, 1);
+            }
+            // Every rank's barrier has to exist before any rank asks the
+            // hardware to complete transactions on it.
+            thread::sync_threads();
+            cluster::cluster_sync();
+
+            // Each rank charges its own barrier; one thread of the cluster
+            // issues. Nothing orders the two, and nothing has to — the
+            // transaction count is a signed accumulator.
+            if leader {
+                mbarrier_arrive_expect_tx(bar, 1, CLC_RESPONSE_BYTES as u32);
+            }
+            if leader && cluster::block_rank() == 0 {
+                clc_try_cancel_multicast(response as *mut u8, bar);
+            }
+
+            let deadline = debug::globaltimer() + deadline_ns;
+            let mut completed = 0u64;
+            while debug::globaltimer() < deadline {
+                if mbarrier_try_wait_parity(bar, 0) {
+                    completed = 1;
+                    break;
+                }
+            }
+
+            let (mut canceled, mut first) = (u64::MAX, u64::MAX);
+            if completed == 1 {
+                let (low, high) = (response.read_volatile(), response.add(1).read_volatile());
+                canceled = clc_query_is_canceled(low, high) as u64;
+                if canceled != 0 {
+                    first = clc_query_get_first_ctaid_x(low, high) as u64;
+                }
+            }
+            clc_record(completed, canceled, first, &mut out);
         }
     }
 
@@ -4146,6 +4276,131 @@ fn check_sttm_roundtrip(
 /// aborted where it is found: a context with a stuck kernel in it cannot be
 /// torn down cleanly, and `abort` is what gets the diagnosis printed and a
 /// non-zero exit out of the run.
+/// Does Cluster Launch Control do the three things `pipeline::run_stealing`
+/// assumes of it? (#88)
+///
+/// The scheduler rests on three claims about one instruction, and a persistent
+/// GEMM built on a wrong one either hangs or drops an output tile — neither of
+/// which points at the instruction. So they are asked directly, of a kernel
+/// small enough that its only content is the question:
+///
+/// 1. **`.multicast::cluster::all` completes the transaction in every CTA of
+///    the requesting cluster.** Every rank waits on its *own* copy of the
+///    barrier while only rank 0 issues, so if the multicast reached only the
+///    issuer, the peer would wait forever. Asked as `completed`, against a
+///    deadline, so the failing case reports rather than hangs.
+/// 2. **Both ranks are told the same thing.** A pair that disagreed would put
+///    the two halves of one cooperative MMA on different output tiles, which is
+///    #51's bug arriving through a new door and silently.
+/// 3. **The cancelled unit is a cluster, not a CTA.** Under a 2-CTA cluster a
+///    cluster-granular response has an even `first_ctaid_x`; an odd one would
+///    mean the item map has to be something other than `ctaid_x / cluster_size`.
+///
+/// It also settles the polarity `cuda_device::clc`'s module doc and its
+/// function doc disagree about, in the only way that is not an argument: a
+/// grid this much larger than the device holds *must* produce cancellations, so
+/// if `is_canceled` were 1-means-nothing-left, no row would ever carry a
+/// coordinate.
+fn check_clc(
+    context: &Arc<CudaContext>,
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<String, Box<dyn Error>> {
+    let blocks = CLC_CLUSTERS * 2;
+    let mut out = DeviceBuffer::<u64>::zeroed(stream, blocks as usize * CLC_FIELDS)?;
+    let config = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: CLC_SHARED_BYTES,
+    };
+    // Safety: one warp, as the kernel's doc names; each CTA writes only the
+    // `CLC_FIELDS` words at its own `blockIdx.x`; the grid is a multiple of two,
+    // which the `#[cluster_launch(2, 1, 1)]` launcher requires.
+    unsafe { module.clc_probe(stream, config, CLC_DEADLINE_NS, &mut out)? };
+    finish_or_abort(context, stream, "clc probe")?;
+    let rows = out.to_host_vec(stream)?;
+    let row = |cta: usize| {
+        let base = cta * CLC_FIELDS;
+        (rows[base], rows[base + 1], rows[base + 2], rows[base + 3])
+    };
+
+    // A cluster that was itself cancelled never ran, so its rows are still the
+    // zeros the buffer was allocated with. That is the mechanism under test
+    // working, not a failure, and `launched` is what tells the two apart.
+    let launched: Vec<usize> = (0..blocks as usize)
+        .filter(|&cta| row(cta).0 == 1)
+        .collect();
+    let stalled = launched.iter().filter(|&&cta| row(cta).1 == 0).count();
+    if stalled > 0 {
+        return Err(format!(
+            "{stalled} of {} launched CTAs never saw their copy of the response within \
+             {CLC_DEADLINE_NS} ns. multicast::cluster::all does not complete the \
+             transaction in every rank at this rev, so a scheduler that has each rank \
+             wait on its own barrier deadlocks",
+            launched.len()
+        )
+        .into());
+    }
+
+    let (mut split, mut odd, mut cancelled, mut ran) = (0usize, 0usize, 0usize, 0usize);
+    for cluster in 0..CLC_CLUSTERS as usize {
+        let (leader_launched, _, leader_canceled, leader_first) = row(2 * cluster);
+        let (peer_launched, _, peer_canceled, peer_first) = row(2 * cluster + 1);
+        if leader_launched != peer_launched {
+            return Err(format!(
+                "cluster {cluster} had one rank launched and the other not, which no \
+                 cancellation of a whole cluster can produce"
+            )
+            .into());
+        }
+        if leader_launched == 0 {
+            continue;
+        }
+        ran += 1;
+        if leader_canceled != peer_canceled || leader_first != peer_first {
+            split += 1;
+        }
+        if leader_canceled == 1 {
+            cancelled += 1;
+            if leader_first % 2 != 0 || leader_first >= blocks as u64 {
+                odd += 1;
+            }
+        }
+    }
+    if split > 0 {
+        return Err(format!(
+            "{split} of {ran} launched clusters had their two ranks told different things — \
+             a pair built on this would split one output tile across two items (#51)"
+        )
+        .into());
+    }
+    if odd > 0 {
+        return Err(format!(
+            "{odd} of {cancelled} cancellations named a CTA that is not the first of a \
+             cluster, so the cancelled unit is not a cluster and item = ctaid_x / \
+             cluster_size is the wrong map"
+        )
+        .into());
+    }
+    if cancelled == 0 {
+        return Err(format!(
+            "no cluster of {ran} that ran stole anything, on a grid far larger than the \
+             device holds. Either nothing was ever pending, or is_canceled reads 1 for \
+             'nothing left' — which is the polarity cuda_device::clc's module example uses"
+        )
+        .into());
+    }
+    // The two must account for the whole grid exactly once: every cluster
+    // either ran or was cancelled by one that did. That is the property a
+    // scheduler needs and the one a dropped tile would break.
+    let missing = CLC_CLUSTERS as usize - ran;
+    Ok(format!(
+        "{ran} clusters ran, {cancelled} of them stole a cluster-aligned item, \
+         {missing} were cancelled and never launched, both ranks agreed everywhere, \
+         no launched rank stalled"
+    ))
+}
+
 fn finish_or_abort(
     context: &Arc<CudaContext>,
     stream: &CudaStream,
@@ -4992,6 +5247,14 @@ fn run() -> Result<usize, Box<dyn Error>> {
     cases.push((
         "tmem residency census",
         Box::new(|| tmem_residency::check(stream, module)),
+    ));
+    // #88's three assumptions about `clusterlaunchcontrol`, asked of the
+    // instruction rather than of a GEMM built on it. It goes here, next to the
+    // census, because both are probes of hardware behaviour that no query
+    // reports — and before `repeated launch`, which can take the process down.
+    cases.push((
+        "clc work stealing",
+        Box::new(|| check_clc(&context, stream, module)),
     ));
     // Last, and not because it is the least interesting: it is the only case
     // that can take the process down (see `finish_or_abort`), so everything

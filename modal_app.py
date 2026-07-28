@@ -14,6 +14,8 @@ Local usage:
     modal run modal_app.py            # the device tests, on a B200
     modal run modal_app.py::examples  # the examples crate's kernels, on a B200
     modal run modal_app.py::bench     # those kernels timed at several sizes
+    modal run modal_app.py::clc_bench # gemm's three item sources on one clock,
+                                      # against the ragged-wave prediction
     modal run modal_app.py::ladder_bench
                                       # four rungs of that ladder on a clock:
                                       # is a streamed band actually slower?
@@ -332,6 +334,26 @@ def bench(case: str = "", m: int = 0, n: int = 0, k: int = 0) -> None:
          "--", "bench", *narrowed],
         cwd=EXAMPLES_DIR,
     )
+
+
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=5400)
+def clc_bench() -> None:
+    """The GEMM's three item sources on one clock -- issue #88.
+
+    Cluster Launch Control is Blackwell's hardware work-stealing: launch one
+    cluster per output tile, and clusters that finish cancel ones the scheduler
+    has not launched yet. The static stride it replaces loses only the ragged
+    last wave, which is 23% at 4096^3 and 0.3% at 16384^3 -- so the table prints
+    that prediction beside each measurement, and a zero at the largest size is
+    the predicted result rather than a failure.
+
+    Same 5400 s as `bench` and for the same reason: 16384^3 stages a gigabyte of
+    operands and checks every one of 268 million output elements against the CPU
+    reference, and this entry point does it once per scheduler.
+    """
+    _run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
+          "--format=csv"], cwd="/")
+    _run(["cargo", "oxide", "run", "kittens-examples", "--", "clc"], cwd=EXAMPLES_DIR)
 
 
 # `cpu=8` because on a cold container the *build* is a long pole in its own
