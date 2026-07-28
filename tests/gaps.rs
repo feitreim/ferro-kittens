@@ -119,8 +119,11 @@ fn shared_vectors_move_and_are_read<E: Element, const N: usize, L: ColLayout<N>>
         let _: f32 = vec.get(0);
         vec.set(0, 1.0);
 
-        vec.tma_load(map, 0, sem);
-        vec.tma_load_2d(map, 0, 0, sem);
+        // Both loads hand back their own charge, and the only thing that takes
+        // one is the barrier they complete on — #29's shape, named here
+        // because a `tma_load` that went back to returning `()` would leave
+        // every producer's `expect_tx` free to disagree with it again.
+        sem.expect_tx(vec.tma_load(map, 0, sem) + vec.tma_load_2d(map, 0, 0, sem));
         vec.tma_store(map, 0);
         vec.tma_store_2d(map, 0, 0);
 

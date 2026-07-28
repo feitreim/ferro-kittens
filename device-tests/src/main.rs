@@ -469,8 +469,7 @@ pub mod kernels {
             }
             thread::sync_threads();
             if tid == 0 {
-                tile.tma_load(source, 0, 0, tma);
-                tma.expect_tx(Tile::<R, C>::BYTES as u32);
+                tma.expect_tx(tile.tma_load(source, 0, 0, tma));
             }
             tma.wait(0);
             thread::sync_threads();
@@ -535,8 +534,7 @@ pub mod kernels {
             }
             thread::sync_threads();
             if tid == 0 {
-                tile.tma_load_2d(source, 0, 0, tma);
-                tma.expect_tx(Tile::<R, C>::BYTES as u32);
+                tma.expect_tx(tile.tma_load_2d(source, 0, 0, tma));
             }
             tma.wait(0);
             thread::sync_threads();
@@ -592,8 +590,7 @@ pub mod kernels {
             }
             thread::sync_threads();
             if tid == 0 {
-                tile.tma_load(source, 0, 0, tma);
-                tma.expect_tx(Tile::<R, C>::BYTES as u32);
+                tma.expect_tx(tile.tma_load(source, 0, 0, tma));
             }
             tma.wait(0);
             thread::sync_threads();
@@ -770,8 +767,7 @@ pub mod kernels {
             }
             thread::sync_threads();
             if lane == 0 {
-                tile.tma_load(source, 0, 0, tma);
-                tma.expect_tx(Tile::<R, C>::BYTES as u32);
+                tma.expect_tx(tile.tma_load(source, 0, 0, tma));
             }
             tma.wait(0);
             thread::sync_threads();
@@ -849,8 +845,7 @@ pub mod kernels {
             }
             thread::sync_threads();
             if lane == 0 {
-                tile.tma_load(source, 0, 0, tma);
-                tma.expect_tx(Tile::<TILE, WIDE>::BYTES as u32);
+                tma.expect_tx(tile.tma_load(source, 0, 0, tma));
             }
             tma.wait(0);
             thread::sync_threads();
@@ -1356,10 +1351,10 @@ pub mod kernels {
             let accumulator = Accumulator::from_raw(tmem);
 
             if leader {
-                a.tma_load(a_map, 0, 0, tma);
-                b_low.tma_load(b_map, 0, 0, tma);
-                b_high.tma_load(b_map, 0, 1, tma);
-                tma.expect_tx((AOperand::BYTES + 2 * BOperand::BYTES) as u32);
+                let staged = a.tma_load(a_map, 0, 0, tma)
+                    + b_low.tma_load(b_map, 0, 0, tma)
+                    + b_high.tma_load(b_map, 0, 1, tma);
+                tma.expect_tx(staged);
             }
             tma.wait(0);
             thread::sync_threads();
@@ -1492,10 +1487,10 @@ pub mod kernels {
             let accumulator = Accumulator::from_raw(tmem);
 
             if leader {
-                a.tma_load(a_map, 0, 0, tma);
-                b_low.tma_load(b_map, 0, 0, tma);
-                b_high.tma_load(b_map, 0, 1, tma);
-                tma.expect_tx((AOperand::BYTES + 2 * BOperand::BYTES) as u32);
+                let staged = a.tma_load(a_map, 0, 0, tma)
+                    + b_low.tma_load(b_map, 0, 0, tma)
+                    + b_high.tma_load(b_map, 0, 1, tma);
+                tma.expect_tx(staged);
             }
             tma.wait(0);
             thread::sync_threads();
@@ -1576,9 +1571,7 @@ pub mod kernels {
             let tmem = alloc_block(tmem_slot, COLUMNS as u32);
 
             if leader {
-                a.tma_load(a_map, 0, 0, tma);
-                b.tma_load(b_map, 0, 0, tma);
-                tma.expect_tx((Tile::<AR, AC>::BYTES + Tile::<BR, BC>::BYTES) as u32);
+                tma.expect_tx(a.tma_load(a_map, 0, 0, tma) + b.tma_load(b_map, 0, 0, tma));
             }
             tma.wait(0);
             thread::sync_threads();
@@ -3012,8 +3005,7 @@ pub mod kernels {
             }
             thread::sync_threads();
             if lane == 0 {
-                vec.tma_load(source, 0, tma);
-                tma.expect_tx(Params::BYTES as u32);
+                tma.expect_tx(vec.tma_load(source, 0, tma));
             }
             tma.wait(0);
             thread::sync_threads();
@@ -3067,8 +3059,7 @@ pub mod kernels {
             }
             thread::sync_threads();
             if lane == 0 {
-                vec.tma_load_2d(source, 0, VECTOR_ROW as i32, tma);
-                tma.expect_tx(Params::BYTES as u32);
+                tma.expect_tx(vec.tma_load_2d(source, 0, VECTOR_ROW as i32, tma));
             }
             tma.wait(0);
             thread::sync_threads();

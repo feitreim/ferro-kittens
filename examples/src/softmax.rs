@@ -287,13 +287,12 @@ pub mod kernels {
             }
             thread::sync_threads();
             if thread::threadIdx_x() == 0 {
-                tile.tma_load(
+                loaded.expect_tx(tile.tma_load(
                     source,
                     (ROWS as u32 * thread::blockIdx_x()) as i32,
                     plane,
                     loaded,
-                );
-                loaded.expect_tx(Tile::BYTES as u32);
+                ));
             }
             loaded.wait(0);
             thread::sync_threads();

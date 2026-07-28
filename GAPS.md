@@ -567,7 +567,6 @@ version; this is a snapshot with a date on it.
 | 49 | Cluster geometry beyond the 2-CTA pair | 2.4 |
 | 50 | Cluster-scope semaphore arrival | 2.4 |
 | 51 | `pipeline::run` cannot schedule a cluster | 4 |
-| 29 | `expect_tx` byte accounting is hand-summed | — |
 
 **Wanted and filed nowhere**, each named in its section above: a second
 `FragmentLayout` (1.3, and 3.4 waits on it), the map and reduction

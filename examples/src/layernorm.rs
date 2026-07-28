@@ -226,13 +226,16 @@ pub mod kernels {
             }
             thread::sync_threads();
             if thread::threadIdx_x() == 0 {
-                tile.tma_load(source, row, 0, loaded);
-                // One instruction each, against a rank-1 map: an unswizzled
-                // box has no atom to be cut into, so a vector never walks
-                // stacked subtiles the way the tile above does.
-                gamma.tma_load(gamma_map, 0, loaded);
-                beta.tma_load(beta_map, 0, loaded);
-                loaded.expect_tx((Tile::BYTES + 2 * Parameters::BYTES) as u32);
+                // One instruction each for the vectors, against a rank-1 map:
+                // an unswizzled box has no atom to be cut into, so a vector
+                // never walks stacked subtiles the way the tile does. Each
+                // load hands back its own charge and the barrier is told their
+                // sum, so the three-term total cannot drift from the three
+                // calls above it (#29).
+                let staged = tile.tma_load(source, row, 0, loaded)
+                    + gamma.tma_load(gamma_map, 0, loaded)
+                    + beta.tma_load(beta_map, 0, loaded);
+                loaded.expect_tx(staged);
             }
             loaded.wait(0);
             thread::sync_threads();
@@ -339,8 +342,7 @@ pub mod kernels {
             }
             thread::sync_threads();
             if thread::threadIdx_x() == 0 {
-                tile.tma_load(source, row, 0, loaded);
-                loaded.expect_tx(Tile::BYTES as u32);
+                loaded.expect_tx(tile.tma_load(source, row, 0, loaded));
             }
             loaded.wait(0);
             thread::sync_threads();
