@@ -18,6 +18,40 @@
 //! released by the MMA's own commit — the accumulator instruction, not a
 //! thread, is what proves the operand has been read.
 //!
+//! ## The grid is persistent, and the cluster is the work item
+//!
+//! One output tile used to be one launch's worth of cluster: the grid was
+//! `2 * tiles` and a CTA read its tile out of `blockIdx.x / 2`. It is now
+//! [`kittens::pipeline::run`] over a [`Tile`] job, on a grid capped at
+//! [`MAX_CLUSTERS`] — a cluster that runs out of items is the whole schedule,
+//! and a cluster that has more walks them.
+//!
+//! That was blocked until #51 for a reason worth keeping: the scaffold's item
+//! map was `blockIdx.x` strided by `gridDim.x`, which gives the two halves of
+//! a pair *different* output tiles. It is `%clusterid` strided by `%nclusterid`
+//! now, which is the same map at the granularity a cooperative MMA's item
+//! actually has. What the job supplies beyond `lcf`'s three methods is one
+//! constant — `RANKS = 2` — and that constant buys the thing per-item barrier
+//! re-initialization needs across a pair: the item boundary is
+//! `barrier.cluster` rather than `bar.sync`, so no rank re-arms a barrier its
+//! peer is still filling and no rank fills one its peer has not re-armed.
+//!
+//! The grid's cap is the entire performance story, and it is a *measurement*
+//! rather than a derivation — see [`CTAS_PER_SM`]. `lcf` at one item per
+//! cluster is the launch-per-tile kernel exactly: same rings, same barriers,
+//! drained at the same points. So a persistent grid changes only how many
+//! clusters exist, and picking that number wrong costs 2×.
+//!
+//! What the scaffold does *not* buy is overlap between items. `lcf` folds the
+//! epilogue into the item, so this kernel's `store_rows` and the next tile's
+//! first K loads are still separated by a boundary that drains the pipeline —
+//! #15's `lcsf` is the shape that would let them cross. So the honest claim for
+//! this port is a **dead heat**: 1.0217 ms at 8192³ against the launch-per-tile
+//! grid's 1.0204, which is 1076 TFLOP/s against 1077. It is not faster. What it
+//! buys is that the scaffold has a caller, and therefore a regression test.
+//! `examples/README.md` §7 is the sweep that found the cap and what it says
+//! about #78.
+//!
 //! ## What this kernel had to reach past the library for
 //!
 //! **Nothing.** There is no `GAP` block left in this file, and the last one to
@@ -57,7 +91,7 @@
 //! here is four tiles issued by two CTAs and the number covering them was
 //! written once, in the CTA that issues half of them.
 
-use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
+use cuda_device::barrier::Barrier;
 use cuda_device::cluster;
 use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
@@ -72,6 +106,7 @@ use std::error::Error;
 
 use kittens::global::{GlobalRows, store_rows};
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
+use kittens::pipeline::{self, Job};
 use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
@@ -134,70 +169,136 @@ pub const SHARED_BYTES: usize = ARing::BYTES + BRing::BYTES + SCRATCH_BYTES;
 /// whose output partition no contract describes.
 const _: () = assert!(THREADS == 128 && SHARED_BYTES == 73_792);
 
-#[cuda_module]
-pub mod kernels {
-    use super::*;
+/// SMs on the device this project targets and measures on — a B200, as
+/// `modal run modal_app.py::bench` prints in its header.
+const SMS: u32 = 148;
+/// CTAs of this kernel one SM holds at once — **measured on a clock, because
+/// nothing else here can see it.**
+///
+/// `cuOccupancyMaxActiveBlocksPerMultiprocessor` takes a block shape and no
+/// cluster, so it cannot answer about a `#[cluster_launch]` kernel at all;
+/// `main.rs` prints `cluster` in this kernel's row for exactly that reason. The
+/// one figure the repo does have is #77's, and extrapolating it here would give
+/// **1**: a CTA that touches `tcgen05.alloc` is charged the SM's whole tensor
+/// memory, and this kernel allocates.
+///
+/// That extrapolation is false, and the cap sweep in `examples/README.md` §7 is
+/// what refutes it. Capping the grid at one CTA per SM makes 8192³ take 2.1036
+/// ms against the launch-per-tile grid's 1.0204, which cannot happen if the
+/// device could only ever hold that many CTAs — the two schedules would then be
+/// the same schedule. Two per SM gives 1.2130, and three gives **1.0217**: a
+/// dead heat, and where the curve stops. So the residency is three, it was
+/// arrived at by bisection rather than by asking, and it is the reason a
+/// persistent grid costs nothing here rather than 2×.
+const CTAS_PER_SM: u32 = 3;
+/// Clusters the persistent grid launches at most, past which a cluster takes a
+/// second work item rather than the scheduler holding a pair back.
+///
+/// This is a *tuning* constant and not a correctness one: [`pipeline::run`]
+/// walks every item whatever the grid is, so a device with a different SM
+/// count computes the same GEMM off a wave that is not quite a wave. Which is
+/// the only reason a hardware figure may sit in it — and, per
+/// [`CTAS_PER_SM`], the reason getting it wrong is a benchmark row and not a
+/// wrong `C`.
+const MAX_CLUSTERS: u32 = SMS * CTAS_PER_SM / RANKS;
+const _: () = assert!(MAX_CLUSTERS == 222);
 
-    /// `C[m, n] = Σₖ A[m, k] · B[n, k]` over a `(2·BLOCK_M, BLOCK_N)` output
-    /// tile per cluster, `k_blocks` stages of `BLOCK_K` deep.
-    ///
-    /// The grid is one CTA pair per output tile: `blockIdx.x / 2` selects the
-    /// tile, and `cluster::block_rank()` says which half of it this CTA owns.
-    /// `a_map` describes `A` as `[rows, K]` bf16, `b_map` describes `B` as
-    /// `[columns, K]`. Both come from a rank-2 [`kittens::global::GlobalLayout`]
-    /// paired with the tile it feeds, so their `[R, 64]` boxes are `ATile`'s
-    /// and `BTile`'s own constants and not numbers [`check`] wrote down.
+/// One output tile of `C`, as the persistent grid's work item.
+///
+/// Every field is what the item needs and does not depend on *which* item it
+/// is: the pair's rings and barriers, the two operand maps, this CTA's half of
+/// the accumulator, and the thread's own coordinates. The item index is the
+/// only thing [`Job::work`] takes, and `(item / tiles_n, item % tiles_n)` is
+/// the whole of what it does with it — the same map `blockIdx.x / 2` used to
+/// carry, now asked of a number that means one tile per *cluster*.
+#[derive(Clone, Copy)]
+struct Tile {
+    a_ring: ARing,
+    b_ring: BRing,
+    /// Filled by the TMA, drained by the MMA. In the leader's copy the whole
+    /// pair's four tiles complete on one barrier; the peer's own copy is
+    /// unused, and initialized anyway because the plan is symmetric.
+    load: SemaphoreRing<STAGES>,
+    /// Released by the MMA's own commit, in both CTAs.
+    free: SemaphoreRing<STAGES>,
+    /// The pair's accumulator complete, likewise multicast by the MMA.
+    done: Semaphore,
+    a_map: *const TmaDescriptor,
+    b_map: *const TmaDescriptor,
+    accumulator: Accumulator,
+    /// `C` with `ldc` in it — built once, since a persistent CTA writes bands
+    /// of the same output through every item it runs.
+    c: GlobalRows,
+    tiles_n: u32,
+    k_blocks: u32,
+    rank: u32,
+    warp_id: u32,
+    lane: u32,
+}
+
+impl Job for Tile {
+    /// The pair shares one barrier set — the peer aims its TMA at the leader's
+    /// stage barrier and the leader's MMA arrives in the peer's `free` and
+    /// `done` — so the item boundary that re-arms them has to be the cluster's.
+    const RANKS: u32 = crate::gemm::RANKS;
+
+    /// Every barrier of the item takes exactly one arrival: the leader's stage
+    /// barrier from the TMA transaction count, `free` and `done` from the MMA
+    /// commit. Nothing here depends on `item`, since every tile is the same
+    /// `k_blocks` deep.
     ///
     /// # Safety
     ///
-    /// The launch geometry is the contract's, but the operands are not: both
-    /// maps must describe live buffers covering `k_blocks * BLOCK_K` along K
-    /// and the full `tiles_m`/`tiles_n` extent the grid walks, and `c` must
-    /// hold `ldc` columns for every row of that walk. The grid must be
-    /// `2 * tiles_m * tiles_n` blocks, since a CTA derives its output tile
-    /// from `blockIdx.x` and never bounds-checks it.
-    #[kernel]
-    #[cluster_launch(2, 1, 1)]
-    #[launch_contract(
-        domain = 1,
-        block = (128, 1, 1),
-        dynamic_shared = 73_792,
-        dynamic_shared_alignment = 128
-    )]
-    pub unsafe fn gemm_cg2(
-        a_map: *const TmaDescriptor,
-        b_map: *const TmaDescriptor,
-        tiles_n: u32,
-        k_blocks: u32,
-        ldc: u32,
-        mut c: DisjointSlice<f32>,
-    ) {
+    /// As [`Semaphore::init`]; [`pipeline::run`] owns the thread and the
+    /// ordering.
+    #[inline(always)]
+    unsafe fn init(&self, _item: u32) {
         unsafe {
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let a_ring = ARing::attach(smem);
-            let b_ring = BRing::attach(smem.add(ARing::BYTES));
-            let scratch = smem.add(ARing::BYTES + BRing::BYTES);
-            let load = SemaphoreRing::<STAGES>::attach(scratch as *mut Barrier);
-            let free = SemaphoreRing::<STAGES>::attach((scratch as *mut Barrier).add(STAGES));
-            let done = Semaphore::attach((scratch as *mut Barrier).add(2 * STAGES));
-            let tmem_slot = scratch.add(2 * STAGES * 8 + 8) as *mut u32;
+            self.load.init_all(1);
+            self.free.init_all(1);
+            self.done.init(1);
+        }
+    }
 
-            let rank = cluster::block_rank();
-            let warp_id = warp::warp_id();
-            let lane = warp::lane_id();
-            let tile = thread::blockIdx_x() / 2;
-            let (tile_m, tile_n) = (tile / tiles_n, tile % tiles_n);
+    /// # Safety
+    ///
+    /// As [`Semaphore::inval`]. The arrivals this wipes are real and not
+    /// hypothetical: the last `STAGES` MMA commits release `free` slots no
+    /// producer will ever wait on again.
+    #[inline(always)]
+    unsafe fn inval(&self) {
+        unsafe {
+            self.load.inval_all();
+            self.free.inval_all();
+            self.done.inval();
+        }
+    }
 
-            if thread::threadIdx_x() == 0 {
-                load.init_all(1);
-                free.init_all(1);
-                done.init(1);
-                fence_proxy_async_shared_cta();
-            }
-            thread::sync_threads();
-            // Also publishes the barriers above to the peer, which writes to
-            // them before it writes to anything of its own.
-            let accumulator = Accumulator::from_raw(alloc_cluster(tmem_slot, BLOCK_N as u32));
+    /// # Safety
+    ///
+    /// Every thread of both CTAs of the cluster must enter with the same
+    /// `item`, which is what [`pipeline::run`]'s cluster-strided map gives, and
+    /// the maps must cover the tile it names.
+    #[inline(always)]
+    unsafe fn work(&mut self, item: u32) {
+        unsafe {
+            let Tile {
+                a_ring,
+                b_ring,
+                load,
+                free,
+                done,
+                a_map,
+                b_map,
+                accumulator,
+                c,
+                tiles_n,
+                k_blocks,
+                rank,
+                warp_id,
+                lane,
+            } = *self;
+            let (tile_m, tile_n) = (item / tiles_n, item % tiles_n);
 
             // `M` is the pair's 256 rows and `N` its 128 columns. The rest of
             // the descriptor is the walk's: both operands are K-major, so the
@@ -243,7 +344,9 @@ pub mod kernels {
             if rank == LEADER && warp_id == 1 && lane == 0 {
                 // The pair's single MMA issuer. Every chunk of every stage
                 // chains into the one accumulator, so only the very first
-                // instruction of the very first stage starts it fresh.
+                // instruction of the very first stage starts it fresh — and
+                // "first" is per *item*, because the epilogue below drains the
+                // accumulator before the next item starts filling it.
                 let mut k = 0u32;
                 while k < k_blocks {
                     load.wait(k);
@@ -278,35 +381,124 @@ pub mod kernels {
             // tile, no descriptor, and no rounding to bf16 on the way out.
             let row_base = 2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * rank + 32 * warp_id;
             let column_base = BLOCK_N as u32 * tile_n;
-            store_rows(
-                GlobalRows::from_slice(&mut c, ldc as usize),
-                row_base,
-                column_base,
-                lane,
-                band,
-            );
+            store_rows(c, row_base, column_base, lane, band);
+        }
+    }
+}
 
+#[cuda_module]
+pub mod kernels {
+    use super::*;
+
+    /// `C[m, n] = Σₖ A[m, k] · B[n, k]`, one `(2·BLOCK_M, BLOCK_N)` output
+    /// tile per work item, `k_blocks` stages of `BLOCK_K` deep.
+    ///
+    /// The grid is persistent and the item map is [`pipeline::run`]'s: a
+    /// *cluster* takes item `%clusterid` and steps by `%nclusterid` until the
+    /// `tiles` are gone, and `cluster::block_rank()` says which half of the
+    /// pair this CTA owns. `a_map` describes `A` as `[rows, K]` bf16, `b_map`
+    /// describes `B` as `[columns, K]`. Both come from a rank-2
+    /// [`kittens::global::GlobalLayout`] paired with the tile it feeds, so
+    /// their `[R, 64]` boxes are `ATile`'s and `BTile`'s own constants and not
+    /// numbers [`check`] wrote down.
+    ///
+    /// Only two things sit outside the item loop, and both are there because
+    /// they span items rather than belong to one: the shared plan, and the
+    /// pair's TMEM allocation. `alloc_cluster` is a whole-cluster collective
+    /// with a `cluster_sync` in it, so running it per item would be a barrier
+    /// and an allocator round trip per output tile for an accumulator whose
+    /// address never changes.
+    ///
+    /// # Safety
+    ///
+    /// The launch geometry is the contract's, but the operands are not: both
+    /// maps must describe live buffers covering `k_blocks * BLOCK_K` along K
+    /// and the full `tiles`/`tiles_n` extent the item loop walks, and `c` must
+    /// hold `ldc` columns for every row of that walk. The grid must be a whole
+    /// number of clusters and `tiles` the item count they are to cover — see
+    /// [`grid`], which is what the launcher below sizes both from.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 73_792,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_cg2(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let scratch = smem.add(ARing::BYTES + BRing::BYTES);
+            let tmem_slot = scratch.add(2 * STAGES * 8 + 8) as *mut u32;
+
+            let mut tile = Tile {
+                a_ring: ARing::attach(smem),
+                b_ring: BRing::attach(smem.add(ARing::BYTES)),
+                load: SemaphoreRing::<STAGES>::attach(scratch as *mut Barrier),
+                free: SemaphoreRing::<STAGES>::attach((scratch as *mut Barrier).add(STAGES)),
+                done: Semaphore::attach((scratch as *mut Barrier).add(2 * STAGES)),
+                a_map,
+                b_map,
+                accumulator: Accumulator::from_raw(alloc_cluster(tmem_slot, BLOCK_N as u32)),
+                c: GlobalRows::from_slice(&mut c, ldc as usize),
+                tiles_n,
+                k_blocks,
+                rank: cluster::block_rank(),
+                warp_id: warp::warp_id(),
+                lane: warp::lane_id(),
+            };
+
+            pipeline::run(&mut tile, tiles);
+
+            // The scaffold's last item boundary already retired the pair's
+            // reads, and this one is for the cluster that got no items at all
+            // — `tiles` under the grid's cluster count leaves some pair having
+            // allocated, never looped, and still owing a deallocation in step
+            // with its peer.
             tcgen05_fence_before_thread_sync();
-            thread::sync_threads();
             cluster::cluster_sync();
-            dealloc_cluster(accumulator.raw(), BLOCK_N as u32);
-            if thread::threadIdx_x() == 0 {
-                load.inval_all();
-                free.inval_all();
-                done.inval();
-            }
+            dealloc_cluster(tile.accumulator.raw(), BLOCK_N as u32);
         }
     }
 }
 
 /// Rows of `C` the correctness run computes — two clusters' worth of `M`, so
-/// the `blockIdx → (tile_m, tile_n)` map is exercised in both axes.
+/// the `item → (tile_m, tile_n)` map is exercised in both axes.
 pub const M: usize = 512;
 /// Columns of `C`: two `BLOCK_N` tiles.
 pub const N: usize = 256;
 /// Reduction depth: four `BLOCK_K` stages against a three-deep pipeline, so
 /// the ring wraps and `wait_recycled` is on trial rather than skipped.
 pub const K: usize = 256;
+
+/// A second correctness size, whose only job is to give every cluster **more
+/// than one work item**.
+///
+/// [`M`]`x`[`N`] is four tiles and the grid holds 222 clusters, so it never
+/// enters [`pipeline::run`]'s loop a second time — it would pass identically
+/// against the pre-#51 kernel, which is exactly what makes it not a test of
+/// this one. The failure modes the persistent scaffold introduces all live at
+/// the *item boundary*: a barrier re-armed while a peer is still filling it,
+/// an accumulator that is not started fresh for the next tile, an epilogue
+/// racing the next item's first loads. Each of those is a deadlock or a wrong
+/// `C`, and each needs a second item to happen at all.
+///
+/// 512 tiles over 222 clusters is three items for most and two for the rest,
+/// so the ragged tail — clusters that leave the loop an item early, while
+/// their neighbours are still running one — is under test too. `K` stays at
+/// the wrapping four stages and the shape stays cheap: the operands are 2 MiB
+/// each and the only large buffer is `C`.
+const ITEMS_M: usize = 4096;
+const ITEMS_N: usize = 4096;
+const ITEMS_K: usize = 256;
 
 /// `A[m, k]` and `B[n, k]`: integers in `[-3, 3]` and `[-10, 10]`.
 ///
@@ -370,11 +562,22 @@ fn stage(rows: usize, k: usize, value: impl Fn(usize, usize) -> f32) -> Vec<u32>
     staged
 }
 
-/// Blocks a `[m, n]` output takes: one CTA pair per `2·BLOCK_M` by `BLOCK_N`
-/// tile of `C`. The benchmark prints it, because at the small end of a size
-/// sweep this number and not the arithmetic is what the run is bound by.
+/// Tiles of `C` a `[m, n]` output has, which is the item count the persistent
+/// grid walks: one per `2·BLOCK_M` by `BLOCK_N` tile.
+fn tiles(m: usize, n: usize) -> u32 {
+    (m / (2 * BLOCK_M) * (n / BLOCK_N)) as u32
+}
+
+/// Blocks the launch asks for — [`MAX_CLUSTERS`] pairs, or fewer where the
+/// problem has fewer tiles than that.
+///
+/// The benchmark prints it, because at the small end of a size sweep this
+/// number and not the arithmetic is what the run is bound by. Since #51 it is
+/// also where the sweep stops growing: past 222 clusters the grid is flat and
+/// the extra tiles arrive as extra *items*, which is the whole difference
+/// between this kernel and the one that launched a pair per tile.
 pub fn grid(m: usize, n: usize) -> u32 {
-    2 * (m / (2 * BLOCK_M) * (n / BLOCK_N)) as u32
+    RANKS * tiles(m, n).min(MAX_CLUSTERS)
 }
 
 /// The `then` a run that is only being checked passes: nothing follows the
@@ -459,6 +662,7 @@ fn run<T>(
                 &launch,
                 a_map.as_ptr(),
                 b_map.as_ptr(),
+                tiles(m, n),
                 tiles_n,
                 (k / BLOCK_K) as u32,
                 n as u32,
@@ -505,9 +709,24 @@ fn run<T>(
     Ok((format!("{m}x{n}x{k} exact"), after))
 }
 
-/// The correctness run: one size, checked, nothing timed.
+/// The correctness run: two sizes, checked, nothing timed.
+///
+/// The second one is [`ITEMS_M`]`x`[`ITEMS_N`], and it is here because the
+/// first cannot fail the way the persistent grid can. Both report the items
+/// their clusters walked, so a size that quietly stopped exercising the loop —
+/// because [`MAX_CLUSTERS`] moved, or because the tiling did — says so in the
+/// pass line instead of in nobody's memory.
 pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String, Box<dyn Error>> {
-    run(context, M, N, K, nothing_after).map(|(note, ())| note)
+    let mut notes = Vec::new();
+    for (m, n, k) in [(M, N, K), (ITEMS_M, ITEMS_N, ITEMS_K)] {
+        let (note, ()) = run(context, m, n, k, nothing_after)?;
+        let clusters = grid(m, n) / RANKS;
+        notes.push(format!(
+            "{note} ({} tiles over {clusters} clusters)",
+            tiles(m, n)
+        ));
+    }
+    Ok(notes.join(", "))
 }
 
 /// The benchmark's entry point: the same check at `shape`, and then the same
