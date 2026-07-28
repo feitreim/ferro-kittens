@@ -52,6 +52,21 @@
 //! `examples/README.md` §7 is the sweep that found the cap and what it says
 //! about #78.
 //!
+//! **That boundary has since been priced, and it is the largest single term in
+//! this kernel's time** (#86). Holding `M` and `N` at 8192 and sweeping `K`
+//! holds the tile count, the wave count, the grid and the `C` traffic fixed
+//! while changing only how much arithmetic sits between two boundaries; the
+//! result is 152.8 / 508.6 / 1074.0 / **1369.9** TFLOP/s at `K` of 512 / 2048 /
+//! 8192 / 32768. Milliseconds against `K` is a line whose intercept is the
+//! boundary; over the ten items a cluster walks, and over every reasonable
+//! choice of which points to fit, that is **28–37 µs per output tile and 27–36%
+//! of the 8192³ launch**, on a steady state of 1480–1550 TFLOP/s. The same
+//! ~30 µs is the flat floor at the small end of the benchmark: 256x128x256 is
+//! one cluster running one item, and it costs 23.4 µs. See `examples/README.md`
+//! §7 for the point-selection table, for why the fit's residuals rule *out* the
+//! obvious pipeline-fill explanation, and for the other two sweeps — the
+//! aspect-ratio one is worth 23% and belongs to #89.
+//!
 //! ## What this kernel had to reach past the library for
 //!
 //! **Nothing.** There is no `GAP` block left in this file, and the last one to
@@ -520,8 +535,8 @@ const ITEMS_K: usize = 256;
 /// `A[m, k]` and `B[n, k]`: integers in `[-3, 3]` and `[-10, 10]`.
 ///
 /// Every operand is exact in bf16 (which holds every integer to 256) and every
-/// partial sum stays under `3 * 10 * K` — 245,760 at the benchmark's largest
-/// `K` of 8192, against fp32's exact integer range of 2²⁴ = 16,777,216. So the
+/// partial sum stays under `3 * 10 * K` — 983,040 at the benchmark's largest
+/// `K` of 32768, against fp32's exact integer range of 2²⁴ = 16,777,216. So the
 /// whole GEMM is exact and the host compares with `==`. That is the point: a
 /// mismatch is a wrong coordinate, a wrong stride or a wrong operand half, and
 /// never a rounding artifact that has to be argued about.

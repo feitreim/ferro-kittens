@@ -1373,6 +1373,222 @@ what would let the two cross, and `tma_store_wait_read` (#9, landed) is the wait
 it needs — it releases the shared buffer as soon as the engine has read it,
 without blocking on global visibility.
 
+##### and the drain is roughly a third of 8192³, priced — #86
+
+The paragraph above was written from the shape of the code. It is right, and it
+is the largest single term: **the item boundary costs 28–37 µs per output tile,
+which is 27–36% of the 8192³ launch** depending on how the fit is taken — see
+the point-selection table below, which is where all the honest uncertainty in
+this section lives. Deepen `K` so the
+boundaries amortize and the same kernel, unchanged in every constant, does
+**1369.9 TFLOP/s — 60.9% of dense peak** — against 1069.6 at 8192³.
+
+#86 asked three things: run 16384³ against a **~1171 TFLOP/s** prediction from
+wave quantization alone, name what binds the kernel with a measurement that
+would have moved had it been something else, and say what the flat ~22–28 µs
+floor at the small end is. Four tables answer them, every row through the same
+verify-then-time path, all in one session on one B200 (driver 580.95.05,
+1965 MHz, 148 SMs), with a second session quoted wherever the spread matters.
+
+**1. 16384³ lands on the prediction, and the curve has flattened.** Wave
+efficiency is `tiles / (222 · waves)`; the last column is the measured rate
+divided by it, which is what the prediction claims is constant.
+
+| shape | tiles | waves | wave eff. | min ms | TFLOP/s | ÷ efficiency |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2048³ | 128 | 1 | 57.7% | 0.0472 | 363.7 | 631 |
+| 4096³ | 512 | 3 | 76.9% | 0.1975 | 695.9 | 905 |
+| 8192³ | 2048 | 10 | 92.3% | 1.0280 | 1069.6 | 1159 |
+| **16384³** | 8192 | 37 | **99.7%** | **7.4638** | **1178.5** | **1182** |
+
+**Confirmed, with the caveat spelled out.** 1182 against a predicted 1171 is
+inside the noise, and the climb — 631, 905, 1159 — stops. But 16384³ is the
+least reproducible row in this file: a second full run of the same tree gives
+**7.8727 ms and 1117.3 TFLOP/s**, 5.5% away, where 8192³ reproduces to 0.02%
+(1069.8 against 1069.6) and every aspect-ratio row below to under 1%. Its
+median-to-minimum gap is 11% against 1% elsewhere. So the honest statement is
+**1117–1179 across two runs, straddling the prediction**, and anyone reading a
+single figure off this row should know it moves.
+
+What that settles is narrower than it looks. Ragged waves *were* the story from
+2048³ to 8192³ — 42% of 2048³ is empty cluster slots — and by 8192³ only 7.7%
+is left, which is why 4× the work buys ~5–10%. It does **not** follow that 1171
+is the kernel's ceiling, and the next table is the direct refutation.
+
+**2. It is not a ceiling. Hold everything but the reduction depth and the same
+kernel climbs past it.** `M` and `N` are 8192 in every row, so all four have the
+same 2048 tiles, the same 10 waves, the same 92.3% wave efficiency, the same
+grid of 444 blocks, the same 268 MB of `C` written, and the same operand bytes
+*per flop* — arithmetic intensity is a property of the `[256, 128]` pair tile,
+not of the shape. Only the arithmetic between one item boundary and the next
+moves.
+
+| K | K blocks per item | min ms | TFLOP/s | % of peak |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 8 | 0.4497 | 152.8 | 6.8% |
+| 2048 | 32 | 0.5404 | 508.6 | 22.6% |
+| 8192 | 128 | 1.0237 | 1074.0 | 47.7% |
+| **32768** | 512 | 3.2105 | **1369.9** | **60.9%** |
+
+Milliseconds against `K` is a line whose intercept is a cost that does not scale
+with the arithmetic. Dividing that intercept by 10 — the items on the critical
+path, since 50 clusters walk 10 and 172 walk 9 — gives a cost per output tile.
+**Which points the fit uses moves the answer, so all of them are shown**, least
+squares on the raw minimum milliseconds rather than on the rounded rates above:
+
+| points | steady state | fixed | per tile | share at K=8192 |
+| --- | ---: | ---: | ---: | ---: |
+| K = 8192, 32768 | 1508 | 0.2948 ms | 29.5 µs | 28.8% |
+| K = 2048, 8192, 32768 | 1534 | 0.3370 ms | 33.7 µs | 32.9% |
+| all four | 1552 | 0.3654 ms | 36.5 µs | 35.7% |
+
+The other session runs 2–4% under all nine of those. So across both sessions and
+every selection: **the boundary is 28–37 µs per output tile and 27–36% of the
+8192³ launch, and the steady state is 1480–1550 TFLOP/s.** Round to that; the
+5.5% cross-run spread on 16384³ is what this benchmark's precision looks like.
+
+**The two deepest points are the preferred fit, and the reason is not the one
+that first suggests itself.** A two-point fit has no residuals, so it checks
+nothing, and the obvious defence — that `K = 512` is 8 blocks against
+`STAGES = 3` and the pipeline barely fills — **is wrong, and the residuals say
+so**. Under the four-point fit they run `+40.0, −2.1, −50.0, +12.0 µs`, and the
+marginal cost of a K block between adjacent rows is **0.378, 0.503,
+0.569 µs** — reproduced as `+34.1, −1.1, −43.3, +10.4` and `0.419, 0.522, 0.580`
+in the other session. A pipeline that fails to fill makes *shallow* loops dear
+per block. These get dearer as they deepen. The curve is convex, and a line
+through convex data has an intercept above the deep-end tangent, which is
+exactly the ordering in the table.
+
+**What is convex about it is a variable this sweep does not hold fixed, and that
+is a limitation of the experiment rather than a subtlety.** `K` sets the operand
+footprint: `A` and `B` are 8 MiB each at `K = 512` and **512 MiB each at
+`K = 32768`**, so the sweep crosses L2 somewhere between the second and third
+rows. The shallow rows are cheap per K block partly because the whole of both
+operands is L2-resident for the entire launch, which the deep rows cannot be. So
+the deepest two points are preferred because `K = 8192` is the regime in
+question and they straddle it in the same cache regime — not because the shallow
+rows fill badly. They also give the *smallest* fixed cost of any selection, so
+the preferred number is the conservative one.
+
+The part that needs no fit at all is the measured **1369.9, sitting 28% above
+8192³ and 17% above the 1171** that was offered as where the curve would stop.
+
+Nothing else in this sweep can be that intercept. It is not launch overhead
+(#67, and `layernorm` reaches 9.2 µs on this harness in this same run), not
+ragged waves (92.3% in all four rows), not occupancy (3 CTAs/SM, #83 and #84,
+and `K` does not touch the shared plan), and not `C` traffic (268 MB in all
+four).
+
+**What it is, structurally:** at a boundary the pair drains. `done.wait`, then
+`sync_threads`, then LDTM of a `[32, 128]` fp32 band into 128 registers a
+thread, then `store_rows` — and `store_rows` is one `st.global.f32` per owned
+value, 128 of them a thread. Under `BaseLdtm` a single one of those stores has
+the warp's 32 lanes writing **eight different rows** of `C`, four four-byte
+words to each, which is 8 sector transactions for 128 useful bytes. Only then
+does `pipeline::run` re-arm the barriers and the next item issue its first TMA
+loads, and only then, a full memory latency later, can the MMA start. Nothing in
+that chain overlaps with anything. That is the shape `lcsf` changes; the
+scattered fp32 store is a second, separable thing and neither is in this issue's
+scope.
+
+**3. The small-size floor is one item boundary.** 256x128x256 is a single
+cluster running exactly one item, and it costs **23.4 µs** against `layernorm`'s
+9.2 µs on the same harness in the same run. 512x256x256 is four clusters running
+one item each: 23.3 µs. It is the same ~30 µs the depth sweep priced, at 1/222
+of the contention — not a launch cost, and not a floor peculiar to small
+problems, but the per-tile cost showing up undivided because there is only one
+tile to divide it by. The check that makes this more than a coincidence of
+magnitudes is 2048³: 128 clusters at one item each, `K = 2048`, **47.2 µs**,
+against the depth sweep's 54.0 µs per item at the same `K` with 222 clusters
+contending. Two shapes that share nothing but their reduction depth land within
+13% of each other on a per-item basis.
+
+**4. The traversal is worth 23%, and #86's L2 arithmetic is optimistic.** The
+issue reads 12.7 TB/s of operand traffic as "~48× reuse over 268 MB of unique
+input". That is the *aggregate* ratio over a whole launch. What L2 can actually
+capture is the reuse available inside one wave, and that is a property of the
+aspect ratio: the 222 clusters of a wave sit on `ceil(222 / tiles_n)` rows of
+tiles, span `min(222 · 128, N)` columns, and march through `K` together, so at
+one `K` block they collectively touch `(rows_of_A + columns_of_B) · 128` bytes.
+Five shapes, every one of them 2048 tiles, 10 waves, 92.3% efficiency, 444
+blocks, 1.1 TFLOP, 12.9 GB of operands requested and 268 MB of `C` written —
+identical runs but for `M : N`:
+
+| shape | tiles_n | distinct per K block | reuse | min ms | TFLOP/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 32768 x 2048 x 8192 | 16 | 0.72 MB | 15.1× | 0.9785 | **1123.7** |
+| 16384 x 4096 x 8192 | 32 | 0.75 MB | 14.5× | 1.0005 | 1099.0 |
+| 8192 x 8192 x 8192 | 64 | 1.18 MB | 9.2× | 1.0246 | 1073.1 |
+| 4096 x 16384 x 8192 | 128 | 2.16 MB | 5.0× | 1.0710 | 1026.6 |
+| 2048 x 32768 x 8192 | 256 | 3.67 MB | 3.0× | 1.2007 | **915.7** |
+
+**23%, monotone, on nothing but the walk** — and reproduced row for row in the
+other session (1112.6 / 1093.4 / 1066.4 / 1014.4 / 910.4, every row within 1%).
+The first and last are transposes of each other with identical 570 MB total
+footprints, so this is not about how much data there is; it is about which
+operand a row-major item map re-reads. The reuse column is what the map leaves
+L2 to capture — **3× to 15×, never the 48× the aggregate suggests** — and the
+throughput follows it. That is #89, and this is the number it is worth.
+
+It is **not** HBM saturation. `layernorm` moves 5497 GB/s of real streaming
+traffic on this device in this same run, and the worst row above is *inferred*
+to pull ~3.8 TB/s against that. Nor is the response a cliff, which is what
+saturation looks like; it is proportional, which is what an exposed miss latency
+looks like against a pipeline `STAGES = 3` deep. Note also that both the
+`distinct` and `reuse` columns are arithmetic on the item map rather than
+counters — see below.
+
+**Subtracting the boundary gives the steady-state rate per shape**, which is
+the number a traversal change would move. Taking the intercept off each row,
+over the range of intercepts the point selections give and both sessions:
+
+| shape | steady TFLOP/s |
+| --- | ---: |
+| 32768 x 2048 x 8192 | **1540 – 1790** |
+| 8192 x 8192 x 8192 | 1500 – 1670 |
+| 2048 x 32768 x 8192 | 1210 – 1320 |
+
+So **this tile shape, with its boundary overlapped and its walk L2-aware, is
+worth roughly 1550–1800 TFLOP/s — 69% to 80% of dense bf16 peak — with no change
+to the tile, the stages or the traversal granularity.** The range is wide
+because the two uncertainties compound in the same direction: a larger fixed
+cost implies a larger recovered rate.
+
+**It is a derivation, not a measurement, and it stacks two assumptions** — that
+the line is the right model, which its own residuals say it is only roughly, and
+that the intercept is shape-independent, which it should be since all three rows
+write the same `C` over the same item count. **Nothing has run at any of these
+rates.** The fastest this kernel has been measured at is the 1369.9 TFLOP/s in
+the depth table, and that is the number to hold anyone to. What the derivation
+is for is ordering the levers, and it is the reason #87's tile sweep is the
+*last* one here rather than the first.
+
+**What could not be measured, and it matters which.** The reuse and traffic
+columns above are *arithmetic on the item map*, not counters. Nsight Compute
+2025.3.0 is in the image and refuses to start: `RmProfilingAdminOnly` is 0, `ncu`
+knows `gb100`, `libnvperf_target.so` is installed, and the injected driver set
+has no `libnvidia-pcc.so` — the performance-counter library — which is not in
+the 580.95.05 package either. So there is no measured L2 hit rate or DRAM byte
+count here, and `modal_app.py::profile` is checked in with that written down. It
+is worth being plain that the substitute is not strictly weaker: a counter
+attributes, an intervention that holds nine things fixed and moves one
+establishes cause, and the three tables above are all interventions.
+
+**The bind at 8192³, in order.** **27–36% is the item boundary**, and `lcsf`
+(#15) is what would let the epilogue and the next tile's first loads cross.
+**6–7%** more is operand traffic this square shape's row-major walk does not
+leave in L2 — **23% at the worst aspect ratio, and that one is measured
+end to end rather than fitted** — and an L2-aware order (#89) is what would
+recover it. Under both sits a steady state of roughly **1550–1800 TFLOP/s** at
+this tile's fixed 85.3 FLOP/byte, and the only lever on *that* is the tile,
+which is #87.
+
+The order is the finding. #86 framed the question as bandwidth versus latency on
+the operand stream and asked which of HBM and L2 to attack; the answer is that
+**the largest term is neither** — it is an epilogue that the pipeline stops for,
+on a kernel whose steady state is already at 67% of dense peak. The tile sweep
+that was queued behind this answer should stay queued behind #15 and #89 too.
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all

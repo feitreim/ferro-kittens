@@ -182,6 +182,26 @@ struct Case {
 /// point. From there each row roughly quadruples the cluster count: 2048 is the
 /// first size past a full wave of CTAs, and 4096 and 8192 are where the K
 /// pipeline should dominate and the curve flatten at this kernel's ceiling.
+///
+/// **16384³ is here because it did not flatten** (#86). The persistent grid
+/// holds 222 clusters and walks `ceil(tiles / 222)` waves of them, so the last
+/// wave is ragged and the *fraction of the last wave that is full* is a pure
+/// function of the shape: 92.3% at 8192³ against **99.7%** at 16384³. Dividing
+/// the measured rate by that fraction gives 660 / 945 / 1171 TFLOP/s at
+/// 2048³ / 4096³ / 8192³ — which is the arithmetic that says 16384³ should
+/// reach ~1171 if ragged waves were the whole story, and the reason to run it
+/// is that the arithmetic can be wrong.
+///
+/// It is not wrong, and it is also not the ceiling. 16384³ measures **1178.5**
+/// and **1117.3 TFLOP/s** in two full runs of this tree — straddling the
+/// prediction, on the least reproducible row in the file, where 8192³ repeats
+/// to 0.02%. So the climb does stop where ragged waves say it stops. What that
+/// does *not* settle is what the kernel could do, and [`GEMM_DEPTH_SIZES`]
+/// below reaches 1369.9 TFLOP/s with no constant changed.
+///
+/// It costs 2.1 GiB of device memory — `A` and `B` are 512 MiB of bf16 each and
+/// `C` is 1 GiB of fp32 — against the 180 GiB a B200 carries, so the size is
+/// bounded by host staging time and not by the device.
 const GEMM_SIZES: &[Shape] = &[
     Shape {
         m: 256,
@@ -212,6 +232,137 @@ const GEMM_SIZES: &[Shape] = &[
         m: 8192,
         n: 8192,
         k: 8192,
+    },
+    Shape {
+        m: 16384,
+        n: 16384,
+        k: 16384,
+    },
+];
+
+/// Five shapes that do **exactly the same work** and differ only in how much of
+/// it L2 can hold — #86's bandwidth question, asked without a profiler.
+///
+/// A cluster owns `256` rows of `A` and `128` columns of `B`, so a tile reads
+/// `384 · K` elements and computes `2 · 256 · 128 · K` flops whatever the
+/// problem is. **Arithmetic intensity is a property of the tile, not of the
+/// shape** — 85.3 FLOP/byte, always — so every shape below requests the same
+/// 12.9 GB of operands from the memory system and writes the same 268 MB of
+/// `C`. Holding `M · N` and `K` fixed at 8192³'s values holds all of that
+/// fixed: 2048 tiles, 10 waves of 222 clusters, 92.3% wave efficiency,
+/// 1.1 TFLOP, one grid of 444 blocks. Only the aspect ratio moves.
+///
+/// What the aspect ratio moves is the *working set*. The item map is row-major,
+/// so the 222 clusters of a wave sit on `ceil(222 / tiles_n)` rows of tiles and
+/// span `min(222 · 128, N)` columns; they march through K together, and at one
+/// K block the bytes they collectively touch are
+/// `(rows_of_A + columns_of_B) · 64 · 2`:
+///
+/// | shape | tiles_n | distinct per K block | reuse | implied HBM read |
+/// | --- | ---: | ---: | ---: | ---: |
+/// | 32768 x 2048 | 16 | 0.72 MB | 15.1x | 0.85 GB |
+/// | 16384 x 4096 | 32 | 0.75 MB | 14.5x | 0.89 GB |
+/// | 8192 x 8192 | 64 | 1.18 MB | 9.2x | 1.39 GB |
+/// | 4096 x 16384 | 128 | 2.16 MB | 5.0x | 2.55 GB |
+/// | 2048 x 32768 | 256 | 3.67 MB | 3.0x | 4.34 GB |
+///
+/// So the traffic that has to come off HBM varies **5.1x across rows that are
+/// otherwise the same run**, while the traffic that has to come off L2 does not
+/// vary at all. If the kernel is bound by what HBM can deliver, this table is a
+/// ramp. If it is bound by what L2 or the SMs can absorb, it is flat. Those are
+/// the two answers #86 says want opposite fixes, and no third thing this
+/// benchmark can vary distinguishes them so cleanly.
+///
+/// The last two rows are worth reading against each other on their own:
+/// `32768 x 2048` and `2048 x 32768` are transposes, with identical *total*
+/// footprints of 570 MB, and they differ only in which operand the row-major
+/// walk re-reads. A gap between those two is not about how much data there is.
+///
+/// `4096 x 16384` is here for a second reason: its 2.16 MB per K block is the
+/// same working set 16384³ has, at 8192³'s wave structure. If the flattening
+/// above is a footprint effect, this row shows it with the quantization held
+/// still.
+const GEMM_FOOTPRINT_SIZES: &[Shape] = &[
+    Shape {
+        m: 32768,
+        n: 2048,
+        k: 8192,
+    },
+    Shape {
+        m: 16384,
+        n: 4096,
+        k: 8192,
+    },
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 8192,
+    },
+    Shape {
+        m: 4096,
+        n: 16384,
+        k: 8192,
+    },
+    Shape {
+        m: 2048,
+        n: 32768,
+        k: 8192,
+    },
+];
+
+/// One square output, four reduction depths — what an *item boundary* costs.
+///
+/// `M` and `N` are 8192 throughout, so every row has the same 2048 tiles, the
+/// same 10 waves over 222 clusters, the same 92.3% wave efficiency, the same
+/// grid of 444 blocks, and writes the same 268 MB of `C`. Every row also has
+/// the same operand traffic *per flop* and the same L2 working set per K block,
+/// because neither depends on `K`. What changes is how much arithmetic sits
+/// between one boundary and the next: 8, 32, 128 and 512 K blocks.
+///
+/// The boundary is not free and #83 said so without pricing it. `lcf` folds the
+/// epilogue into the item, so a cluster finishing a tile drains its accumulator
+/// through LDTM, writes 64 KiB of fp32 per CTA to global memory, and only then
+/// issues the next tile's first `STAGES` loads — the store and the refill
+/// cannot cross, which is exactly what #15's `lcsf` is for. That cost is per
+/// *tile* and constant, so as a fraction of the run it goes as `1/K`, and a
+/// sweep over `K` at a fixed tile count is the only way to see it separately
+/// from everything else this kernel does.
+///
+/// Read the rows as a ramp with an asymptote: the top is what the steady-state
+/// pipeline can do, and the distance from a row to it is what that row's
+/// boundaries cost. It is also the honest version of the "small size" question
+/// — the smallest rows of [`GEMM_SIZES`] confound a short reduction with a grid
+/// far under one wave, and this separates them by holding the grid full.
+///
+/// **One thing it does not hold fixed, and the fit has to answer for it.** `K`
+/// sets the operand footprint: `A` and `B` are 8 MiB each in the first row and
+/// **512 MiB each in the last**, so the sweep crosses L2 between the second row
+/// and the third. That is visible in the numbers — the marginal cost of a K
+/// block rises 0.378 → 0.503 → 0.569 µs across the three intervals, which is
+/// the *opposite* of what a pipeline failing to fill would do, and it makes the
+/// curve convex. So a straight line through all four rows overstates the
+/// intercept, and `examples/README.md` §7 reports the fixed cost as a range
+/// over point selections rather than as one number off one fit.
+const GEMM_DEPTH_SIZES: &[Shape] = &[
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 512,
+    },
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 2048,
+    },
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 8192,
+    },
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 32768,
     },
 ];
 
@@ -305,6 +456,22 @@ fn cases() -> Vec<Case> {
             bench: gemm::bench,
         },
         Case {
+            name: "gemm-footprint",
+            bound: Bound::Compute,
+            sizes: GEMM_FOOTPRINT_SIZES,
+            work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
+            blocks: |shape| gemm::grid(shape.m, shape.n),
+            bench: gemm::bench,
+        },
+        Case {
+            name: "gemm-depth",
+            bound: Bound::Compute,
+            sizes: GEMM_DEPTH_SIZES,
+            work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
+            blocks: |shape| gemm::grid(shape.m, shape.n),
+            bench: gemm::bench,
+        },
+        Case {
             name: "softmax",
             bound: Bound::Memory,
             // Every element is read once and written once, both as bf16, and
@@ -338,7 +505,7 @@ fn cases() -> Vec<Case> {
 /// keeps one out, not its speed.
 const SKIPPED: &[(&str, &str)] = &[("flash_forward", "no launcher yet — would report TFLOP/s")];
 
-fn report(context: &Arc<CudaContext>, case: &Case) -> usize {
+fn report(context: &Arc<CudaContext>, case: &Case, sizes: &[Shape]) -> usize {
     let bound = case.bound;
     println!(
         "\n{} — {}, over {ITERATIONS} timed launches after {WARMUP} warm-up",
@@ -364,7 +531,7 @@ fn report(context: &Arc<CudaContext>, case: &Case) -> usize {
     );
 
     let mut failures = 0;
-    for &shape in case.sizes {
+    for &shape in sizes {
         eprintln!("{shape}: staging and checking");
         let timings = match (case.bench)(context, shape) {
             Ok(timings) => timings,
@@ -392,10 +559,41 @@ fn report(context: &Arc<CudaContext>, case: &Case) -> usize {
     failures
 }
 
+/// What a `bench <name> [<m> <n> <k>]` argument list selects: one case, and
+/// optionally one size of it instead of that case's whole sweep.
+///
+/// Both narrowings exist for the same reason, which is that the sweep is the
+/// wrong thing to point an instrument at. A profiler serializes and replays
+/// every launch it is asked about, and the interesting one is buried two
+/// hundred launches deep behind five sizes that are not the question; a
+/// diagnostic table wants its own rows without re-staging 16384³ beside them.
+///
+/// Nothing else changes — the same [`Case`], the same staging, the same CPU
+/// reference, the same clock. A narrowed run is still a *checked* run, which is
+/// the rule this file exists to enforce and the one a diagnostic has the most
+/// reason to want to slip.
+fn selection() -> Option<(String, Option<Shape>)> {
+    let arguments: Vec<String> = std::env::args().skip(2).collect();
+    let size = |text: &String| text.parse().ok();
+    match arguments.as_slice() {
+        [name] => Some((name.clone(), None)),
+        [name, m, n, k] => Some((
+            name.clone(),
+            Some(Shape {
+                m: size(m)?,
+                n: size(n)?,
+                k: size(k)?,
+            }),
+        )),
+        _ => None,
+    }
+}
+
 /// `cargo oxide run kittens-examples -- bench`. Unlike the status table, this
 /// is meaningless without a device, so a missing one is a failure rather than
 /// something to degrade past.
 pub fn main() -> ExitCode {
+    let selected = selection();
     let context = match CudaContext::new(0) {
         Ok(context) => context,
         Err(error) => {
@@ -414,9 +612,21 @@ pub fn main() -> ExitCode {
         _ => println!("device 0 (attributes unavailable)"),
     }
 
+    if let Some((name, _)) = &selected
+        && !cases().iter().any(|case| case.name == name)
+    {
+        println!("no case named {name}; the sweep runs all of them when given no arguments");
+        return ExitCode::FAILURE;
+    }
+
     let mut failures = 0;
     for case in cases() {
-        failures += report(&context, &case);
+        let sizes = match &selected {
+            Some((name, _)) if name != case.name => continue,
+            Some((_, Some(shape))) => vec![*shape],
+            _ => case.sizes.to_vec(),
+        };
+        failures += report(&context, &case, &sizes);
         match case.bound.peak() {
             Some(peak) => println!(
                 "% of peak is against {peak} TFLOP/s, dense bf16 for one B200: NVIDIA's HGX\n\
