@@ -295,20 +295,45 @@ pub const N: usize = 256;
 /// the ring wraps and `wait_recycled` is on trial rather than skipped.
 pub const K: usize = 256;
 
-/// `A[m, k]` and `B[n, k]`: integers in `[-3, 3]` and `[-2, 2]`.
+/// `A[m, k]` and `B[n, k]`: integers in `[-3, 3]` and `[-10, 10]`.
 ///
-/// Every operand is exact in bf16 and every partial sum stays under `6 * K`,
-/// well inside fp32's exact integer range — so the whole GEMM is exact and the
-/// host compares with `==`. That is the point: a mismatch is a wrong
-/// coordinate, a wrong stride or a wrong operand half, and never a rounding
-/// artifact that has to be argued about. The two patterns share no period, so
-/// a transposed or offset read does not accidentally agree.
+/// Every operand is exact in bf16 (which holds every integer to 256) and every
+/// partial sum stays under `3 * 10 * K` — 245,760 at the benchmark's largest
+/// `K` of 8192, against fp32's exact integer range of 2²⁴ = 16,777,216. So the
+/// whole GEMM is exact and the host compares with `==`. That is the point: a
+/// mismatch is a wrong coordinate, a wrong stride or a wrong operand half, and
+/// never a rounding artifact that has to be argued about.
+///
+/// Both generators depend on `depth`, and #48 is why that is spelled out
+/// rather than assumed. `b_value` used to read `(column * 3 + depth * 5) % 5`,
+/// and `depth * 5 % 5` is identically zero — `B` was constant along `K`, so
+/// the exact check was blind to precisely the axis `mma_walk_cg2`'s chunk
+/// arithmetic computes. A kernel reading one plane of `B` every step, walking
+/// K backwards, or aliasing the ring slot for the K index passed anyway.
+///
+/// The moduli are 7 for `A` and 21 for `B`, and the pair is chosen rather than
+/// convenient. `A`'s values over one period of `depth` are `0..7` shifted to
+/// sum to zero, so if `B`'s `depth` period were *coprime* to 7 the sum over
+/// one combined period would factor as `(Σ A)(Σ B) = 0` — the dot product
+/// would then be a function of `K mod 7·P` alone, bounded independently of
+/// `K`, and two different K walks would collide by accident. Sharing the
+/// factor 7 defeats that: the partial sums grow with `K`, and a swept check of
+/// every legal `K` up to 8192 (every multiple of `BLOCK_K`) finds no wrong K
+/// walk this reference cannot see — same plane, reversed, off by a plane, off
+/// by a chunk, off by a stage, chunk order permuted, stage order reversed, or
+/// the three-deep ring slot mistaken for the K index.
+///
+/// The residual is worth stating because it is bounded and provable rather
+/// than hoped for: when `K` is a multiple of 21 the tail vanishes and `B`'s
+/// column period collapses from 21 to 7, so a column error that is a multiple
+/// of 7 becomes invisible. No `K` this project runs is a multiple of 21 — they
+/// are all powers of two — and the K axis stays exact even there.
 fn a_value(row: usize, depth: usize) -> f32 {
     ((row * 5 + depth * 3) % 7) as f32 - 3.0
 }
 
 fn b_value(column: usize, depth: usize) -> f32 {
-    ((column * 3 + depth * 5) % 5) as f32 - 2.0
+    ((column * 4 + depth * 5) % 21) as f32 - 10.0
 }
 
 /// Round-to-nearest-even fp32 → bf16. Exact for every value [`a_value`] and
@@ -431,16 +456,17 @@ fn run<T>(
     };
     launch_once(&mut c)?;
 
-    // `a_value` repeats every 7 rows and `b_value` every 5 columns, so the
-    // reference has 35 distinct dot products at any size and the naive
+    // `a_value` repeats every 7 rows and `b_value` every 21 columns, so the
+    // reference has 147 distinct dot products at any size and the naive
     // `O(m·n·k)` form is pure waste — minutes of host time at the sizes the
-    // benchmark reaches, for the same 35 numbers. Every element of `C` is
+    // benchmark reaches, for the same 147 numbers. Every element of `C` is
     // still compared against its own expected value, in the same summation
-    // order, so the comparison is the one it always was.
-    let reference: Vec<f32> = (0..7 * 5)
+    // order, so the comparison is the one it always was. The sum stays over
+    // the *full* `k`, since both generators vary along it.
+    let reference: Vec<f32> = (0..7 * 21)
         .map(|cell| {
             (0..k)
-                .map(|depth| a_value(cell / 5, depth) * b_value(cell % 5, depth))
+                .map(|depth| a_value(cell / 21, depth) * b_value(cell % 21, depth))
                 .sum()
         })
         .collect();
@@ -448,7 +474,7 @@ fn run<T>(
     let (mut wrong, mut sample) = (0usize, Vec::new());
     for row in 0..m {
         for column in 0..n {
-            let expected = reference[(row % 7) * 5 + column % 5];
+            let expected = reference[(row % 7) * 21 + column % 21];
             let value = observed[row * n + column];
             if value != expected {
                 wrong += 1;
