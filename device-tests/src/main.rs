@@ -16,6 +16,11 @@
 //! coordinate and never a numerical artifact, and the observed map can be read
 //! straight back out of the dump.
 //!
+//! The [`SharedVec`] cases are the one family whose subject is the *absence*
+//! of a layout: an unswizzled box is the shape nothing else here builds, so
+//! they are what says the engine writes a vector contiguously rather than
+//! saying a phase was computed right.
+//!
 //! Run it with `modal run modal_app.py` (see `modal_app.py` at the repo root);
 //! it exits non-zero if any case fails.
 
@@ -39,13 +44,13 @@ use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, thread, warp};
 
 use kittens::global::{GlobalLayout, encode_bf16_panels};
-use kittens::ldst::{load_fragment, load_tile, store_fragment, store_tile};
+use kittens::ldst::{load_fragment, load_tile, load_vec, store_fragment, store_tile};
 use kittens::mma::{self, MmaShape, mma_abt};
 use kittens::reg::{
-    BaseLdtm, ColVec, Fragment, FragmentLayout, Mul, RegTile, RegVec, online_rescale,
+    BaseLdtm, ColLayout, ColVec, Fragment, FragmentLayout, Mul, RegTile, RegVec, online_rescale,
 };
 use kittens::shared::{
-    Bf16, SharedTile, Swizzle128B, tma_store_commit, tma_store_wait, tma_store_wait_read,
+    Bf16, SharedTile, SharedVec, Swizzle128B, tma_store_commit, tma_store_wait, tma_store_wait_read,
 };
 use kittens::sync::Semaphore;
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block, store_wait};
@@ -87,6 +92,26 @@ type Accumulator = TmemTile<ROWS, COLUMNS>;
 /// [`SharedTile::chunk_writer`] accepts, which is what `store_fragment`
 /// addresses into.
 type LaneStage = SharedTile<Bf16, 32, TILE, Swizzle128B>;
+
+/// Elements of the vector cases' parameter vector. [`WIDE`] bf16 is 256 bytes
+/// — one unswizzled TMA box, and twice the 128-byte swizzle atom a tile's box
+/// is capped at, so a vector that was quietly cut into atoms comes back with
+/// only its first half in place.
+const VECTOR: usize = WIDE;
+/// Rows of the 2-D parameter buffer the rank-2 vector case slices, and the row
+/// it asks for. The row is neither the first nor the last, so a descriptor
+/// that ignores the coordinate and one that runs off the end are different
+/// failures.
+const VECTOR_ROWS: usize = 4;
+const VECTOR_ROW: usize = 2;
+
+type Params = SharedVec<Bf16, VECTOR>;
+/// The vector's plan: itself plus the same scratch tail the tiles use.
+/// `Params::BYTES` is 128-byte aligned, so the barrier lands where a barrier
+/// may.
+const VECTOR_SHARED: u32 = (Params::BYTES + 32) as u32;
+/// Values one lane holds of a `ColVec<VECTOR, BaseLdtm>`.
+const VECTOR_VALUES: usize = <BaseLdtm as ColLayout<VECTOR>>::VALUES;
 
 /// Bytes a swizzle case's plan needs: its tile plus a scratch tail for the TMA
 /// barrier.
@@ -1815,6 +1840,112 @@ pub mod kernels {
     ) {
         unsafe { lane_probe::<128, PER_QUERY>(scores, steps, &mut out) }
     }
+
+    /// Every path a [`SharedVec`] has, in the order a kernel uses them: TMA a
+    /// rank-1 box in, broadcast it to registers, write it back element by
+    /// element, TMA it out again.
+    ///
+    /// The dump is indexed by `(lane, value)` alone — the host applies
+    /// [`BaseLdtm::column`], so a wrong broadcast reports the column the
+    /// hardware handed that register rather than a bare mismatch. The write
+    /// half reverses the vector, so a wrong element stride lands identities at
+    /// positions that name other positions, and a store that inherited a
+    /// tile's atom leaves the second half of the destination [`POISON`].
+    ///
+    /// Launch with one warp: [`load_vec`] is warp scope, and 32 lanes writing
+    /// four elements each is exactly the neighbour-clobbering case a per-word
+    /// scalar write would have failed.
+    #[kernel]
+    pub unsafe fn shared_vec_roundtrip(
+        source: *const TmaDescriptor,
+        destination: *const TmaDescriptor,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let vec = Params::from_raw(smem);
+            let tma = Semaphore::attach(smem.add(Params::BYTES) as *mut Barrier);
+            let lane = warp::lane_id();
+
+            if lane == 0 {
+                tma.init(1);
+                fence_proxy_async_shared_cta();
+            }
+            thread::sync_threads();
+            if lane == 0 {
+                vec.tma_load(source, 0, tma);
+                tma.expect_tx(Params::BYTES as u32);
+            }
+            tma.wait(0);
+            thread::sync_threads();
+
+            let cols: ColVec<VECTOR, BaseLdtm> = load_vec(vec, lane);
+            let mut value = 0usize;
+            while value < VECTOR_VALUES {
+                *out.get_unchecked_mut(lane as usize * VECTOR_VALUES + value) = cols.get(value);
+                value += 1;
+            }
+            thread::sync_threads();
+
+            let mut index = lane as usize;
+            while index < VECTOR {
+                vec.set(index, cell(0, VECTOR - 1 - index));
+                index += 32;
+            }
+            // `set` writes through the generic proxy and the TMA engine reads
+            // through the async one, exactly as `store_tile` does.
+            fence_proxy_async_shared_cta();
+            thread::sync_threads();
+
+            if lane == 0 {
+                vec.tma_store(destination, 0);
+                tma_store_commit();
+                tma_store_wait::<0>();
+                tma.inval();
+            }
+        }
+    }
+
+    /// One *row* of a `[VECTOR, VECTOR_ROWS]` buffer through
+    /// [`SharedVec::tma_load_2d`], dumped in logical order.
+    ///
+    /// The rank-2 box is `[VECTOR, 1]`, so this is the case that says a
+    /// vector's second box dimension really is one row and that the minor
+    /// coordinate selects it: every element carries its source row, so a
+    /// descriptor that delivered the wrong row reports *that* row rather than
+    /// a misplaced element. Launch with one warp.
+    #[kernel]
+    pub unsafe fn shared_vec_row(source: *const TmaDescriptor, mut out: DisjointSlice<f32>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let vec = Params::from_raw(smem);
+            let tma = Semaphore::attach(smem.add(Params::BYTES) as *mut Barrier);
+            let lane = warp::lane_id();
+
+            if lane == 0 {
+                tma.init(1);
+                fence_proxy_async_shared_cta();
+            }
+            thread::sync_threads();
+            if lane == 0 {
+                vec.tma_load_2d(source, 0, VECTOR_ROW as i32, tma);
+                tma.expect_tx(Params::BYTES as u32);
+            }
+            tma.wait(0);
+            thread::sync_threads();
+
+            let mut index = lane as usize;
+            while index < VECTOR {
+                *out.get_unchecked_mut(index) = vec.get(index);
+                index += 32;
+            }
+
+            thread::sync_threads();
+            if lane == 0 {
+                tma.inval();
+            }
+        }
+    }
 }
 
 /// The layout shapes with a [`FragmentLayout`] impl, one line each — adding a
@@ -2124,6 +2255,148 @@ fn check_band_roundtrip(
         )?
     };
     compare_tile(&out.to_host_vec(stream)?, &expected, words)
+}
+
+/// Does a [`SharedVec`] survive the whole loop — global, shared, registers,
+/// shared, global — with every element where the library says it is?
+///
+/// Four claims in one launch, and each fails distinguishably:
+///
+/// - **The box.** A rank-1 map with `CU_TENSOR_MAP_SWIZZLE_NONE` and a
+///   `[VECTOR]` box is a shape nothing in this harness had built. `VECTOR` is
+///   twice a swizzle atom, so a box quietly capped at one atom delivers half
+///   the vector and leaves the rest zero.
+/// - **The broadcast.** The register dump is indexed by `(lane, value)` and
+///   the host applies [`BaseLdtm::column`], so what a failure prints is the
+///   column the hardware actually handed that register.
+/// - **The scalar write.** 32 lanes write four elements each into a 2-byte
+///   element type; a write that went through a 32-bit word would lose one of
+///   every adjacent pair.
+/// - **The store.** The destination is seeded with [`POISON`], which no
+///   identity can be, so an unwritten or short store is not a plausible
+///   neighbour.
+fn check_shared_vec(
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<String, Box<dyn Error>> {
+    let staged = identity_tile(1, VECTOR);
+    let source = DeviceBuffer::from_host(stream, &staged)?;
+    let source_map = unsafe { GlobalLayout::<Bf16, 1>::packed(source.cu_deviceptr(), [VECTOR]) }
+        .tensor_map::<Params>(stream)?;
+
+    let destination = DeviceBuffer::from_host(stream, &vec![POISON; staged.len()])?;
+    let destination_map =
+        unsafe { GlobalLayout::<Bf16, 1>::packed(destination.cu_deviceptr(), [VECTOR]) }
+            .tensor_map::<Params>(stream)?;
+
+    let mut out = DeviceBuffer::<f32>::zeroed(stream, 32 * VECTOR_VALUES)?;
+    unsafe {
+        module.shared_vec_roundtrip(
+            stream,
+            launch_config(32, VECTOR_SHARED),
+            source_map.as_ptr(),
+            destination_map.as_ptr(),
+            &mut out,
+        )?
+    };
+
+    let observed = out.to_host_vec(stream)?;
+    let mut report = String::new();
+    let mut mismatches = 0usize;
+    for lane in 0..32u32 {
+        for value in 0..VECTOR_VALUES {
+            let column = BaseLdtm::column(lane, value) as usize;
+            let got = observed[lane as usize * VECTOR_VALUES + value];
+            if got == cell(0, column) {
+                continue;
+            }
+            mismatches += 1;
+            if mismatches <= 8 {
+                let _ = match decode_cell(got) {
+                    Some((_, delivered)) => write!(
+                        report,
+                        "\n    lane {lane} value {value}: owns column {column}, was handed {delivered}"
+                    ),
+                    None => write!(
+                        report,
+                        "\n    lane {lane} value {value}: owns column {column}, was handed {got}, \
+                         which names no position"
+                    ),
+                };
+            }
+        }
+    }
+    if mismatches > 0 {
+        return Err(format!(
+            "{mismatches} of {} broadcast values wrong{report}",
+            32 * VECTOR_VALUES
+        )
+        .into());
+    }
+
+    // The write half: element `i` was overwritten with the identity of
+    // `VECTOR - 1 - i`, so the destination is the staged vector reversed.
+    let mut reversed = Vec::with_capacity(staged.len());
+    for pair in 0..VECTOR / 2 {
+        reversed.push(pack(
+            cell_bits(0, VECTOR - 1 - 2 * pair),
+            cell_bits(0, VECTOR - 2 - 2 * pair),
+        ));
+    }
+    compare_tile(&destination.to_host_vec(stream)?, &reversed, VECTOR / 2)
+}
+
+/// Does a vector's rank-2 box really select one row?
+///
+/// The buffer is `VECTOR_ROWS` rows of position identities carrying their own
+/// row index, and the kernel asks for [`VECTOR_ROW`]. A descriptor whose box
+/// spans more than one row, or that ignores the minor coordinate, reports the
+/// row it delivered instead of a mismatch.
+fn check_shared_vec_row(
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<String, Box<dyn Error>> {
+    let staged = identity_tile(VECTOR_ROWS, VECTOR);
+    let source = DeviceBuffer::from_host(stream, &staged)?;
+    let map =
+        unsafe { GlobalLayout::<Bf16, 2>::packed(source.cu_deviceptr(), [VECTOR, VECTOR_ROWS]) }
+            .tensor_map::<Params>(stream)?;
+
+    let mut out = DeviceBuffer::<f32>::zeroed(stream, VECTOR)?;
+    unsafe {
+        module.shared_vec_row(
+            stream,
+            launch_config(32, VECTOR_SHARED),
+            map.as_ptr(),
+            &mut out,
+        )?
+    };
+
+    let observed = out.to_host_vec(stream)?;
+    let mut report = String::new();
+    let mut mismatches = 0usize;
+    for (column, &got) in observed.iter().enumerate() {
+        if got == cell(VECTOR_ROW, column) {
+            continue;
+        }
+        mismatches += 1;
+        if mismatches <= 8 {
+            let _ = match decode_cell(got) {
+                Some((row, delivered)) => write!(
+                    report,
+                    "\n    element {column}: wanted row {VECTOR_ROW}, got row {row} column {delivered}"
+                ),
+                None => write!(report, "\n    element {column}: {got} names no position"),
+            };
+        }
+    }
+    if mismatches == 0 {
+        Ok(format!(
+            "{VECTOR} elements of row {VECTOR_ROW} placed exactly"
+        ))
+    } else {
+        Err(format!("{mismatches} of {VECTOR} elements wrong{report}").into())
+    }
 }
 
 /// Does `ldmatrix` hand each register the element [`BaseLdtm`] says it owns?
@@ -2740,6 +3013,15 @@ fn run() -> Result<usize, Box<dyn Error>> {
                 module.tma_store_roundtrip_wide(stream, config, source, packed, pitched)
             })
         }),
+    ));
+    // The vector shape (#13): an unswizzled box, at rank 1 and rank 2.
+    cases.push((
+        "shared vector round trip",
+        Box::new(|| check_shared_vec(stream, module)),
+    ));
+    cases.push((
+        "shared vector row",
+        Box::new(|| check_shared_vec_row(stream, module)),
     ));
     cases.push((
         "tma store early recycle",
