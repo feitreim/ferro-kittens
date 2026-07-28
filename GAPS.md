@@ -1,20 +1,43 @@
 # Gaps vs ThunderKittens
 
 Measured against HazyResearch/ThunderKittens `main` (~21.3k lines of headers under
-`include/`, plus `prototype/`). ferro-kittens is 1851 lines.
+`include/`, plus `prototype/`). `wc -l src/*.rs` answers for this side, so that
+number is not maintained here: it was 1851 when this file was written and 7353
+on the date below.
 
 The size difference overstates the functional gap and understates the structural
 one. TK's surface is a **cross product** — every op is templated over element
 type × layout × scope (thread/warp/warpgroup/`group<N>`) × tile-or-vector — so
 one conceptual op like `row_sum` expands into dozens of instantiations. This port
 is a **vertical slice**: one element type (bf16 operands, fp32 accumulate), one
-swizzle (128B), one fragment layout, one MMA family (tcgen05), the ops two
+swizzle (128B), one fragment layout, one MMA family (tcgen05), the ops the
 working kernels actually needed. Most of what follows is widening that slice,
-not adding new concepts.
+not adding new concepts — which is also why quadrupling the line count has
+closed rather less of the cross product than the ratio suggests.
 
 Gaps are marked **[NON-GOAL]** where the omission is a deliberate consequence of
 targeting Blackwell/tcgen05 only, **[SCOPE]** where it belongs to a different
 layer in a Rust world, and left unmarked where it is a genuine hole.
+
+## How to read this file, and when it was last true
+
+**Audited against the source on 2026-07-28** (#65). Every entry was checked by
+reading the module it names, not the log — the failure this file keeps having is
+an entry that still says *missing* for something that shipped, and no commit
+message contradicts one of those. §3.2 read "Missing: … generic `row_reduce`"
+for the whole of #6's life; §1.4 read "Absent entirely" three PRs after the type
+landed; §1.5 described a builder that had become a type. Each was found
+incidentally by someone working nearby.
+
+Two habits follow from that, and they are the only maintenance this file asks
+for. **Counts are not restated here** where the tooling already prints them:
+`cargo test` reports its own, `device-tests` prints `N of M cases passed`, and
+`gh issue list` is the live version of the work order below. **Claims that
+something landed are named in `tests/gaps.rs`**, a test whose whole body is a
+generic function that is never instantiated — so renaming an exported symbol
+breaks the build beside the section asserting it. Absence cannot be checked that
+way (there is no way to write "no second `FragmentLayout` exists"), so the
+*missing* half stays prose, and stays dated.
 
 ---
 
@@ -77,32 +100,78 @@ between them; `rv` has three layouts (`align`/`ortho`/`naive`) matching how a
 vector pairs with a tile.
 
 We have `Swizzle128B` as the sole `Swizzle` impl (the trait is there) and
-`BaseLdtm` as the sole `FragmentLayout`/`RowLayout` impl (issue #1 made the
-layout a parameter; a second one is still unwritten). The 128B-only restriction
+`BaseLdtm` as the sole `FragmentLayout`/`RowLayout`/`ColLayout` impl — #1 made
+the layout a parameter and #23 opened its shape set to every multiple of 16 up
+to 512, but a second impl is still unwritten. The 128B-only restriction
 is documented as honest rather than
 accidental — the subtile scheme depends on the 128-byte atom — but 64B tiles are
 what you want for narrow operands, and no-swizzle for staging tiles that never
 feed an MMA.
 
-### 1.4 No shared vectors (`sv`)
+The swizzle half is **#14**, and it is the larger of the two jobs: `ATOM_BYTES`
+is both the swizzle period and a TMA box's width, and an unswizzled mode needs
+those separated first — which is why `SharedVec` routes around `Swizzle` rather
+than borrowing it (1.4). A second `FragmentLayout` is **filed nowhere**, and
+3.4's `transpose`/`swap_layout` wait on it.
 
-Absent entirely. TK has `sv` as a first-class type with its own maps,
-reductions, conversions, and TMA paths — it's how row statistics, biases, and
-norm accumulators get staged. We keep row stats only in registers (`RegVec`),
-which works for a fused flash kernel but blocks anything that needs to hand a
-vector between warps through shared memory. **~200 lines.**
+### 1.4 Shared vectors — the type landed (#13), the ops did not
 
-### 1.5 Global layout is one concrete builder, not a type
+TK has `sv` as a first-class type with its own maps, reductions, conversions and
+TMA paths — it's how row statistics, biases and norm accumulators get staged.
+This entry read "Absent entirely" until #65; the type shipped with #53.
+
+`SharedVec<E, N>` is a base pointer and a compile-time length: `at`/`get`/`set`
+for scalar access, and four TMA paths (`tma_load`, `tma_load_2d`, `tma_store`,
+`tma_store_2d`) that are **one instruction each**, because an unswizzled box has
+no atom to be cut into the way `SharedTile::tma_load`'s stacked subtiles are. It
+carries a `TileBox` impl, so `GlobalLayout::tensor_map` derives its descriptor
+from the destination type exactly as a tile's is derived (1.5), and
+`ldst::load_vec`/`store_vec` bridge it to the `ColVec` a per-column op consumes
+— which is how `layernorm`'s `gamma`/`beta` reach the registers that multiply by
+them. Device cases `shared vector round trip` and `shared vector row` cover
+rank 1 and rank 2.
+
+It deliberately does **not** go through `Swizzle`, and that is the decision
+worth carrying forward rather than an omission: `ATOM_BYTES` is both the swizzle
+period and the width of a TMA box, and a one-row run of elements wants neither —
+its box is `N` wide, a number no mode marker can hold. What `ATOM_BYTES` should
+mean in the absence of a swizzle is a real question about *tiles*, and it is #14's.
+
+The box rules (`N * E::BYTES` a multiple of 16, `N <= 256`) sit on the four
+transfers rather than on `from_raw`, because the one use that never meets a
+descriptor is `sync::block_reduce`'s scratch — a two-warp block's partials are
+8 bytes and could not otherwise be constructed.
+
+What #13 asked for and did not get is the other half: the map and reduction
+instantiations, on shared vectors **and** shared tiles. The issue closed on the
+type. See 3.1 — nothing tracks the ops.
+
+### 1.5 Global layout — a type since #8, and still bf16-only
 
 TK's `gl` is a template over element type and up to 4 dims, with each extent
 independently compile-time or runtime, and it generates the matching TMA
-descriptor as a member. `cgl` (complex) and `pgl` (multi-GPU) wrap it.
+descriptor as a member. `cgl` (complex) and `pgl` (multi-GPU) wrap it — both
+stay **[SCOPE]** (section 5).
 
-We have `PanelMap` — bf16, 3-D, tiled, fixed box shape — built by
-`encode_bf16_panels`. It's correct and it's the only shape the kernels use, but
-the agreement between map and `SharedTile` is enforced by that one builder being
-generic, not by a general layout type. Widening this is prerequisite to most of
-section 2.
+`GlobalLayout<E, RANK>` is that type for rank 1 through 5, built `packed` (each
+dimension the product of the extents below it) or `strided` (a leading dimension
+wider than the columns, or a slice of a larger tensor), with dimension 0
+contiguous because the engine reads it that way. Its `tensor_map::<T: TileBox>`
+reads the data type, box shape and swizzle mode off the **destination** type, so
+the only way to build a descriptor disagreeing with the tile it feeds is to pair
+the layout with a different tile than the kernel loads. `check_driver_requirements`
+rejects what `cuTensorMapEncodeTiled` would refuse — base alignment, stride
+alignment, a box wider than 256 or narrower than a 16-byte line, an extent
+smaller than its own box — naming the field and the byte count rather than
+returning a bare `CUDA_ERROR_INVALID_VALUE`. `PanelMap` is now a type alias for
+`TensorMap`, and `encode_bf16_panels` a five-line wrapper over
+`GlobalLayout::<Bf16, 3>::packed`, kept because `softmax` calls it.
+
+What is left is the element, and it is a one-impl hole rather than a design one:
+`TensorMapElement` has exactly one impl, `Bf16`. An fp32 buffer cannot be
+described even though `F32` has been an `Element` since #3, because nothing in
+tree TMAs one. The prerequisite this entry used to name for section 2 is
+discharged.
 
 ---
 
@@ -148,14 +217,17 @@ The two are also the only movers here generic over `FragmentLayout` rather
 than pinned to `BaseLdtm`: `ldmatrix`, `stmatrix` and LDTM each fix a lane map
 in hardware, and a plain global store fixes nothing.
 
-Two things this deliberately is not. It is **fp32 only**, because the element
-parameter belongs to `Element` and that is bf16-only until #2 — and fp32 out
-of registers without a rounding step is the whole point of the entry. And it
-**bounds-checks nothing**: the extents a TMA descriptor carries are absent
-rather than forgotten, since predicating every value would be paid by the
-epilogues that do divide. TK's ragged-tail loads want them back, and that is
-what is left of this entry, along with the vector shapes (`RegVec`/`ColVec`
-straight out of global memory) and group scope (1.1).
+Two things this deliberately is not. It is **fp32 only**: `GlobalRows` names a
+`*mut f32` outright rather than carrying an `Element`, and fp32 out of registers
+without a rounding step is the whole point of the entry. The reason first given
+here — that `Element` was bf16-only — expired with #2 and #3, which made it a
+real trait with `F32` under it; the parameter is available now and nothing has
+asked for it. And it **bounds-checks nothing**: the extents a TMA descriptor
+carries are absent rather than forgotten, since predicating every value would be
+paid by the epilogues that do divide. TK's ragged-tail loads want them back, and
+that is what is left of this entry, along with the vector shapes
+(`RegVec`/`ColVec` straight out of global memory — the shared-memory bridge
+exists, `ldst::load_vec`, but not the global one) and group scope (1.1).
 
 ### 2.3 TMA store side — plain stores landed (#9), reductions absent
 
@@ -168,13 +240,17 @@ straight out of global memory) and group scope (1.1).
 | `prefetch` | — |
 | im2col descriptors | — **[SCOPE]** (conv-only) |
 
+`SharedVec` carries its own `tma_load`/`tma_load_2d`/`tma_store`/`tma_store_2d`
+beside these (1.4), at rank 1 and 2 and one instruction each.
+
 What is left of this entry is the *reduction* stores, and they are a different
 kind of missing: `cp.reduce.async.bulk.tensor` is absent from cuda-oxide at the
 pinned revision in every form, so unlike the plain stores they are not a
 transcription. `store_add_async` is what makes split-K and multi-CTA reduction
 epilogues cheap, and getting it means a local `ptx_asm!` intrinsic (`ldst.rs`
-sets the precedent) or an upstream contribution. Prefetch is absent upstream
-for the same reason.
+sets the precedent) or an upstream contribution — filed as **#42**, which argues
+for the upstream half. Prefetch is absent upstream for the same reason and is
+filed nowhere.
 
 ### 2.4 Cluster ops stop at cg2
 
@@ -207,23 +283,49 @@ Done for the register families (#5): `UnaryOp`/`BinaryOp`/`TernaryOp`, the
 `splat` with the constant written out; TK's `copy`/`copy2` have no by-value
 equivalent to be.
 
-Missing: the shared-tile and shared-vector instantiations (#13). The per-column
-operand of `col_map` can be carried and broadcast today but not yet *produced* —
-that reduction is #6.
+Missing: the shared-tile and shared-vector instantiations. Shared memory is
+still a movement target only — nothing in `shared.rs` maps or folds in place, so
+data comes back to registers before anything is done to it. #13 asked for these
+beside the `SharedVec` type and closed on the type alone (1.4); **no open issue
+carries the rest**. The per-column operand of `col_map` is no longer the hole
+this entry described: `col_reduce` produces one (3.2), and `ldst::load_vec`
+reads one out of shared memory.
 
-### 3.2 Reductions
+### 3.2 Reductions — the register side is done (#6), the shared side is not
 
 TK: `row_max row_min row_sum row_prod row_reduce`, `col_*` mirrors, plus whole-
 tile `max min sum prod` — on register **and shared** tiles.
 
-We have quad-shuffle `quad_max`/`quad_sum` on `RegVec`/`RegTile` (i.e. row-wise
-max and sum only), and `online_rescale`/`scale_rows` for the flash softmax
-pattern. Missing: everything column-wise, `prod`, `min`, generic `row_reduce`,
-and all shared-tile reductions. Column reductions are the awkward ones — the
-fragment map replicates rows across a quad, so a column reduce needs a different
-shuffle pattern than the one `quad_*` uses. #5 added the destination type
-(`ColVec`) and the layout half (`ColLayout`) a column reduce would fill; what is
-left is the strided shuffle across the 8 lanes of a column group.
+Done for the register tiles (#6). `RegTile::row_reduce`, `col_reduce` and
+`tile_reduce` are each generic over a `ReduceOp` — a `BinaryOp` narrowed to the
+associative and commutative ones, since the fragment map hands a fold its
+operands in the layout's order rather than the tile's, and carrying an
+`IDENTITY` so every fold seeds the same way instead of special-casing element
+zero. `Add`, `Mul`, `Max` and `Min` implement it; `Sub` and `Div` deliberately
+do not, because `row_reduce::<Sub>` has no meaning worth a spelling. The named
+wrappers are the whole of TK's list — `row_max`/`row_min`/`row_sum`/`row_prod`,
+the four `col_*`, and `tile_max`/`tile_min`/`tile_sum`/`tile_prod`, the last
+group prefixed because `max` is already the elementwise binary op and Rust has
+no overloading to tell the two apart. `Mul` *is* the product op, so there is no
+separate `Prod`. One level down, `RegVec::reduce`, `ColVec::reduce` and the free
+`quad_reduce`/`column_group_reduce`/`warp_reduce` are the same folds over a
+single value; `quad_max`/`quad_sum` survive as the two named quad shuffles, and
+`online_rescale`/`scale_rows` still carry the flash softmax pattern.
+
+The column reduce this entry called the awkward one is written. `col_reduce`
+folds a lane's own rows into a `ColVec`, then `column_group_reduce` runs a
+three-shuffle butterfly over masks 4, 8 and 16 — the 8 lanes `BaseLdtm::col_of`
+spreads a column across — against the two-shuffle quad a row reduce uses, and
+all five masks for a whole-tile fold. Which masks those are is the entire
+correctness question, so `reduction_masks_are_the_ownership_maps_lane_groups`
+derives the lane groups from the maps rather than restating the constants, and
+`reductions_fold_exactly_their_logical_axis` folds each axis against the
+*logical* tile. On silicon they are the `reduction shuffles` device case.
+
+Still missing: **every shared-tile and shared-vector reduction**, which is 3.1's
+other half and is tracked nowhere. Note also that everything above is warp
+scope. The fold four warps need is `sync::block_reduce` (1.1) — storage between
+two barriers, not a wider `Op`, because warps cannot shuffle to each other.
 
 ### 3.3 MMA shape and dtype coverage — shapes done (#12), dtypes not
 
@@ -285,8 +387,9 @@ because the tile is a sub-block of a larger matrix whose diagonal sits at
 block. `broadcast_row`/`broadcast_col` landed with 3.1.
 
 Absent: `transpose`, `swap_layout`, `copy` between layouts — all three need a
-second `FragmentLayout`, which the crate does not have. **~60 lines**, once one
-exists.
+second `FragmentLayout`, which the crate does not have and no issue asks for
+(1.3). **~60 lines**, once one exists. `#7` named them in its title and closed
+without them, as its own sequencing asked.
 
 ### 3.5 Warp-level MMA fallbacks **[NON-GOAL]**
 
@@ -299,9 +402,12 @@ only, no arch dispatch.
 ## 4. Missing kernel scaffolding
 
 `pipeline::run` + `trait Job` is TK's `prototype::lcf` (load-compute-finish), and
-it's a faithful port of that shape.
+it's a faithful port of that shape — still the only one, and still uncalled by
+anything in `examples/`, which is worth knowing before porting a second: the
+GEMM declines it deliberately, because `run` strides work items by `blockIdx.x`
+and a cluster launch needs the whole cluster on the same item (**#51**).
 
-Missing from `prototype/`:
+Missing from `prototype/` (**#15**):
 
 - **`lcsf`** — load-compute-**store**-finish. The store stage is what a training
   kernel with a producer-consumer epilogue needs; without it the store is folded
@@ -333,27 +439,60 @@ Missing from `prototype/`:
 
 ## 6. Missing infrastructure (not a TK gap, a repo gap)
 
-- **Host tests are address arithmetic only.** TK has `tests/` with a generated
-  harness over the type/layout cross product. We have 73 `#[cfg(test)]` unit
-  tests (`cargo test --features host`), all of them pure coordinate and pointer
-  math — they prove the crate is self-consistent, not that it agrees with
-  silicon.
-- **Device tests cover six paths.** `device-tests/` (a separate kernel crate,
-  run on a B200 through `modal_app.py`) checks the SWIZZLE_128B round trip
-  against the TMA engine, `BaseLdtm`'s fragment ownership map against a
-  position-encoding MMA at all three layout shapes, the `stmatrix` store path,
-  STTM — as a register round trip through TMEM, and by restaging a probed
-  accumulator into a second column band and re-draining it — `load_rows`,
-  the one case whose source reaches registers with no descriptor between them,
-  and (#12) all four MMA operand orders against one product, with a host-side
-  blind-spot sweep and an untransposed control. The matching global *store* is
-  checked by `examples/gemm.rs` instead, whose whole epilogue is one
-  `store_rows` compared elementwise against an exact CPU reference. Everything
-  else — the phase-parity rules, the pipeline scaffold, the cluster/multicast
-  paths — is still verified only by downstream kernels being numerically
-  correct.
-- **No CI.** Nothing runs `cargo check` on the device surface automatically, let
-  alone `--features host` on a CUDA box or the device tests on a GPU.
+- **Host tests are no longer address arithmetic only** — the claim they were was
+  itself stale, along with the count that used to sit here. TK has `tests/` with
+  a generated harness over the type/layout cross product; ours are hand-written
+  `#[cfg(test)]` modules and `cargo test` reports how many, which is the only
+  place that number is worth keeping. Most are still coordinate and pointer
+  math, but a real minority are not: `exp2_polynomial_stays_inside_its_error_bound`
+  and `log2_series_stays_inside_its_error_bound` bound the two software
+  approximations, `unary_ops_are_their_scalar_definitions` and its binary twin
+  hold the op set to its scalar meanings, `named_wrappers_resolve_to_their_ops`
+  pins each wrapper to the op it claims, and the reduction tests simulate the
+  shuffle by folding over the lane groups the *map* names. What none of them do
+  is run on silicon: they prove the crate is self-consistent, not that it agrees
+  with hardware. `cargo test` needs no toolkit; `--features host` adds `global`'s
+  descriptor-shape tests and pulls `cuda-core` → `cuda-bindings`, which wants
+  `cuda.h` — so it is a CI tier (below) rather than a laptop command.
+- **Device tests reach a good deal more than the six paths this entry used to
+  list.** `device-tests/` (a separate kernel crate, run on a B200 through
+  `modal_app.py::device_tests`) registers its cases as a `Vec<(&str, closure)>`
+  in `run` and prints `N of M cases passed`, so the count is the harness's to
+  report and is not restated here. What they reach: the SWIZZLE_128B round trip
+  against the TMA engine, narrow and wide and at a short tile whose second
+  subtile starts mid-period; `BaseLdtm`'s ownership map against a
+  position-encoding MMA at all three layout shapes; `stmatrix` and `ldmatrix`
+  in both directions, narrow and wide; STTM both as a register round trip
+  through TMEM and by restaging a probed accumulator into a second column band;
+  composed `[M, N]` bands (`load_tile` into `store_tile`); all four MMA operand
+  orders against one product, with a host-side blind-spot sweep and an
+  untransposed control (#12); `load_rows`, the one case whose source reaches
+  registers with no descriptor between them; both `SharedVec` ranks through the
+  TMA, `load_vec` and `set`; `block_reduce_sum` and `block_reduce::<Max, 4>`;
+  the row, column and whole-tile reduction shuffles; the TMA store paths
+  including `tma_store_wait_read`'s early recycle; and a repeated-launch probe
+  under a watchdog that would catch a TMEM leak across waves.
+
+  The matching global *store* is checked by `examples/gemm.rs` instead, whose
+  whole epilogue is one `store_rows` compared elementwise against an exact CPU
+  reference. Still verified only by downstream kernels being numerically
+  correct: the phase-parity rules, the pipeline scaffold, the masking ops
+  (`mask_probe` is a codegen probe and says so in its own doc comment), and
+  every cluster/multicast path — those last live in `examples/src/gemm.rs` and
+  are covered by `modal_app.py::examples` rather than by a case here.
+- **CI, in three tiers** (#17). `ci.yml` runs `fmt`, lockfile freshness,
+  `clippy --all-targets -- -D warnings`, `test` and `cargo doc` under
+  `RUSTDOCFLAGS=-D warnings` on every push and pull request, with no toolkit and
+  no credential — the library's default features are device-only and
+  `cuda-device` is ordinary Rust. `cuda.yml` is `modal_app.py::build`: the
+  `host` feature, its tests and its docs, plus a real
+  `cargo oxide build --arch sm_100a` of both kernel crates against the driver
+  stub. That last is the tier that earns its money, because a
+  post-monomorphization `const { assert!(..) }` in a tile shape fires at
+  *codegen* and `cargo check` cannot see it. `gpu.yml` runs the B200 harness
+  behind a label. `CI.md` carries the policy and the costs. What is still
+  uncovered: fork pull requests get tier 1 only, since the two tiers above it
+  need a Modal token.
 - **Register cost is swept now, not sampled** (#60). Every claim in this file
   and in `examples/README.md` used to be measured at 32 and 128 columns, and
   the reason was structural rather than budgetary: `ptxas` is a host compiler
@@ -371,11 +510,11 @@ Missing from `prototype/`:
   local memory, so a register count on its own no longer settles a comparison.
 - **And a register count does not settle it on the clock either** (#63). `modal
   run modal_app.py::ladder_bench` is the first thing in this repo to *time* a
-  register claim rather than count it: four of the ladder's rungs on a B200,
-  each spelling verified against a CPU reference at every grid and step count it
-  is timed at, timed in repeated rounds so the table states its own noise floor
-  (0.8% worst case), with a `t(2S)/t(S)` control that says the loop under test
-  was not hoisted. On that probe the streamed band #60 flagged is **not**
+  register claim rather than count it: four of the ladder's shapes on a B200, all
+  five spellings each, every one verified against a CPU reference at every grid
+  and step count it is timed at, timed in repeated rounds so the table states its
+  own noise floor (0.8% worst case), with a `t(2S)/t(S)` control that says the
+  loop under test was not hoisted. On that probe the streamed band #60 flagged is **not**
   slower: the fully in-place spelling — 32 registers, band in local memory — is
   the fastest form at all four shapes, 6–10% per warp and 25–42% across a full
   device, and the control shape `[32, 128]`, where `fused` wins on both static
@@ -401,27 +540,32 @@ Missing from `prototype/`:
 
 ## Work order
 
-Tracked as issues #1–#16, filed in priority order. Structural items first, since
-they change signatures across the crate and get expensive to retrofit.
+The original order was issues #1–#16, structural items first, since they change
+signatures across the crate and get expensive to retrofit. **Thirteen of the
+sixteen have closed** — #1 through #13 — and the sections above name the work
+beside each. Listing them again here only creates a second place for the status
+to go stale, which is how this file earned #65.
+
+What was open on 2026-07-28, and where it lives. `gh issue list` is the live
+version; this is a snapshot with a date on it.
 
 | # | Issue | Section |
 | --- | --- | --- |
-| 1 | Generalize `RegTile` to a logical shape with a layout parameter | 1.3 |
-| 2 | `Element` carries MMA kind and conversion, ready for sub-bf16 | 1.2 |
-| 3 | Block-scope reductions (filed as scope parameterization) | 1.1 |
-| 4 | Device test harness | 6 |
-| 5 | Generic map mechanism and the standard elementwise op set | 3.1 |
-| 6 | Reductions: column-wise, whole-tile, generic reduce | 3.2 |
-| 7 | Masking and shape utilities | 3.4 |
-| 8 | Generalize the global layout beyond `PanelMap` | 1.5 |
-| 9 | TMA store path | 2.3 |
-| 10 | Register to TMEM (STTM) | 2.1 |
-| 11 | Direct global ↔ register load/store | 2.2 |
-| 12 | MMA: `AtB`/`AtBt` walks, `mm` entry points, generic `KIND` routing — done | 3.3 |
-| 13 | Shared vectors, and ops on shared tiles | 1.4 |
 | 14 | Swizzle modes: 32B, 64B, unswizzled | 1.3 |
 | 15 | `lcsf` and the rest of the prototype layer | 4 |
 | 16 | FP8 element support | 1.2 |
+| 42 | Reduction TMA stores — upstream rather than a local `ptx_asm!` | 2.3 |
+| 49 | Cluster geometry beyond the 2-CTA pair | 2.4 |
+| 50 | Cluster-scope semaphore arrival | 2.4 |
+| 51 | `pipeline::run` cannot schedule a cluster | 4 |
+| 29 | `expect_tx` byte accounting is hand-summed | — |
+
+**Wanted and filed nowhere**, each named in its section above: a second
+`FragmentLayout` (1.3, and 3.4 waits on it), the map and reduction
+instantiations on shared tiles and shared vectors (3.1, 3.2 — the half of #13
+that closed without them), an fp32 `TensorMapElement` (1.5), TMA prefetch (2.3),
+DSMEM (2.5), and naming each op's scope in its type rather than in its index
+math (1.1).
 
 ## cuda-oxide support at the pinned rev (`b099f64`)
 
@@ -434,7 +578,7 @@ Checked against the vendored source, since several gaps turn on it:
 | Sparse MMA | ✅ `tcgen05_mma_sp_*` (unused) |
 | Register → TMEM (STTM) | ✅ full `tcgen05_st_*` family + `tcgen05_store_wait` |
 | TMA store | ✅ `cp_async_bulk_tensor_{1..5}d_s2g` + commit/wait groups |
-| TMA reduction store (add/min/max) | ❌ absent — needs `ptx_asm!` or an upstream PR |
+| TMA reduction store (add/min/max) | ❌ absent — needs `ptx_asm!` or an upstream PR (#42) |
 | TMA prefetch | ❌ absent |
 | f32 → fp8 | ✅ `cvt_rn_satfinite_{e4m3,e5m2}x2_f32` (+ `relu`) |
 | f32 → fp4/fp6/e8m0 | ❌ absent — hand bit-packing |
