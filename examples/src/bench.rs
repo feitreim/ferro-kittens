@@ -307,9 +307,12 @@ fn cases() -> Vec<Case> {
         Case {
             name: "softmax",
             bound: Bound::Memory,
-            // Every element is read once and written once, both as bf16. The
-            // kernel's arithmetic is one `exp2` and one divide per element,
-            // which is why this row is bytes and not flops.
+            // Every element is read once and written once, both as bf16, and
+            // read twice more out of shared memory — the denominator counts
+            // the global traffic, which is what an HBM figure would divide.
+            // Bytes and not flops because the arithmetic is two `ex2.approx`
+            // and a multiply per element; #76 is what that costs, and it is
+            // not something a FLOP/s number would have described.
             work: |shape| 2.0 * 2.0 * (shape.m * shape.n * shape.k) as f64,
             sizes: SOFTMAX_SIZES,
             blocks: |shape| softmax::grid(shape.m, shape.k),
