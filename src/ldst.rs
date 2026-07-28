@@ -18,12 +18,17 @@
 //! composition [`crate::tmem::TmemTile::tile`] does over the drain, and out of
 //! the same helpers, so a band cannot mean one thing in TMEM and another in
 //! shared memory.
+//!
+//! [`load_vec`] and [`store_vec`] are the vector pair, and they are plain
+//! scalar loads rather than a matrix instruction: a [`ColVec`]'s values are
+//! one element each at columns no `ldmatrix` shape describes, and the lanes of
+//! a column group all want the same address, which shared memory broadcasts.
 
 use cuda_device::ptx_asm;
 use cuda_device::wmma::ldmatrix_x2;
 
-use crate::reg::{BaseLdtm, Fragment, FragmentLayout, RegTile};
-use crate::shared::{Element, SwizzledChunks};
+use crate::reg::{BaseLdtm, ColLayout, ColVec, Fragment, FragmentLayout, RegTile};
+use crate::shared::{Element, SharedVec, SwizzledChunks};
 use crate::tmem::{place_block, take_block};
 
 /// The `(row, chunk)` that `lane` supplies as slot `slot`'s `m8n8.x2` address,
@@ -225,6 +230,65 @@ pub unsafe fn store_tile<E: Element<Unpacked = [f32; 2]>, const M: usize, const 
                 column_block += 1;
             }
             row_block += 1;
+        }
+    }
+}
+
+/// Broadcast a [`SharedVec`] into the [`ColVec`] a per-column op consumes:
+/// each lane reads the `L::VALUES` columns [`ColLayout::col_of`] says it holds.
+///
+/// The shared-memory twin of [`load_tile`] for the vector shape, and the way a
+/// parameter loaded once per CTA — layernorm's `gamma`, an attention bias —
+/// reaches the registers that multiply by it. Under [`BaseLdtm`] a column
+/// depends only on `lane % 4`, so the 8 lanes of a column group issue the same
+/// address and shared memory answers all of them from one bank read; there is
+/// no shuffle here and nothing for a swizzle to spread.
+///
+/// # Safety
+///
+/// The vector's bytes must already be visible to the generic proxy (a TMA load
+/// needs its barrier waited on, another warp's [`SharedVec::set`] a barrier),
+/// and `L`'s columns must fit `N` — which every [`ColLayout<N>`] impl
+/// guarantees.
+#[inline(always)]
+pub unsafe fn load_vec<E: Element, const N: usize, L: ColLayout<N>>(
+    vec: SharedVec<E, N>,
+    lane: u32,
+) -> ColVec<N, L> {
+    unsafe {
+        let mut cols = ColVec::<N, L>::splat(0.0);
+        let mut value = 0usize;
+        while value < L::VALUES {
+            cols.set(value, vec.get(L::col_of(lane, value) as usize));
+            value += 1;
+        }
+        cols
+    }
+}
+
+/// The inverse of [`load_vec`]: each lane writes back the columns it holds.
+///
+/// Every column of the vector is written by the four lanes of one quad rather
+/// than by one lane, and they write the same value — a [`ColVec`] is
+/// replicated across the lanes of a column group, so the redundancy is the
+/// layout's and not this loop's. That makes the write idempotent, which is
+/// what keeps it a plain store instead of a lane-masked one.
+///
+/// # Safety
+///
+/// All 32 lanes of the warp must call this together, and the caller owes a
+/// `fence.proxy.async.shared::cta` before the TMA engine reads the vector.
+#[inline(always)]
+pub unsafe fn store_vec<E: Element, const N: usize, L: ColLayout<N>>(
+    vec: SharedVec<E, N>,
+    lane: u32,
+    cols: ColVec<N, L>,
+) {
+    unsafe {
+        let mut value = 0usize;
+        while value < L::VALUES {
+            vec.set(L::col_of(lane, value) as usize, cols.get(value));
+            value += 1;
         }
     }
 }
