@@ -92,6 +92,36 @@ gh workflow run gpu.yml -f ref=refs/pull/17/merge # a specific PR
 
 `cuda.yml` takes the same `ref` input.
 
+### Running Modal by hand, and the two ways it costs you money
+
+Use the wrapper rather than `modal run` directly:
+
+```
+scripts/modal-run device_tests
+scripts/modal-run bench --case gemm-depth
+```
+
+A GPU function bills the whole container, including the minutes it spends
+compiling before a kernel launches. #93 fixed the worst of that by giving the
+GPU entry points a whole CPU — the build went from ~44 minutes to ~7.5 — and
+`timeout=` now caps each entry point at what its work actually takes rather than
+the flat ninety minutes every one of them used to carry.
+
+That leaves one hole, and the wrapper is what plugs it. **A container can wedge
+before it reaches Python**, in which case `timeout=` is the only thing that ever
+stops it and nothing inside `modal_app.py` runs to notice: one died after
+twenty-six minutes having printed fifteen lines of NVIDIA banner and no
+`$ <command>` line at all. From the outside that is indistinguishable from a
+cold build. The tell is that a healthy run emits `Compiling …` within a couple
+of minutes of the banner, and `scripts/modal-run` watches for exactly that,
+stops the app when it does not arrive, and exits 3. It exits 2 on the workspace
+spend limit, which fails every entry point at once and reads exactly like a
+broken diff.
+
+If you do run `modal run` by hand, check `modal app list` afterwards and confirm
+your app is `stopped`. A live app you have stopped paying attention to is still
+a live app.
+
 ## Pull requests from forks
 
 Fork PRs get no secrets, so tiers 2 and 3 are skipped rather than failed —
