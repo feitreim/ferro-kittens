@@ -1595,8 +1595,11 @@ the operand stream and asked which of HBM and L2 to attack; the answer is that
 on a kernel whose steady state is already at 67% of dense peak. The tile sweep
 that was queued behind this answer should stay queued behind #15 and #89 too.
 
-> #89 has since landed. The tile sweep stays queued behind **#15**, which is now
-> the only untouched term of the three.
+> #89 has since landed, and it moved the kernel this sweep was fitted on. **The
+> fit below should be read as describing the pre-#89 kernel**, and `gemm-depth`
+> re-run on the post-#89 tree is what re-establishes the boundary's share and the
+> steady state. The ordering of #15 and #87 depends on that re-fit and not on the
+> numbers as they stand here.
 
 ##### and a third of that boundary was one instruction — #91
 
@@ -2225,18 +2228,37 @@ hit rate would have been worth having.
 
 **What this leaves.** The decomposition above put 6-7% on traversal at the square
 shape and 23% at the worst aspect ratio; the measurements are 8.4% and 27.6%, so
-the estimate was conservative in both places. What none of it touches is the item
-boundary, still the largest single term at 20-22% of the launch after #91 — and
-`GROUP` is a measurement at the `[256, 128]` pair tile that **#87 will move**,
-which is why it is a parameter with a sweep behind it rather than a swizzle
-written into the map.
+the estimate was conservative in both places. `GROUP` is a measurement at the
+`[256, 128]` pair tile that **#87 will move**, which is why it is a parameter
+with a sweep behind it rather than a swizzle written into the map.
 
-**The boundary is still the biggest term, but it is no longer the obvious next
-move**, and that is #98's doing rather than this section's. `lcsf` has to clear
-an occupancy step worth 14–16%, so it has to hide roughly 70% of the boundary to
-be worth building — a real question with a number on it, where before it was
-simply "the largest term". This traversal had no such threshold to clear, which
-is most of why it went first and landed.
+**And this section invalidates the fit that ranks everything queued behind it.**
+The item boundary's 20–22% and the 1521 TFLOP/s steady state both come from the
+K-depth sweep, which was measured on the row-major kernel. This section moved
+that kernel — 16384³ grouped is **1466.3**, close enough to the old *slope* that
+the fit now describes a kernel which no longer exists. So "there is 20–22% of
+item boundary left to win" is **what was true pre-#89 and is not currently a
+supported claim**; `gemm-depth` has to be re-run on this tree before #15 or #87
+is ranked off it. That is stated here rather than left for someone to trip over,
+because the whole apparatus for choosing the next lever is downstream of it.
+
+What does survive is the *shape* of #98's constraint: whatever the boundary
+re-fits to, `lcsf` has to clear an occupancy step worth 14–16% to be worth
+building, and this traversal had no such threshold to clear — which is most of
+why it went first and landed.
+
+**One coincidence worth being suspicious of, and it is not a finding.** The
+`K = 32768` row regressed under grouping at **1443.9 TFLOP/s**, and 16384³
+grouped lands at **1466.3**. Two shapes with almost nothing in common — a deep
+reduction over a small output against a large square — sitting within 2% of each
+other is *consistent with* a ceiling that is not operand traffic, which would be
+a much larger finding than this section's, since it would mean neither a bigger
+tile (#87) nor a store stage (#15) touches what is actually binding. **Two points
+measured once each is not a ceiling and this does not claim one.** What would
+test it is the re-fit above plus a third shape reaching the same number by a
+third route; if `gemm-depth` re-fits to a steady state near 1470 rather than
+1521, that is the same suspicion arriving from a fourth. A reader coming to that
+re-fit should arrive already suspicious rather than surprised.
 
 One cross-check worth recording, since the two sections were measured for
 unrelated reasons in different containers: **#98's 3-CTA control and this
