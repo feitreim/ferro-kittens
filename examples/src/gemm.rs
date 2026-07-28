@@ -121,7 +121,7 @@ use std::error::Error;
 
 use kittens::global::{GlobalRows, store_rows};
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
-use kittens::pipeline::{self, Job};
+use kittens::pipeline::{self, ClcQueue, Job};
 use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
@@ -166,10 +166,23 @@ type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
 /// One warp's band of it, drained.
 type Band = RegTile<32, BLOCK_N, BaseLdtm>;
 
-/// Barriers and the TMEM staging word, in the tail of the shared plan: the two
-/// `STAGES`-deep rings, the MMA-complete semaphore, and one `u32`.
-const SCRATCH_BYTES: usize = 2 * STAGES * 8 + 8 + 8;
+/// Barriers, the TMEM staging word and the scheduler's queue, in the tail of
+/// the shared plan: the two `STAGES`-deep rings, the MMA-complete semaphore,
+/// one `u32`, and [`ClcQueue::BYTES`] for the hardware work queue.
+const SCRATCH_BYTES: usize = 2 * STAGES * 8 + 8 + 8 + ClcQueue::BYTES;
+/// Where the work queue sits, and the one thing about it a constant has to
+/// say: `try_cancel` writes a `.b128`, so the offset has to be aligned for one.
+/// This assert fires at codegen, which is the only place the ring byte counts
+/// under it are known.
+const QUEUE_OFFSET: usize = ARing::BYTES + BRing::BYTES + 2 * STAGES * 8 + 8 + 8;
+const _: () = assert!(QUEUE_OFFSET % ClcQueue::ALIGNMENT == 0);
 /// Dynamic shared memory the launch must provide.
+///
+/// Every scheduler below launches with the *same* plan, including the static
+/// one that never touches the queue. Twenty-four bytes is not worth a second
+/// envelope, and paying them on both sides is what keeps the A/B a comparison
+/// of schedules rather than of residencies — 73 816 B still admits the three
+/// CTAs per SM that #84 counted at 73 792.
 pub const SHARED_BYTES: usize = ARing::BYTES + BRing::BYTES + SCRATCH_BYTES;
 
 /// `#[launch_contract]` takes literals, so the envelope is written twice; this
@@ -182,7 +195,7 @@ pub const SHARED_BYTES: usize = ARing::BYTES + BRing::BYTES + SCRATCH_BYTES;
 /// zero blocks per SM at 144. `cluster_launch` has nothing to do with it.
 /// [`kittens::launch::admit_shared_plan`] is the same opt-in for a kernel
 /// whose output partition no contract describes.
-const _: () = assert!(THREADS == 128 && SHARED_BYTES == 73_792);
+const _: () = assert!(THREADS == 128 && SHARED_BYTES == 73_816);
 
 /// SMs on the device this project targets and measures on — a B200, as
 /// `modal run modal_app.py::bench` prints in its header.
@@ -232,8 +245,43 @@ const CTAS_PER_SM: u32 = 3;
 /// the only reason a hardware figure may sit in it — and, per
 /// [`CTAS_PER_SM`], the reason getting it wrong is a benchmark row and not a
 /// wrong `C`.
+///
+/// **It is also the constant [`Scheduler::Stealing`] exists to delete**, and
+/// the case against carrying it is now stronger than "a benchmark row": #84
+/// showed [`CTAS_PER_SM`] is measured and underivable, so this line is right
+/// for a B200 and cannot be known to be right for anything else. Under CLC the
+/// grid is the tile count and the residency is the scheduler's business. This
+/// constant survives here only for as long as the static path is the control.
 const MAX_CLUSTERS: u32 = SMS * CTAS_PER_SM / RANKS;
 const _: () = assert!(MAX_CLUSTERS == 222);
+
+/// Which item source a launch runs on. The [`Tile`] job is identical under all
+/// three — that is the point of it being a [`Job`] — and what changes is the
+/// grid, and where the next item comes from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Scheduler {
+    /// [`pipeline::run`]: a grid capped at [`MAX_CLUSTERS`], each cluster
+    /// taking a fixed share decided before the kernel starts. The control.
+    Static,
+    /// [`pipeline::run_stealing`] with the request prefetched behind the
+    /// current item's MMA.
+    Stealing,
+    /// The same, with the request on the critical path: issued and harvested
+    /// together at the item boundary. Here to price the prefetch rather than
+    /// to assert it.
+    StealingSerial,
+}
+
+impl Scheduler {
+    /// What the benchmark prints, and the only place these names are spelled.
+    pub fn name(self) -> &'static str {
+        match self {
+            Scheduler::Static => "static",
+            Scheduler::Stealing => "clc",
+            Scheduler::StealingSerial => "clc-serial",
+        }
+    }
+}
 
 /// One output tile of `C`, as the persistent grid's work item.
 ///
@@ -422,6 +470,75 @@ impl Job for Tile {
 pub mod kernels {
     use super::*;
 
+    /// The item and the work queue, laid over the one shared plan all three
+    /// entry points launch with. Everything here spans items rather than
+    /// belonging to one, which is why it is hoisted out of every scheduler
+    /// alike: the rings, the barriers, the operand maps, and the pair's TMEM
+    /// allocation, whose `alloc_cluster` is a whole-cluster collective with a
+    /// `cluster_sync` in it and must not be inside anybody's item loop.
+    ///
+    /// # Safety
+    ///
+    /// The launch geometry's, and the operands': both maps must describe live
+    /// buffers covering `k_blocks * BLOCK_K` along K and the full extent the
+    /// item loop walks, and `c` must hold `ldc` columns for every row of it.
+    #[inline(always)]
+    unsafe fn attach(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_n: u32,
+        k_blocks: u32,
+        ldc: u32,
+        c: &mut DisjointSlice<f32>,
+    ) -> (Tile, ClcQueue) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let scratch = smem.add(ARing::BYTES + BRing::BYTES);
+            let tmem_slot = scratch.add(2 * STAGES * 8 + 8) as *mut u32;
+
+            let tile = Tile {
+                a_ring: ARing::attach(smem),
+                b_ring: BRing::attach(smem.add(ARing::BYTES)),
+                load: SemaphoreRing::<STAGES>::attach(scratch as *mut Barrier),
+                free: SemaphoreRing::<STAGES>::attach((scratch as *mut Barrier).add(STAGES)),
+                done: Semaphore::attach((scratch as *mut Barrier).add(2 * STAGES)),
+                a_map,
+                b_map,
+                accumulator: Accumulator::from_raw(alloc_cluster(tmem_slot, BLOCK_N as u32)),
+                c: GlobalRows::from_slice(c, ldc as usize),
+                tiles_n,
+                k_blocks,
+                rank: cluster::block_rank(),
+                warp_id: warp::warp_id(),
+                lane: warp::lane_id(),
+            };
+            (tile, ClcQueue::attach(smem.add(QUEUE_OFFSET)))
+        }
+    }
+
+    /// Give the pair's accumulator back.
+    ///
+    /// The scaffold's last item boundary already retired the pair's reads, and
+    /// this `cluster_sync` is for the cluster that got no items at all —
+    /// [`Scheduler::Static`] can leave a pair having allocated, never looped,
+    /// and still owing a deallocation in step with its peer. Under CLC no
+    /// cluster is ever launched without an item, and the sync is kept anyway
+    /// because it costs one barrier at the end of a kernel and the alternative
+    /// is a scheduler-shaped hole in a resource protocol.
+    ///
+    /// # Safety
+    ///
+    /// Every thread of every rank must arrive, with the accumulator's last
+    /// reader retired.
+    #[inline(always)]
+    unsafe fn release(tile: &Tile) {
+        unsafe {
+            tcgen05_fence_before_thread_sync();
+            cluster::cluster_sync();
+            dealloc_cluster(tile.accumulator.raw(), BLOCK_N as u32);
+        }
+    }
+
     /// `C[m, n] = Σₖ A[m, k] · B[n, k]`, one `(2·BLOCK_M, BLOCK_N)` output
     /// tile per work item, `k_blocks` stages of `BLOCK_K` deep.
     ///
@@ -434,27 +551,20 @@ pub mod kernels {
     /// their `[R, 64]` boxes are `ATile`'s and `BTile`'s own constants and not
     /// numbers [`check`] wrote down.
     ///
-    /// Only two things sit outside the item loop, and both are there because
-    /// they span items rather than belong to one: the shared plan, and the
-    /// pair's TMEM allocation. `alloc_cluster` is a whole-cluster collective
-    /// with a `cluster_sync` in it, so running it per item would be a barrier
-    /// and an allocator round trip per output tile for an accumulator whose
-    /// address never changes.
+    /// Everything outside the item loop is `attach` and `release`; what is
+    /// left here is the schedule.
     ///
     /// # Safety
     ///
-    /// The launch geometry is the contract's, but the operands are not: both
-    /// maps must describe live buffers covering `k_blocks * BLOCK_K` along K
-    /// and the full `tiles`/`tiles_n` extent the item loop walks, and `c` must
-    /// hold `ldc` columns for every row of that walk. The grid must be a whole
-    /// number of clusters and `tiles` the item count they are to cover — see
-    /// [`grid`], which is what the launcher below sizes both from.
+    /// `attach`'s, plus: the grid must be a whole number of clusters and
+    /// `tiles` the item count they are to cover — see [`grid`], which is what
+    /// the launcher below sizes both from.
     #[kernel]
     #[cluster_launch(2, 1, 1)]
     #[launch_contract(
         domain = 1,
         block = (128, 1, 1),
-        dynamic_shared = 73_792,
+        dynamic_shared = 73_816,
         dynamic_shared_alignment = 128
     )]
     pub unsafe fn gemm_cg2(
@@ -467,37 +577,78 @@ pub mod kernels {
         mut c: DisjointSlice<f32>,
     ) {
         unsafe {
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let scratch = smem.add(ARing::BYTES + BRing::BYTES);
-            let tmem_slot = scratch.add(2 * STAGES * 8 + 8) as *mut u32;
-
-            let mut tile = Tile {
-                a_ring: ARing::attach(smem),
-                b_ring: BRing::attach(smem.add(ARing::BYTES)),
-                load: SemaphoreRing::<STAGES>::attach(scratch as *mut Barrier),
-                free: SemaphoreRing::<STAGES>::attach((scratch as *mut Barrier).add(STAGES)),
-                done: Semaphore::attach((scratch as *mut Barrier).add(2 * STAGES)),
-                a_map,
-                b_map,
-                accumulator: Accumulator::from_raw(alloc_cluster(tmem_slot, BLOCK_N as u32)),
-                c: GlobalRows::from_slice(&mut c, ldc as usize),
-                tiles_n,
-                k_blocks,
-                rank: cluster::block_rank(),
-                warp_id: warp::warp_id(),
-                lane: warp::lane_id(),
-            };
-
+            let (mut tile, _) = attach(a_map, b_map, tiles_n, k_blocks, ldc, &mut c);
             pipeline::run(&mut tile, tiles);
+            release(&tile);
+        }
+    }
 
-            // The scaffold's last item boundary already retired the pair's
-            // reads, and this one is for the cluster that got no items at all
-            // — `tiles` under the grid's cluster count leaves some pair having
-            // allocated, never looped, and still owing a deallocation in step
-            // with its peer.
-            tcgen05_fence_before_thread_sync();
-            cluster::cluster_sync();
-            dealloc_cluster(tile.accumulator.raw(), BLOCK_N as u32);
+    /// The same GEMM on the hardware's schedule: a grid of one cluster per
+    /// output tile, of which the device launches as many as it holds, and the
+    /// rest are cancelled out from under the scheduler by clusters that have
+    /// finished — [`pipeline::run_stealing`].
+    ///
+    /// **There is no `tiles` argument, and that absence is the feature.** The
+    /// static entry point above needs the item count because its grid is capped
+    /// at a constant that had to be measured on one device (#84). Here the grid
+    /// *is* the item count, and neither [`SMS`] nor [`CTAS_PER_SM`] appears
+    /// anywhere on the path.
+    ///
+    /// # Safety
+    ///
+    /// `attach`'s, plus [`pipeline::run_stealing`]'s: the grid is exactly
+    /// `RANKS` × the tile count, one-dimensional, on sm_100a.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 73_816,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_cg2_clc(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_n: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let (mut tile, queue) = attach(a_map, b_map, tiles_n, k_blocks, ldc, &mut c);
+            pipeline::run_stealing::<Tile, true>(&mut tile, queue);
+            release(&tile);
+        }
+    }
+
+    /// [`gemm_cg2_clc`] with the steal on the critical path instead of behind
+    /// the MMA. Identical in every other respect — same job, same grid, same
+    /// barrier count — so the difference between the two rows of the comparison
+    /// table is the prefetch and nothing else.
+    ///
+    /// # Safety
+    ///
+    /// As [`gemm_cg2_clc`].
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 73_816,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_cg2_clc_serial(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_n: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let (mut tile, queue) = attach(a_map, b_map, tiles_n, k_blocks, ldc, &mut c);
+            pipeline::run_stealing::<Tile, false>(&mut tile, queue);
+            release(&tile);
         }
     }
 }
@@ -609,7 +760,39 @@ fn tiles(m: usize, n: usize) -> u32 {
 /// the extra tiles arrive as extra *items*, which is the whole difference
 /// between this kernel and the one that launched a pair per tile.
 pub fn grid(m: usize, n: usize) -> u32 {
-    RANKS * tiles(m, n).min(MAX_CLUSTERS)
+    grid_for(Scheduler::Static, m, n)
+}
+
+/// Blocks a `scheduler`'s launch asks for, which is the one host-visible
+/// difference between them.
+///
+/// The static grid is capped and the stealing grid is not: CLC cancels
+/// clusters out of the *pending* queue, so a cluster that never launches is
+/// exactly how the hardware caps it, and asking for fewer than one cluster per
+/// tile would leave items nothing can reach. This is the shape of the
+/// deletion — one branch reads a measured constant and the other reads the
+/// problem.
+pub fn grid_for(scheduler: Scheduler, m: usize, n: usize) -> u32 {
+    let clusters = match scheduler {
+        Scheduler::Static => tiles(m, n).min(MAX_CLUSTERS),
+        Scheduler::Stealing | Scheduler::StealingSerial => tiles(m, n),
+    };
+    RANKS * clusters
+}
+
+/// Waves the static grid takes at `m`x`n`, and how full the last one is.
+///
+/// This is the entire quantity CLC has to win back, and it is worth computing
+/// rather than measuring against: a cluster's item takes the same time whoever
+/// scheduled it, so the static stride's only loss is the clusters idle through
+/// the ragged last wave. At [`MAX_CLUSTERS`] the efficiency is 57.7% at 2048³,
+/// 76.9% at 4096³, 92.3% at 8192³ and **99.7% at 16384³** — so the predicted
+/// gain runs from 23% down to nothing across the sweep, and the largest size,
+/// the one a peak claim would be made on, predicts nothing.
+pub fn wave_efficiency(m: usize, n: usize) -> (u32, f64) {
+    let tiles = tiles(m, n);
+    let waves = tiles.div_ceil(MAX_CLUSTERS);
+    (waves, tiles as f64 / (waves * MAX_CLUSTERS) as f64)
 }
 
 /// The `then` a run that is only being checked passes: nothing follows the
@@ -641,6 +824,7 @@ fn run<T>(
     m: usize,
     n: usize,
     k: usize,
+    scheduler: Scheduler,
     then: impl FnOnce(
         &cuda_core::CudaStream,
         &mut dyn FnMut() -> Result<(), Box<dyn Error>>,
@@ -679,27 +863,62 @@ fn run<T>(
     let b_map = b_layout.tensor_map::<BTile>(&stream)?;
 
     let mut c = DeviceBuffer::<f32>::zeroed(&stream, m * n)?;
-    let launch = module.prepare_gemm_cg2(LaunchConfig1D::new(
-        grid(m, n),
-        THREADS,
-        SHARED_BYTES as u32,
-    ))?;
+    // All three are prepared and one is launched. Preparing is a driver call
+    // opting the entry point into its 72 KiB, and doing it for the entry points
+    // this call will not use costs nothing measurable and keeps the dispatch
+    // below a `match` over launches rather than over types the kernel macro
+    // named.
+    let config = |scheduler| {
+        LaunchConfig1D::new(
+            grid_for(scheduler, m, n),
+            THREADS,
+            SHARED_BYTES as u32,
+        )
+    };
+    let static_launch = module.prepare_gemm_cg2(config(Scheduler::Static))?;
+    let clc_launch = module.prepare_gemm_cg2_clc(config(Scheduler::Stealing))?;
+    let serial_launch = module.prepare_gemm_cg2_clc_serial(config(Scheduler::StealingSerial))?;
     let tiles_n = (n / BLOCK_N) as u32;
+    let k_blocks = (k / BLOCK_K) as u32;
     let launch_once = |c: &mut DeviceBuffer<f32>| -> Result<(), Box<dyn Error>> {
         // SAFETY: both maps describe live buffers covering the walk the grid
-        // above takes, and `c` holds `n` columns for every row of it.
+        // above takes, and `c` holds `n` columns for every row of it. The
+        // stealing entries additionally take a grid of exactly one cluster per
+        // tile, which is what `grid_for` gives them.
         unsafe {
-            module.gemm_cg2(
-                &stream,
-                &launch,
-                a_map.as_ptr(),
-                b_map.as_ptr(),
-                tiles(m, n),
-                tiles_n,
-                (k / BLOCK_K) as u32,
-                n as u32,
-                c,
-            )?
+            match scheduler {
+                Scheduler::Static => module.gemm_cg2(
+                    &stream,
+                    &static_launch,
+                    a_map.as_ptr(),
+                    b_map.as_ptr(),
+                    tiles(m, n),
+                    tiles_n,
+                    k_blocks,
+                    n as u32,
+                    c,
+                )?,
+                Scheduler::Stealing => module.gemm_cg2_clc(
+                    &stream,
+                    &clc_launch,
+                    a_map.as_ptr(),
+                    b_map.as_ptr(),
+                    tiles_n,
+                    k_blocks,
+                    n as u32,
+                    c,
+                )?,
+                Scheduler::StealingSerial => module.gemm_cg2_clc_serial(
+                    &stream,
+                    &serial_launch,
+                    a_map.as_ptr(),
+                    b_map.as_ptr(),
+                    tiles_n,
+                    k_blocks,
+                    n as u32,
+                    c,
+                )?,
+            }
         };
         Ok(())
     };
@@ -760,6 +979,27 @@ pub(crate) fn check_c(
     Ok(())
 }
 
+/// A scheduler's own failure modes, named so a passing line says what it
+/// proved. All three are silent on the device and all three reach the host as
+/// a wrong `C`, which is why the exact comparison above is the only gate that
+/// sees them:
+///
+/// - a **dropped tile** — a steal that succeeded and was read as "no work
+///   left", so the cancelled cluster's item is computed by nobody. The
+///   `is_canceled` polarity is exactly this bug, and cuda-oxide's own module
+///   doc has the sense inverted against its function doc and its lowering.
+/// - a **tile computed twice**, which is only visible through the tile it
+///   displaces, since the epilogue stores rather than accumulates.
+/// - a **split pair** — #51 again, if the two CTAs of a cluster ever steal
+///   separately and land on different output tiles.
+///
+/// A deadlock is the fourth and reports itself.
+const SCHEDULERS: [Scheduler; 3] = [
+    Scheduler::Static,
+    Scheduler::Stealing,
+    Scheduler::StealingSerial,
+];
+
 /// The correctness run: two sizes, checked, nothing timed.
 ///
 /// The second one is [`ITEMS_M`]`x`[`ITEMS_N`], and it is here because the
@@ -770,21 +1010,109 @@ pub(crate) fn check_c(
 pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String, Box<dyn Error>> {
     let mut notes = Vec::new();
     for (m, n, k) in [(M, N, K), (ITEMS_M, ITEMS_N, ITEMS_K)] {
-        let (note, ()) = run(context, m, n, k, nothing_after)?;
-        let clusters = grid(m, n) / RANKS;
-        notes.push(format!(
-            "{note} ({} tiles over {clusters} clusters)",
-            tiles(m, n)
-        ));
+        for scheduler in SCHEDULERS {
+            let (note, ()) = run(context, m, n, k, scheduler, nothing_after)?;
+            let clusters = grid_for(scheduler, m, n) / RANKS;
+            notes.push(format!(
+                "{note} on {} ({} tiles over {clusters} clusters)",
+                scheduler.name(),
+                tiles(m, n)
+            ));
+        }
     }
     Ok(notes.join(", "))
 }
 
 /// The benchmark's entry point: the same check at `shape`, and then the same
 /// launch timed.
+///
+/// Still the static schedule, deliberately. This row is what a reader compares
+/// against every earlier run of this table, and moving it to a different
+/// scheduler in the same change that introduces one would make the comparison
+/// unreadable. [`compare`] is where the schedulers are put beside each other.
 pub fn bench(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     shape: Shape,
 ) -> Result<Timings, Box<dyn Error>> {
-    run(context, shape.m, shape.n, shape.k, time).map(|(_, timings)| timings)
+    run(context, shape.m, shape.n, shape.k, Scheduler::Static, time).map(|(_, timings)| timings)
+}
+
+/// Sizes the scheduler comparison runs at, which are the sizes the prediction
+/// varies across — 23% at 4096³ down to nothing at 16384³. The largest is here
+/// because a result of *zero* at it is the finding, and a sweep that stopped
+/// before the point where the static stride is already 99.7% efficient would
+/// be a sweep chosen to flatter this work.
+const COMPARE_SIZES: &[Shape] = &[
+    Shape {
+        m: 2048,
+        n: 2048,
+        k: 2048,
+    },
+    Shape {
+        m: 4096,
+        n: 4096,
+        k: 4096,
+    },
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 8192,
+    },
+    Shape {
+        m: 16384,
+        n: 16384,
+        k: 16384,
+    },
+];
+
+/// The three schedulers on one clock, with the ragged-wave prediction beside
+/// them — `cargo oxide run kittens-examples -- clc`.
+///
+/// The prediction column is computed from [`wave_efficiency`] and not fitted to
+/// anything, and it is printed *first* so the table is read as a test of a
+/// stated number rather than as a result looking for an explanation. Every size
+/// is checked against the CPU reference under every scheduler before it is
+/// timed, by the same entry point the rest of the harness uses.
+pub fn compare(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<(), Box<dyn Error>> {
+    println!(
+        "gemm schedulers — min ms over 30 timed launches, all three on one shared plan\n\
+         `predicted` is the ragged last wave the static grid idles through, which is the\n\
+         whole of what a dynamic schedule has to win back: 1 - tiles/(waves x {MAX_CLUSTERS})."
+    );
+    println!(
+        "{:<18}{:>7}{:>7}{:>10}{:>12}{:>11}{:>11}{:>13}{:>11}",
+        "shape",
+        "tiles",
+        "waves",
+        "wave eff",
+        "predicted",
+        "static ms",
+        "clc ms",
+        "clc-serial ms",
+        "measured"
+    );
+    for &shape in COMPARE_SIZES {
+        let Shape { m, n, k } = shape;
+        let (waves, efficiency) = wave_efficiency(m, n);
+        let mut milliseconds = Vec::new();
+        for scheduler in SCHEDULERS {
+            eprintln!("{shape} on {}: staging and checking", scheduler.name());
+            let (_, timings) = run(context, m, n, k, scheduler, time)?;
+            milliseconds.push(timings.min());
+        }
+        let (static_ms, clc_ms, serial_ms) = (milliseconds[0], milliseconds[1], milliseconds[2]);
+        println!(
+            "{:<18}{:>7}{:>7}{:>9.1}%{:>11.1}%{:>11.4}{:>11.4}{:>13.4}{:>10.1}%",
+            shape,
+            tiles(m, n),
+            waves,
+            100.0 * efficiency,
+            100.0 * (1.0 - efficiency),
+            static_ms,
+            clc_ms,
+            serial_ms,
+            100.0 * (1.0 - clc_ms / static_ms)
+        );
+    }
+    Ok(())
 }

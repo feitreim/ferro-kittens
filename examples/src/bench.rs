@@ -118,7 +118,9 @@ impl std::fmt::Display for Shape {
 pub struct Timings(Vec<f64>);
 
 impl Timings {
-    fn min(&self) -> f64 {
+    /// The headline. `pub` because [`gemm::compare`](crate::gemm::compare)
+    /// puts three schedulers' headlines in one row of its own table.
+    pub fn min(&self) -> f64 {
         self.0[0]
     }
 

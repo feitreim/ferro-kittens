@@ -71,11 +71,76 @@
 //! `#[cluster_launch]` kernel — it takes a block shape and no cluster — so the
 //! GEMM's came off a clock by bisection. `examples/README.md` §7 has the sweep
 //! and what it says about #78.
+//!
+//! # The schedule the hardware picks, and what it is actually worth
+//!
+//! [`run_stealing`] is the same loop over a different item source. Instead of a
+//! share decided before the kernel starts, a cluster runs the item it was
+//! launched for and then *steals* one from the clusters the scheduler has not
+//! launched yet — Blackwell's Cluster Launch Control, which is
+//! `clusterlaunchcontrol.try_cancel` and a 16-byte response delivered on an
+//! mbarrier. So the grid is one cluster per item, [`run_stealing`] takes no
+//! item count at all, and how many clusters are *resident* is a thing the
+//! hardware decides rather than a number this repo writes down.
+//!
+//! **What it is worth, stated before the argument for it.** The static stride's
+//! only loss is the ragged last wave, and at `MAX_CLUSTERS = 222` with the
+//! GEMM's `[256, 128]` tiles that is 23% at 4096³, 8% at 8192³ and **0.3% at
+//! 16384³**. At the sizes a peak-throughput claim would be made on, the static
+//! stride is already 99.7% efficient and there is nothing here to win. This is
+//! a fix for mid-sized problems and ragged tails and it is not a route to peak;
+//! a measurement showing nothing at 16384³ is the predicted result.
+//!
+//! **The reason to want it anyway is that it deletes the constants.** Picking a
+//! persistent grid needs `SMS` and `CTAS_PER_SM`, and #84 established that the
+//! second one is a *measured* property that no query in the table reports — so
+//! it cannot be derived at compile time and cannot be right on hardware nobody
+//! has run. `MAX_CLUSTERS` is what makes the scaffold B200-shaped. Under
+//! [`run_stealing`] the grid is the problem's own tile count, the residency is
+//! the scheduler's business, and both constants have nothing left to do.
+//!
+//! ## Why the steal has to be the cluster's and not the CTA's
+//!
+//! The request is `clusterlaunchcontrol.try_cancel…multicast::cluster::all`,
+//! and the multicast is not an optimization. A 2-CTA cluster whose halves each
+//! stole would put the pair on two different output tiles, which is #51's bug
+//! coming back through a new door — and silently, since both halves would still
+//! compute *something*. The multicast form writes one response into every CTA
+//! of the cluster and completes every CTA's copy of the barrier, so the next
+//! item is a fact the cluster agrees on by construction rather than by a
+//! rendezvous someone has to remember to write.
+//!
+//! ## The steal is prefetched, because it is allowed to be
+//!
+//! The response arrives on an mbarrier, so the request does not have to be
+//! anywhere near the point the answer is needed. [`run_stealing`] issues the
+//! request for the *next* item before the current item's `work` runs and
+//! harvests it after — the whole of a tile's K pipeline sits between the
+//! `try_cancel` and the wait, and a steal on the critical path never happens.
+//! `PREFETCH` is a const parameter rather than a hard-coded `true` so that the
+//! critical-path form is a thing that can be *run* rather than a claim: it is
+//! the same loop with the request moved next to the harvest, identical in
+//! barrier count, differing in exactly the one thing under test.
+//!
+//! ## What orders a read of the response against the next request
+//!
+//! Every thread reads the response, because every thread needs the item and a
+//! shared read is cheaper than a broadcast. That makes the buffer a thing many
+//! threads read and one thread overwrites, and the harvest is therefore placed
+//! *before* the item boundary that already exists rather than after it: the
+//! boundary that retires the item is also what says no thread is still reading
+//! the response the next request will land on. It costs no extra barrier.
 
+use cuda_device::barrier::Barrier;
 use cuda_device::barrier::fence_proxy_async_shared_cta;
+use cuda_device::clc::{
+    clc_query_get_first_ctaid_x, clc_query_is_canceled, clc_try_cancel_multicast,
+};
 use cuda_device::cluster;
 use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 use cuda_device::thread;
+
+use crate::sync::{Semaphore, TransactionBytes};
 
 /// One persistent kernel's work, split at the points the scaffold owns.
 /// Implementations are plain structs of tile/semaphore handles built once
@@ -171,6 +236,227 @@ pub unsafe fn run<J: Job>(job: &mut J, items: u32) {
         }
         if leader && initialized {
             job.inval();
+        }
+    }
+}
+
+/// The hardware's work queue, as the shared memory a cluster asks it through:
+/// the 16-byte `try_cancel` response and the mbarrier it is delivered on.
+///
+/// It is the caller's storage rather than the scaffold's for the same reason a
+/// [`Job`]'s barriers are — a kernel owns one shared plan and nothing else may
+/// carve out of it — and it must sit at the *same offset in every rank*, which
+/// the multicast response requires and a symmetric plan gives for free.
+#[derive(Clone, Copy)]
+pub struct ClcQueue {
+    response: *mut u64,
+    sem: Semaphore,
+}
+
+impl ClcQueue {
+    /// The response's size, which is the ISA's (`.b128`) and is also exactly
+    /// the transaction count its mbarrier is charged.
+    const RESPONSE_BYTES: usize = 16;
+    /// Shared bytes to reserve: the response, then the barrier under it.
+    pub const BYTES: usize = Self::RESPONSE_BYTES + 8;
+    /// The response is a 128-bit store, so the base is 16-byte aligned.
+    pub const ALIGNMENT: usize = 16;
+
+    /// Lay a queue over [`Self::BYTES`] of shared memory.
+    ///
+    /// # Safety
+    ///
+    /// `base` must point to [`Self::BYTES`] of shared memory aligned to
+    /// [`Self::ALIGNMENT`], used by nothing else for the kernel's duration, and
+    /// at the same offset in every CTA of the cluster.
+    #[inline(always)]
+    pub const unsafe fn attach(base: *mut u8) -> Self {
+        Self {
+            response: base as *mut u64,
+            sem: unsafe { Semaphore::attach(base.add(Self::RESPONSE_BYTES) as *mut Barrier) },
+        }
+    }
+
+    /// Arm this CTA's copy of the response barrier. One thread per CTA, once,
+    /// before any rank issues a request.
+    ///
+    /// # Safety
+    ///
+    /// As [`Semaphore::init`].
+    #[inline(always)]
+    unsafe fn arm(self) {
+        unsafe { self.sem.init(1) }
+    }
+
+    /// Retire it.
+    ///
+    /// # Safety
+    ///
+    /// As [`Semaphore::inval`], with no request outstanding.
+    #[inline(always)]
+    unsafe fn disarm(self) {
+        unsafe { self.sem.inval() }
+    }
+
+    /// Charge this CTA's barrier for the response it is about to be sent. One
+    /// thread per CTA, per request — including the ranks that do not issue,
+    /// because a multicast response completes transactions on *every* rank's
+    /// copy and `expect_tx` is `.shared::cta`, so no rank can charge another's.
+    ///
+    /// Nothing orders this against [`Self::issue`] and nothing has to: an
+    /// mbarrier's transaction count is a signed accumulator, so a response that
+    /// lands before the charge that expects it leaves the same total.
+    ///
+    /// # Safety
+    ///
+    /// As [`Semaphore::expect_tx`]; exactly one charge per request, and the
+    /// request must actually be issued or this barrier never completes.
+    #[inline(always)]
+    unsafe fn charge(self) {
+        unsafe {
+            self.sem
+                .expect_tx(TransactionBytes::new(Self::RESPONSE_BYTES))
+        }
+    }
+
+    /// Ask the hardware to cancel a cluster the scheduler has not launched yet.
+    /// **One thread of the whole cluster**, after every rank has charged.
+    ///
+    /// # Safety
+    ///
+    /// The kernel must be a cluster launch on sm_100a, every rank must hold
+    /// this queue at the same shared offset, and no request may be outstanding.
+    #[inline(always)]
+    unsafe fn issue(self) {
+        unsafe { clc_try_cancel_multicast(self.response as *mut u8, self.sem.raw()) }
+    }
+
+    /// Wait out the outstanding request and decode it: the item a cancelled
+    /// cluster would have run, or `None` when there was nothing left to cancel
+    /// and this cluster is done.
+    ///
+    /// Every thread of every rank calls it and every one gets the same answer,
+    /// which is what the multicast is for. The item is the *cluster* index
+    /// behind the CTA coordinate the response names — the same map
+    /// [`cluster::cluster_idx`] gives, read back off the grid.
+    ///
+    /// # Safety
+    ///
+    /// A request must be outstanding, `parity` must follow the barrier's phase,
+    /// and the grid must be one-dimensional — the response is a CTA coordinate
+    /// and only a 1-D grid makes `ctaid.x` the whole of it.
+    #[inline(always)]
+    unsafe fn harvest(self, parity: u32) -> Option<u32> {
+        unsafe {
+            self.sem.wait(parity);
+            // Written by the async proxy and read generically; the barrier
+            // phase is what makes it visible, and `read_volatile` is what stops
+            // the two halves being hoisted across the request that refills them.
+            let (low, high) = (
+                self.response.read_volatile(),
+                self.response.add(1).read_volatile(),
+            );
+            if clc_query_is_canceled(low, high) == 0 {
+                None
+            } else {
+                Some(clc_query_get_first_ctaid_x(low, high) / cluster::cluster_nctaidX())
+            }
+        }
+    }
+}
+
+/// Run `job` over the grid's own items, taking the first from this cluster's
+/// launch position and every one after it from the hardware's pending queue.
+///
+/// There is no item count: the grid **is** the item count, one cluster per
+/// item, and a cluster that gets no steal ran exactly the one it was launched
+/// for. That is the whole of how this deletes a tuning constant — nothing here
+/// needs to know how many clusters the device holds, because the ones it does
+/// not hold are the ones that get stolen.
+///
+/// `PREFETCH` says where the request sits. `true` issues the next item's
+/// request before the current item's `work` and harvests it after, so the
+/// steal's latency hides behind a whole tile of pipeline; `false` issues and
+/// harvests together at the item boundary, which is the same schedule with the
+/// steal on the critical path and exists to be measured against.
+///
+/// # Safety
+///
+/// Everything [`run`] requires, and four things it does not:
+///
+/// - **The grid is exactly one cluster per work item**, one-dimensional. A
+///   cluster past the last item would run it, and a response naming a CTA in a
+///   `y` or `z` the item map cannot see would decode to the wrong item.
+/// - **[`Job::RANKS`] is the launch's cluster size.** Unlike [`run`], this is
+///   not free: the response is multicast to every CTA of the cluster and read
+///   by every thread of it, so the boundary that separates those reads from the
+///   next request has to cover the same set. A `RANKS == 1` job under a
+///   multi-CTA cluster launch would take a `bar.sync` there and race.
+/// - **`queue` is live, exclusive, and at the same offset in every rank**, per
+///   [`ClcQueue::attach`].
+/// - **The device is sm_100a and the launch is a cluster launch**, which
+///   `clusterlaunchcontrol` requires and nothing here can check.
+#[inline(always)]
+pub unsafe fn run_stealing<J: Job, const PREFETCH: bool>(job: &mut J, queue: ClcQueue) {
+    unsafe {
+        let leader = thread::threadIdx_x() == 0;
+        let issuer = leader && cluster::block_rank() == 0;
+        let mut item = cluster::cluster_idx();
+        let mut parity = 0u32;
+
+        if leader {
+            queue.arm();
+        }
+        // Every rank's barrier has to be armed before any rank asks the
+        // hardware to complete transactions on it.
+        boundary::<J>();
+        if PREFETCH {
+            if leader {
+                queue.charge();
+            }
+            if issuer {
+                queue.issue();
+            }
+        }
+
+        loop {
+            if leader {
+                job.init(item);
+                fence_proxy_async_shared_cta();
+            }
+            boundary::<J>();
+            job.work(item);
+            tcgen05_fence_before_thread_sync();
+            if !PREFETCH {
+                if leader {
+                    queue.charge();
+                }
+                if issuer {
+                    queue.issue();
+                }
+            }
+            // Harvested before the boundary, so the boundary that retires the
+            // item is also what says every reader is done with the response.
+            let stolen = queue.harvest(parity);
+            parity ^= 1;
+            boundary::<J>();
+            if leader {
+                job.inval();
+            }
+            let Some(next) = stolen else { break };
+            item = next;
+            if PREFETCH {
+                if leader {
+                    queue.charge();
+                }
+                if issuer {
+                    queue.issue();
+                }
+            }
+        }
+
+        if leader {
+            queue.disarm();
         }
     }
 }

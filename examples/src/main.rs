@@ -246,6 +246,25 @@ fn main() -> ExitCode {
         return bench::main();
     }
 
+    // `cargo oxide run kittens-examples -- clc` (#88): the GEMM's three item
+    // sources on one clock, with the ragged-wave prediction beside them. Its
+    // own argument rather than a row of `bench`, because it times one kernel
+    // three ways and its sizes are chosen by what the prediction does across
+    // them rather than by what crosses a regime.
+    if std::env::args().nth(1).as_deref() == Some("clc") {
+        let Ok(context) = cuda_core::CudaContext::new(0) else {
+            println!("clc needs a CUDA device");
+            return ExitCode::FAILURE;
+        };
+        return match gemm::compare(&context) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     println!(
         "{:<16}{:<38}{:>8}{:>14}",
         "kernel", "status", "threads", "shared"
