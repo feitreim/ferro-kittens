@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use cuda_core::{CudaContext, CudaStream};
 
-use crate::{gemm, softmax};
+use crate::{gemm, layernorm, softmax};
 
 /// Launches discarded before timing begins. The first pays module load and the
 /// first launch of a given shape pays the driver's own setup for it; neither is
@@ -254,6 +254,46 @@ const SOFTMAX_SIZES: &[Shape] = &[
     },
 ];
 
+/// Sizes for `layernorm`, as `rows x columns`. It has no plane coordinate — a
+/// CTA takes its whole position from `blockIdx.x` — so the rows carry what
+/// `softmax`'s rows and planes carry together, and they are deliberately twice
+/// `SOFTMAX_SIZES`' so the two sweeps land on the *same block counts* and the
+/// same bytes moved. A row of this table and the row above it are comparable
+/// numbers, which is the point: the two kernels differ in their band and in
+/// two parameter vectors, and nothing else.
+const LAYERNORM_SIZES: &[Shape] = &[
+    Shape {
+        m: 256,
+        n: 128,
+        k: 1,
+    },
+    Shape {
+        m: 1024,
+        n: 128,
+        k: 1,
+    },
+    Shape {
+        m: 8192,
+        n: 128,
+        k: 1,
+    },
+    Shape {
+        m: 65536,
+        n: 128,
+        k: 1,
+    },
+    Shape {
+        m: 524288,
+        n: 128,
+        k: 1,
+    },
+    Shape {
+        m: 1048576,
+        n: 128,
+        k: 1,
+    },
+];
+
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -275,20 +315,25 @@ fn cases() -> Vec<Case> {
             blocks: |shape| softmax::grid(shape.m, shape.k),
             bench: softmax::bench,
         },
+        Case {
+            name: "layernorm",
+            bound: Bound::Memory,
+            // Every element is read once and written once, both as bf16. The
+            // two parameter vectors are `2 * COLUMNS` elements per CTA against
+            // `ROWS * COLUMNS` of activations — under 2% and not counted, which
+            // is the honest direction to round a denominator.
+            work: |shape| 2.0 * 2.0 * (shape.m * shape.n) as f64,
+            sizes: LAYERNORM_SIZES,
+            blocks: |shape| layernorm::grid(shape.m),
+            bench: layernorm::bench,
+        },
     ]
 }
 
-/// Examples with no row above, and why. Both compile and neither has a
-/// launcher or a CPU reference, and there is no path through this file that
-/// times a launch it did not first check — so the missing reference is what
-/// keeps them out, not their speed.
-const SKIPPED: &[(&str, &str)] = &[
-    (
-        "layernorm",
-        "no launcher yet — would report GB/s, memory-bound like softmax",
-    ),
-    ("flash_forward", "no launcher yet — would report TFLOP/s"),
-];
+/// Examples with no row above, and why. There is no path through this file
+/// that times a launch it did not first check — so a missing reference is what
+/// keeps one out, not its speed.
+const SKIPPED: &[(&str, &str)] = &[("flash_forward", "no launcher yet — would report TFLOP/s")];
 
 fn report(context: &Arc<CudaContext>, case: &Case) -> usize {
     let bound = case.bound;
