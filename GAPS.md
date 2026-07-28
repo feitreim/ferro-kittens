@@ -48,10 +48,11 @@ signature. **~150 lines + a mechanical sweep.**
 `Element` now carries the byte width, the fp32 → element pack, and (via
 `MmaElement`) the tcgen05 operand kind, so shape math, `ldst`'s pack, and
 `mma`'s bounds are all generic — but `Bf16` is still the only impl (issue #2
-did the trait work; #16 adds fp8). Two bf16 facts remain hardcoded behind
-asserts rather than guessed at: `mma` still calls the kind-specialized
-`tcgen05_mma_f16` instead of the `KIND`-generic intrinsic (#12), and its K=16
-chunk geometry assumes 32 bytes per chunk. FP8 is the consequential one: it
+did the trait work; #16 adds fp8). One bf16 fact remains hardcoded behind an
+assert rather than guessed at: `mma`'s K=16 chunk geometry assumes 32 bytes
+per chunk. The *instruction* left that list with #12 — the walks issue through
+`MmaElement::mma`, which routes tcgen05's `KIND` off the element. FP8 is the
+consequential one: it
 changes the swizzle atom's element count, needs a store path whose `stmatrix`
 form matches 4-per-word packing, and adds block-scale operands (see 3.3).
 
@@ -211,20 +212,54 @@ shuffle pattern than the one `quad_*` uses. #5 added the destination type
 (`ColVec`) and the layout half (`ColLayout`) a column reduce would fill; what is
 left is the strided shuffle across the 8 lanes of a column group.
 
-### 3.3 MMA shape and dtype coverage
+### 3.3 MMA shape and dtype coverage — shapes done (#12), dtypes not
 
 TK's tcgen05 layer: `{mm, mma} × {AB, ABt, AtB, AtBt} × {1-CTA, 2-CTA}` = 16
 entry points, generic over element type, plus `load_mxnv_scale_async` for
 block-scaled MXFP.
 
-We have `mma_abt`, `mma_ab` (single-CTA) and `mma_walk_cg2` (2-CTA, runtime
-K-major/MN-major via `OperandWalk`).
+The operand-order square is closed: `mma_abt`, `mma_ab`, `mma_atb`, `mma_atbt`
+(single-CTA) and `mma_walk_cg2` (2-CTA, runtime K-major/MN-major via
+`OperandWalk`), each with an `mm_*` twin that starts the accumulator fresh
+rather than taking a `bool` — so a call site whose choice is static states it
+in the entry point and only gemm's genuinely runtime `k > 0` still threads an
+argument. The instruction is `KIND`-generic now too: the walks issue through
+`MmaElement::mma`/`mma_cg2`, which each impl writes as
+`tcgen05_mma_shared::<{ Self::MMA_KIND }, ..>`, so fp8 is an `Element` impl
+and not a second MMA layer. It has to be a *method*: an associated const of a
+type parameter is not a legal const-generic argument without
+`generic_const_exprs`.
 
-Missing: `AtB`/`AtBt` walks; the `mm` (zero-initializing) variants as distinct
-entry points — we thread `enable_d` by hand, which is the same instruction but
-puts the accumulator-init invariant on the caller; FP8/FP4 operands; MXFP scale
-loading. Adding `AtB`/`AtBt` is mostly descriptor transpose-bit work in the same
-walk skeleton. **~80 lines for the missing walks.**
+**The estimate was low.** The two walks are 70 lines with their docs, near
+enough the ~80 above — but the walks were never the work. Nothing calls them,
+and an unused walk that is wrong is worse than an absent one, so the case that
+had to be built first was the one that could tell them apart:
+`device-tests`' five `mma A·Bᵀ` … `mma transpose control` cases, ~420 lines,
+which run all four orders over one pair of logical matrices staged four ways
+and require the same product from each. `walk blind spots` is the sixth and
+runs on the host: it removes each of the 64 K planes in turn, permutes the K
+chunks four ways, and confuses the two stacked MN subtiles five ways, and
+fails if the reference cannot see any of it — the standing answer to #48, whose
+`depth * 5 % 5` was identically zero. `mma transpose control` is #55's shape:
+the same operands under `mma_abt`, required to *disagree*, so the transposed
+cases prove their transpose bits and not merely that some walk multiplies.
+Total: **70 lines of walks, ~420 of harness.**
+
+Two things that fell out of building it. The MN-major operand has *two*
+descriptor spellings in this crate and both are right: `mma_ab` bands 64 wide
+with a 16-byte leading offset, and the new walks cover a 128-wide MN in one
+instruction with the leading offset set to `SUBTILE_BYTES` — the second
+subtile is reached through the descriptor, never by a step along the row. And
+`tcgen05_mma_f16` and `tcgen05_mma_shared::<0, 1, 0>` do **not** lower to the
+same PTX at the pinned revision, though they are semantically the same
+instruction: the f16 wrapper emits the `.disable_output_lane` form with an
+all-zero mask (four `mov.u32` of zero), the generic one emits
+`.collector::a::discard` and no mask.
+
+Still missing: FP8/FP4 operands (#16) and MXFP scale loading — both dtype
+work, not shape work. `tcgen05_mma_sp_*` (sparse), `tcgen05_mma_ws_*`
+(weight-stationary) and `tcgen05_shift_down` remain available upstream and
+unused.
 
 ### 3.4 Tile-shape utilities
 
@@ -290,18 +325,19 @@ Missing from `prototype/`:
   tests (`cargo test --features host`), all of them pure coordinate and pointer
   math — they prove the crate is self-consistent, not that it agrees with
   silicon.
-- **Device tests cover five paths.** `device-tests/` (a separate kernel crate,
+- **Device tests cover six paths.** `device-tests/` (a separate kernel crate,
   run on a B200 through `modal_app.py`) checks the SWIZZLE_128B round trip
   against the TMA engine, `BaseLdtm`'s fragment ownership map against a
   position-encoding MMA at all three layout shapes, the `stmatrix` store path,
   STTM — as a register round trip through TMEM, and by restaging a probed
-  accumulator into a second column band and re-draining it — and `load_rows`,
-  the one case whose source reaches registers with no descriptor between them.
-  The matching *store* is checked by `examples/gemm.rs` instead, whose whole
-  epilogue is one `store_rows` compared elementwise against an exact CPU
-  reference. Everything else — the phase-parity rules, the pipeline scaffold,
-  the cluster/multicast paths, the MMA walks beyond the single `M128_N64` the
-  probe issues — is still verified only by downstream kernels being numerically
+  accumulator into a second column band and re-draining it — `load_rows`,
+  the one case whose source reaches registers with no descriptor between them,
+  and (#12) all four MMA operand orders against one product, with a host-side
+  blind-spot sweep and an untransposed control. The matching global *store* is
+  checked by `examples/gemm.rs` instead, whose whole epilogue is one
+  `store_rows` compared elementwise against an exact CPU reference. Everything
+  else — the phase-parity rules, the pipeline scaffold, the cluster/multicast
+  paths — is still verified only by downstream kernels being numerically
   correct.
 - **No CI.** Nothing runs `cargo check` on the device surface automatically, let
   alone `--features host` on a CUDA box or the device tests on a GPU.
@@ -342,7 +378,7 @@ they change signatures across the crate and get expensive to retrofit.
 | 9 | TMA store path | 2.3 |
 | 10 | Register to TMEM (STTM) | 2.1 |
 | 11 | Direct global ↔ register load/store | 2.2 |
-| 12 | MMA: `AtB`/`AtBt` walks, `mm` entry points, generic `KIND` routing | 3.3 |
+| 12 | MMA: `AtB`/`AtBt` walks, `mm` entry points, generic `KIND` routing — done | 3.3 |
 | 13 | Shared vectors, and ops on shared tiles | 1.4 |
 | 14 | Swizzle modes: 32B, 64B, unswizzled | 1.3 |
 | 15 | `lcsf` and the rest of the prototype layer | 4 |

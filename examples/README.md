@@ -481,6 +481,18 @@ only the element type, which is #2 and is ~15 lines.
 covered every multiply in all four kernels. Worth recording as a negative
 result: the MMA layer is the part of this library that is finished.
 
+That negative result is what shaped #12 when it landed. Nothing here wanted
+`AtB`/`AtBt`, so nothing here would have caught them being wrong, and an
+unused walk that is wrong is worse than an absent one. The work is therefore
+mostly *harness*: `device-tests` now runs all four operand orders over one
+pair of logical matrices staged four ways, with a host blind-spot sweep that
+fails if the reference cannot see a dropped K plane, a permuted chunk or a
+confused MN subtile, and an untransposed control required to disagree. The
+one thing this file's kernels did ask for is the `mm_*` half: `flash_forward`
+passed `false` twice for "start this band fresh", and that is now
+`mm_abt`/`mm_ab` — the invariant in the entry point instead of in an
+argument.
+
 ---
 
 ### Came from writing kernels, not from ThunderKittens' feature list
@@ -668,10 +680,14 @@ library is already at that bar:
   multiply in four kernels, in the layouts they wanted, with no gaps. Each
   builds its own instruction descriptor from the walk it issues and the
   operand element, so a kernel names only its accumulator band's `MmaShape`
-  and cannot pair a walk with transpose bits that disagree (#30). The one
-  field still stated by a caller is `mma_walk_cg2`'s element
-  (`mma_walk_cg2::<Bf16, CHUNKS>`) — an `OperandWalk` has erased it, and #12
-  owns whether the walk carries it back.
+  and cannot pair a walk with transpose bits that disagree (#30). #12 has
+  since closed the operand-order square (`mma_atb`, `mma_atbt`) and given
+  every walk an `mm_*` twin that starts the accumulator fresh, which is the
+  form both of `flash_forward`'s MMAs now take. The one field still stated by
+  a caller is `mma_walk_cg2`'s element (`mma_walk_cg2::<Bf16, CHUNKS>`), and
+  it stays that way: since #12 the element routes tcgen05's `KIND` as well as
+  the operand format, so a walk that carried its element back would stop being
+  layout-only.
 - **TMEM segment carving.** Flash splits one allocation into its `[128, 64]`
   scores and `[128, 128]` output with `TmemTile::split_columns`, so no kernel
   here adds a column offset to a bare TMEM address (#28).

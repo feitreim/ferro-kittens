@@ -27,7 +27,7 @@
 
 use core::marker::PhantomData;
 
-use cuda_device::tcgen05::{Tcgen05ElementType, cvt_f32x2_bf16x2};
+use cuda_device::tcgen05::{Tcgen05ElementType, cvt_f32x2_bf16x2, tcgen05_mma_shared};
 use cuda_device::tma::{
     TmaDescriptor, cp_async_bulk_commit_group, cp_async_bulk_tensor_1d_g2s,
     cp_async_bulk_tensor_1d_s2g, cp_async_bulk_tensor_2d_g2s,
@@ -100,16 +100,33 @@ pub trait Element {
     unsafe fn write(at: *mut u8, value: f32);
 }
 
+/// `collector::a::discard` — the `COLLECTOR_A` selector every walk here
+/// issues under, and tcgen05's own default: nothing in this crate reuses an
+/// `A` operand across instructions, so no chain has a collector buffer to
+/// keep alive.
+const COLLECTOR_DISCARD: u32 = 0;
+
 /// Element types a tcgen05 MMA accepts as an operand.
 ///
 /// Split from [`Element`] because operand kind is an MMA property and a tile
 /// that only moves bytes never reaches an MMA — the same split, for the same
 /// reason, as [`crate::reg::RowLayout`] out of [`crate::reg::FragmentLayout`].
+///
+/// The element is also where the *instruction* is selected, not just the
+/// operand format: [`Self::mma`] and [`Self::mma_cg2`] are the whole of
+/// [`crate::mma`]'s routing to silicon (#12). That is deliberate — it is what
+/// makes a new operand type a new impl of this trait rather than a new MMA
+/// layer — and it is why the routing is a *method* and not
+/// `tcgen05_mma_shared::<{ Self::MMA_KIND }, ..>` at the call site: Rust
+/// cannot pass an associated const of a type *parameter* as a const-generic
+/// argument without `generic_const_exprs`. An impl writing `Self::MMA_KIND`
+/// for itself is legal and is what keeps the const and the instruction from
+/// drifting apart.
 pub trait MmaElement: Element {
     /// The operand kind tcgen05's `KIND` const selects: 0 = f16, 1 = tf32,
     /// 2 = f8f6f4, 3 = i8. A `u32` to match the const-generic parameter of
-    /// `tcgen05_mma_shared`/`tcgen05_mma_tensor` exactly, so wiring it up
-    /// (#12) is a substitution and not a cast.
+    /// `tcgen05_mma_shared`/`tcgen05_mma_tensor` exactly, so an impl's
+    /// [`Self::mma`] is a substitution and not a cast.
     const MMA_KIND: u32;
 
     /// The instruction descriptor's `atype`/`btype` field, which settles the
@@ -118,6 +135,29 @@ pub trait MmaElement: Element {
     /// wrong one produces a full accumulator of wrong numbers, so it belongs
     /// to the element rather than to whoever assembles the descriptor.
     const ELEMENT_TYPE: Tcgen05ElementType;
+
+    /// One `cta_group::1` MMA of this element's kind: accumulate
+    /// `a_desc · b_desc` into the TMEM accumulator at `tmem` under
+    /// `instruction`, adding to what is already there when `enable_d`.
+    ///
+    /// # Safety
+    ///
+    /// Exactly one thread issues this. `tmem` must name an allocation the
+    /// instruction descriptor's shape fits, both operand descriptors must
+    /// describe committed shared memory of `Self`, and the descriptor's
+    /// `atype`/`btype` must be [`Self::ELEMENT_TYPE`] — reading the bytes
+    /// under another element's format faults nothing and computes garbage.
+    unsafe fn mma(tmem: u32, a_desc: u64, b_desc: u64, instruction: u32, enable_d: bool);
+
+    /// [`Self::mma`] under `cta_group::2`: one instruction from the leader
+    /// CTA drives the pair's shared accumulator, each CTA supplying its own
+    /// operand halves at the same shared offsets.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::mma`], from the leader CTA's issuing thread only, with the
+    /// cluster's peer holding its halves at those offsets.
+    unsafe fn mma_cg2(tmem: u32, a_desc: u64, b_desc: u64, instruction: u32, enable_d: bool);
 }
 
 /// bf16 — the only staged-operand element the tcgen05 kernels use.
@@ -164,6 +204,32 @@ impl MmaElement for Bf16 {
     /// instruction descriptor's element-type field, not by `KIND`.
     const MMA_KIND: u32 = 0;
     const ELEMENT_TYPE: Tcgen05ElementType = Tcgen05ElementType::BF16;
+
+    #[inline(always)]
+    unsafe fn mma(tmem: u32, a_desc: u64, b_desc: u64, instruction: u32, enable_d: bool) {
+        unsafe {
+            tcgen05_mma_shared::<{ Self::MMA_KIND }, 1, COLLECTOR_DISCARD>(
+                tmem,
+                a_desc,
+                b_desc,
+                instruction,
+                enable_d,
+            )
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn mma_cg2(tmem: u32, a_desc: u64, b_desc: u64, instruction: u32, enable_d: bool) {
+        unsafe {
+            tcgen05_mma_shared::<{ Self::MMA_KIND }, 2, COLLECTOR_DISCARD>(
+                tmem,
+                a_desc,
+                b_desc,
+                instruction,
+                enable_d,
+            )
+        }
+    }
 }
 
 /// Swizzle mode marker. Only `SWIZZLE_128B` is implemented: it is the only

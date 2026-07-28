@@ -34,8 +34,11 @@
 //!
 //! ## What already works
 //!
-//! Everything structural. [`mma_abt`] and [`mma_ab`] are exactly the two MMAs
-//! this kernel issues, in the layouts it issues them; the semaphore protocol,
+//! Everything structural. [`mm_abt`] and [`mm_ab`] are exactly the two MMAs
+//! this kernel issues, in the layouts it issues them — and, since #12, in the
+//! *accumulator discipline* it issues them under: both start a band fresh,
+//! which is now the entry point's name rather than an argument this file has
+//! to get right. The semaphore protocol,
 //! the swizzled `P` staging tile, and [`online_rescale`] — the fused
 //! running-max correction, the one genuinely subtle piece of flash — are all
 //! first-class. And the whole register-side body — drain, mask, scale,
@@ -51,7 +54,7 @@ use cuda_device::{DisjointSlice, cuda_module, kernel, thread, warp};
 
 use kittens::global::{GlobalRows, store_rows};
 use kittens::ldst::store_tile;
-use kittens::mma::{MmaShape, commit, mma_ab, mma_abt};
+use kittens::mma::{MmaShape, commit, mm_ab, mm_abt};
 use kittens::reg::{BaseLdtm, RegTile, RegVec, online_rescale};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
@@ -155,9 +158,9 @@ pub mod kernels {
                 q_loaded.expect_tx(QTile::BYTES as u32);
             }
 
-            // Only the accumulator bands' shapes: `mma_abt`/`mma_ab` each
-            // carry the transpose configuration their own walk reads under,
-            // and the element comes from the tiles.
+            // Only the accumulator bands' shapes: `mm_abt`/`mm_ab` each carry
+            // the transpose configuration their own walk reads under, and the
+            // element comes from the tiles.
             let score_shape = MmaShape::M128_N64;
             let output_shape = MmaShape::M128_N128;
 
@@ -185,7 +188,7 @@ pub mod kernels {
                 thread::sync_threads();
 
                 if leader {
-                    mma_abt(scores.raw(), q, k_ring.tile(block), score_shape, false);
+                    mm_abt(scores.raw(), q, k_ring.tile(block), score_shape);
                     commit(scored);
                 }
                 scored.wait(block & 1);
@@ -216,9 +219,11 @@ pub mod kernels {
                 thread::sync_threads();
 
                 if leader {
-                    // `accumulate` is false: the running output lives in
-                    // registers, so TMEM only ever holds this block's `P·V`.
-                    mma_ab(output.raw(), p, v_ring.tile(block), output_shape, false);
+                    // `mm` and not `mma` (#12): the running output lives in
+                    // registers, so TMEM only ever holds this block's `P·V`,
+                    // and that is now a fact about which entry point this
+                    // calls rather than a `false` a reader has to check.
+                    mm_ab(output.raw(), p, v_ring.tile(block), output_shape);
                     commit(accumulated);
                 }
                 accumulated.wait(block & 1);
