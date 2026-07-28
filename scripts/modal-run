@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""`modal run` under a watchdog, because a wedged container looks like a slow one.
+
+`modal_app.py`'s `timeout=` is a ceiling on the *function*. It is not a ceiling
+on getting to the function: a container can print the NVIDIA banner, never reach
+Python, and sit there. One did, for twenty-six minutes, holding a B200 and
+compiling nothing, and from the outside it was indistinguishable from a cold
+build. Nothing inside `modal_app.py` can catch that -- `_run`'s first act is a
+`print`, and that print never happened -- so the guard has to live in the only
+process still awake, which is this one.
+
+The tell is cheap and it is what this script watches: a healthy run emits our
+own `$ <command>` line within a few minutes of the banner. Silence past that is
+a wedge, not a slow start, and the answer is to stop the app rather than let it
+ride the timeout.
+
+    scripts/modal-run device_tests
+    scripts/modal-run bench --case gemm-depth
+
+Exit codes: the run's own on a clean finish, 2 on the workspace spend limit,
+3 on a wedge this script stopped.
+"""
+
+import os
+import queue
+import re
+import subprocess
+import sys
+import threading
+import time
+
+# How long a container may take to reach our first `print`. Image pull and
+# container start live in here, so it is generous on purpose -- this is aimed at
+# a hang, not at a slow morning.
+#
+# Both are overridable so the guard can be *seen to fire* against a stub that
+# hangs on purpose, rather than trusted because it reads correctly. A check
+# nobody has watched fail is not a check.
+STARTUP_GRACE = int(os.environ.get("MODAL_RUN_STARTUP_GRACE", 300))
+# How long a started run may say nothing. `bench` is quiet across a 16384^3
+# sweep, so this is well above any real gap between lines.
+SILENCE_GRACE = int(os.environ.get("MODAL_RUN_SILENCE_GRACE", 1200))
+
+APP_ID = re.compile(r"\bap-[A-Za-z0-9]{18,}\b")
+# `_run` prints this before every command; it is the first thing our own code
+# emits and so the first evidence that Python is alive in there.
+OURS = re.compile(r"^\$ |^Compiling |^\s+Compiling ")
+SPEND_LIMIT = "exceeded its spend limit"
+
+
+def stream(pipe, into):
+    for line in pipe:
+        into.put(line)
+    into.put(None)
+
+
+def main(argv):
+    if not argv:
+        sys.exit(f"usage: {sys.argv[0]} <entry-point> [args...]")
+    entry, *rest = argv
+    cmd = ["modal", "run", f"modal_app.py::{entry}", *rest]
+    print(f"$ {' '.join(cmd)}", flush=True)
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+    lines = queue.Queue()
+    threading.Thread(target=stream, args=(proc.stdout, lines), daemon=True).start()
+
+    app, alive, spent = None, False, False
+    last = time.monotonic()
+    while True:
+        # The deadline is the startup one until our own output proves the
+        # container got somewhere, and the silence one after.
+        grace = SILENCE_GRACE if alive else STARTUP_GRACE
+        try:
+            line = lines.get(timeout=max(1.0, grace - (time.monotonic() - last)))
+        except queue.Empty:
+            return wedged(proc, app, alive, grace)
+        if line is None:
+            break
+        print(line, end="", flush=True)
+        last = time.monotonic()
+        alive = alive or bool(OURS.match(line))
+        spent = spent or SPEND_LIMIT in line
+        app = app or next(iter(APP_ID.findall(line)), None)
+
+    code = proc.wait()
+    if spent:
+        print(
+            "\n!! the workspace spend limit is exhausted -- this is not your diff.\n"
+            "   Every Modal entry point fails at once and the `build` gate goes red\n"
+            "   in seconds. Raise the limit, then re-run; do not retry in a loop.",
+            file=sys.stderr,
+        )
+        return 2
+    return code
+
+
+def wedged(proc, app, alive, grace):
+    stage = "said nothing for" if alive else "never reached Python in"
+    print(
+        f"\n!! wedged: the run {stage} {grace}s. Stopping it rather than paying\n"
+        f"   out the function timeout.",
+        file=sys.stderr,
+    )
+    proc.kill()
+    if app:
+        # Killing the client does not reliably stop the container, and the
+        # container is the thing being billed.
+        subprocess.run(["modal", "app", "stop", "-y", app], check=False)
+        print(f"   stopped {app}", file=sys.stderr)
+    else:
+        print(
+            "   could not find an app id in the output -- check `modal app list`\n"
+            "   for a live ferro-kittens app and stop it by hand.",
+            file=sys.stderr,
+        )
+    return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

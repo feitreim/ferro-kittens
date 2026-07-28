@@ -32,6 +32,7 @@ Local usage:
 
 import re
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -199,12 +200,35 @@ EXAMPLES_DIR = f"{PROJECT_DIR}/examples"
 STUB_ENV = ["env", "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs"]
 
 
+# Every GPU entry point carried `timeout=5400` -- ninety minutes, uniform
+# across six functions doing very different amounts of work, and derived from
+# nothing. That ceiling is what a wedged container rides to the end, and a
+# wedged container is indistinguishable from a slow one from the outside: one
+# died after twenty-six minutes having printed fifteen lines of NVIDIA banner
+# and never reached Python, billed at B200 rates the whole way.
+#
+# These are sized from what the runs take, and the elapsed line `_run` prints
+# is the evidence for tightening them further. `build` is 155-221 s over ten
+# CI runs warm, ~7.5 min cold since #93 gave it a whole CPU.
+CHECKING = 900  # compile and lint, no launches: `build`, `regcount`
+RUNNING = 1200  # compile and a short harness: `device_tests`, `examples`
+SWEEPING = 2700  # 16384^3 launched dozens of times: `bench` and the profiles
+ASKING = 300  # one driver query, nothing built: `doctor`
+
+
 def _run(cmd: list[str], cwd: str) -> None:
     print(f"$ {' '.join(cmd)}  (cwd={cwd})", flush=True)
-    subprocess.run(cmd, cwd=cwd, check=True)
+    start = time.monotonic()
+    try:
+        subprocess.run(cmd, cwd=cwd, check=True)
+    finally:
+        # Printed on the failure path too -- a step that ran for nineteen of a
+        # twenty-minute budget and a step that died on contact are different
+        # diagnoses, and the exception alone does not distinguish them.
+        print(f"  ({time.monotonic() - start:.1f}s)", flush=True)
 
 
-@app.function(cpu=8, timeout=1800)
+@app.function(cpu=8, timeout=CHECKING)
 def build() -> None:
     """Everything that does not need a GPU: the library's host surface (which
     cannot be checked off a CUDA box, `global.rs` needs cuda.h) and a full
@@ -275,14 +299,14 @@ def build() -> None:
 # compiler** -- the worst ratio in this file, and paid on the two gates every
 # change runs. `bench`, `ladder_bench` and `profile` already say it; these two
 # were simply missed.
-@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=5400)
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=RUNNING)
 def device_tests() -> None:
     """The harness itself. One binary, every case, non-zero exit on failure."""
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
     _run(["cargo", "oxide", "run", "device-tests"], cwd=HARNESS_DIR)
 
 
-@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=5400)
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=RUNNING)
 def examples() -> None:
     """The examples crate's own launchers. Prints the status table, then runs
     every kernel that has one against its CPU reference; non-zero on a wrong
@@ -295,7 +319,7 @@ def examples() -> None:
 # 5400 rather than 1800 since #86 put 16384^3 in the sweep: the *device* work is
 # eight milliseconds a launch, but staging it is 268 million host-side operand
 # values per matrix and the exact check compares 268 million elements of `C`.
-@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=5400)
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
 def bench(case: str = "", m: int = 0, n: int = 0, k: int = 0) -> None:
     """The same kernels, timed at several sizes, reporting achieved throughput.
 
@@ -339,7 +363,7 @@ def bench(case: str = "", m: int = 0, n: int = 0, k: int = 0) -> None:
     )
 
 
-@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=5400)
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
 def clc_bench() -> None:
     """The GEMM's three item sources on one clock -- issue #88.
 
@@ -366,7 +390,7 @@ def clc_bench() -> None:
 # rounds at two grids, is a further half hour. 1800 s does not fit it, and a
 # run that dies between the third shape and the fourth has spent the GPU and
 # answered three quarters of the question.
-@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=5400)
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
 def ladder_bench() -> None:
     """Four rungs of #60's register ladder, with a clock on them — issue #63.
 
@@ -428,7 +452,7 @@ NCU_SECTIONS = (
 NCU_SKIP, NCU_COUNT = "6", "1"
 
 
-@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=5400)
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
 def profile(kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192) -> None:
     """One launch of one kernel at one size, under Nsight Compute — issue #86.
 
@@ -485,7 +509,7 @@ def profile(kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192) -
     )
 
 
-@app.function(gpu=DEFAULT_GPU, timeout=600)
+@app.function(gpu=DEFAULT_GPU, timeout=ASKING)
 def doctor() -> None:
     _run(["nvidia-smi"], cwd="/")
     _run(["cargo", "oxide", "doctor"], cwd="/opt/warmup")
@@ -998,7 +1022,7 @@ def _check_occupancy_step(measured: dict[tuple[str, str], dict[str, int]]) -> No
     print("\n  every gated kernel is inside its step.")
 
 
-@app.function(cpu=8, timeout=1800)
+@app.function(cpu=8, timeout=CHECKING)
 def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) -> None:
     """Register pressure of every kernel the harness and the examples emit,
     from `ptxas -v`.
