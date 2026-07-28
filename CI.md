@@ -26,7 +26,7 @@ need neither, so both crates get those two checks for free.
 The `host`-gated links in `global`'s docs are allowed to dangle here (see the
 `cfg_attr` at the top of `src/lib.rs`); tier 2 is where they must resolve.
 
-## Tier 2 — the host feature, and device codegen without a device
+## Tier 2 — the host feature, device codegen without a device, and the register gate
 
 `modal run modal_app.py::build`: clippy across all three crates with
 `--features host`, the host tests, `cargo doc --features host`, and a real
@@ -37,6 +37,16 @@ That last part is why this tier is worth its money. A post-monomorphization
 `const { assert!(..) }` in a tile shape fires at *codegen*. `cargo check` cannot
 see it; only an actual device build can. This is the highest value-per-minute
 job here, and it needs no GPU.
+
+A second job runs `modal run modal_app.py::regcount`: the `ptxas -v` table, the
+shape ladder, #63's timed twins, and #95's **occupancy-step gate**, which fails
+when a named kernel's register count would cost it a CTA per SM. That entry
+point predates this job by a long way and until #95 ran in no workflow at all,
+so a kernel could cross the step on any PR and nothing would say so. It is a
+separate job because it goes red for a different reason than `build` does — a
+register count rather than a compile — and that is worth seeing on the check
+list rather than in a log. It builds both kernel crates in its own container,
+so tier 2 now costs roughly twice what it did; still CPU-minutes.
 
 ### Why Modal rather than a CUDA container on a GitHub runner
 

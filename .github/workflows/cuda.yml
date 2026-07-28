@@ -88,3 +88,48 @@ jobs:
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+  # `modal run modal_app.py::regcount` — the `ptxas -v` table, the shape ladder,
+  # #63's timed twins, and since #95 a **gate**: a kernel that crosses its
+  # occupancy step fails this job. Until #95 that entry point existed and ran
+  # nowhere, so the only thing between `gemm_cg2` and a silent third of its
+  # occupancy was somebody remembering to run it and read a column.
+  #
+  # A job of its own rather than a step in `build`, for two reasons. It goes red
+  # for a different reason than `build` does — a register count, not a compile —
+  # and that distinction is worth having on the check list rather than inside a
+  # log. And it is independent work, so it runs beside `build` instead of after
+  # it. The price is honest: it builds both kernel crates again in its own
+  # container, so tier 2 costs roughly twice what it did. Still CPU-minutes.
+  regcount:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Modal credential is configured
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "::error::MODAL_TOKEN_ID / MODAL_TOKEN_SECRET are not set on this repository, so tier 2 cannot run. Get them from \`modal token new\`. See CI.md."
+            exit 1
+          fi
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - run: pip install modal
+
+      - name: ptxas register table, the ladder, and the occupancy-step gate
+        run: modal run modal_app.py::regcount
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}

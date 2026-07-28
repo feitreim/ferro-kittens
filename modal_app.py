@@ -9,8 +9,11 @@ codegen backend from scratch.
 
 Local usage:
     modal run modal_app.py::build     # host tests + a CPU-only device build
-    modal run modal_app.py::regcount  # ptxas -v register/spill table + the
-                                      # shape ladder and its cliff, no GPU
+    modal run modal_app.py::regcount  # ptxas -v register/spill table, the
+                                      # shape ladder and its cliff, and the
+                                      # occupancy-step gate (#95). No GPU, and
+                                      # the only thing here that fails a run on
+                                      # a register count.
     modal run modal_app.py            # the device tests, on a B200
     modal run modal_app.py::examples  # the examples crate's kernels, on a B200
     modal run modal_app.py::bench     # those kernels timed at several sizes
@@ -725,6 +728,254 @@ def _print_timed_twins(measured: dict[tuple[str, str], dict[str, int]]) -> None:
     print(f"\n  identical at all {len(rows)} rungs, every counter.")
 
 
+# --- the occupancy step (#95) ------------------------------------------------
+#
+# #94 took `gemm_cg2` from 40 registers to 167 and won 13.7% at 8192^3, and 167
+# is one register under the count at which that kernel would hold **two** CTAs
+# an SM instead of three. Nothing in the repo was watching, for a good reason:
+# until #94 registers were nowhere near binding, and #84's residency census
+# found the 73792 B shared plan to be the only cap. They are the joint cap now,
+# and #15, #87 and #88 all add live state to that same kernel.
+#
+# **Read what this gate claims narrowly.** It does not say fewer registers are
+# faster. #47, #63, #67, #76 and #94 are five occasions in this repo where the
+# register column ordered time backwards, and #94 is one where four times the
+# registers bought 13.7% — `ladder_bench` found the 32-register spelling that
+# streams its whole band through local memory beating the 252-register one at
+# every shape it timed. Crossing the step is a different kind of event: it does
+# not make a thread slower, it takes a third of the CTAs off the SM. And for
+# `gemm_cg2` that is not even a throughput argument in the abstract — its grid
+# is literally `SMS * CTAS_PER_SM / RANKS` clusters, so a residency the kernel
+# no longer has is a persistent grid that oversubscribes.
+#
+# So: gate on the step, and on nothing else. A wobble of a couple of registers
+# inside a step is codegen noise and passes.
+#
+# **And know what it is likely to catch.** `gemm_cg2`'s ceiling works out at 168
+# and `ptxas` puts it at 167, which is not a coincidence to bank on: four
+# unrelated kernels in this tree land at 167-168 (`gemm_cg2`, `flash_forward`,
+# both `global_copy_probe_128_*`), and 168 is exactly the largest count that
+# keeps twelve warps on an SM. `ptxas`' own default target sits on this
+# kernel's step. Forcing eight registers of extra live state into the epilogue
+# moved it 167 -> 168 and no further; forcing thirty-two moved the *frame* by
+# 256 B and left the count at 168. So the way this gate is most likely to fire
+# is not a kernel drifting up into it — it is `THREADS` or `CTAS_PER_SM`
+# moving, a `#[launch_bounds]` or `-maxrregcount` being introduced, or a
+# toolkit upgrade changing that default. Those are all real, all silent today,
+# and #87 and #15 can each produce the first of them.
+
+# sm_100a's register file, and the only hardware figure below that is not
+# arithmetic: 64 K 32-bit registers per SM, from the CUDA C Programming Guide's
+# compute-capability table for 10.0. `ptxas` is the only NVIDIA tool in this
+# container that could have been asked instead, and it does not know.
+REGISTERS_PER_SM = 65536
+WARP_SIZE = 32
+# `ptxas` will not allocate past this, so a ceiling that lands on 255 means
+# "registers can never cost this kernel that CTA" rather than a real edge.
+# `cuda_occupancy.h` admits 256 for compute major >= 7; ptxas' limit binds
+# first, and using it keeps the search over counts that can actually be emitted.
+MAX_REGISTERS_PER_THREAD = 255
+# The two numbers that make the step coarser than `file / threads / CTAs`, both
+# read off the toolkit's `cuda_occupancy.h` for compute major 10 and re-checked
+# against it on every run by `_check_occupancy_model`: registers are handed to a
+# **warp** in units of 256, and the file is split four ways across
+# sub-partitions that a warp is assigned to whole.
+REGISTER_ALLOCATION_UNIT = 256
+SUB_PARTITIONS_PER_SM = 4
+
+
+def _ctas_by_registers(registers: int, threads: int) -> int:
+    """CTAs of `threads` threads an SM holds when a thread wants `registers` of
+    them — counting the register term and nothing else.
+
+    Transcribed from `cudaOccMaxBlocksPerSMRegsLimit` in `cuda_occupancy.h`.
+    The rounding *is* the content, so it is written the way NVIDIA writes it
+    rather than as `REGISTERS_PER_SM // registers // threads`: at 128 threads
+    that shortcut says 170 registers still fit three CTAs and the hardware model
+    says 168, because 169 registers a thread is 5408 a warp, which rounds to
+    5632, of which a 16384-register sub-partition holds two warps and not three.
+
+    The warp and CTA-count ceilings an SM also has are separate terms and are
+    deliberately not folded in: this answers "what do the registers allow",
+    which is the whole of what a register gate is entitled to say."""
+    warps_per_cta = -(-threads // WARP_SIZE)
+    per_warp = -(-registers * WARP_SIZE // REGISTER_ALLOCATION_UNIT) * REGISTER_ALLOCATION_UNIT
+    warps_per_sub_partition = REGISTERS_PER_SM // SUB_PARTITIONS_PER_SM // per_warp
+    return warps_per_sub_partition * SUB_PARTITIONS_PER_SM // warps_per_cta
+
+
+def _register_ceiling(ctas: int, threads: int) -> int:
+    """The most registers a thread may use with `ctas` CTAs of `threads` still
+    resident — the step, as a number.
+
+    Searched rather than solved. A closed form is where the granularity gets
+    dropped on the floor, and there are 255 candidates."""
+    fits = [
+        registers
+        for registers in range(1, MAX_REGISTERS_PER_THREAD + 1)
+        if _ctas_by_registers(registers, threads) >= ctas
+    ]
+    return max(fits, default=0)
+
+
+# Kernels this gate watches, and the file that states their launch. Neither
+# number it needs is written down here, because both are already written down
+# there and a copy would be free to drift: `#[launch_contract(block = ...)]` is
+# the exact block shape the host launch is validated against, and `CTAS_PER_SM`
+# is the residency the kernel's own grid is sized from — for `gemm_cg2`
+# measured twice, by #83 on a clock and by #84 by counting `%smid`, with the
+# argument in its doc comment. A kernel joins this table by declaring both.
+GATED_KERNELS = (("gemm_cg2", "examples/src/gemm.rs"),)
+
+_CONTRACT_BLOCK = re.compile(r"block\s*=\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)")
+_CTAS_PER_SM = re.compile(r"\bconst\s+CTAS_PER_SM\s*:\s*u32\s*=\s*(\d+)\s*;")
+
+
+def _launch_geometry(source: str, kernel: str) -> tuple[int, int]:
+    """`(threads, CTAs per SM)` for `kernel`, read out of its own source."""
+    text = Path(PROJECT_DIR, source).read_text()
+    declared = text.find(f"fn {kernel}(")
+    blocks = _CONTRACT_BLOCK.findall(text[:declared]) if declared >= 0 else []
+    residencies = _CTAS_PER_SM.findall(text)
+    if not blocks or len(residencies) != 1:
+        raise RuntimeError(
+            f"{source} no longer states {kernel}'s launch in the two forms this gate "
+            "reads: an exact `#[launch_contract(block = (x, y, z))]` above the kernel "
+            f"(found {len(blocks)}) and one `const CTAS_PER_SM: u32 = N;` in the file "
+            f"(found {len(residencies)}). Restore them, or drop the kernel from "
+            "GATED_KERNELS — an occupancy gate that cannot read the launch is not one."
+        )
+    x, y, z = (int(extent) for extent in blocks[-1])
+    return x * y * z, int(residencies[0])
+
+
+# `cuda_occupancy.h` is header-only, needs no driver and no GPU, and is the
+# authority `_ctas_by_registers` is transcribed from. So compile it and ask it,
+# rather than trusting the transcription. Same move as `--determinism`: a
+# derived step is only better than a magic number if the derivation is checked,
+# and #95's own table gives 170 where this gives 168. One of the two had to be
+# wrong, and a hand-copied rounding rule is exactly the kind of thing that is.
+OCCUPANCY_MODEL_CPP = r"""
+#include <cstdio>
+#include <cstdlib>
+#include <cuda_occupancy.h>
+
+// argv: <compute major> <compute minor> <registers per SM> <warp size> <threads>
+int main(int argc, char **argv) {
+    if (argc != 6) return 2;
+    cudaOccDeviceProp device;
+    device.computeMajor          = atoi(argv[1]);
+    device.computeMinor          = atoi(argv[2]);
+    device.regsPerBlock          = atoi(argv[3]);
+    device.regsPerMultiprocessor = atoi(argv[3]);
+    device.warpSize              = atoi(argv[4]);
+    int threads = atoi(argv[5]);
+    for (int registers = 1; registers <= 255; ++registers) {
+        cudaOccFuncAttributes function;
+        function.numRegs = registers;
+        cudaOccResult result;
+        cudaOccPartitionedGCConfig caching = PARTITIONED_GC_OFF;
+        int limit = -1;
+        if (cudaOccMaxBlocksPerSMRegsLimit(
+                &limit, &caching, &result, &device, &function, threads)
+            != CUDA_OCC_SUCCESS) {
+            return 1;
+        }
+        printf("%d %d\n", registers, limit);
+    }
+    return 0;
+}
+"""
+
+
+def _check_occupancy_model(threads: int) -> int:
+    """`_ctas_by_registers` against NVIDIA's own occupancy model, at every
+    register count `ptxas` can emit. Returns how many agreed; raises if any
+    did not."""
+    source = Path("/tmp/occupancy_model.cpp")
+    source.write_text(OCCUPANCY_MODEL_CPP)
+    binary = source.with_suffix("")
+    subprocess.run(
+        ["g++", "-I/usr/local/cuda/include", "-o", str(binary), str(source)], check=True
+    )
+    reference = subprocess.run(
+        [str(binary), "10", "0", str(REGISTERS_PER_SM), str(WARP_SIZE), str(threads)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    rows = [line.split() for line in reference.stdout.splitlines() if line]
+    differences = [
+        f"  {registers} registers: cuda_occupancy.h says {ctas}, "
+        f"_ctas_by_registers says {_ctas_by_registers(int(registers), threads)}"
+        for registers, ctas in rows
+        if int(ctas) != _ctas_by_registers(int(registers), threads)
+    ]
+    if differences:
+        raise RuntimeError(
+            f"the occupancy model in this file disagrees with the toolkit's own at "
+            f"{len(differences)} of {len(rows)} register counts, at {threads} threads. "
+            "Every step below is derived from it, so none of them mean anything until "
+            "this agrees.\n" + "\n".join(differences)
+        )
+    return len(rows)
+
+
+def _check_occupancy_step(measured: dict[tuple[str, str], dict[str, int]]) -> None:
+    """Registers against the occupancy step, per gated kernel — issue #95."""
+    by_kernel = {name: counts for (_, name), counts in measured.items()}
+    print("\n  the occupancy model, against the toolkit's own (`cuda_occupancy.h`,")
+    print("  compiled here — it needs no driver, and neither does this whole run):")
+    for threads in sorted({_launch_geometry(source, kernel)[0] for kernel, source in GATED_KERNELS}):
+        agreed = _check_occupancy_model(threads)
+        print(f"    {threads:>4} threads: identical at all {agreed} register counts ptxas can emit")
+
+    rows, crossed = [], []
+    for kernel, source in GATED_KERNELS:
+        counts = by_kernel.get(kernel)
+        if counts is None:
+            raise RuntimeError(
+                f"{kernel} is gated on its occupancy step but emitted no PTX, so this run "
+                "measured nothing about it. Either it stopped being monomorphized or it was "
+                "renamed; a gate that silently watches an absent kernel is worse than none."
+            )
+        threads, ctas = _launch_geometry(source, kernel)
+        ceiling = _register_ceiling(ctas, threads)
+        registers = counts["registers"]
+        allowed = _ctas_by_registers(registers, threads)
+        rows.append((kernel, threads, ctas, registers, ceiling, ceiling - registers, allowed))
+        if allowed < ctas:
+            crossed.append(
+                f"  {kernel}: {registers} registers at {threads} threads leaves {allowed} "
+                f"CTAs/SM where the kernel is built for {ctas}. {ceiling} is the most a "
+                f"thread may use and keep {ctas} — it is {registers - ceiling} over."
+            )
+
+    print("\n  the occupancy step (#95) — registers against the residency each kernel's")
+    print("  own grid is sized for. `ceiling` is derived, not written down anywhere:")
+    print(f"    {'kernel':<20}{'threads':>8}{'wants':>7}{'regs':>6}{'ceiling':>9}{'headroom':>10}{'allows':>8}")
+    for kernel, threads, ctas, registers, ceiling, headroom, allowed in rows:
+        print(
+            f"    {kernel:<20}{threads:>8}{ctas:>7}{registers:>6}"
+            f"{ceiling:>9}{headroom:>10}{allowed:>8}"
+        )
+    if crossed:
+        raise RuntimeError(
+            "a kernel crossed its occupancy step: it now costs a CTA per SM.\n"
+            + "\n".join(crossed)
+            + "\n\nThis is not a claim that the kernel got slower per thread — the register "
+            "column has ordered time backwards five times here (#47, #63, #67, #76, #94), "
+            "and #94 spent 40 -> 167 registers on `gemm_cg2` for +13.7%. It is the one "
+            "consequence of a register count that does not depend on any theory of what "
+            "the registers are for: CTAs come off the SM. A kernel whose grid is sized "
+            "from CTAS_PER_SM (`gemm_cg2`'s is `SMS * CTAS_PER_SM / RANKS` clusters) is "
+            "then sized for a residency it does not have. If the trade is worth it, say "
+            "so and move CTAS_PER_SM — but move it having measured, not having seen this "
+            "go red."
+        )
+    print("\n  every gated kernel is inside its step.")
+
+
 @app.function(cpu=8, timeout=1800)
 def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) -> None:
     """Register pressure of every kernel the harness and the examples emit,
@@ -755,6 +1006,15 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     a register count if the two describe the same compiled kernel, and that is
     a thing to check here, on CPU, before spending a B200 on it.
 
+    The fourth is #95's, and it is a **gate**: for every kernel in
+    `GATED_KERNELS`, the registers `ptxas` allocated against the most it may use
+    and still keep the CTAs per SM its own grid is sized for. That ceiling is
+    derived from the launch and the register file, checked against the toolkit's
+    `cuda_occupancy.h` on every run, and it fails the run when it is crossed.
+    Nothing else here fails on a register count, and nothing else should: this
+    one is about *occupancy*, which is the one consequence of the count that
+    does not depend on a theory of what the registers are for.
+
     `--determinism` measures the same tree twice, with both crates' artifacts
     thrown away in between, and asserts the two tables are identical. It is not
     ceremony: a diff of this table is only evidence if the table is a function
@@ -768,6 +1028,7 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     _print_kernels(measured)
     _print_ladder(measured)
     _print_timed_twins(measured)
+    _check_occupancy_step(measured)
 
     if not determinism:
         return
