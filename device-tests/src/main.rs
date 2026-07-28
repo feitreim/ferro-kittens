@@ -24,6 +24,17 @@
 //! matrix, addressed by the calling thread, with no descriptor between it and
 //! the registers.
 //!
+//! The `mma A·Bᵀ` … `mma transpose control` family is the one whose subject is
+//! *arithmetic* rather than addressing, and the one written against a surface
+//! no kernel in this repo calls. All four operand orders (#12) multiply the
+//! same two logical matrices, staged four ways because no TMA box transposes,
+//! and every one of them is required to produce the same product. Two things
+//! carry that: `walk blind spots`, which runs on the host and fails if
+//! [`walk_reference`] cannot see a dropped K plane, a permuted K chunk or a
+//! confused MN subtile — the standing answer to a reference that certifies
+//! whatever it is handed — and `mma transpose control`, which is the same
+//! operands under the *untransposed* walk and is required to disagree.
+//!
 //! Run it with `modal run modal_app.py` (see `modal_app.py` at the repo root);
 //! it exits non-zero if any case fails.
 
@@ -55,7 +66,7 @@ use cuda_device::{cuda_module, kernel, thread, warp};
 
 use kittens::global::{GlobalLayout, GlobalRows, encode_bf16_panels, load_rows, store_rows};
 use kittens::ldst::{load_fragment, load_tile, load_vec, store_fragment, store_tile};
-use kittens::mma::{self, MmaShape, mma_abt};
+use kittens::mma::{self, MmaShape, mm_ab, mm_abt, mm_atb, mm_atbt, mma_abt};
 use kittens::reg::{
     BaseLdtm, ColLayout, ColVec, Fragment, FragmentLayout, Mul, RegTile, RegVec, online_rescale,
 };
@@ -138,6 +149,38 @@ const PROBE_SHARED: usize = AOperand::BYTES + 2 * BOperand::BYTES + 32;
 /// The STTM round trip touches no shared tile at all — its whole plan is the
 /// TMEM staging word.
 const STTM_SHARED: usize = 32;
+
+/// The four operand orders' `A` staged K-major, `[M, K]`.
+type AKMajor = Tile<ROWS, DEPTH>;
+/// The same `A` staged MN-major, `[K, M]` — the transposed walks' operand,
+/// and the transpose of [`AKMajor`] in *global* memory rather than in the
+/// walk, because no TMA box transposes.
+type AMnMajor = Tile<DEPTH, ROWS>;
+/// `B` staged K-major, `[N, K]`.
+type BKMajor = Tile<COLUMNS, DEPTH>;
+/// `B` staged MN-major, `[K, N]`.
+type BMnMajor = Tile<DEPTH, COLUMNS>;
+
+/// Dynamic shared plan of an operand-order case: two operand tiles and the
+/// same 32-byte tail the fragment probe uses. Every one of the four staged
+/// tiles is `[128, 64]` or `[64, 128]` bf16, so one number serves all of
+/// them — asserted rather than assumed, since the launch config is written
+/// from it.
+const WALK_SHARED: usize = 2 * AKMajor::BYTES + 32;
+const _: () = assert!(
+    AKMajor::BYTES == AMnMajor::BYTES
+        && AKMajor::BYTES == BKMajor::BYTES
+        && AKMajor::BYTES == BMnMajor::BYTES
+);
+/// The accumulator band the operand-order cases drain, one per warp.
+const WALK_SLOTS: usize = RegTile::<32, COLUMNS, BaseLdtm>::SLOTS;
+const WALK_VALUES: usize = RegTile::<32, COLUMNS, BaseLdtm>::VALUES;
+/// K=16 chunks one operand-order MMA chains.
+const WALK_CHUNKS: usize = DEPTH / 16;
+/// The square the untransposed control computes and the host compares over —
+/// one swizzle subtile of the accumulator. See
+/// [`kernels::walk_untransposed_control`].
+const CONTROL_EDGE: usize = 64;
 
 /// Columns [`kernels::relaunch_probe`] allocates: the whole SM's tensor
 /// memory. No two CTAs can hold an allocation on the same SM at once, so
@@ -1365,6 +1408,180 @@ pub mod kernels {
                 tma.inval();
                 mma_done.inval();
             }
+        }
+    }
+
+    /// The staging every operand-order case shares: the two operand tiles at
+    /// the head of the plan, the two barriers and the TMEM staging word in
+    /// its 32-byte tail, one TMA per tile charged once, and the CTA
+    /// synchronized behind the arrival.
+    ///
+    /// Returns both tiles, the accumulator's TMEM base, and both semaphores —
+    /// the second for the issuing thread to commit its chain to, the first
+    /// only so [`walk_drain`] can invalidate it.
+    #[inline(always)]
+    unsafe fn walk_stage<const AR: usize, const AC: usize, const BR: usize, const BC: usize>(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+    ) -> (Tile<AR, AC>, Tile<BR, BC>, u32, Semaphore, Semaphore) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let a = Tile::<AR, AC>::from_raw(smem);
+            let b = Tile::<BR, BC>::from_raw(smem.add(Tile::<AR, AC>::BYTES));
+            let scratch = smem.add(Tile::<AR, AC>::BYTES + Tile::<BR, BC>::BYTES);
+            let tma = Semaphore::attach(scratch as *mut Barrier);
+            let mma_done = Semaphore::attach(scratch.add(8) as *mut Barrier);
+            let tmem_slot = scratch.add(16) as *mut u32;
+
+            let leader = thread::threadIdx_x() == 0;
+            if leader {
+                tma.init(1);
+                mma_done.init(1);
+                fence_proxy_async_shared_cta();
+            }
+            thread::sync_threads();
+            let tmem = alloc_block(tmem_slot, COLUMNS as u32);
+
+            if leader {
+                a.tma_load(a_map, 0, 0, tma);
+                b.tma_load(b_map, 0, 0, tma);
+                tma.expect_tx((Tile::<AR, AC>::BYTES + Tile::<BR, BC>::BYTES) as u32);
+            }
+            tma.wait(0);
+            thread::sync_threads();
+            (a, b, tmem, tma, mma_done)
+        }
+    }
+
+    /// The other half of [`walk_stage`]: wait out the committed MMA chain,
+    /// drain a warp's 32 accumulator rows, dump them by `(warp, lane, slot,
+    /// value)`, and give the allocation back.
+    #[inline(always)]
+    unsafe fn walk_drain(
+        tmem: u32,
+        tma: Semaphore,
+        mma_done: Semaphore,
+        out: &mut DisjointSlice<f32>,
+    ) {
+        unsafe {
+            mma_done.wait(0);
+            thread::sync_threads();
+
+            let warp_id = warp::warp_id();
+            let accumulator = Accumulator::from_raw(tmem);
+            let band = accumulator.tile::<32, COLUMNS>(32 * warp_id, 0);
+            dump_band(band, warp_id, warp::lane_id(), out);
+
+            thread::sync_threads();
+            dealloc_block(tmem, COLUMNS as u32);
+            if thread::threadIdx_x() == 0 {
+                tma.inval();
+                mma_done.inval();
+            }
+        }
+    }
+
+    /// `D = A·Bᵀ` with both operands K-major — the walk the fragment probe
+    /// already issues, here against a reference that varies along *K* rather
+    /// than one that collapses to a single chunk. Launch with `ROWS` threads
+    /// and [`WALK_SHARED`] bytes, as all five operand-order cases are.
+    #[kernel]
+    pub unsafe fn walk_abt(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let (a, b, tmem, tma, done) = walk_stage::<ROWS, DEPTH, COLUMNS, DEPTH>(a_map, b_map);
+            if thread::threadIdx_x() == 0 {
+                mm_abt(tmem, a, b, MmaShape::M128_N128);
+                mma::commit(done);
+            }
+            walk_drain(tmem, tma, done, &mut out);
+        }
+    }
+
+    /// `D = A·B` — `A` K-major, `B` MN-major. The banding walk: one `N = 64`
+    /// instruction per stacked `B` subtile, into `tmem + 64 * subtile`.
+    #[kernel]
+    pub unsafe fn walk_ab(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let (a, b, tmem, tma, done) = walk_stage::<ROWS, DEPTH, DEPTH, COLUMNS>(a_map, b_map);
+            if thread::threadIdx_x() == 0 {
+                mm_ab(tmem, a, b, MmaShape::M128_N64);
+                mma::commit(done);
+            }
+            walk_drain(tmem, tma, done, &mut out);
+        }
+    }
+
+    /// `D = Aᵀ·B` — both operands MN-major, both reaching their second
+    /// stacked subtile through the descriptor's leading offset, in one
+    /// `M128_N128` instruction per K chunk.
+    #[kernel]
+    pub unsafe fn walk_atb(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let (a, b, tmem, tma, done) = walk_stage::<DEPTH, ROWS, DEPTH, COLUMNS>(a_map, b_map);
+            if thread::threadIdx_x() == 0 {
+                mm_atb(tmem, a, b, MmaShape::M128_N128);
+                mma::commit(done);
+            }
+            walk_drain(tmem, tma, done, &mut out);
+        }
+    }
+
+    /// `D = Aᵀ·Bᵀ` — `A` MN-major, `B` K-major.
+    #[kernel]
+    pub unsafe fn walk_atbt(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let (a, b, tmem, tma, done) = walk_stage::<DEPTH, ROWS, COLUMNS, DEPTH>(a_map, b_map);
+            if thread::threadIdx_x() == 0 {
+                mm_atbt(tmem, a, b, MmaShape::M128_N128);
+                mma::commit(done);
+            }
+            walk_drain(tmem, tma, done, &mut out);
+        }
+    }
+
+    /// **The positive control.** [`walk_atb`]'s operands, its accumulator
+    /// shape, its dump — and the *untransposed* walk. `mma_abt` reads the two
+    /// `[K, M]` / `[K, N]` tiles as though K ran along their rows, which is
+    /// the failure a transposed walk that quietly dropped its transpose bits
+    /// would have; the host requires this dump to disagree with the reference
+    /// [`walk_atb`] matches. Without it the transposed cases prove only that
+    /// *some* walk computes `Aᵀ·B`, not that this one had to be transposed.
+    ///
+    /// The shape is [`CONTROL_EDGE`]-square and not the band's, because the
+    /// untransposed reading of a `[64, 128]` tile is a `[64, 128]` K-major
+    /// matrix: `M64_N64` over `K = 128` touches each tile's 16 KiB exactly
+    /// once and nothing past it. The host compares only that quadrant; the
+    /// rest of the accumulator is never written and is not read into any
+    /// claim.
+    #[kernel]
+    pub unsafe fn walk_untransposed_control(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let (a, b, tmem, tma, done) = walk_stage::<DEPTH, ROWS, DEPTH, COLUMNS>(a_map, b_map);
+            if thread::threadIdx_x() == 0 {
+                mm_abt(tmem, a, b, MmaShape::M64_N64);
+                mma::commit(done);
+            }
+            walk_drain(tmem, tma, done, &mut out);
         }
     }
 
@@ -3617,6 +3834,336 @@ fn check_fragment_map(
     .into())
 }
 
+/// `A[m, k]` of the operand-order cases — integers in `[-15, 15]`.
+///
+/// The pair with [`walk_b`] is chosen against what the reference has to be
+/// able to *see*, which is the lesson of #48: `b_value`'s `depth * 5 % 5` was
+/// identically zero there, so an exact GEMM check certified a kernel that
+/// read one plane of `B` forever. Both generators here vary along every one
+/// of their arguments, and [`walk_blind_spots`] is the standing proof of it —
+/// it removes each K plane in turn, permutes the K chunks, and swaps the
+/// stacked MN subtiles, and requires the reference to notice every time.
+///
+/// Neither generator is symmetric in its two arguments, and the staged `A` is
+/// `[64, 128]` against `[128, 64]`, so `Aᵀ·B` and `A·B` are not the same
+/// numbers and cannot be confused by an operand that happens to be its own
+/// transpose. Every value is an integer under 32 (exact in bf16, which holds
+/// every integer to 256) and every dot product is under `15 · 30 · 64 =
+/// 28,800` (exact in fp32, whose integers run to 2²⁴), so the comparison is
+/// `==` and a mismatch is an address and never a rounding artifact.
+fn walk_a(m: usize, k: usize) -> f32 {
+    ((m * 13 + k * 7) % 31) as f32 - 15.0
+}
+
+/// `B[k, n]` of the operand-order cases — integers in `[-30, 30]`. See
+/// [`walk_a`].
+fn walk_b(k: usize, n: usize) -> f32 {
+    ((n * 11 + k * 5) % 61) as f32 - 30.0
+}
+
+/// A `[rows, columns]` bf16 operand as the packed `u32` words a device buffer
+/// holds, row-major — the staging a [`kittens::global::PanelMap`] describes.
+/// The four staged buffers differ only in which of `(m, k)` / `(k, n)` this
+/// walks fastest, since no TMA box transposes on the way in.
+fn stage_walk_operand(
+    rows: usize,
+    columns: usize,
+    value: impl Fn(usize, usize) -> f32,
+) -> Vec<u32> {
+    let mut staged = Vec::with_capacity(rows * columns / 2);
+    for row in 0..rows {
+        for pair in 0..columns / 2 {
+            staged.push(pack(
+                to_bf16(value(row, 2 * pair)),
+                to_bf16(value(row, 2 * pair + 1)),
+            ));
+        }
+    }
+    staged
+}
+
+/// `D[m, n] = Σₖ A[m, remap(k)] · B[k, n]` — the reference at `remap =
+/// identity`, and a named wrong K walk otherwise.
+fn walk_product(remap: impl Fn(usize) -> usize) -> Vec<f32> {
+    let mut product = vec![0.0f32; ROWS * COLUMNS];
+    for m in 0..ROWS {
+        for n in 0..COLUMNS {
+            let mut sum = 0.0f32;
+            for k in 0..DEPTH {
+                sum += walk_a(m, remap(k)) * walk_b(k, n);
+            }
+            product[m * COLUMNS + n] = sum;
+        }
+    }
+    product
+}
+
+/// The reference every operand-order case is compared against. All four walks
+/// stage the *same* two logical matrices — only the majorness of the staging
+/// differs — so one reference serves the whole square, and a walk that read
+/// its operand under the other order is wrong against the same numbers the
+/// other three are right against.
+fn walk_reference() -> Vec<f32> {
+    walk_product(|k| k)
+}
+
+/// A named wrong K walk, as the remap of `A`'s K index that produces it.
+type ChunkHypothesis = (&'static str, fn(usize) -> usize);
+/// A named confusion of output coordinates, as the permutation of `(m, n)`
+/// that produces it.
+type CoordinateHypothesis = (&'static str, fn(usize, usize) -> (usize, usize));
+
+/// Does [`walk_reference`] actually depend on everything an operand-order
+/// walk computes?
+///
+/// A reference that does not vary along a coordinate cannot catch an error in
+/// that coordinate, and a check built on one certifies whatever it is handed.
+/// This is the host case that says it does not: every K plane, every K chunk
+/// permutation a chained walk could get wrong, and every confusion between
+/// the two stacked MN subtiles the transposed walks reach by leading offset.
+/// It runs on the host and needs no GPU.
+fn walk_blind_spots() -> Result<String, Box<dyn Error>> {
+    let reference = walk_reference();
+    let mut visible = 0usize;
+
+    // Every K plane. Dropping plane `k` subtracts `A[m, k] · B[k, n]` from
+    // every element exactly (all partial sums are exact integers), so the
+    // plane is visible exactly when that product is nonzero somewhere.
+    for k in 0..DEPTH {
+        let carries_a = (0..ROWS).any(|m| walk_a(m, k) != 0.0);
+        let carries_b = (0..COLUMNS).any(|n| walk_b(k, n) != 0.0);
+        if !(carries_a && carries_b) {
+            return Err(format!(
+                "K plane {k} contributes nothing: a walk that skipped it would pass"
+            )
+            .into());
+        }
+        visible += 1;
+    }
+
+    // K chunk order. A chained walk issues `DEPTH / 16` instructions and
+    // pairs `A`'s chunk with `B`'s; these are the ways that pairing goes
+    // wrong without going out of bounds.
+    let chunk_hypotheses: [ChunkHypothesis; 4] = [
+        ("A's K chunks reversed", |k| {
+            (WALK_CHUNKS - 1 - k / 16) * 16 + k % 16
+        }),
+        ("A's K chunks rotated by one", |k| {
+            ((k / 16 + 1) % WALK_CHUNKS) * 16 + k % 16
+        }),
+        ("A's chunk 1 re-reading chunk 0", |k| {
+            if k / 16 == 1 { k - 16 } else { k }
+        }),
+        ("K reversed within each chunk", |k| {
+            (k / 16) * 16 + 15 - k % 16
+        }),
+    ];
+    for (name, remap) in chunk_hypotheses {
+        if walk_product(remap) == reference {
+            return Err(format!("{name} gives the same reference — it is a blind spot").into());
+        }
+        visible += 1;
+    }
+
+    // Coordinate confusions. `M` and `N` are 128 here and a swizzle subtile
+    // is 64 wide, so both are two stacked subtiles an MN-major walk reaches
+    // only through the descriptor's leading offset. A leading offset of zero
+    // reads the first subtile twice; a wrong one swaps them.
+    let coordinate_hypotheses: [CoordinateHypothesis; 5] = [
+        ("A's MN subtiles swapped", |m, n| (m ^ 64, n)),
+        ("B's MN subtiles swapped", |m, n| (m, n ^ 64)),
+        ("A's second subtile reading its first", |m, n| (m % 64, n)),
+        ("B's second subtile reading its first", |m, n| (m, n % 64)),
+        ("the product transposed", |m, n| (n, m)),
+    ];
+    for (name, permute) in coordinate_hypotheses {
+        let permuted: Vec<f32> = (0..ROWS * COLUMNS)
+            .map(|index| {
+                let (m, n) = permute(index / COLUMNS, index % COLUMNS);
+                reference[m * COLUMNS + n]
+            })
+            .collect();
+        if permuted == reference {
+            return Err(format!("{name} gives the same reference — it is a blind spot").into());
+        }
+        visible += 1;
+    }
+
+    Ok(format!("{visible} wrong walks, every one of them visible"))
+}
+
+/// Which of the four operand orders a case issues — and the control, which is
+/// none of them.
+#[derive(Clone, Copy)]
+enum Order {
+    Abt,
+    Ab,
+    AtB,
+    AtBt,
+    /// [`Self::AtB`]'s operands under the untransposed walk. Required to
+    /// *disagree* with the reference; see
+    /// [`kernels::walk_untransposed_control`].
+    UntransposedControl,
+}
+
+impl Order {
+    const ALL: [Order; 5] = [
+        Order::Abt,
+        Order::Ab,
+        Order::AtB,
+        Order::AtBt,
+        Order::UntransposedControl,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Order::Abt => "mma AB\u{1d40}",
+            Order::Ab => "mma AB",
+            Order::AtB => "mma A\u{1d40}B",
+            Order::AtBt => "mma A\u{1d40}B\u{1d40}",
+            Order::UntransposedControl => "mma transpose control",
+        }
+    }
+
+    /// The `[rows, columns]` of the accumulator this order actually writes,
+    /// and so the only part of the dump that carries a claim. Every real walk
+    /// covers the whole band; the control covers one subtile square (see
+    /// [`kernels::walk_untransposed_control`]).
+    fn region(self) -> (usize, usize) {
+        match self {
+            Order::UntransposedControl => (CONTROL_EDGE, CONTROL_EDGE),
+            _ => (ROWS, COLUMNS),
+        }
+    }
+
+    /// Which staged majorness each operand wants: `(A transposed, B
+    /// transposed)`, where "transposed" is the MN-major staging.
+    fn staging(self) -> (bool, bool) {
+        match self {
+            Order::Abt => (false, false),
+            Order::Ab => (false, true),
+            Order::AtB | Order::UntransposedControl => (true, true),
+            Order::AtBt => (true, false),
+        }
+    }
+
+    unsafe fn launch(
+        self,
+        module: &kernels::LoadedModule,
+        stream: &CudaStream,
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), cuda_core::DriverError> {
+        let config = launch_config(ROWS as u32, WALK_SHARED as u32);
+        unsafe {
+            match self {
+                Order::Abt => module.walk_abt(stream, config, a_map, b_map, out),
+                Order::Ab => module.walk_ab(stream, config, a_map, b_map, out),
+                Order::AtB => module.walk_atb(stream, config, a_map, b_map, out),
+                Order::AtBt => module.walk_atbt(stream, config, a_map, b_map, out),
+                Order::UntransposedControl => {
+                    module.walk_untransposed_control(stream, config, a_map, b_map, out)
+                }
+            }
+        }
+    }
+}
+
+/// Does the walk `order` names compute `A·B` at the coordinates
+/// [`BaseLdtm`] claims?
+///
+/// The kernel dumps by `(warp, lane, slot, value)` and nothing else, so the
+/// map is applied here and never there — the same discipline the fragment
+/// cases follow, over a product the kernel has no way to encode.
+fn check_walk(
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+    order: Order,
+) -> Result<String, Box<dyn Error>> {
+    let a_k = DeviceBuffer::from_host(stream, &stage_walk_operand(ROWS, DEPTH, walk_a))?;
+    let a_mn = DeviceBuffer::from_host(
+        stream,
+        &stage_walk_operand(DEPTH, ROWS, |k, m| walk_a(m, k)),
+    )?;
+    let b_k = DeviceBuffer::from_host(
+        stream,
+        &stage_walk_operand(COLUMNS, DEPTH, |n, k| walk_b(k, n)),
+    )?;
+    let b_mn = DeviceBuffer::from_host(stream, &stage_walk_operand(DEPTH, COLUMNS, walk_b))?;
+
+    let a_k_map =
+        unsafe { encode_bf16_panels::<ROWS, DEPTH>(stream, a_k.cu_deviceptr(), ROWS, 1)? };
+    let a_mn_map =
+        unsafe { encode_bf16_panels::<DEPTH, ROWS>(stream, a_mn.cu_deviceptr(), DEPTH, 1)? };
+    let b_k_map =
+        unsafe { encode_bf16_panels::<COLUMNS, DEPTH>(stream, b_k.cu_deviceptr(), COLUMNS, 1)? };
+    let b_mn_map =
+        unsafe { encode_bf16_panels::<DEPTH, COLUMNS>(stream, b_mn.cu_deviceptr(), DEPTH, 1)? };
+
+    let (a_transposed, b_transposed) = order.staging();
+    let a_map = if a_transposed { &a_mn_map } else { &a_k_map };
+    let b_map = if b_transposed { &b_mn_map } else { &b_k_map };
+
+    let mut out = DeviceBuffer::<f32>::zeroed(stream, ROWS * COLUMNS)?;
+    unsafe { order.launch(module, stream, a_map.as_ptr(), b_map.as_ptr(), &mut out)? };
+    let observed = out.to_host_vec(stream)?;
+
+    let reference = walk_reference();
+    let (region_rows, region_columns) = order.region();
+    let mut report = String::new();
+    let (mut compared, mut mismatches) = (0usize, 0usize);
+    for warp in 0..ROWS / 32 {
+        for lane in 0..32u32 {
+            for slot in 0..WALK_SLOTS {
+                for value in 0..WALK_VALUES {
+                    let index = dump_index(warp, lane, slot, value, WALK_SLOTS, WALK_VALUES);
+                    let (row, column) =
+                        RegTile::<32, COLUMNS, BaseLdtm>::coordinate(lane, slot, value);
+                    let (m, n) = (32 * warp + row as usize, column as usize);
+                    if m >= region_rows || n >= region_columns {
+                        continue;
+                    }
+                    compared += 1;
+                    let expected = reference[m * COLUMNS + n];
+                    if observed[index] == expected {
+                        continue;
+                    }
+                    mismatches += 1;
+                    if mismatches <= 8 && !matches!(order, Order::UntransposedControl) {
+                        let _ = write!(
+                            report,
+                            "\n    D[{m}, {n}] (warp {warp} lane {lane} slot {slot} \
+                             value {value}): got {}, want {expected}",
+                            observed[index]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if matches!(order, Order::UntransposedControl) {
+        return if mismatches == 0 {
+            Err(
+                "the untransposed walk reproduced Aᵀ·B exactly, so the transposed \
+                 cases prove nothing about their transpose bits"
+                    .into(),
+            )
+        } else {
+            Ok(format!(
+                "{mismatches} of {compared} values differ from Aᵀ·B, as they must"
+            ))
+        };
+    }
+    if mismatches == 0 {
+        return Ok(format!(
+            "{compared} values exact, {WALK_CHUNKS} chained K chunks"
+        ));
+    }
+    Err(format!("{mismatches} of {compared} values wrong{report}").into())
+}
+
 /// Every statistic [`kernels::reduction_probe`] dumps, as the host derives it:
 /// where it lands in the dump, what it must be, and what to call it in a
 /// failure. All of it comes from [`BaseLdtm`]'s map and [`accumulator_value`],
@@ -3790,6 +4337,17 @@ fn run() -> Result<usize, Box<dyn Error>> {
         cases.push((
             shape.name(),
             Box::new(move || check_fragment_map(stream, module, shape)),
+        ));
+    }
+    // The four operand orders (#12), against a reference that varies along
+    // every coordinate they compute — and the control that says the
+    // transposed ones had to be transposed. The blind-spot sweep goes first
+    // because everything after it is only as good as it is.
+    cases.push(("walk blind spots", Box::new(walk_blind_spots)));
+    for order in Order::ALL {
+        cases.push((
+            order.name(),
+            Box::new(move || check_walk(stream, module, order)),
         ));
     }
     cases.push((
