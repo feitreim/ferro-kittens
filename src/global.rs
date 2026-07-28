@@ -56,12 +56,15 @@ use cuda_device::DisjointSlice;
 /// it. Extents are therefore absent rather than forgotten — see
 /// [`store_rows`]' safety contract for what the caller owes instead.
 ///
-/// **fp32 only.** The element type belongs in a parameter and cannot go there
-/// yet: [`crate::shared::Element`] is implemented for `Bf16` alone (#2), so
-/// `GlobalRows<E>` would have exactly one instantiation and it would be the
-/// wrong one — a register tile *is* fp32, and this path exists to move it
-/// without rounding. When `Element` gains an fp32 impl the parameter is a
-/// bound and two `E::read`/`E::write` calls.
+/// **fp32 only**, and since #3 that is a choice rather than a constraint. The
+/// argument used to be that [`crate::shared::Element`] was implemented for
+/// `Bf16` alone, so `GlobalRows<E>` would have had exactly one instantiation
+/// and it would have been the wrong one — a register tile *is* fp32, and this
+/// path exists to move it without rounding. [`crate::shared::F32`] is that
+/// impl now, so what remains is the parameter, a bound, and two
+/// `E::read`/`E::write` calls here and in [`load_rows`]/[`store_rows`]. Nobody
+/// has asked for a narrow one yet, and a mover with one caller and two element
+/// types is generality bought before it is wanted.
 #[derive(Clone, Copy)]
 pub struct GlobalRows {
     base: *mut f32,

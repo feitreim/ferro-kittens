@@ -1,12 +1,13 @@
 # examples
 
 Four kernels written the way we want them to read, and a header on each saying
-whether it runs, whether it only compiles, or whether it is aspirational.
+whether it runs or whether it only compiles. All four compile as of #3; two run.
 
-The value of this crate is the **diff** between what the kernels want to say and
-what `kittens` can express. An aspirational example is not a placeholder — it is
-a statement of a missing API in the only terms that matter, which is what a
-kernel author has to type. This file collects that diff across all four.
+The value of this crate was the **diff** between what the kernels wanted to say
+and what `kittens` could express. An aspirational example — one naming API that
+did not exist yet — is not a placeholder but a statement of a missing API in the
+only terms that matter, which is what a kernel author has to type. That diff is
+now empty, and this file is the record of what it produced while it was not.
 
 Its own workspace, like `device-tests`, so `cargo` at the repo root never sees
 it. (The root `Cargo.toml` also needs `autoexamples = false`: `examples/` is one
@@ -21,7 +22,16 @@ target *of the library*.)
 | [`gemm`](src/gemm.rs) | **runs** — exact against a CPU reference | — (and no gap worked around in-file any more) |
 | [`softmax`](src/softmax.rs) | **runs** — within 2⁻⁸ of a CPU reference | — |
 | [`flash_forward`](src/flash_forward.rs) | **compiles** — no launcher yet | — |
-| [`layernorm`](src/layernorm.rs) | `layernorm_rows` **compiles**; `groupnorm_tile` aspirational | #3 (and #2 under it), for `groupnorm_tile` only |
+| [`layernorm`](src/layernorm.rs) | **compiles** — both kernels, no launcher yet | — |
+
+All four are in the default build and this crate has **no cargo features left**.
+That is not tidying: `cargo oxide build kittens-examples --arch sm_100a` — which
+is `modal run modal_app.py::build`, and CI tier 2 — compiles the *default*
+feature set, so a gated kernel was never codegened by the thing that codegens
+this crate. `flash_forward` is the example with the most library surface in it
+(both MMA layouts, the swizzled `P` staging tile, `online_rescale`, masking,
+both memory ends), and until #3 it was the one example nothing could catch a
+regression in. The gate was standing in for a claim a real build makes better.
 
 Two of the four **run** rather than merely compile, which is a strictly stronger
 claim and the one worth holding the rest to: a launcher, a CPU reference, and an
@@ -59,16 +69,24 @@ last mover, the one with no engine behind it: `global::load_rows`/`store_rows`
 address a plain pitched buffer from the fragment layout's own coordinates,
 which is what took the GEMM's epilogue from twelve lines of index math to one
 call. Those two landed together and between them took `flash_forward` from
-aspirational to compiling. What remains across the four is one structural gap
-(#3, layernorm's block-scope statistic) — and it is the only one left.
+aspirational to compiling. **#3** was the last structural gap — layernorm's
+block-scope statistic — and with it closed **no kernel here is blocked on
+missing API any more**. All four compile against the real library, and what
+separates the two that *run* from the two that do not is a launcher and a CPU
+reference. What is still open is on the other list, the one that came from
+writing kernels rather than from ThunderKittens' feature set: cluster-scope
+semaphore arrival, a cluster geometry for multicast, a work-item map that knows
+about clusters, and the `expect_tx` byte accounting. None of them blocks a
+kernel in this directory.
 
-`layernorm` is the first example to be **split** by a landed issue rather than
-promoted whole, and the split is the honest reading of what #13 bought.
-`layernorm_rows` is in the default build and gets a real `sm_100a` compile;
-`groupnorm_tile` beside it keeps the `layernorm` feature and its `WANT` block,
-because its statistic spans four warps. The `#[cfg]` sits on the *kernel* — the
-`#[cuda_module]` macro honours it — so the file that documents the gap is the
-file that builds, and one aspirational kernel does not gate a finished one.
+`layernorm` was the first example to be **split** by a landed issue rather than
+promoted whole: #13 took `layernorm_rows` out of the gate and left
+`groupnorm_tile` behind it, because its statistic spans four warps and #13
+supplied only the storage half of what that needs. #3 supplied the other half
+and the split is over — both kernels are in the default build and both get a
+real `sm_100a` compile. The `layernorm` cargo feature went with it, and so did
+`flash`: see the status table above for why a feature gating a kernel that
+compiles is worse than no feature at all.
 
 No arithmetic entry is open any more. `RegTile::add_assign` was the last one
 and **#31** landed it, along with an `_assign` twin for every other map on all
@@ -77,42 +95,49 @@ the API it shipped, and § "in-place versus by-value" below is rewritten around
 it.
 
 ```sh
-cargo oxide build kittens-examples --arch sm_100a   # the default set: gemm, softmax, layernorm_rows
+cargo oxide build kittens-examples --arch sm_100a   # all four kernels
 cargo oxide run kittens-examples                    # and run the ones with launchers, on a B200
-cargo check --features flash                        # read flash's gap list
-cargo check --features aspirational                 # every gated kernel's
 ```
 
-From the repo root: `modal run modal_app.py::build` for the first,
-`modal run modal_app.py::examples` for the second, and
-`modal run modal_app.py::gaps` for the last two — it prints both gap lists and
-never fails, since an empty one is a finding rather than an error.
+From the repo root: `modal run modal_app.py::build` for the first and
+`modal run modal_app.py::examples` for the second.
 
-Each aspirational kernel is behind its own feature and off by default, so
-everything in the default build genuinely compiles and the two kinds are
-distinguishable without running anything. Turning a feature on prints the
-missing API as compiler errors, at the call sites that want it. Verified: every
-error is `unresolved import`, `no method named`, or an unsatisfied
-`FragmentLayout` bound — there is nothing in these files that fails for any
-reason other than the API not existing.
+## The gap lists, and why there is no longer a command for them
 
-One kernel is still behind a feature — `groupnorm_tile`, which shares a file
-with one that is not — and it is down to a single error. That list is read off
-`modal run modal_app.py::gaps`, which checks each feature on its own so an
-error belongs to a known kernel:
+`modal run modal_app.py::gaps` is **retired** (#3). It turned each aspirational
+kernel's cargo feature on and printed the resulting compiler errors, which is
+the right instrument while a kernel names API that does not exist: the missing
+surface *is* the error list, at the call sites that want it, read off a compiler
+rather than off the last person's memory. It is gone because **every list
+reached empty and the features are gone with them** — and an empty section is
+not a finding, it is a command with nothing to say.
 
-- **`flash_forward`** — **empty**, which is the interesting outcome for a gap
-  list. It stays behind its feature only for want of a launcher and a CPU
-  reference; nothing in it reaches past the library any more. The list was
-  three errors until #23 landed, two until #11 and #31 landed together, and how
-  the third went is worth keeping: `make_causal_at` (#7) was wanted all along
-  and never appeared as its own error, because it is called on the `[32, 64]`
-  band whose `FragmentLayout` bound already failed, and an unsatisfied bound on
-  the receiver suppresses method resolution on it. Counting errors would have
-  said #7 had landed.
-- **`layernorm`** — `sync::block_reduce_sum` (#3), and nothing else. One error,
-  in `groupnorm_tile` only; `layernorm_rows` left the feature gate with #13.
-  Verified by running the check, not by reading the file.
+What replaced it is stronger rather than weaker. All four kernels are in the
+default build, so `build` codegens each one for real `sm_100a`, and that catches
+what a `cargo check` cannot: a post-monomorphization `const { assert!(..) }` is
+invisible to a type-check and fires only at codegen. `SharedVec<F32, 4>`'s box
+assert was exactly one of those.
+
+The two lists as they stood at the end, both read off the last run of `gaps`
+before it was retired, and kept because *how* each emptied is the useful part:
+
+- **`flash_forward`** — **empty**, which was the interesting outcome for a gap
+  list. Nothing in it reaches past the library; it wants a launcher and a CPU
+  reference. The list was three errors until #23 landed, two until #11 and #31
+  landed together, and how the third went is worth keeping: `make_causal_at`
+  (#7) was wanted all along and never appeared as its own error, because it is
+  called on the `[32, 64]` band whose `FragmentLayout` bound already failed, and
+  an unsatisfied bound on the receiver suppresses method resolution on it.
+  Counting errors would have said #7 had landed.
+- **`layernorm`** — one error, `sync::block_reduce_sum` (#3), in
+  `groupnorm_tile` only; `layernorm_rows` had left the gate with #13. #3 closed
+  it, and the feature went with the kernel.
+
+If a new aspirational kernel is ever written, the instrument is worth rebuilding
+exactly as it was — a feature per kernel, checked on its own so an error belongs
+to a known kernel, non-zero exit reported rather than raised. What is not worth
+keeping is the gate on a kernel that compiles, because a gated kernel is one the
+`sm_100a` build never sees.
 
 Nothing named `scale`, `shift` or `rsqrt` is in either list any more (#38),
 nothing named `add_assign` (#31), and nothing named `FragmentLayout` or
@@ -144,7 +169,7 @@ argues it and states what is left over.
 `gemm` **runs**, and is the first numerical result this library has produced.
 `gemm::check` launches it over `[512, 256] x [256, 256]ᵀ` on a B200 and compares
 every element against a CPU reference. The operands are integers in `[-3, 3]`
-and `[-2, 2]`, so every product and every partial sum is exact in bf16 and fp32
+and `[-10, 10]`, so every product and every partial sum is exact in bf16 and fp32
 alike and the comparison is `==` — a mismatch is a wrong coordinate, a wrong
 stride or a wrong operand half, and never a rounding artifact to argue about.
 `main` runs every kernel that has a launcher and exits non-zero on a wrong
@@ -515,8 +540,10 @@ masks 1,2 for a row (what `quad_max`/`quad_sum` already were), 4,8,16 for a
 column, all five for a tile.
 
 All of it is **warp scope**. `tile_sum` folds one warp's band; layernorm's
-group-norm statistic spans four warps' bands and still needs them to agree,
-which is the #3 entry below — #13 has since supplied the storage half of it.
+group-norm statistic spans four warps' bands and needs them to agree, which is
+the #3 entry below — #13 supplied the storage half and #3 the fold, and the two
+compose exactly the way `groupnorm_tile` wanted:
+`block_reduce_sum(partials, x.tile_sum())`.
 
 **#7 — masking. Landed**, with the correction the examples surfaced. The issue
 as filed describes ThunderKittens' signature, which takes no coordinate origin;
@@ -572,12 +599,13 @@ Three things about it are decisions rather than transcription:
   `stmatrix`, and this shares none of it. It also cannot be called
   `store_tile`, because `flash_forward` imports `ldst::store_tile` in the same
   file and would then have two of them.
-- **It is fp32 and not generic over `Element`.** The type parameter belongs
-  there and cannot go there yet: `Element` is implemented for `Bf16` alone
-  (#2), so `GlobalRows<E>` would have exactly one instantiation and it would
-  be the wrong one — a `RegTile` *is* fp32, and this path exists to move one
-  without rounding. When #2 lands it is a bound and two `E::read`/`E::write`
-  calls.
+- **It is fp32 and not generic over `Element`** — a choice since #3, and a
+  constraint before it. The argument was that `Element` was implemented for
+  `Bf16` alone, so `GlobalRows<E>` would have had exactly one instantiation and
+  it would have been the wrong one: a `RegTile` *is* fp32, and this path exists
+  to move one without rounding. `F32` is that impl now, so what is left is the
+  parameter, a bound and two `E::read`/`E::write` calls — and no caller wanting
+  a narrow one, which is why it is still fp32.
 - **It is the only mover generic over `FragmentLayout`.** `ldmatrix`,
   `stmatrix` and LDTM each fix a lane map in hardware, so every other mover in
   the crate is pinned to `BaseLdtm`. A plain `st.global` fixes nothing, so
@@ -620,34 +648,90 @@ on: `BOX_COLS = N`, `BOX_ROWS = 1`, `SWIZZLE = NONE`, so a rank-1
 `GlobalLayout` finally has something to hand a box to. Rank 1 is no longer
 "expressible but untried" — the `shared vector round trip` device case runs one.
 
-**#3 — scope parameterization.** Layernorm's whole-tile statistic, and the one
-demand #6 deliberately did not meet. A tile owned by four warps needs the warps
-to agree.
+**#3 — block-scope reductions. Landed**, and it is what promoted
+`groupnorm_tile`. `kittens::sync::block_reduce::<Op, WARPS>` folds one
+warp-uniform value per warp into one block-uniform value through a
+`SharedVec<F32, WARPS>`, with `block_reduce_sum` as the `Add` wrapper — the
+same relationship `scale_rows` has to `row_map_assign` (#31), and for the same
+reason. Under it, the `impl Element for F32` that **#2** closed without.
 
-> The storage half of the note below is now answered. `SharedVec` is a type a
-> block-reduction signature can name, and its scalar access is deliberately per
-> *element* rather than per packed word — warp `w` writing index `w` must not
-> read-modify-write a neighbour's value, which is exactly the case a word-wide
-> `Element::pack` could not serve. What #3 still owes is the fold itself, and
-> what it owes *under* #3 is **#2**: `Element` is implemented only for `Bf16`,
-> so `SharedVec<F32, 4>` — the shape a partial actually has — does not exist
-> yet. The type is generic over `E: Element` and needs no change when it does.
+The issue was filed as *scope parameterization* — a `Scope` trait swept through
+every signature — and it was retired in that form before it was built. The
+argument for it was "cheap at 1851 lines, expensive after #5, #6 and #7"; those
+landed, the op surface tripled, and the window closed. More decisively, a
+`Scope` of `{ WARPS, THREADS, rank(), sync() }` **cannot express the one thing
+the only real consumer wanted**: warps cannot shuffle to each other, so a fold
+across them needs *storage* between two barriers, which is not a member of that
+trait and cannot be. Sweeping the library would have left `groupnorm_tile`
+exactly as blocked as it was.
 
-> A finding from writing #6 against this, worth having before #3 is picked up:
-> **`Scope` as filed cannot express the block reduction.** The proposed trait is
-> `WARPS` / `THREADS` / `rank()` / `sync()`, and a block-scope fold needs none
-> of those so much as it needs *storage* — somewhere for each warp's partial to
-> live between the two barriers. `groupnorm_tile` guesses at that today with a
-> bare `*mut f32` carved out of its own shared plan, and the library cannot
-> allocate one on its behalf: the shared plan belongs to the kernel. So the
-> block reduction's signature is either "take a scratch pointer" (not scope
-> parameterization at all) or "take #13's `SharedVec`". #3 and #13 have to be
-> sequenced together, and #6 does not force either.
+What the trait would still be for — a `Warp`/`Warpgroup`/`Block` distinction in
+the *types* rather than in the index math — this work says nothing about, and
+building the reduction turned up no new evidence for it. It also did not need
+one: the collective takes `WARPS` as a bare const parameter and derives nothing
+else from it. Two cautions for whoever picks it up, both older than this issue
+and both still standing: `Scope::rank()` would settle **#27** (implicit `lane`)
+by accident, and `Warp::sync()` beside `Block::sync()` in one trait makes two
+instructions of very different cost look interchangeable at a call site that
+cannot afford `__syncthreads`.
+
+Three things about the reduction are decisions rather than transcription:
+
+- **Its bound is `ReduceOp`, not `BinaryOp`** as the issue's signature had it.
+  The warps' partials arrive in slot order, which is not an order the caller
+  chose, so a fold over them has to be associative and commutative to mean
+  anything — the identical argument that keeps `Sub` and `Div` out of
+  `row_reduce`. The identity is also what lets one loop serve every width.
+- **The input must be warp-uniform, and it does not fold across lanes first.**
+  Its input is a `tile_sum` result, which is already the whole warp's; folding
+  again would count all 32 lanes' copies. That choice is not reversible by
+  taste — under `Add` the two readings differ by a factor of 32 and the wrong
+  one returns a number, so it is stated as a safety condition and a per-lane
+  value has to go through `warp_reduce` at the call site.
+- **Two barriers, and the second is the reusable part.** `groupnorm_tile` calls
+  it twice on one scratch — mean, then variance — with nothing between the calls
+  but arithmetic. The collective syncs *after* its own read as well as before
+  it, so the variance pass cannot overwrite a slot the mean pass has not folded
+  yet, and the caller owes no barrier. The alternative spelling (sync before the
+  write instead of after the read) costs exactly the same two barriers and makes
+  the rule a precondition on the caller rather than a postcondition the function
+  establishes; this one was chosen so that back-to-back calls are self-sufficient
+  by construction.
+
+And one thing it moved on the way. `WARPS` was briefly forced to a multiple of
+four: `SharedVec::BOX_OK` wants a whole number of the TMA's 16-byte lines, so
+four fp32 — 16 bytes exactly, as predicted, the minimum legal box — was the
+narrowest scratch that would *construct*, and a 1- or 2-warp block could not
+take the reduction at all. But that rule is a statement about a **TMA box**, and
+a block reduction's scratch is the one use of `SharedVec` that never becomes
+one: it is written by `set`, read by `get`, and never handed to a descriptor. So
+`BOX_OK` and `LENGTH_OK` moved off `from_raw` and onto the four transfer
+methods, where they still fire at codegen for every caller they genuinely bind —
+verified by hand, and the error names the instantiation:
+`SharedVec::<Bf16, 4>::BOX_OK` failed *while instantiating*
+`SharedVec::<Bf16, 4>::tma_store`. Nothing was relying on the construction-time
+placement; the host side already rejects the same shapes when a tensor map is
+built, with a better message, in `check_driver_requirements`.
+
+The lesson is narrower than the fix. An assert on a constructor reads as a
+statement about the type, and this one was a statement about four of its
+methods — `SharedVec` was saying "I am a thing the TMA can deliver" when what it
+is, is a run of elements that *may* be delivered.
+
+> The note that decided the shape, kept because it is the argument. A finding
+> from writing #6: **`Scope` as filed cannot express the block reduction.** A
+> block-scope fold needs somewhere for each warp's partial to live between the
+> two barriers. `groupnorm_tile` guessed at that with a bare `*mut f32` carved
+> out of its own shared plan, and the library cannot allocate one on its
+> behalf: the shared plan belongs to the kernel. So the signature was either
+> "take a scratch pointer" — not scope parameterization at all — or "take #13's
+> `SharedVec`".
 >
 > **Settled by #13**: the second one. A `SharedVec` is a type the signature can
-> name, and it is still the *kernel's* allocation — `from_raw` takes a base
-> pointer like every shared type here — so nothing about the shared plan moved
-> into the library.
+> name, its scalar access is per *element* rather than per packed word so warp
+> `w` writing index `w` cannot read-modify-write a neighbour's value, and it is
+> still the *kernel's* allocation — `from_raw` takes a base pointer like every
+> shared type here — so nothing about the shared plan moved into the library.
 
 **#8 — global layout.** ~~Not reachable from a kernel at all~~ — **closed**, and
 it is why this crate now has a launcher at all. `kittens::global::GlobalLayout<E,
@@ -657,13 +741,18 @@ the data type off the `SharedTile` the map is paired with — the agreement
 `encode_bf16_panels` had by being one hardcoded builder, now stated as a type.
 `gemm::check` builds both operands' maps from it and differs only in extents.
 
-What #8 does *not* close: `GlobalLayout` is bf16-only, because `Element` is
-implemented only for `Bf16` (#2 owns that), so an fp32 buffer still cannot be
-described. Two of the three things that entry used to say have since gone:
-`TileBox` has a second impl (#13), so a layout has something to hand a
-non-tile box to, and rank 1 is no longer untried — the `shared vector round
-trip` device case builds one and moves a vector through it. What remains is
-only the element type, which is #2 and is ~15 lines.
+What #8 does *not* close: `GlobalLayout` is bf16-only, and since #3 the reason
+has moved one trait along. `Element` has an fp32 impl now, but a tensor map
+also needs `TensorMapElement` — the `CUtensorMapDataType` the driver reads the
+buffer as — and that is `Bf16` alone, so an fp32 buffer still cannot be
+described. It is one associated constant
+(`CU_TENSOR_MAP_DATA_TYPE_FLOAT32`), left undone because nothing in tree TMAs
+an fp32 buffer: a block reduction's scratch is written by `set` and read by
+`get`, and never meets the engine. Two of the three things that entry used to
+say have since gone: `TileBox` has a second impl (#13), so a layout has
+something to hand a non-tile box to, and rank 1 is no longer untried — the
+`shared vector round trip` device case builds one and moves a vector through
+it.
 
 **#12 — MMA coverage.** Not demanded. `mma_abt`, `mma_ab` and `mma_walk_cg2`
 covered every multiply in all four kernels. Worth recording as a negative
@@ -816,8 +905,13 @@ The work-item map is `blockIdx.x` strided by `gridDim.x`, so the two CTAs of a
 cluster get *different* items. The GEMM therefore does not use the persistent
 scaffold at all — it is one cluster per output tile with the K loop as its
 pipeline. `prototype::lcf` predates clusters in ThunderKittens too, so this is
-not a porting oversight; it is the scaffold needing #3's `Scope` before it can
-describe who a work item belongs to.
+not a porting oversight; the scaffold needs a way to say who a work item
+belongs to, and `blockIdx.x` is not it.
+
+This entry used to name #3's `Scope` as the missing piece. #3 shipped a block
+reduction instead and no `Scope`, so what is wanted here is unfiled: a cluster
+rank in the work-item map, which is a `%cluster_ctarank` and a divisor, not a
+trait. Nothing about the block reduction bears on it.
 
 Related, and cheaper: #15's `lcsf` was filed as depending on #9, which has now
 landed with the wait it needs — `tma_store_wait_read` releases the shared buffer
@@ -861,8 +955,8 @@ actually needs from it is the address space. Filed as a correction on #24.
 ## What the examples confirm already works
 
 Worth recording, because the promotion of an example from aspirational to
-compiling is the thing that proves an issue is finished, and half of this
-library is already at that bar:
+compiling is the thing that proved an issue finished, and every kernel here has
+now made that promotion:
 
 - **The MMA layer.** `mma_abt`, `mma_ab` and `mma_walk_cg2` covered every
   multiply in four kernels, in the layouts they wanted, with no gaps. Each
