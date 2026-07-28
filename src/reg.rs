@@ -30,6 +30,15 @@
 //! has nowhere to keep a `k`. The consequence is that every tile-against-scalar
 //! form the op set can express is reachable without a new op.
 //!
+//! Masking ([`RegTile::make_causal`], `tril`/`triu`, the fills) is the other
+//! use of the ownership map: a select at each value's logical `(row, column)`,
+//! in place, with no lane learning anything from another. Every one of them
+//! takes a **coordinate origin** — a `diagonal`, or a fill index — because the
+//! tile being masked is a sub-block of a much larger score matrix and its
+//! diagonal sits at `query_base - key_base`. Masking a tile against its own
+//! `row == column` instead compiles, runs, and is wrong everywhere off the
+//! diagonal block; see [`RegTile::make_causal_at`].
+//!
 //! Reductions take the same [`BinaryOp`] and come in two halves: a thread's own
 //! registers, then a `shuffle_xor` butterfly over the lanes the map spreads the
 //! folded axis across. Which lanes those are is the entire correctness
@@ -1070,6 +1079,118 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
         (L::row_of(lane, slot), L::col_of(lane, value))
     }
 
+    /// Replace every value whose logical coordinate `keep` rejects with
+    /// `fill`, in place — the mechanism under the masks and fills below.
+    ///
+    /// Lane-local: the map hands a thread whole `(row, column)` pairs, so a
+    /// mask is a select on registers it already holds and no lane learns
+    /// anything from another. In place because a mask is the innermost thing
+    /// in an attention loop and its input is dead the instant it returns; the
+    /// by-value spelling would put a second band beside the score band at
+    /// exactly the width #5 and #38 measured that to cost.
+    ///
+    /// Coordinates are `i32`, not `u32`: a tiled kernel's bounds are
+    /// differences of block origins and leave `0..M × 0..N` in both
+    /// directions. That is not an edge case — it is how a band wholly above
+    /// the diagonal takes `keep` false everywhere and one wholly below takes
+    /// it true everywhere, which is most of the bands in a causal kernel.
+    #[inline(always)]
+    pub fn mask(&mut self, lane: u32, fill: f32, keep: impl Fn(i32, i32) -> bool) {
+        let mut slot = 0;
+        while slot < L::SLOTS {
+            let row = L::row_of(lane, slot) as i32;
+            let mut value = 0;
+            while value < L::VALUES {
+                let column = L::col_of(lane, value) as i32;
+                if !keep(row, column) {
+                    self.set(slot, value, fill);
+                }
+                value += 1;
+            }
+            slot += 1;
+        }
+    }
+
+    /// Keep the lower triangle — `column - row <= diagonal` — and fill the
+    /// rest.
+    ///
+    /// `diagonal` is where the boundary crosses this tile's own `(0, 0)`, so
+    /// a tile that is a sub-block of a larger matrix passes the difference of
+    /// its origins and gets the larger matrix's diagonal. TK's `tril` has no
+    /// such parameter because it masks a tile against itself, which is right
+    /// for exactly one block of a tiled kernel and silently wrong for the
+    /// rest; see [`Self::make_causal_at`].
+    #[inline(always)]
+    pub fn tril(&mut self, lane: u32, diagonal: i32, fill: f32) {
+        self.mask(lane, fill, |row, column| column - row <= diagonal);
+    }
+
+    /// Keep the upper triangle, `column - row >= diagonal`; the mirror of
+    /// [`Self::tril`] and its exact complement at `diagonal + 1`.
+    #[inline(always)]
+    pub fn triu(&mut self, lane: u32, diagonal: i32, fill: f32) {
+        self.mask(lane, fill, |row, column| column - row >= diagonal);
+    }
+
+    /// Causal attention's mask: a query attends to no key after it, so this is
+    /// [`Self::tril`] under the name every attention kernel knows it by, with
+    /// `fill` the pre-softmax sentinel (`f32::NEG_INFINITY`, or a finite
+    /// `-1e30` if the row could be entirely masked).
+    #[inline(always)]
+    pub fn make_causal(&mut self, lane: u32, diagonal: i32, fill: f32) {
+        self.tril(lane, diagonal, fill);
+    }
+
+    /// [`Self::make_causal`] for a transposed score band — `Kᵀ·Q` rather than
+    /// `Q·Kᵀ` — which is [`Self::triu`] about the same diagonal.
+    #[inline(always)]
+    pub fn make_causal_t(&mut self, lane: u32, diagonal: i32, fill: f32) {
+        self.triu(lane, diagonal, fill);
+    }
+
+    /// [`Self::make_causal`] taking the two block origins a flash kernel
+    /// already holds instead of their difference: the band covers queries
+    /// `query_base..query_base + M` against keys `key_base..key_base + N`, and
+    /// its diagonal sits at `query_base - key_base`.
+    ///
+    /// Taking them separately is not sugar. The difference is negative for
+    /// every band above the diagonal — the fully-masked ones — and both
+    /// origins are `u32` at the call site, so `query_base - key_base` written
+    /// there wraps to a huge positive number and masks nothing. This subtracts
+    /// in `i32`.
+    #[inline(always)]
+    pub fn make_causal_at(&mut self, lane: u32, query_base: u32, key_base: u32, fill: f32) {
+        self.make_causal(lane, query_base as i32 - key_base as i32, fill);
+    }
+
+    /// Fill the columns at and right of `column`, keeping the rest — the
+    /// ragged-tail mask, with `column` the number of real keys left at this
+    /// band's origin (`keys - key_base`, which may be negative or past `N`).
+    #[inline(always)]
+    pub fn right_fill(&mut self, lane: u32, column: i32, fill: f32) {
+        self.mask(lane, fill, |_, c| c < column);
+    }
+
+    /// Fill the columns left of `column`; the mirror of [`Self::right_fill`],
+    /// and a sliding window's other edge.
+    #[inline(always)]
+    pub fn left_fill(&mut self, lane: u32, column: i32, fill: f32) {
+        self.mask(lane, fill, |_, c| c >= column);
+    }
+
+    /// Fill the rows above `row` — [`Self::left_fill`] on the query axis.
+    #[inline(always)]
+    pub fn upper_fill(&mut self, lane: u32, row: i32, fill: f32) {
+        self.mask(lane, fill, |r, _| r >= row);
+    }
+
+    /// Fill the rows at and below `row`: [`Self::right_fill`] on the query
+    /// axis, for a band whose last rows run past the sequence.
+    #[inline(always)]
+    pub fn lower_fill(&mut self, lane: u32, row: i32, fill: f32) {
+        self.mask(lane, fill, |r, _| r < row);
+    }
+
     /// Scale every value in row-slot `s` by `factors` slot `s` — the
     /// running-max rescale of an online-softmax accumulator.
     ///
@@ -2101,6 +2222,160 @@ mod tests {
         }
         for value in 0..Cols::VALUES {
             assert_eq!(Cols::splat(1.0).get(value), 1.0);
+        }
+    }
+
+    /// The sentinel a masked score carries into `exp2` — finite, so a fully
+    /// masked row sums to zero rather than to `NaN`.
+    const MASKED: f32 = -1.0e30;
+
+    #[test]
+    fn causal_masks_against_the_bands_global_origin() {
+        // The whole of #7's correction. The band is a [32, 64] sub-block of a
+        // much larger score matrix, so what decides an element is whether its
+        // *global* key index is at or before its global query index — and the
+        // origin-free mask agrees with that only when the two bases are equal,
+        // which is one block of a tiled kernel and no others.
+        for (query_base, key_base) in [(0u32, 0u32), (32, 0), (0, 32), (128, 64), (64, 128)] {
+            for lane in 0..32 {
+                let unmasked: Band = indexed(lane);
+                let mut band = unmasked;
+                band.make_causal_at(lane, query_base, key_base, MASKED);
+                for slot in 0..Band::SLOTS {
+                    for value in 0..Band::VALUES {
+                        let (row, column) = Band::coordinate(lane, slot, value);
+                        let attends = key_base + column <= query_base + row;
+                        assert_eq!(
+                            band.get(slot, value),
+                            if attends {
+                                unmasked.get(slot, value)
+                            } else {
+                                MASKED
+                            },
+                            "({query_base}, {key_base}) lane {lane} at ({row}, {column})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_band_off_the_diagonal_is_all_or_nothing() {
+        // The two common cases in a tiled kernel, and the two the origin-free
+        // signature cannot express at all. `key_base > query_base + M` is
+        // wholly after every query in the band; `query_base > key_base + N`
+        // wholly before every key.
+        for lane in 0..32 {
+            let unmasked: Band = indexed(lane);
+
+            let mut above = unmasked;
+            above.make_causal_at(lane, 0, 1024, MASKED);
+            let mut below = unmasked;
+            below.make_causal_at(lane, 1024, 0, MASKED);
+
+            for slot in 0..Band::SLOTS {
+                for value in 0..Band::VALUES {
+                    assert_eq!(above.get(slot, value), MASKED);
+                    assert_eq!(below.get(slot, value), unmasked.get(slot, value));
+                }
+            }
+        }
+        // And that the origin arrives as a signed difference: the same band
+        // through the `u32` subtraction a call site would write instead
+        // wraps to +4294966272 and masks nothing.
+        let mut wrapped: Band = indexed(0);
+        wrapped.make_causal(0, 0u32.wrapping_sub(1024) as i32, MASKED);
+        assert_eq!(wrapped.get(0, 0), MASKED);
+    }
+
+    #[test]
+    fn tril_and_triu_partition_the_tile() {
+        // Complements about `diagonal`, at every diagonal that crosses the
+        // tile and two that miss it entirely.
+        for lane in 0..32 {
+            for diagonal in [-64, -1, 0, 1, 17, 31, 64] {
+                let full = coordinate_tile(lane);
+                let mut lower = full;
+                lower.tril(lane, diagonal, 0.0);
+                let mut upper = full;
+                upper.triu(lane, diagonal + 1, 0.0);
+                let mut causal = full;
+                causal.make_causal(lane, diagonal, MASKED);
+                let mut transposed = full;
+                transposed.make_causal_t(lane, diagonal, MASKED);
+                let mut mirrored = full;
+                mirrored.triu(lane, diagonal, MASKED);
+
+                for slot in 0..Scores::SLOTS {
+                    for value in 0..Scores::VALUES {
+                        let (row, column) = Scores::coordinate(lane, slot, value);
+                        let below = column as i32 - row as i32 <= diagonal;
+                        let x = full.get(slot, value);
+                        assert_eq!(lower.get(slot, value), if below { x } else { 0.0 });
+                        assert_eq!(upper.get(slot, value), if below { 0.0 } else { x });
+                        assert_eq!(causal.get(slot, value), if below { x } else { MASKED });
+                        assert_eq!(transposed.get(slot, value), mirrored.get(slot, value));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fills_cut_at_their_index_and_saturate_off_the_tile() {
+        // Bounds outside `0..N` are the ragged tail's ordinary case — a band
+        // wholly past the sequence end, or wholly inside it — so they are
+        // asserted alongside the ones that cut.
+        for lane in 0..32 {
+            for bound in [-16, 0, 1, 9, 32, 64, 96] {
+                let full: Band = indexed(lane);
+                let (mut right, mut left, mut upper, mut lower) = (full, full, full, full);
+                right.right_fill(lane, bound, MASKED);
+                left.left_fill(lane, bound, MASKED);
+                upper.upper_fill(lane, bound, MASKED);
+                lower.lower_fill(lane, bound, MASKED);
+
+                for slot in 0..Band::SLOTS {
+                    for value in 0..Band::VALUES {
+                        let (row, column) = Band::coordinate(lane, slot, value);
+                        let (row, column) = (row as i32, column as i32);
+                        let x = full.get(slot, value);
+                        let cut = |keep: bool| if keep { x } else { MASKED };
+                        assert_eq!(right.get(slot, value), cut(column < bound));
+                        assert_eq!(left.get(slot, value), cut(column >= bound));
+                        assert_eq!(upper.get(slot, value), cut(row >= bound));
+                        assert_eq!(lower.get(slot, value), cut(row < bound));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn masks_are_the_predicate_over_the_layouts_coordinates() {
+        // Every mask above is `mask` with a predicate, and `mask` is a select
+        // at the coordinate the *layout* gives — not at `(slot, value)`. A
+        // mask that indexed by storage position instead would pass every test
+        // that only checks the diagonal block, so this checks the mechanism
+        // directly, on a shape whose slots and values are both plural.
+        for lane in 0..32 {
+            let full: Band = indexed(lane);
+            let mut masked = full;
+            masked.mask(lane, MASKED, |row, column| (row + column) % 3 == 0);
+            for slot in 0..Band::SLOTS {
+                for value in 0..Band::VALUES {
+                    let (row, column) = Band::coordinate(lane, slot, value);
+                    assert_eq!(
+                        masked.get(slot, value),
+                        if (row + column) % 3 == 0 {
+                            full.get(slot, value)
+                        } else {
+                            MASKED
+                        }
+                    );
+                }
+            }
         }
     }
 
