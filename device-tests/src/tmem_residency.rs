@@ -109,6 +109,16 @@
 //!   querying occupancy at four sizes, got 1 every time, and concluded shared
 //!   memory was not the lever. Every one of those four answers was the allocator
 //!   pinning the query. It is the only lever that kernel has.
+//!
+//! # And three rungs that exist to be a control for something else (#98)
+//!
+//! `gemm`'s plan and the same plan with 8192 and 49152 dead bytes on the end
+//! count **3, 2 and 1**. Nothing in this file needs those numbers; they are
+//! here because `examples/README.md` prices what an occupancy step costs that
+//! kernel's *throughput*, by declaring exactly those envelopes and touching
+//! none of the added bytes. That experiment's whole claim is that the only
+//! thing it moved was residency, and a claim about residency in this repo is
+//! counted rather than queried.
 
 use std::error::Error;
 use std::fmt::Write as _;
@@ -164,6 +174,28 @@ const FLASH_SHARED: u32 = 147_536;
 /// in common with a throughput curve — different kernel, different signal,
 /// same envelope.
 const GEMM_SHARED: u32 = 73_792;
+
+/// `gemm_cg2`'s plan as it stands today — [`GEMM_SHARED`] plus the 24 bytes the
+/// CLC work queue added, which every scheduler now pays whether it reads the
+/// queue or not.
+///
+/// Carried separately because 73792 and 73816 are on the same side of the same
+/// step and it is worth saying so with a count rather than with arithmetic:
+/// three of either fit in an SM's 233472 B.
+const GEMM_PLAN: u32 = 73_816;
+
+/// [`GEMM_PLAN`] with a dead 8192 B on the end — #98's 3 → 2 step.
+///
+/// Nothing reads these bytes. They exist to move residency and nothing else,
+/// which is what makes the throughput either side of them a price for the
+/// occupancy step rather than for an epilogue. 4033 B would cross the step;
+/// 8192 clears it with room to spare, and since the bytes are never touched
+/// there is no cost to overshooting.
+const GEMM_PLAN_TWO: u32 = GEMM_PLAN + 8_192;
+
+/// The same, sized to cross the 2 → 1 step. A linear cost and a cliff are
+/// different answers, so both steps get counted.
+const GEMM_PLAN_ONE: u32 = GEMM_PLAN + 49_152;
 
 /// How far the achieved hold may sit under [`HOLD_NS`] before the harness
 /// calls the spin broken rather than the residency low. A CTA that exited on
@@ -331,6 +363,37 @@ fn rungs() -> Vec<Rung> {
             2,
             true,
             GEMM_SHARED
+        ),
+        // #98: what one CTA an SM is worth to that kernel. The question is a
+        // throughput one and it is asked in `examples/README.md` by growing
+        // `gemm_cg2`'s declared plan with bytes no code touches; these three
+        // rungs are what says the growth moved residency, on the instrument
+        // that counts rather than the query that is pinned at 1 (#77). The
+        // dead bytes are a *launch parameter*, so there is nothing for a
+        // compiler to eliminate and no work either side of them differs.
+        rung!(
+            "gemm plan today",
+            residency_census_cluster_128,
+            Some(128),
+            2,
+            true,
+            GEMM_PLAN
+        ),
+        rung!(
+            "gemm plan + 8192 dead",
+            residency_census_cluster_128,
+            Some(128),
+            2,
+            true,
+            GEMM_PLAN_TWO
+        ),
+        rung!(
+            "gemm plan + 49152 dead",
+            residency_census_cluster_128,
+            Some(128),
+            2,
+            true,
+            GEMM_PLAN_ONE
         ),
     ]
 }

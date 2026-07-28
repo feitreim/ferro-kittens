@@ -1667,6 +1667,13 @@ residency to **2 CTAs/SM, or 1**. Against a steady state already at 67% of dense
 peak, cutting concurrency by a third to recover a term now worth 20–22% is a
 losing trade — and it was already close *before* this change, at 27–36%.
 
+**The premise under that last sentence has since been measured, and it is
+wrong.** "Cutting concurrency by a third" is a third of the *residency*, and a
+third of the residency turns out to be 14–16% of the throughput, not 33% — see
+#98 below, which prices the occupancy step on a dead allocation. The trade is
+not a losing one on those grounds. It is decided instead by how much of the
+boundary `lcsf` hides, and the threshold is about 70%.
+
 The one version that could pay reuses an existing ring slot (an `ARing` stage is
 16384 B, exactly one band) so the plan does not grow. That serializes the next
 item's first loads against the store unless the schedule changes with it, which
@@ -1870,6 +1877,135 @@ questions it settles both fail silently. It also settles a polarity that
 `cuda_device::clc` documents two ways: `is_canceled == 1` means *work is
 available*, as the function's own doc says and its module-level usage example
 does not.
+
+##### and one CTA an SM is worth 14–16%, not a third — the premise, measured (#98)
+
+The TMEM → shared → TMA store epilogue (#9) that #91's section priced and did
+not build was rejected on an arithmetic: it costs an occupancy
+step, a step is `MAX_CLUSTERS` 222 → 148, and *"cutting concurrency by a third
+to recover a term now worth 20–22% is a losing trade."* The arithmetic is right.
+**A third of the residency is not a third of the throughput**, and nothing in
+this repo had asked which. Residency buys latency hiding, and a pipeline that
+already covers its own latencies does not need the third CTA. #15 turns on the
+difference: at 33% its straight route loses and it becomes a scheduling change,
+at 10% it is an epilogue change and worth a lot.
+
+**The measurement is a dead allocation.** `gemm_cg2`'s declared shared plan
+grows by bytes that no code reads or writes — 8192 to cross 3 → 2, 49152 to
+cross 2 → 1 — and `CTAS_PER_SM` moves with it so the persistent grid asks for
+the residency the device will actually give it. The work, the traversal, the
+instruction mix and the register count are identical either side: **the diff is
+four integer literals and no code at all.** A real staging buffer moves the
+epilogue and the residency at once, which is precisely why the paragraph above
+could not separate its cost from its benefit and fell back on arithmetic. The
+dead tail has all of the cost and none of the benefit, which is the control.
+
+**There is nothing here for a compiler to delete,** which is worth stating
+because a silently-eliminated allocation would measure nothing and look like a
+null result. The bytes are not an array `ptxas` could see and discard — dynamic
+shared memory is a *launch parameter*, written in `#[launch_contract]` and
+handed to the driver, so the only thing that could refuse to charge for it is
+the driver. It charges, and the census is what says so.
+
+**The step happened, and it was counted rather than queried.** #77's
+`cuOccupancyMaxActiveBlocksPerMultiprocessor` answers 1 for anything containing
+a `tcgen05.alloc`, so it cannot see this at all — it reads 1 at all three
+envelopes. `device-tests`' `tmem residency census` counts instead: every CTA
+records its `%smid` and timestamps both ends off `%globaltimer`, and the host
+sweeps for the most ever open at once on one SM. Three rungs were added at the
+exact envelopes the experiment declares:
+
+| plan | counted holders | resident | driver's query |
+| --- | ---: | ---: | ---: |
+| 73792 B (#84's rung) | 3 | 3 | 1 |
+| **73816 B — the plan today** | **3** | 3 | 1 |
+| **82008 B — +8192 dead** | **2** | 2 | 1 |
+| **122968 B — +49152 dead** | **1** | 1 | 1 |
+
+`resident` equals `holding` at every one, so no CTA is parked in a blocking
+allocator inflating the count, and the census's own `verdict` *asserts* that
+holders equal what the per-CTA resources divide to — the case passing is the
+assertion. Residency visibly moved. It is also the first count of the plan
+`gemm_cg2` actually declares: the 24 bytes the CLC work queue added sit on the
+same side of the step as 73792, which the repo had assumed and never checked.
+
+**The prediction, stated before the run:** 10–16% for the first step and a cliff
+of 35–45% for the second, reasoning from §7's old cap sweep and from #91 having
+made the epilogue cheaper, so there is less left for a third CTA to hide. Both
+came out about right, and the ways they did not are worth naming: the first step
+overshot the band on raw times at 16384³ (−18.3%, against a predicted ceiling of
+16%) and lands at its top edge once drift is divided out, and the second step
+was inside its band at 8192³ and 16384³ but well under it at 4096³ (−25.1%).
+The cliff was predicted and it is there; its depth is size-dependent in a way
+the prediction did not anticipate.
+
+Min ms over 30 timed launches, three separate B200 containers in one session,
+every row checked against the CPU reference before it was timed:
+
+| shape | 3 CTAs/SM | 2 CTAs/SM | 1 CTA/SM | TFLOP/s, 3 → 2 → 1 |
+| --- | ---: | ---: | ---: | ---: |
+| 4096³ | 0.1527 | 0.1727 | 0.2347 | 899.8 → 795.8 → 585.5 |
+| 8192³ | 0.8965 | 1.0668 | 1.8694 | 1226.5 → 1030.6 → 588.2 |
+| 16384³ | 6.7735 | 8.2907 | 13.7760 | 1298.6 → 1061.0 → 638.5 |
+
+**cuBLASLt is the drift control and it moves the answer.** It runs untouched in
+the same container at every rung, and it was not identical across them — 1789.5,
+1739.5 and 1771.7 TFLOP/s at 8192³, a 2.9% spread — so part of each raw delta is
+the session and not the step. Dividing it out gives the ratio to the library,
+and the size dependence of the first step largely collapses:
+
+| shape | ours/cuBLASLt at 3 → 2 → 1 | **3 → 2** | **2 → 1** |
+| --- | ---: | ---: | ---: |
+| 4096³ | 0.595 → 0.505 → 0.378 | **−15.1%** | **−25.1%** |
+| 8192³ | 0.685 → 0.592 → 0.332 | **−13.6%** | **−43.9%** |
+| 16384³ | 0.703 → 0.590 → 0.343 | **−16.1%** | **−41.9%** |
+
+**One CTA an SM is worth 14–16% of this kernel's throughput at the step that
+matters.** It is not worth 33%.
+
+**The two steps are not the same price, and that is the second finding.** The
+cost is strongly convex: the third CTA is worth a seventh, the second is worth
+25–44%. It is a cliff, not a linear cost, which is what #98 asked for
+because the two predict differently for #87 — a tile change spending the same
+budget can afford the first step and must not take the second.
+
+The far end says why, and it is a structural fact about this kernel rather than
+a benchmark row. **At one CTA per SM the throughput is ~585–640 TFLOP/s at
+4096³, 8192³ and 16384³ alike** — flat, where the 3-CTA curve climbs from 900 to
+1299 across the same sizes. So a lone CTA sustains about 590 TFLOP/s and
+*everything above that is overlap between CTAs*: rather more than half of what
+this kernel achieves is one CTA's stall covered by another's work. §7's old cap
+sweep got 523 TFLOP/s at cap 74 on a much earlier tree, which is the same
+plateau from a different direction.
+
+**The static grid is not what is doing it.** Resizing `MAX_CLUSTERS` with the
+residency also changes the ragged last wave — in the *favourable* direction here
+(8192³ goes from 92.3% to 98.8% wave efficiency), so if anything this understates
+the cost. The `clc` scheduler is the control that has no cap at all: its grid is
+the tile count either way and only the device's capacity changed. It agrees —
+0.8900 → 1.0729 at 8192³, **−17.0%** against the static path's −16.1%.
+
+This also supersedes §7's cap sweep as an answer to this question. That sweep
+shrank the *grid* and left the capacity alone, so it could not distinguish "two
+CTAs an SM" from "a grid that happens to place two on most SMs" — and CTAs are
+not obliged to distribute evenly. The dead tail makes the third CTA impossible
+rather than merely unrequested, and the census is what confirms it.
+
+**What this does to #15.** The item boundary is 20–22% of the 8192³ launch after
+#91. If `lcsf` hides a fraction `f` of it and pays one occupancy step costing
+`c`, the trade breaks even at `0.21f ≥ c` — so at the measured 13.6–16.1% band,
+**`lcsf` has to hide roughly two thirds to three quarters of the item boundary
+(f ≈ 0.65–0.76) to be worth an occupancy step.** Hide all of it and 8192³ goes
+to about 1330 TFLOP/s and 0.74 of cuBLASLt; hide half and it is a 4% *loss*.
+
+So the verdict is neither the rejection nor a green light. **#94 was wrong about
+the price — it is a seventh, not a third — and that is enough to put the
+straight route back on the table**, where the arithmetic as written had removed
+it. It is not enough to build it on. What decides #15 is now a different and
+more answerable question than "what does a CTA cost": it is *how much of the
+boundary does `lcsf` actually hide*, and ~70% is the number it has to beat. That
+is worth measuring on a prototype before the plumbing (`TensorMapElement` is
+`Bf16`-only, no fp32 `SharedTile` swizzle, `stmatrix` is b16) gets built.
 
 #### 8. Multicast has no geometry to live in
 
