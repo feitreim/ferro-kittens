@@ -21,6 +21,8 @@
 #![cfg_attr(not(feature = "host"), allow(rustdoc::broken_intra_doc_links))]
 
 pub mod global;
+#[cfg(feature = "host")]
+pub mod launch;
 pub mod ldst;
 pub mod mma;
 pub mod pipeline;

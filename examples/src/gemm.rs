@@ -120,7 +120,12 @@ pub const SHARED_BYTES: usize = ARing::BYTES + BRing::BYTES + SCRATCH_BYTES;
 /// is what keeps the two in step. The contract is not decoration: 72 KiB is
 /// past the 48 KiB a block gets by default, and the opt-in
 /// (`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`) is issued by the
-/// prepared-launch path and by nothing else.
+/// prepared-launch path. #70 asked whether this kernel was silently relying on
+/// something and the answer is no — it relies on this line, which is why it
+/// launches at 72 KiB while `flash_forward`, a plain `#[kernel]`, reported
+/// zero blocks per SM at 144. `cluster_launch` has nothing to do with it.
+/// [`kittens::launch::admit_shared_plan`] is the same opt-in for a kernel
+/// whose output partition no contract describes.
 const _: () = assert!(THREADS == 128 && SHARED_BYTES == 73_792);
 
 #[cuda_module]

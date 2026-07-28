@@ -107,6 +107,13 @@ fn examples() -> Vec<Example> {
 /// *with*, and those want opposite fixes. The driver is asked rather than the
 /// arithmetic reproduced here, because the shared-memory carveout it picks is
 /// its own business and not a number this file can derive.
+///
+/// The envelope includes the *opt-in* (#70), which is why
+/// [`kittens::launch::admit_shared_plan`] is called before the query and not
+/// only before a launch. A plan over 48 KiB is inadmissible on a function
+/// nobody opted in for, and the driver answers 0 for that exactly as it
+/// answers 0 for a plan too big to fit — so without that call the column
+/// reports the omission and reads like the tiles.
 fn occupancy(context: &std::sync::Arc<cuda_core::CudaContext>) {
     let Ok(module) = cuda_host::load_embedded_module(context, env!("CARGO_PKG_NAME")) else {
         return;
@@ -116,24 +123,83 @@ fn occupancy(context: &std::sync::Arc<cuda_core::CudaContext>) {
         "{:<16}{:>8}{:>14}{:>12}{:>11}",
         "kernel", "threads", "shared", "blocks/SM", "warps/SM"
     );
+    let mut notes = Vec::new();
     for example in examples() {
-        let blocks = example.entry.and_then(|entry| {
-            let function = module.load_function(entry).ok()?;
-            function
-                .max_active_blocks_per_multiprocessor(example.threads, example.shared_bytes as u32)
-                .ok()
-        });
-        let (blocks, warps) = match blocks {
-            Some(blocks) => (
+        let measured = measure(&module, &example);
+        let (blocks, warps) = match &measured {
+            Occupancy::Blocks(blocks) => (
                 blocks.to_string(),
                 (blocks * example.threads / 32).to_string(),
             ),
-            None => ("cluster".to_string(), "—".to_string()),
+            Occupancy::Cluster => ("cluster".to_string(), "—".to_string()),
+            Occupancy::TooLarge(_) => ("too large".to_string(), "—".to_string()),
+            Occupancy::Failed(_) => ("no answer".to_string(), "—".to_string()),
         };
+        match measured {
+            Occupancy::TooLarge(error) => notes.push(format!("{}: {error}", example.name)),
+            Occupancy::Failed(error) => notes.push(format!("{}: {error}", example.name)),
+            Occupancy::Blocks(_) | Occupancy::Cluster => {}
+        }
         println!(
             "{:<16}{:>8}{:>12} B{:>12}{:>11}",
             example.name, example.threads, example.shared_bytes, blocks, warps
         );
+    }
+    // The cells are four characters wide and two of the four outcomes have
+    // something to say that does not fit in one. Saying it under the table
+    // beats widening the column for the case that should never fire.
+    for note in notes {
+        println!("  {note}");
+    }
+}
+
+/// What the occupancy query has to say about one kernel — which is four
+/// different things, and #70 is what happens when two of them share a cell.
+///
+/// The zero that started #70 meant "nobody opted this function in", and read
+/// as "these tiles do not fit". Collapsing the failures back into one absence
+/// here would rebuild that same ambiguity one layer up: a plan the device
+/// genuinely will not admit would print `cluster`, which is what the GEMM
+/// prints for a legitimate reason, and the next person would spend the same
+/// hour.
+enum Occupancy {
+    /// Blocks per SM at the kernel's own envelope, opt-in included.
+    Blocks(u32),
+    /// No entry point to ask about. `cuOccupancyMaxActiveBlocksPerMultiprocessor`
+    /// takes a block shape and no cluster, so a `#[cluster_launch]` kernel
+    /// would get an answer about a launch it never performs — an absence on
+    /// purpose, and the only one here that is not a problem.
+    Cluster,
+    /// The plan is past what this device will admit even with the opt-in. This
+    /// is candidate (2) from #70, and the only outcome that means the tiles
+    /// are the problem.
+    TooLarge(kittens::launch::SharedPlanTooLarge),
+    /// The driver refused something on the way. Not an answer about the
+    /// kernel, and not to be read as one.
+    Failed(String),
+}
+
+fn measure(module: &std::sync::Arc<cuda_core::CudaModule>, example: &Example) -> Occupancy {
+    use kittens::launch::AdmitError;
+
+    let Some(entry) = example.entry else {
+        return Occupancy::Cluster;
+    };
+    let bytes = example.shared_bytes as u32;
+    let function = match module.load_function(entry) {
+        Ok(function) => function,
+        Err(error) => return Occupancy::Failed(format!("no {entry} in the module: {error}")),
+    };
+    match kittens::launch::admit_shared_plan(&function, bytes) {
+        Ok(()) => {}
+        Err(AdmitError::TooLarge(error)) => return Occupancy::TooLarge(error),
+        Err(AdmitError::Driver(error)) => {
+            return Occupancy::Failed(format!("admitting {bytes} B: {error}"));
+        }
+    }
+    match function.max_active_blocks_per_multiprocessor(example.threads, bytes) {
+        Ok(blocks) => Occupancy::Blocks(blocks),
+        Err(error) => Occupancy::Failed(format!("occupancy query: {error}")),
     }
 }
 

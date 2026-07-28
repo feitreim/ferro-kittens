@@ -456,6 +456,37 @@ band in registers and walk the tile in narrower chunks, which is exactly what
 in-place spellings that let `ptxas` stream are the fastest thing measured here
 and the register table's "failure" is a win.
 
+#### and a zero in that column is two different things (#70)
+
+`flash_forward` printed **0 blocks/SM** at 147536 B, which reads like a plan
+too big for the SM and was not. Dynamic shared memory over 48 KiB is opt-in per
+function — `cuFuncSetAttribute` with
+`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` — and
+`cuOccupancyMaxActiveBlocksPerMultiprocessor` answers 0 for a function nobody
+opted in for in exactly the same way it answers 0 for tiles that do not fit.
+Same function, same 147536 B, one `kittens::launch::admit_shared_plan` call
+between them:
+
+| | max dynamic shared | blocks/SM |
+| --- | ---: | ---: |
+| before | 49152 B | **0** |
+| after | 147536 B | **1** |
+
+The device's opt-in ceiling is 232448 B, so the plan was never within 84 KiB of
+being too large. `gemm` is over 48 KiB too and launches because
+`#[launch_contract]` issues the same opt-in from the prepared-launch path —
+`cluster_launch` was never what saved it.
+
+The second half of that measurement is the more useful one. Swept on a freshly
+loaded function per probe, `flash_forward` answers 1 block/SM at 147536 B, at
+73792, at 32800 and at **0** — and 1 at block widths of 32, 64, 128 and 256,
+where `softmax_rows` goes 28/14/7/3 and `layernorm_rows` 8/4/2/1. A ceiling
+flat in both shared memory and warp count is neither of those resources; it is
+something held once per CTA. `flash_forward` is the only queryable entry here
+that allocates TMEM. So **shrinking the K/V rings would buy nothing**, which is
+the opposite of what the 0 invited, and the register-versus-occupancy advice
+above applies to this kernel not at all until that per-CTA ceiling is named.
+
 Within a spelling choice at fixed shape, the ordering is small and stable:
 fully in place is fastest, one fused expression next, rebinding last. That
 ordering is worth 1–3% per warp. Which side of the streaming cliff the shape

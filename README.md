@@ -56,6 +56,7 @@ carries both tables and reads them against each other.
 | `sync` | Semaphores over mbarrier intrinsics, and the block-scope fold warps cannot shuffle |
 | `pipeline` | Persistent-grid harness (ThunderKittens' `prototype::lcf` shape) |
 | `global` | Global layouts and their TMA tensor maps (host-only) |
+| `launch` | The >48 KiB shared-memory opt-in a large tile plan needs (host-only) |
 
 ## Usage
 
