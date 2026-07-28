@@ -26,9 +26,12 @@
 
 use std::error::Error;
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 use cuda_device::DisjointSlice;
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
@@ -98,6 +101,27 @@ const PROBE_SHARED: usize = AOperand::BYTES + 2 * BOperand::BYTES + 32;
 /// The STTM round trip touches no shared tile at all — its whole plan is the
 /// TMEM staging word.
 const STTM_SHARED: usize = 32;
+
+/// Columns [`kernels::relaunch_probe`] allocates: the whole SM's tensor
+/// memory. No two CTAs can hold an allocation on the same SM at once, so
+/// every CTA after the first is served out of columns the one before it gave
+/// back — a probe taking a quarter of TMEM would be handed a free quarter
+/// without the allocator ever having to hand anything over.
+const RELAUNCH_COLUMNS: usize = 512;
+/// Blocks in that probe's grid: twice the B200's 148 SMs, so the launch
+/// cannot fit in one wave at any occupancy.
+const RELAUNCH_BLOCKS: u32 = 296;
+/// Launches of it in one process. The class of failure this case exists for
+/// is invisible to the first launch by construction, so one launch is not a
+/// test; the third is free and covers a resource that takes more than one CTA
+/// to exhaust.
+const RELAUNCHES: usize = 3;
+/// How long a launch may run before the harness calls it deadlocked rather
+/// than slow. The probe is microseconds of work per CTA.
+const HANG_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often the watchdog asks. Long enough to cost nothing, short enough
+/// that a passing run is not measurably slower for being watched.
+const HANG_POLL: Duration = Duration::from_millis(20);
 
 /// A bf16 bit pattern naming a position in a tile of at most 64 rows by 128
 /// columns.
@@ -734,6 +758,76 @@ pub mod kernels {
 
             thread::sync_threads();
             dealloc_block(tmem, COLUMNS as u32);
+        }
+    }
+
+    /// One CTA's whole TMEM lifecycle, over a grid that does not fit in one
+    /// wave and a process that launches it more than once.
+    ///
+    /// Every other case here launches once over one wave, which cannot see a
+    /// resource acquired at CTA entry and released at exit: nothing is
+    /// scheduled behind the CTA that leaked it. This one is the standing
+    /// guard for that whole class — "fine once, broken twice" — and TMEM is
+    /// merely the first resource with the shape. Each CTA takes the SM's
+    /// entire tensor memory, so every CTA but the first on an SM is served
+    /// out of columns its predecessor gave back, in one launch and across
+    /// launches.
+    ///
+    /// It is a guard and not a reproduction: #46's leaked allocation permit
+    /// is *not* what it catches, because on a B200 that leak has no
+    /// observable effect (see `tmem::alloc_block`). What it does catch is any
+    /// leak of the columns themselves, an unbalanced allocator collective,
+    /// and whatever the next entry-acquired resource turns out to be.
+    ///
+    /// The round trip through TMEM is [`sttm_roundtrip`]'s and proves nothing
+    /// new about the store map; it is here so a CTA that finished is
+    /// distinguishable from one that was never scheduled.
+    ///
+    /// Launch with `ROWS` threads over [`RELAUNCH_BLOCKS`] blocks.
+    #[kernel]
+    pub unsafe fn relaunch_probe(mut out: DisjointSlice<f32>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tmem = alloc_block(smem as *mut u32, RELAUNCH_COLUMNS as u32);
+            let allocation = TmemTile::<ROWS, RELAUNCH_COLUMNS>::from_raw(tmem);
+            let warp_id = warp::warp_id();
+            // Each thread's registers carry their own index in the dump, so
+            // the host's expectation is "index `i` came back as `i`" and a
+            // CTA's identity is in the values it writes.
+            let base = (thread::blockIdx_x() as usize * ROWS + thread::threadIdx_x() as usize)
+                * Fragment::SLOTS
+                * Fragment::VALUES;
+
+            let mut fragment = Fragment::zero();
+            let mut slot = 0usize;
+            while slot < Fragment::SLOTS {
+                let mut value = 0usize;
+                while value < Fragment::VALUES {
+                    fragment.set(slot, value, (base + slot * Fragment::VALUES + value) as f32);
+                    value += 1;
+                }
+                slot += 1;
+            }
+
+            // The four warps take a 16-row block each, so the whole CTA is in
+            // the allocation it opened.
+            allocation.store_fragment_tile(16 * warp_id, 0, fragment);
+            store_wait();
+            let read = allocation.fragment_tile(16 * warp_id, 0);
+
+            let mut slot = 0usize;
+            while slot < Fragment::SLOTS {
+                let mut value = 0usize;
+                while value < Fragment::VALUES {
+                    *out.get_unchecked_mut(base + slot * Fragment::VALUES + value) =
+                        read.get(slot, value);
+                    value += 1;
+                }
+                slot += 1;
+            }
+
+            thread::sync_threads();
+            dealloc_block(tmem, RELAUNCH_COLUMNS as u32);
         }
     }
 
@@ -2003,6 +2097,107 @@ fn check_sttm_roundtrip(
     Err(format!("{mismatches} of {} registers wrong{report}", observed.len()).into())
 }
 
+/// Wait for everything queued on `stream`, and take the process down if it
+/// does not arrive within [`HANG_TIMEOUT`].
+///
+/// `cuStreamSynchronize` behind a deadlocked launch never returns, and neither
+/// would any later call in this harness — a case that can hang is a case that
+/// reports nothing and burns the container's full timeout, which is strictly
+/// worse than no case at all. So the wait is a polled event, and a hang is
+/// aborted where it is found: a context with a stuck kernel in it cannot be
+/// torn down cleanly, and `abort` is what gets the diagnosis printed and a
+/// non-zero exit out of the run.
+fn finish_or_abort(
+    context: &Arc<CudaContext>,
+    stream: &CudaStream,
+    what: &str,
+) -> Result<(), Box<dyn Error>> {
+    let event = context.new_event(None)?;
+    event.record(stream)?;
+    let deadline = Instant::now() + HANG_TIMEOUT;
+    while !event.query()? {
+        if Instant::now() >= deadline {
+            println!(
+                "FAIL  {what}: still running after {HANG_TIMEOUT:?}. \
+                 A launch of bounded work that does not finish is blocked on a \
+                 resource an earlier CTA did not give back — the SM's TMEM \
+                 allocator is the one candidate this harness has. Nothing on \
+                 this context can make progress, so the run aborts here."
+            );
+            let _ = std::io::stdout().flush();
+            std::process::abort();
+        }
+        std::thread::sleep(HANG_POLL);
+    }
+    Ok(())
+}
+
+/// Does a kernel that allocates TMEM still run when it is not the first thing
+/// to have run on the SM?
+///
+/// [`RELAUNCHES`] launches over [`RELAUNCH_BLOCKS`] blocks, the whole dump
+/// checked every time, each launch watched by [`finish_or_abort`] so that a
+/// launch which never returns is a reported failure instead of a container
+/// that sits until its timeout. See [`kernels::relaunch_probe`] for what this
+/// does and does not claim.
+fn check_relaunch(
+    context: &Arc<CudaContext>,
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<String, Box<dyn Error>> {
+    let registers = Fragment::SLOTS * Fragment::VALUES;
+    let width = ROWS * registers;
+    let mut out = DeviceBuffer::<f32>::zeroed(stream, RELAUNCH_BLOCKS as usize * width)?;
+    let config = LaunchConfig {
+        grid_dim: (RELAUNCH_BLOCKS, 1, 1),
+        block_dim: (ROWS as u32, 1, 1),
+        shared_mem_bytes: STTM_SHARED as u32,
+    };
+
+    for launch in 1..=RELAUNCHES {
+        // Wiped between launches: a launch whose CTAs never ran would
+        // otherwise pass on the previous one's dump.
+        out.zero_async(stream)?;
+        unsafe { module.relaunch_probe(stream, config, &mut out)? };
+        finish_or_abort(
+            context,
+            stream,
+            &format!("repeated launch {launch}/{RELAUNCHES}"),
+        )?;
+
+        let observed = out.to_host_vec(stream)?;
+        let mut report = String::new();
+        let mut mismatches = 0usize;
+        for (index, &got) in observed.iter().enumerate() {
+            if got == index as f32 {
+                continue;
+            }
+            mismatches += 1;
+            if mismatches <= 8 {
+                let thread = index / registers;
+                let _ = write!(
+                    report,
+                    "\n    launch {launch}, block {} thread {} register {}: read back {got}",
+                    thread / ROWS,
+                    thread % ROWS,
+                    index % registers
+                );
+            }
+        }
+        if mismatches > 0 {
+            return Err(format!(
+                "{mismatches} of {} registers wrong on launch {launch}{report}",
+                observed.len()
+            )
+            .into());
+        }
+    }
+    Ok(format!(
+        "{RELAUNCH_BLOCKS} blocks × {RELAUNCHES} launches, \
+         {RELAUNCH_COLUMNS} TMEM columns per CTA"
+    ))
+}
+
 /// Compare a logical-order tile dump against the identities that were staged
 /// into it, reporting the first few misplaced elements by coordinate.
 fn compare_tile(
@@ -2372,6 +2567,13 @@ fn run() -> Result<usize, Box<dyn Error>> {
                 module.tma_store_recycle(stream, config, source, packed, pitched)
             })
         }),
+    ));
+    // Last, and not because it is the least interesting: it is the only case
+    // that can take the process down (see `finish_or_abort`), so everything
+    // else has reported by the time it runs.
+    cases.push((
+        "repeated launch",
+        Box::new(|| check_relaunch(&context, stream, module)),
     ));
 
     let mut failures = 0usize;
