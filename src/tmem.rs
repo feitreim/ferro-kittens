@@ -14,10 +14,11 @@
 
 use cuda_device::cusimd::{CuSimd, TmemRegs4};
 use cuda_device::tcgen05::{
-    tcgen05_alloc, tcgen05_dealloc, tcgen05_ld_16x256b_pure, tcgen05_load_wait,
+    tcgen05_alloc, tcgen05_alloc_cg2, tcgen05_dealloc, tcgen05_dealloc_cg2,
+    tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_relinquish_alloc_permit_cg2,
     tcgen05_st_16x256b_x1_raw, tcgen05_store_wait,
 };
-use cuda_device::{thread, warp};
+use cuda_device::{cluster, thread, warp};
 
 use crate::reg::{BaseLdtm, Fragment, FragmentLayout, RegTile};
 
@@ -52,6 +53,59 @@ pub unsafe fn dealloc_block(address: u32, columns: u32) {
     unsafe {
         if warp::warp_id() == 0 {
             tcgen05_dealloc(address, columns);
+        }
+    }
+}
+
+/// Cluster-wide TMEM allocation: [`alloc_block`]'s `cta_group::2` twin, for
+/// the single allocation a 2-CTA MMA accumulates into.
+///
+/// The three `cta_group::2` allocator instructions all say the same thing
+/// about who issues them — *one full warp in each peer CTA* — so both CTAs
+/// allocate, both relinquish, both later [`dealloc_cluster`], and each reads
+/// the address out of its own staging word, because the collective writes one
+/// into each. A peer that instead maps the leader's word over distributed
+/// shared memory gets the right address and still leaves the pair's allocator
+/// half-driven, which is what hung the GEMM's second launch (#40); this body
+/// is that kernel's fix, lifted (#24), unchanged because it is the version
+/// that ran on silicon.
+///
+/// The `cluster_sync` is what publishes the staging words across the pair; a
+/// caller that stages barriers for its peer before allocating gets that
+/// publication out of the same sync.
+///
+/// # Safety
+///
+/// Every thread of every CTA in the cluster must call this together and at
+/// most once, with `slot` at the same shared offset in both CTAs.
+#[inline(always)]
+pub unsafe fn alloc_cluster(slot: *mut u32, columns: u32) -> u32 {
+    unsafe {
+        if warp::warp_id() == 0 {
+            tcgen05_alloc_cg2(slot, columns);
+        }
+        thread::sync_threads();
+        cluster::cluster_sync();
+        if warp::warp_id() == 0 {
+            tcgen05_relinquish_alloc_permit_cg2();
+        }
+        *(slot as *const u32)
+    }
+}
+
+/// Release the cluster's TMEM allocation, warp 0 of each peer CTA taking its
+/// half — [`dealloc_block`]'s `cta_group::2` twin, and as with that one the
+/// fence and the syncs that retire the pair's reads are the caller's.
+///
+/// # Safety
+///
+/// No thread of either CTA may touch the allocation afterwards; `address` and
+/// `columns` must be that CTA's own [`alloc_cluster`] result and argument.
+#[inline(always)]
+pub unsafe fn dealloc_cluster(address: u32, columns: u32) {
+    unsafe {
+        if warp::warp_id() == 0 {
+            tcgen05_dealloc_cg2(address, columns);
         }
     }
 }

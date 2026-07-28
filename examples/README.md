@@ -265,7 +265,7 @@ result: the MMA layer is the part of this library that is finished.
 
 The most valuable output here. Ordered by how badly it hurts. Items 1–6 were
 filed as **#21**, **#22**, **#25**, **#23** and **#24** (which covers both
-cluster-scope entries); **1, 2 and 3 have since shipped**. The numbers are noted
+cluster-scope entries); **1, 2, 3 and 5 have since shipped**. The numbers are noted
 inline and the prose is kept as written, because it is the argument rather than
 the ticket.
 
@@ -344,17 +344,19 @@ chose.
 Wanted: export the macro, or a blanket impl over the shapes the layout actually
 supports.
 
-#### 5. No cluster-scope TMEM allocation (#24)
+#### 5. ~~No cluster-scope TMEM allocation~~ (#24) — **closed by #46**
 
 `tmem::alloc_block` is `tcgen05.alloc.cta_group::1`. A `cg2` accumulator is one
-allocation spanning the CTA pair, so exactly one warp in the leader may issue
-it — and the peer, which drains its own 128 rows of that same allocation, can
-learn the address only by reading the leader's staging word over DSMEM. Both
-halves are hardware facts about a cluster accumulator; both are open-coded in
-`gemm.rs`'s first `GAP` block. `tcgen05_alloc_cg2` / `tcgen05_dealloc_cg2` /
-`tcgen05_relinquish_alloc_permit_cg2` are all present upstream and unused.
+allocation spanning the CTA pair, and this section used to say that only the
+leader may issue it, with the peer reading the leader's staging word over
+DSMEM. That was the bug, not the fact: all three `cta_group::2` allocator
+instructions want *one full warp in each peer CTA*, the collective writes an
+address into each CTA's own staging word, and issuing them from rank 0 alone
+hung the kernel's second launch (#40).
 
-Wanted: `tmem::alloc_cluster(slot, columns) -> u32`.
+Shipped as `tmem::alloc_cluster` / `tmem::dealloc_cluster` — `gemm.rs`'s own
+fixed body, moved rather than rewritten, since it is the version that ran on
+silicon.
 
 #### 6. No cluster-scope semaphore arrival (#24)
 

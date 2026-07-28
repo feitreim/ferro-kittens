@@ -20,14 +20,18 @@
 //!
 //! ## What this kernel had to reach past the library for
 //!
-//! Two `GAP` blocks below, neither with an open issue behind it:
+//! One `GAP` block below, with no open issue behind it:
 //!
-//! - **cluster-scope TMEM allocation.** [`kittens::tmem::alloc_block`] is
-//!   `tcgen05.alloc.cta_group::1`; a 2-CTA accumulator needs the `cg2` form
-//!   plus a way for the peer to learn the address.
 //! - **global stores from registers.** The epilogue is open-coded index math
 //!   against `RegTile::coordinate`, which is the arithmetic this library
 //!   exists to delete (#11).
+//!
+//! The cluster-scope TMEM allocation that used to sit beside it is now
+//! [`kittens::tmem::alloc_cluster`] / [`kittens::tmem::dealloc_cluster`]
+//! (#24, #46) — this file was where the `cta_group::2` allocator's
+//! participation rules and its relinquish were worked out against silicon,
+//! and they are hardware facts about a cluster accumulator rather than
+//! anything this kernel chose.
 //!
 //! A third one is gone, and how it went is worth recording. The pair's four
 //! TMA loads have to complete on *one* barrier for the leader to know the
@@ -45,10 +49,7 @@
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::cluster;
 use cuda_device::shared::DynamicSharedArray;
-use cuda_device::tcgen05::{
-    tcgen05_alloc_cg2, tcgen05_dealloc_cg2, tcgen05_fence_before_thread_sync,
-    tcgen05_relinquish_alloc_permit_cg2,
-};
+use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{
     DisjointSlice, cluster_launch, cuda_module, kernel, launch_contract, thread, warp,
@@ -62,7 +63,7 @@ use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
-use kittens::tmem::TmemTile;
+use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
 
 /// Rows of `C` one CTA owns. The pair covers `2 * BLOCK_M`, which is the `M`
 /// the instruction descriptor names.
@@ -275,60 +276,12 @@ pub mod kernels {
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
             cluster::cluster_sync();
-            if warp_id == 0 {
-                tcgen05_dealloc_cg2(accumulator.raw(), BLOCK_N as u32);
-            }
+            dealloc_cluster(accumulator.raw(), BLOCK_N as u32);
             if thread::threadIdx_x() == 0 {
                 load.inval_all();
                 free.inval_all();
                 done.inval();
             }
-        }
-    }
-
-    /// ---- GAP (cluster-scope TMEM allocation; no open issue) --------------
-    ///
-    /// What this wants to be: `tmem::alloc_cluster(slot, columns)`, the
-    /// cta_group::2 twin of [`kittens::tmem::alloc_block`].
-    ///
-    /// A `cg2` accumulator is one allocation spanning the pair, and all three
-    /// of the `cta_group::2` allocator instructions say the same thing about
-    /// who issues them: *one full warp in each peer CTA*. So both CTAs
-    /// allocate, both relinquish and both deallocate, and each reads the
-    /// address out of its own staging word — the collective writes one to
-    /// each. All of that is a hardware fact about a cluster accumulator and
-    /// belongs in `tmem.rs` rather than in every kernel that wants one.
-    ///
-    /// This file used to issue all three from rank 0 alone, and #40 is how
-    /// that surfaced: a single launch was always fine, and the *second* launch
-    /// of the same kernel in a process hung forever inside `tcgen05.alloc`.
-    /// A CTA that never relinquishes its allocation permit, or never
-    /// participates in the pair's dealloc, leaves the SM's allocator short by
-    /// its half, and the next CTA scheduled there waits on columns that are
-    /// never coming back. Nothing a one-shot correctness run does can see it,
-    /// which is the general shape of the thing: launching twice is a different
-    /// claim from launching once.
-    ///
-    /// The `cluster_sync` here is load-bearing twice over: it publishes the
-    /// staging word, and it is the point after which the peer's TMA may write
-    /// to the leader's barriers.
-    ///
-    /// # Safety
-    ///
-    /// Every thread of every CTA in the cluster must call this together, with
-    /// `slot` pointing at a shared `u32` at the same offset in both.
-    #[inline(always)]
-    unsafe fn alloc_cluster(slot: *mut u32, columns: u32) -> u32 {
-        unsafe {
-            if warp::warp_id() == 0 {
-                tcgen05_alloc_cg2(slot, columns);
-            }
-            thread::sync_threads();
-            cluster::cluster_sync();
-            if warp::warp_id() == 0 {
-                tcgen05_relinquish_alloc_permit_cg2();
-            }
-            *(slot as *const u32)
         }
     }
 }
