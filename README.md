@@ -30,6 +30,20 @@ function of tile *shape*, and it is not a smooth one. `--determinism` measures
 the same tree twice and asserts an identical table, which is what makes a diff
 of two runs evidence.
 
+**And read that table as allocation, not as a ranking.** `modal run
+modal_app.py::ladder_bench` puts a clock on four of those rungs — the first
+timed register claim in this repo, on a B200 — and none of registers, stack
+frame or occupancy orders the resulting times. On that probe the spelling that
+leaves the whole band in local memory at 32 registers is the *fastest* at all
+four shapes, and the one shape where the static counters favour the fused
+expression is a shape where it loses. On `softmax`, #47 timed the same
+phenomenon and it cost **2.6×**. Both are right: a streamed band costs real
+time, and whether it is worth paying turns on whether the registers it frees are
+the resource actually binding that kernel — shared memory caps `softmax` either
+way, where the probe has none. So a register count is half an argument and
+occupancy is the other half. `examples/README.md` § "in-place versus by-value"
+carries both tables and reads them against each other.
+
 ## Modules
 
 | Module | What it holds |
