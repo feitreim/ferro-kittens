@@ -77,9 +77,11 @@ reference. What is still open is on the other list, the one that came from
 writing kernels rather than from ThunderKittens' feature set: a cluster
 geometry for multicast. The `expect_tx` byte accounting was the other and is
 closed by #29 — every producer's charge is now derived from the loads it
-issued. None of them blocks a kernel in this directory. The work-item map that knows about clusters
-is closed by #51 — and §7 below is worth reading for the half that is *not* the
-API, since the GEMM adopted the scaffold, computed exactly, and was slower.
+issued. None of them blocks a kernel in this directory. The work-item map that
+knows about clusters is closed by #51, and the GEMM runs on it — §7 below is
+worth reading for the half that is *not* the API, since picking the persistent
+grid's size wrong cost a factor of two and picking it right needed a residency
+the driver cannot be asked for.
 
 `layernorm` was the first example to be **split** by a landed issue rather than
 promoted whole: #13 took `layernorm_rows` out of the gate and left
@@ -1157,7 +1159,7 @@ own-bit mask that used to sit open-coded in `gemm.rs`;
 `tma_load_2d_multicast_cg2` keeps the mask and is now the replication form
 alone (#49).
 
-#### 7. ~~`pipeline::run` cannot schedule a cluster~~ (#51) — **scaffold closed, and the GEMM is not adopting it**
+#### 7. ~~`pipeline::run` cannot schedule a cluster~~ (#51) — **closed, and the GEMM runs on it**
 
 The work-item map was `blockIdx.x` strided by `gridDim.x`, so the two CTAs of a
 cluster got *different* items. `prototype::lcf` predates clusters in
@@ -1182,72 +1184,75 @@ supply for the block-reduction half. The two halves separate cleanly, and
 wrapping a special register in a trait would add a name without adding a fact.
 No rank API was added.
 
-##### The GEMM adopted it, computed exactly, and got slower
+`gemm.rs` is now a `Tile: Job` — one output tile per item, `RANKS = 2`, TMEM
+allocated once outside the loop. It is the first caller this scaffold has ever
+had, which is most of what it buys: `pipeline::run` was untested by anything
+before, and is now on the `::examples` gate.
 
-This is the half worth reading. `gemm.rs` was ported to a `Tile: Job` — one
-output tile per item, `RANKS = 2`, TMEM allocated once outside the loop — and
-it is **correct**: `pass gemm 512x256x256 exact, 4096x4096x256 exact` on a
-B200, and `::bench` checks every sweep size against the CPU reference before
-timing it, so the numbers below all belong to launches that computed. The port
-is in this PR's history rather than in the tree, because it is also slower, at
-every size where the persistent grid's cap actually binds.
+##### The cap is the whole performance story, and two guesses at it were wrong
+
+The persistent grid runs `MAX_CLUSTERS` pairs and walks the rest as items. That
+number is the only thing the port changes — `lcf` at one item per cluster *is*
+the launch-per-tile kernel, same rings, same barriers, drained at the same
+points — and getting it wrong costs a factor of two.
 
 Min ms over 30 timed launches, B200, 148 SMs. The cap is in clusters; a cluster
-is 2 CTAs. **Rows where the problem has fewer tiles than the cap are marked `=`:
-there the grid is byte-identical to the launch-per-tile grid and each cluster
-runs exactly one item, so they are a free control on the scaffold itself.**
+is 2 CTAs. **Rows marked `=` have fewer tiles than the cap, so the grid is
+byte-identical to the launch-per-tile grid and each cluster runs exactly one
+item — a free control on the scaffold's own cost.** Two independent
+launch-per-tile runs are shown because the cross-run spread is a few percent and
+the conclusion has to survive it.
 
-| shape | launch per tile | cap 74 | cap 148 |
-| --- | ---: | ---: | ---: |
-| 256x128x256 | 0.0224 | `=` 0.0223 | `=` 0.0234 |
-| 512x256x256 | 0.0225 | `=` 0.0225 | `=` 0.0251 |
-| 1024x1024x1024 | 0.0283 | `=` 0.0268 | `=` 0.0284 |
-| 2048x2048x2048 | 0.0451 | 0.0593 | `=` 0.0478 |
-| 4096x4096x4096 | 0.1891 | 0.2808 | 0.2059 |
-| 8192x8192x8192 | **1.0169** | **2.1036** | **1.2130** |
+| shape | per tile (run 1) | per tile (run 4) | cap 74 | cap 148 | **cap 222** |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 256x128x256 | 0.0224 | 0.0239 | `=` 0.0223 | `=` 0.0234 | `=` 0.0231 |
+| 512x256x256 | 0.0225 | 0.0239 | `=` 0.0225 | `=` 0.0251 | `=` 0.0258 |
+| 1024x1024x1024 | 0.0283 | 0.0285 | `=` 0.0268 | `=` 0.0284 | `=` 0.0292 |
+| 2048x2048x2048 | 0.0451 | 0.0481 | 0.0593 | `=` 0.0478 | `=` 0.0492 |
+| 4096x4096x4096 | 0.1891 | 0.1900 | 0.2808 | 0.2059 | 0.1944 |
+| 8192x8192x8192 | **1.0169** | **1.0204** | **2.1036** | **1.2130** | **1.0217** |
 
-As TFLOP/s at 8192³: 1081 launch-per-tile, 523 at cap 74, 906 at cap 148.
+TFLOP/s at 8192³: **1081 / 1077** launch per tile, **523** at cap 74, **906** at
+cap 148, **1076** at cap 222.
 
-Two things the control rows earn. First, **the scaffold costs nothing**: at an
-identical grid and one item per cluster the three (four at cap 148) control
-rows are within noise of the launch-per-tile kernel. Second, they carry the
-run-to-run offset, which is not negligible and would otherwise be invisible —
-the cap-148 run's controls sit 0.4% to 11.6% above baseline, about 5% on
-average, so its 8192³ figure is nearer 13% slow than 19%.
+At the last cap it is a dead heat — 0.13% at 8192³, and 4096³'s 2.3% is exactly
+the offset that run's own `=` control rows carry. It is **not faster**. What the
+sweep bought is the reason it is not slower, and that reason is not in the
+scaffold.
 
-##### The reading, which is not "persistent kernels are slow"
+##### The residency, measured on a clock because nothing could be asked
 
-`lcf` with one item per cluster **is** the launch-per-tile kernel: same rings,
-same barriers, same prologue, same epilogue, drained the same way at the same
-points. So the only thing a persistent grid changes here is *how many clusters
-exist*, and the control rows confirm nothing else moved. The regression is
-therefore entirely the cap, and the cap is a residency question.
+Picking the cap needs to know how many CTAs of this kernel an SM holds, and the
+repo cannot query it: `cuOccupancyMaxActiveBlocksPerMultiprocessor` takes a
+block shape and no cluster, which is why `main.rs` prints `cluster` in the
+GEMM's occupancy row — the honest absence #70 built that column to preserve.
 
-Which the repo cannot currently answer for this kernel.
-`cuOccupancyMaxActiveBlocksPerMultiprocessor` takes a block shape and no
-cluster, so `main.rs` prints `cluster` in the GEMM's occupancy row — the honest
-absence #70 built that column to preserve. The one figure available is #77's,
-and it predicts **1** CTA/SM for anything touching `tcgen05.alloc`.
+So it came off the clock by bisection, and the answer is **3 CTAs per SM**,
+which is what 228 KiB / 72 KiB of shared memory admits. The route matters as
+much as the number:
 
-**The clock refutes that extrapolation for this kernel.** Capping at one CTA per
-SM costs 2.07× at 8192³, and that cannot happen if the device could only ever
-hold that many CTAs — the two schedules would then *be* the same schedule.
-Doubling the cap recovers most of it (973 → 1688 tiles/ms, sublinear and still
-climbing), so residency is at least 2 CTAs/SM and the curve points at the 3 that
-shared memory would admit at 228 KiB / 72 KiB. **222 clusters is the value that
-was predicted and never measured**: the Modal workspace hit its spend limit
-before that run. Shipping a cap on an extrapolation is exactly the mistake the
-table above is a record of, so the GEMM keeps its launch-per-tile grid and the
-scaffold lands on its own.
+- **Cap 74 (1 CTA/SM) costs 2.07×.** That alone refutes extrapolating #77's 1
+  CTA/SM here — if the device could only ever hold 148 CTAs, a 148-CTA grid and
+  a 4096-CTA grid would *be* the same schedule and could not differ at all.
+- **Cap 148 (2/SM) recovers most of it and not all**, 973 → 1688 tiles/ms:
+  sublinear, still climbing.
+- **Cap 222 (3/SM) draws level and the curve stops.**
 
-Two follow-ups have their subject sharpened by this. **#78** asks whether the
-GEMM is at 1 CTA/SM like `flash_forward`; the answer here is no, by at least a
-factor of two, measured on a clock because the query cannot see it. And **#15**'s
-`lcsf` is what would make persistence pay for something rather than merely break
-even: under `lcf` the epilogue is inside the item, so `store_rows` and the next
-tile's first K loads are separated by a boundary that drains the pipeline, and a
-persistent GEMM buys a saved launch and nothing else. `tma_store_wait_read` (#9,
-landed) is the wait that would let them cross.
+This is the evidence **#78** asked for in its step one, which is whether the
+GEMM is pinned at 1 CTA/SM like `flash_forward`. It is not, by a factor of
+three, and the method is worth as much as the result: for a `#[cluster_launch]`
+kernel a timing sweep over the persistent grid's cap is a residency probe, and
+currently the only one available.
+
+##### What is still on the table
+
+`lcf` folds the epilogue into the item, so `store_rows` and the next tile's
+first K loads are separated by a boundary that drains the pipeline. A dead heat
+is therefore the *ceiling* for this shape, not a disappointment: the persistent
+grid saves launches and the drain gives it straight back. **#15's `lcsf`** is
+what would let the two cross, and `tma_store_wait_read` (#9, landed) is the wait
+it needs — it releases the shared buffer as soon as the engine has read it,
+without blocking on global visibility.
 
 #### 8. Multicast has no geometry to live in
 

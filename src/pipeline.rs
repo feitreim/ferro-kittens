@@ -52,24 +52,25 @@
 //! a superset of the block scope they replace. At `RANKS == 1` the branch folds
 //! away at compile time and `sync_threads` is back.
 //!
-//! # No kernel in this repo runs on it, and the GEMM's reason is a number
+//! # What using it costs, which is nothing, and was not obvious
 //!
-//! Worth stating plainly rather than leaving to be discovered. `run` had no
-//! caller before #51 and has none after it, but the reason changed: it used to
-//! be that the cluster kernel *could* not use the scaffold, and it is now that
-//! the one that can does not want to. `gemm.rs` was ported to a [`Job`] and ran
-//! **exact** on a B200 — so what is above is verified against silicon and not
-//! only against a compiler — and it was slower than the launch-per-tile grid it
-//! replaced, by 2.07× at 8192³ with a one-wave cap and by roughly 13% with a
-//! two-wave one.
+//! `examples/src/gemm.rs` is the caller — the kernel #51 filed this against,
+//! and the first this scaffold has ever had. It runs **exact** on a B200, so
+//! what is above is verified against silicon and not only against a compiler,
+//! and at 8192³ it is a dead heat with the launch-per-tile grid it replaces:
+//! 1.0217 ms against 1.0204.
 //!
-//! The cause is not in this file. `lcf` at one item per cluster *is* the
-//! launch-per-tile kernel — same rings, same barriers, drained at the same
-//! points — so a persistent grid changes only how many clusters exist, and
-//! choosing that number is a residency question the occupancy query cannot
-//! answer for a `#[cluster_launch]` kernel. `examples/README.md` §7 has the
-//! table, the controls that isolate the scaffold's own cost at zero, and what
-//! it says about #78.
+//! The path there is worth carrying, because it is a trap this file sets for
+//! its next caller. `lcf` at one item per cluster *is* the non-persistent
+//! kernel — same rings, same barriers, drained at the same points — so the only
+//! thing [`run`] changes is how many clusters exist, and **that number is the
+//! whole performance story**. The GEMM was 2.07× slower at a one-wave grid and
+//! 1.19× at a two-wave one before a three-wave grid drew level. Picking it
+//! needs the residency, which
+//! `cuOccupancyMaxActiveBlocksPerMultiprocessor` cannot supply for a
+//! `#[cluster_launch]` kernel — it takes a block shape and no cluster — so the
+//! GEMM's came off a clock by bisection. `examples/README.md` §7 has the sweep
+//! and what it says about #78.
 
 use cuda_device::barrier::fence_proxy_async_shared_cta;
 use cuda_device::cluster;
