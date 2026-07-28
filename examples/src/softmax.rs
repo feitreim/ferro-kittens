@@ -39,6 +39,10 @@ use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, thread, warp};
 
+// Host side: the launcher's error type, and the benchmark's size and clock.
+use crate::bench::{Shape, Timings, time};
+use std::error::Error;
+
 use kittens::ldst::{load_tile, store_tile};
 use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, Swizzle128B, tma_store_commit, tma_store_wait};
@@ -136,26 +140,30 @@ pub const CHECK_ROWS: usize = 2 * ROWS;
 /// Planes it covers: two, so `blockIdx.y` is as well.
 pub const CHECK_PLANES: usize = 2;
 
-/// The input at `(plane, row, column)`.
+/// Which multiple of 1/8 sits at `(plane, row, column)`.
 ///
 /// Within a row the exponent walks every multiple of 1/8 below 16 in a
 /// stride-11 permutation — 11 is odd, so it is a bijection mod 128 — which
 /// makes all 128 values of a row distinct and therefore all 128 outputs
 /// distinct. `plane` and `row` rotate the permutation, so a wrong plane or a
 /// wrong row is a wholly different set of numbers rather than a plausible one.
-/// Every value is a multiple of 1/8 below 16, so bf16 holds it exactly and
-/// nothing is lost on the way in.
+fn permutation(plane: usize, row: usize, column: usize) -> usize {
+    (53 * plane + 37 * row + 11 * column) % 128
+}
+
+/// The input at `(plane, row, column)`. Every value is a multiple of 1/8 below
+/// 16, so bf16 holds it exactly and nothing is lost on the way in.
 fn input(plane: usize, row: usize, column: usize) -> f32 {
-    ((53 * plane + 37 * row + 11 * column) % 128) as f32 / 8.0
+    permutation(plane, row, column) as f32 / 8.0
 }
 
 /// The whole input as the packed `u32` words a `[planes, rows, COLUMNS]` bf16
 /// staging buffer holds — the layout [`kittens::global::encode_bf16_panels`]
 /// describes and the kernel's row/plane coordinates index.
-fn staged() -> Vec<u32> {
-    let mut staged = Vec::with_capacity(CHECK_PLANES * CHECK_ROWS * COLUMNS / 2);
-    for plane in 0..CHECK_PLANES {
-        for row in 0..CHECK_ROWS {
+fn staged(rows: usize, planes: usize) -> Vec<u32> {
+    let mut staged = Vec::with_capacity(planes * rows * COLUMNS / 2);
+    for plane in 0..planes {
+        for row in 0..rows {
             for pair in 0..COLUMNS / 2 {
                 let (low, high) = (input(plane, row, 2 * pair), input(plane, row, 2 * pair + 1));
                 staged.push(to_bf16(low) as u32 | ((to_bf16(high) as u32) << 16));
@@ -172,8 +180,26 @@ fn to_bf16(value: f32) -> u16 {
     (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16
 }
 
-/// Launch the kernel over `CHECK_PLANES * CHECK_ROWS` rows and compare every
-/// output against a CPU reference.
+/// Blocks a `[planes, rows, COLUMNS]` problem takes: one CTA per `ROWS` of a
+/// plane. The benchmark prints it, because at the small end of a size sweep
+/// this number and not the bytes is what the run is bound by.
+pub fn grid(rows: usize, planes: usize) -> u32 {
+    (rows / ROWS * planes) as u32
+}
+
+/// The `then` a run that is only being checked passes.
+fn nothing_after(
+    _: &cuda_core::CudaStream,
+    _: &mut dyn FnMut() -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+/// Launch the kernel over `planes * rows` rows, compare every output against a
+/// CPU reference, and only then hand the launch to `then`.
+///
+/// That order is the whole design of [`crate::bench`]: the timing hook cannot
+/// be reached from a launch whose output was wrong.
 ///
 /// The tolerance is relative and it is the honest one: the result is bf16, so
 /// half an ulp is already 2⁻⁹, and the kernel's `exp2` is the FMA polynomial
@@ -182,9 +208,15 @@ fn to_bf16(value: f32) -> u16 {
 /// room to spare and is still forty times tighter than the gap between two
 /// neighbouring outputs of a row, which is what a misplaced element would have
 /// to hide inside.
-pub fn check(
+fn run<T>(
     context: &std::sync::Arc<cuda_core::CudaContext>,
-) -> Result<String, Box<dyn std::error::Error>> {
+    rows: usize,
+    planes: usize,
+    then: impl FnOnce(
+        &cuda_core::CudaStream,
+        &mut dyn FnMut() -> Result<(), Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<(String, T), Box<dyn Error>> {
     use cuda_core::{DeviceBuffer, LaunchConfig};
     use kittens::global::encode_bf16_panels;
     use kittens::shared::Element;
@@ -192,10 +224,17 @@ pub fn check(
     /// Half a bf16 ulp is 2⁻⁹; this is the next power of two up.
     const TOLERANCE: f32 = 1.0 / 256.0;
 
+    // One CTA owns a whole `ROWS` band and the kernel bounds-checks nothing.
+    if rows % ROWS != 0 || planes == 0 {
+        return Err(
+            format!("{rows} rows x {planes} planes does not divide {ROWS} rows a CTA").into(),
+        );
+    }
+
     let stream = context.default_stream();
     let module = kernels::load(context)?;
 
-    let staged = staged();
+    let staged = staged(rows, planes);
     let source = DeviceBuffer::from_host(&stream, &staged)?;
     // Zeroed rather than left alone: a store that never lands reads back as
     // bf16 zero, which no softmax output can be.
@@ -203,66 +242,83 @@ pub fn check(
     // SAFETY: both buffers outlive every launch consuming their maps below.
     let (source_map, destination_map) = unsafe {
         (
-            encode_bf16_panels::<ROWS, COLUMNS>(
-                &stream,
-                source.cu_deviceptr(),
-                CHECK_ROWS,
-                CHECK_PLANES,
-            )?,
-            encode_bf16_panels::<ROWS, COLUMNS>(
-                &stream,
-                destination.cu_deviceptr(),
-                CHECK_ROWS,
-                CHECK_PLANES,
-            )?,
+            encode_bf16_panels::<ROWS, COLUMNS>(&stream, source.cu_deviceptr(), rows, planes)?,
+            encode_bf16_panels::<ROWS, COLUMNS>(&stream, destination.cu_deviceptr(), rows, planes)?,
         )
     };
 
     let config = LaunchConfig {
-        grid_dim: ((CHECK_ROWS / ROWS) as u32, CHECK_PLANES as u32, 1),
+        grid_dim: ((rows / ROWS) as u32, planes as u32, 1),
         block_dim: (THREADS, 1, 1),
         shared_mem_bytes: SHARED_BYTES as u32,
     };
-    // SAFETY: the grid covers exactly the rows and planes both maps describe,
-    // and the block and shared plan are the kernel's own constants.
-    unsafe {
-        module.softmax_rows(
-            &stream,
-            config,
-            source_map.as_ptr(),
-            destination_map.as_ptr(),
-            0,
-        )?
+    let mut launch_once = || -> Result<(), Box<dyn Error>> {
+        // SAFETY: the grid covers exactly the rows and planes both maps
+        // describe, and the block and shared plan are the kernel's own.
+        unsafe {
+            module.softmax_rows(
+                &stream,
+                config,
+                source_map.as_ptr(),
+                destination_map.as_ptr(),
+                0,
+            )?
+        };
+        Ok(())
     };
+    launch_once()?;
 
+    // Every row is the same 128 values in a different order, so the reference
+    // is one 128-entry table at any size: the peak is always 127/8 and the
+    // denominator is always the same sum. Every output is still compared
+    // against its own expected value, which is now a permuted lookup.
+    let weight: Vec<f64> = (0..COLUMNS)
+        .map(|value| (value as f64 / 8.0 - 127.0 / 8.0).exp2())
+        .collect();
+    let total: f64 = weight.iter().sum();
     let observed = destination.to_host_vec(&stream)?;
-    let mut wrong = Vec::new();
-    let mut worst = 0.0f32;
-    for plane in 0..CHECK_PLANES {
-        for row in 0..CHECK_ROWS {
-            let exponents: Vec<f64> = (0..COLUMNS).map(|c| input(plane, row, c) as f64).collect();
-            let peak = exponents.iter().copied().fold(f64::MIN, f64::max);
-            let weights: Vec<f64> = exponents.iter().map(|x| (x - peak).exp2()).collect();
-            let total: f64 = weights.iter().sum();
+    let (mut wrong, mut sample, mut worst) = (0usize, Vec::new(), 0.0f32);
+    for plane in 0..planes {
+        for row in 0..rows {
             for column in 0..COLUMNS {
-                let index = ((plane * CHECK_ROWS + row) * COLUMNS + column) / 2;
+                let index = ((plane * rows + row) * COLUMNS + column) / 2;
                 let word = Bf16::unpack(observed[index]);
                 let value = word[column % 2];
-                let expected = (weights[column] / total) as f32;
+                let expected = (weight[permutation(plane, row, column)] / total) as f32;
                 let error = (value - expected).abs() / expected;
                 worst = worst.max(error);
-                if !(error <= TOLERANCE) && wrong.len() < 8 {
-                    wrong.push(format!(
-                        "[{plane}, {row}, {column}] = {value}, want {expected} ({error:.2e})"
-                    ));
+                if !(error <= TOLERANCE) {
+                    wrong += 1;
+                    if sample.len() < 8 {
+                        sample.push(format!(
+                            "[{plane}, {row}, {column}] = {value}, want {expected} ({error:.2e})"
+                        ));
+                    }
                 }
             }
         }
     }
-    if !wrong.is_empty() {
-        return Err(format!("{} outputs outside 2^-8: {}", wrong.len(), wrong.join("; ")).into());
+    if wrong > 0 {
+        return Err(format!("{wrong} outputs outside 2^-8: {}", sample.join("; ")).into());
     }
-    Ok(format!(
-        "{CHECK_PLANES}x{CHECK_ROWS}x{COLUMNS} rows normalized, worst relative error {worst:.2e}"
+
+    let after = then(&stream, &mut launch_once)?;
+    Ok((
+        format!("{planes}x{rows}x{COLUMNS} rows normalized, worst relative error {worst:.2e}"),
+        after,
     ))
+}
+
+/// The correctness run: one size, checked, nothing timed.
+pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String, Box<dyn Error>> {
+    run(context, CHECK_ROWS, CHECK_PLANES, nothing_after).map(|(note, ())| note)
+}
+
+/// The benchmark's entry point: the same check at `shape`, and then the same
+/// launch timed. A softmax [`Shape`] is `rows x COLUMNS x planes`.
+pub fn bench(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    shape: Shape,
+) -> Result<Timings, Box<dyn Error>> {
+    run(context, shape.m, shape.k, time).map(|(_, timings)| timings)
 }

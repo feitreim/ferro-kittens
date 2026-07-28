@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use cuda_core::{CudaContext, CudaStream};
 
-use crate::gemm;
+use crate::{gemm, softmax};
 
 /// Launches discarded before timing begins. The first pays module load and the
 /// first launch of a given shape pays the driver's own setup for it; neither is
@@ -215,33 +215,81 @@ const GEMM_SIZES: &[Shape] = &[
     },
 ];
 
+/// Sizes for `softmax`, as `rows x columns x planes`. The columns are the
+/// kernel's own 128 and the planes stay at the two the correctness run uses, so
+/// `blockIdx.y` is under test at every size; the rows are what sweeps. One CTA
+/// owns 128 rows, so the first row is two CTAs, and the last moves half a
+/// gigabyte — far enough past the launch floor for the number to be bandwidth
+/// and not scheduling.
+const SOFTMAX_SIZES: &[Shape] = &[
+    Shape {
+        m: 128,
+        n: 128,
+        k: 2,
+    },
+    Shape {
+        m: 512,
+        n: 128,
+        k: 2,
+    },
+    Shape {
+        m: 4096,
+        n: 128,
+        k: 2,
+    },
+    Shape {
+        m: 32768,
+        n: 128,
+        k: 2,
+    },
+    Shape {
+        m: 262144,
+        n: 128,
+        k: 2,
+    },
+    Shape {
+        m: 524288,
+        n: 128,
+        k: 2,
+    },
+];
+
 fn cases() -> Vec<Case> {
-    vec![Case {
-        name: "gemm",
-        bound: Bound::Compute,
-        sizes: GEMM_SIZES,
-        work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
-        blocks: |shape| gemm::grid(shape.m, shape.n),
-        bench: gemm::bench,
-    }]
+    vec![
+        Case {
+            name: "gemm",
+            bound: Bound::Compute,
+            sizes: GEMM_SIZES,
+            work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
+            blocks: |shape| gemm::grid(shape.m, shape.n),
+            bench: gemm::bench,
+        },
+        Case {
+            name: "softmax",
+            bound: Bound::Memory,
+            // Every element is read once and written once, both as bf16. The
+            // kernel's arithmetic is one `exp2` and one divide per element,
+            // which is why this row is bytes and not flops.
+            work: |shape| 2.0 * 2.0 * (shape.m * shape.n * shape.k) as f64,
+            sizes: SOFTMAX_SIZES,
+            blocks: |shape| softmax::grid(shape.m, shape.k),
+            bench: softmax::bench,
+        },
+    ]
 }
 
-/// Examples with no row above, and why. All three are aspirational and sit
-/// behind their own cargo feature, so they are not even compiled into the
-/// default build — the status table `main` prints is the same claim from the
-/// other side.
+/// Examples with no row above, and why. Both are aspirational and sit behind
+/// their own cargo feature, so they are not even compiled into the default
+/// build — the status table `main` prints is the same claim from the other
+/// side. Neither is missing here because it is slow.
 const SKIPPED: &[(&str, &str)] = &[
     (
-        "softmax",
-        "aspirational (#9, the TMA store) — would report GB/s",
-    ),
-    (
         "layernorm",
-        "aspirational (#3, #9, #13, #22) — would report GB/s",
+        "aspirational (#3, #13) — would report GB/s, memory-bound like softmax",
     ),
     (
         "flash_forward",
-        "aspirational (#7, #11, #22, #23, #31) — would report TFLOP/s",
+        "aspirational (#7, #11, #23, #31) — would report TFLOP/s",
     ),
 ];
 
@@ -324,12 +372,16 @@ pub fn main() -> ExitCode {
     let mut failures = 0;
     for case in cases() {
         failures += report(&context, &case);
-        if let Some(peak) = case.bound.peak() {
-            println!(
+        match case.bound.peak() {
+            Some(peak) => println!(
                 "% of peak is against {peak} TFLOP/s, dense bf16 for one B200: NVIDIA's HGX\n\
                  B200 page lists 36 PFLOPS FP16/BF16 across 8 GPUs, footnoted \"Sparse. Dense\n\
                  is ½ sparse spec shown\" — https://www.nvidia.com/en-us/data-center/hgx/"
-            );
+            ),
+            // Deliberately absent rather than forgotten. The same page states
+            // the B200's flops per GPU and does not state its HBM bandwidth
+            // per GPU, and an unsourced denominator is worse than none.
+            None => println!("no % of peak: no sourced per-GPU HBM bandwidth figure to divide by"),
         }
     }
 
