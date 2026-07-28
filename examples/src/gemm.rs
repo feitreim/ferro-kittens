@@ -565,11 +565,11 @@ const ITEMS_K: usize = 256;
 /// column period collapses from 21 to 7, so a column error that is a multiple
 /// of 7 becomes invisible. No `K` this project runs is a multiple of 21 — they
 /// are all powers of two — and the K axis stays exact even there.
-fn a_value(row: usize, depth: usize) -> f32 {
+pub(crate) fn a_value(row: usize, depth: usize) -> f32 {
     ((row * 5 + depth * 3) % 7) as f32 - 3.0
 }
 
-fn b_value(column: usize, depth: usize) -> f32 {
+pub(crate) fn b_value(column: usize, depth: usize) -> f32 {
     ((column * 4 + depth * 5) % 21) as f32 - 10.0
 }
 
@@ -583,7 +583,7 @@ fn to_bf16(value: f32) -> u16 {
 /// A `[rows, k]` bf16 operand as the packed `u32` words a device buffer holds,
 /// K contiguous — which is what makes both operands K-major and the MMA
 /// transpose-free.
-fn stage(rows: usize, k: usize, value: impl Fn(usize, usize) -> f32) -> Vec<u32> {
+pub(crate) fn stage(rows: usize, k: usize, value: impl Fn(usize, usize) -> f32) -> Vec<u32> {
     let mut staged = Vec::with_capacity(rows * k / 2);
     for row in 0..rows {
         for pair in 0..k / 2 {
@@ -704,14 +704,36 @@ fn run<T>(
         Ok(())
     };
     launch_once(&mut c)?;
+    check_c(&c.to_host_vec(&stream)?, m, n, k)?;
 
-    // `a_value` repeats every 7 rows and `b_value` every 21 columns, so the
-    // reference has 147 distinct dot products at any size and the naive
-    // `O(m·n·k)` form is pure waste — minutes of host time at the sizes the
-    // benchmark reaches, for the same 147 numbers. Every element of `C` is
-    // still compared against its own expected value, in the same summation
-    // order, so the comparison is the one it always was. The sum stays over
-    // the *full* `k`, since both generators vary along it.
+    let after = then(&stream, &mut || launch_once(&mut c))?;
+    Ok((format!("{m}x{n}x{k} exact"), after))
+}
+
+/// Compare an observed `[m, n]` row-major fp32 `C` against the CPU reference
+/// for `[m, k] · [n, k]ᵀ`, element by element and with `==`.
+///
+/// `a_value` repeats every 7 rows and `b_value` every 21 columns, so the
+/// reference has 147 distinct dot products at any size and the naive
+/// `O(m·n·k)` form is pure waste — minutes of host time at the sizes the
+/// benchmark reaches, for the same 147 numbers. Every element of `C` is still
+/// compared against its own expected value, in the same summation order, so the
+/// comparison is the one it always was. The sum stays over the *full* `k`,
+/// since both generators vary along it.
+///
+/// It is a function rather than a block inside [`run`] because the **cuBLASLt
+/// baseline** (#92) is checked by it too. A denominator produced by a different
+/// GEMM is worth nothing, and the way that happens is a transposed operand or a
+/// wrong leading dimension — which computes the wrong matrix at full speed and
+/// looks like a plausible number. Sharing this function rather than copying it
+/// is what makes "checked against the same CPU reference" a property of the
+/// code instead of a claim in a comment.
+pub(crate) fn check_c(
+    observed: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), Box<dyn Error>> {
     let reference: Vec<f32> = (0..7 * 21)
         .map(|cell| {
             (0..k)
@@ -719,7 +741,6 @@ fn run<T>(
                 .sum()
         })
         .collect();
-    let observed = c.to_host_vec(&stream)?;
     let (mut wrong, mut sample) = (0usize, Vec::new());
     for row in 0..m {
         for column in 0..n {
@@ -736,9 +757,7 @@ fn run<T>(
     if wrong > 0 {
         return Err(format!("{wrong} of {} elements wrong: {}", m * n, sample.join("; ")).into());
     }
-
-    let after = then(&stream, &mut || launch_once(&mut c))?;
-    Ok((format!("{m}x{n}x{k} exact"), after))
+    Ok(())
 }
 
 /// The correctness run: two sizes, checked, nothing timed.

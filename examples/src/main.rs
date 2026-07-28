@@ -40,6 +40,11 @@
 use std::process::ExitCode;
 
 pub mod bench;
+/// The GEMM's denominator, behind the off-by-default `cublas` feature (#92).
+/// Absent from a default build, which is what keeps a crate that anyone can
+/// compile from needing a CUDA toolkit to link against.
+#[cfg(feature = "cublas")]
+pub mod cublaslt;
 pub mod flash_forward;
 pub mod gemm;
 pub mod layernorm;
