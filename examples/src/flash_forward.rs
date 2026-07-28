@@ -1,7 +1,17 @@
 //! # Flash-attention forward, causal, one query block per CTA
 //!
-//! **Status: aspirational.** Excluded from the default build; read its gap
-//! list with `cargo check --features flash`.
+//! **Status: compiles**, and is in the default build. It has no launcher and
+//! no CPU reference, which is the only thing between it and **runs** — and the
+//! reason it says *compiles*: "runs against an exact reference" is a claim that
+//! has to be earned, and #48 and #56 are what earning it looked like for the
+//! two kernels that make it.
+//!
+//! It sat behind `--features flash` until its gap list emptied, and then for a
+//! while after — which was the bug. A gated kernel is not in what
+//! `modal run modal_app.py::build` compiles, so the one example exercising the
+//! whole stack at once (both MMA layouts, the swizzled `P` staging tile,
+//! [`online_rescale`], masking, and both memory ends) was the one example CI
+//! could not catch a regression in.
 //!
 //! Blocked on:
 //!
@@ -69,7 +79,13 @@ const HEAD: usize = 128;
 /// Pipeline depth over the key blocks.
 const STAGES: usize = 3;
 /// `log2(e)`, folded into the score scale so the exponential is `exp2`.
-const LOG2E: f32 = 1.442_695;
+///
+/// The library constant rather than a literal: `1.442_695` rounds to the same
+/// fp32 bit pattern (`0x3fb8aa3b`), so this is not a numerics change, but
+/// `clippy::approx_constant` is deny-by-default and the literal was a build
+/// error nobody saw while this file sat behind a cargo feature. It is also what
+/// `reg::Exp` scales by, so the kernel and the op now name one constant.
+const LOG2E: f32 = core::f32::consts::LOG2_E;
 
 type QTile = SharedTile<Bf16, QUERIES, HEAD, Swizzle128B>;
 type KTile = SharedTile<Bf16, KEYS, HEAD, Swizzle128B>;

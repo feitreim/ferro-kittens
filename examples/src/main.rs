@@ -1,25 +1,31 @@
 //! Kernels written against the API we want.
 //!
-//! Four kernels, each with a header stating whether it **runs**, whether it
-//! only **compiles**, or whether it is **aspirational** — naming API that does
-//! not exist yet, with the issue numbers it is blocked on. An aspirational
-//! example is not a placeholder: it is a precise statement of a missing
-//! surface, in the only terms that matter, which is what a kernel author has to
-//! type. The diff between these files and the library *is* the backlog.
-//! `examples/README.md` collects it.
+//! Four kernels, each with a header stating whether it **runs** or only
+//! **compiles**. There used to be a third status — *aspirational*, naming API
+//! that did not exist yet — and an example in it was not a placeholder but a
+//! precise statement of a missing surface, in the only terms that matter, which
+//! is what a kernel author has to type. The diff between these files and the
+//! library *was* the backlog; `examples/README.md` collects what it produced.
 //!
 //! | Kernel | Status |
 //! | --- | --- |
 //! | [`gemm`] | runs — checked against a CPU reference by [`gemm::check`] |
 //! | [`softmax`] | runs — checked against a CPU reference by [`softmax::check`] |
-//! | `flash_forward` | compiles — `--features flash`, no launcher yet |
-//! | [`layernorm`] | compiles — both kernels, in the default build |
+//! | [`flash_forward`] | compiles — no launcher yet |
+//! | [`layernorm`] | compiles — both kernels, no launcher yet |
 //!
-//! Each aspirational kernel sits behind its own feature and is off by default,
-//! so anything in the default build genuinely compiles and a reader can tell
-//! the two apart without running anything. Turning a feature on is how you
-//! read that kernel's gap list: the compiler errors *are* the missing API,
-//! reported at the call sites that want it.
+//! **Every kernel here is in the default build**, and there are no cargo
+//! features left. That is what makes `modal run modal_app.py::build` — a real
+//! `sm_100a` codegen of this crate — a regression gate on all four: a gated
+//! kernel is not in the default feature set, so it was never compiled by the
+//! thing that compiles this crate, and the example exercising the most of the
+//! library at once was the one nothing checked.
+//!
+//! **Compiles is not runs**, and the distinction is the point of the column.
+//! Two of these have a launcher and a CPU reference and exit non-zero on a
+//! wrong number; two have neither. Giving the other two a launcher is real work
+//! with a real failure mode — see the seed argument in [`softmax::permutation`]
+//! — and not a status to be assigned.
 //!
 //! Until #8 there was no launcher here at all, because `global.rs` built one
 //! shape of tensor map (3-D bf16 panels) and the GEMM's operands are 2-D.
@@ -33,15 +39,10 @@
 use std::process::ExitCode;
 
 pub mod bench;
+pub mod flash_forward;
 pub mod gemm;
-// Both its kernels are in the default build since #3 — `groupnorm_tile` was
-// the last thing behind the `layernorm` feature, and the feature is gone with
-// it.
 pub mod layernorm;
 pub mod softmax;
-
-#[cfg(feature = "flash")]
-pub mod flash_forward;
 
 /// A kernel's launch envelope, as the example derives it from the library's
 /// own shape constants — the numbers a host launcher would need.
@@ -57,11 +58,8 @@ struct Example {
     entry: Option<&'static str>,
 }
 
-/// `mut` is used only when an aspirational feature is on, which is the default
-/// build's whole point.
-#[allow(unused_mut)]
 fn examples() -> Vec<Example> {
-    let mut examples = vec![
+    vec![
         Example {
             name: "gemm",
             status: "runs",
@@ -85,16 +83,18 @@ fn examples() -> Vec<Example> {
             shared_bytes: layernorm::SHARED_BYTES,
             entry: Some("layernorm_rows"),
         },
-    ];
-    #[cfg(feature = "flash")]
-    examples.push(Example {
-        name: "flash_forward",
-        status: "compiles (no launcher yet)",
-        threads: flash_forward::THREADS,
-        shared_bytes: flash_forward::SHARED_BYTES,
-        entry: None,
-    });
-    examples
+        Example {
+            name: "flash_forward",
+            status: "compiles (no launcher yet)",
+            threads: flash_forward::THREADS,
+            shared_bytes: flash_forward::SHARED_BYTES,
+            // No launcher, but a plain `#[kernel]` rather than a
+            // `#[cluster_launch]`, so the occupancy query describes it
+            // faithfully — and this is the kernel carrying the most library
+            // surface, which makes its envelope the one worth watching.
+            entry: Some("flash_forward"),
+        },
+    ]
 }
 
 /// Blocks per SM the driver says each kernel's own launch envelope admits, and

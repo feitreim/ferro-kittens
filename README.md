@@ -80,6 +80,9 @@ triggers. `CI.md` has the policy, the costs, and how to ask for a GPU run.
 
 `examples/` holds real kernels — a cluster GEMM, flash-attention forward,
 softmax, layernorm — written the way we want them to read, each with a header
-saying whether it compiles today or names API that does not exist yet.
-`examples/README.md` collects the missing surface all four demand, mapped to
-issues, with the part no issue covers called out separately.
+saying whether it **runs** against a CPU reference or only **compiles**. All
+four compile as of #3, the crate has no cargo features left, and
+`cargo oxide build kittens-examples --arch sm_100a` therefore codegens every one
+of them. `examples/README.md` is the record of the missing surface they demanded
+while they were still asking for it, mapped to issues, with the part no issue
+covered called out separately.

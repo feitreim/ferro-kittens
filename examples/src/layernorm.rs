@@ -62,8 +62,9 @@ type Parameters = SharedVec<Bf16, COLUMNS>;
 /// The four warps' partial statistics, between the two barriers a block
 /// reduction is made of. fp32 and not bf16: a partial rounded on its way
 /// through shared memory would lose eight bits of the sum, and the variance
-/// pass would inherit the error of the mean pass. 16 bytes — one TMA line, and
-/// the narrowest vector [`SharedVec`] admits.
+/// pass would inherit the error of the mean pass. 16 bytes, and never a TMA
+/// box — the whole life of this vector is [`SharedVec::set`] then
+/// [`SharedVec::get`], one barrier apart.
 type Partials = SharedVec<F32, WARPS>;
 
 pub const SHARED_BYTES: usize = Tile::BYTES + 2 * Parameters::BYTES + 64;

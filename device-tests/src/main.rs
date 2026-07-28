@@ -137,10 +137,10 @@ const VECTOR_ROWS: usize = 4;
 const VECTOR_ROW: usize = 2;
 
 type Params = SharedVec<Bf16, VECTOR>;
-/// The block reduction's staging buffer: one fp32 per warp, which at four
-/// warps is 16 bytes — the TMA's own line, and so the narrowest vector
-/// `SharedVec::BOX_OK` admits. fp32 and not bf16 because a partial rounded on
-/// its way through shared memory is a wrong sum, not a wrong layout.
+/// The block reduction's staging buffer: one fp32 per warp, 16 bytes at four
+/// warps and never a TMA box — written by `set`, read by `get`, one barrier
+/// apart. fp32 and not bf16 because a partial rounded on its way through
+/// shared memory is a wrong sum, not a wrong layout.
 type Partials = SharedVec<F32, BLOCK_WARPS>;
 /// One warp's band in that case. `[32, 64]` is 2048 values, the divisor
 /// [`block_partial`]'s seeds are scaled by.
@@ -273,9 +273,9 @@ const REDUCTION_COLUMNS: usize = COLUMNS / 4;
 /// band's max and the narrow band's sum.
 const REDUCTION_STRIDE: usize = REDUCTION_ROWS + REDUCTION_COLUMNS + 2;
 
-/// Warps the block-reduction case runs — the width of the only block scope
-/// [`SharedVec`] can hold partials for, since four fp32 is 16 bytes and a
-/// narrower vector is not a legal box.
+/// Warps the block-reduction case runs. Four because that is `groupnorm_tile`'s
+/// width and the one this library's kernels all launch at, not because the
+/// collective needs it — `WARPS` is free.
 const BLOCK_WARPS: usize = 4;
 /// One warp's band in that case, and the source of its partial: 2048 values,
 /// so a seed of `8^w / 2048` folds to exactly `8^w` with every partial sum

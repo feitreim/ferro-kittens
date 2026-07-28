@@ -11,17 +11,14 @@ edition = "2024"
 # cannot break the library's build or its CI.
 [workspace]
 
-[features]
-default = []
-# Each aspirational kernel sits behind its own feature and is off by default,
-# so everything in the default build genuinely compiles. Turning one on is how
-# you read its gap list: the compiler errors *are* the missing API surface,
-# named at the call sites that want it.
-flash = []
-# `layernorm` was one of these until #3: both of that file's kernels are in the
-# default build now, so a feature holding nothing back is a feature that only
-# makes `gaps` print an empty section. Deleted rather than kept as a no-op.
-aspirational = ["flash"]
+# No features. Each aspirational kernel used to sit behind one and be off by
+# default, so that everything in the default build genuinely compiled and
+# turning a feature on printed that kernel's gap list as compiler errors. Every
+# gap list is empty now (#3 closed the last one), so the features held nothing
+# back — and worse, a gated kernel is absent from the default set that
+# `cargo oxide build kittens-examples --arch sm_100a` compiles, which made the
+# examples with the most library surface in them the ones CI never codegened.
+# All four kernels are in the default build.
 
 [dependencies]
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }

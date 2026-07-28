@@ -838,6 +838,15 @@ impl<E: Element> SwizzledChunks<E> {
 /// with `CU_TENSOR_MAP_SWIZZLE_NONE`, which the engine writes contiguously —
 /// the same bytes [`Self::at`] addresses. That agreement is what the
 /// [`crate::global::TileBox`] impl states.
+///
+/// # The engine is optional
+///
+/// A vector need not be TMA'd at all — [`crate::sync::block_reduce`]'s scratch
+/// is written by [`Self::set`] and read by [`Self::get`] and never touches a
+/// descriptor — so the shape rules an unswizzled box obeys are enforced by the
+/// four transfer methods rather than by [`Self::from_raw`]. `N` may be any
+/// length as a handle; it must make a legal box only where one is built. See
+/// `Self::TMA_OK`.
 pub struct SharedVec<E: Element, const N: usize> {
     base: *mut u8,
     _marker: PhantomData<E>,
@@ -868,18 +877,44 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     /// format, and a vector is a single box by construction.
     const LENGTH_OK: () = assert!(N <= 256, "a TMA box dimension is at most 256 elements");
 
+    /// Both box rules, forced at each of the four calls that hand the vector to
+    /// the engine — and nowhere else.
+    ///
+    /// They used to be forced by [`Self::from_raw`], which read as "a
+    /// `SharedVec` is a thing the TMA can deliver" and is a stronger claim than
+    /// either assert makes. Both are statements about a *descriptor's box*, and
+    /// [`crate::sync::block_reduce`]'s scratch is the one use of this type that
+    /// never meets a descriptor: a four-warp block's partials are 16 bytes, a
+    /// two-warp block's are 8, and only the first could be constructed under
+    /// the old placement. So the rules moved to the calls they are about,
+    /// where they still fire at codegen for every caller they genuinely bind,
+    /// and a vector that is only ever written by [`Self::set`] and read by
+    /// [`Self::get`] pays nothing for a box it does not have.
+    ///
+    /// The host side is unchanged and is the other half of this: building a
+    /// tensor map runs `GlobalLayout::check_driver_requirements`, which rejects
+    /// the same shapes at map-construction time with a message naming the field
+    /// and the byte count.
+    const TMA_OK: () = {
+        #[allow(clippy::let_unit_value)]
+        let _ = (Self::BOX_OK, Self::LENGTH_OK);
+    };
+
     /// Wrap a raw shared-memory base (a `DynamicSharedArray` offset or a
     /// `SharedArray` static).
+    ///
+    /// Asserts nothing about the length: see `Self::TMA_OK` for why the box
+    /// rules live on the transfers rather than here.
     ///
     /// # Safety
     ///
     /// `base` must point to at least `Self::BYTES` bytes of shared memory,
-    /// 128-byte aligned (the TMA engine's destination alignment), living as
-    /// long as every use of the vector.
+    /// living as long as every use of the vector. A vector this crate's TMA
+    /// paths will touch must also be 128-byte aligned, which is the engine's
+    /// destination alignment; one used only through [`Self::get`] and
+    /// [`Self::set`] needs no more than `E`'s own alignment.
     #[inline(always)]
     pub const unsafe fn from_raw(base: *mut u8) -> Self {
-        #[allow(clippy::let_unit_value)]
-        let _ = (Self::BOX_OK, Self::LENGTH_OK);
         Self {
             base,
             _marker: PhantomData,
@@ -937,12 +972,18 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     /// One instruction, unlike [`SharedTile::tma_load`]'s one per subtile —
     /// an unswizzled box has no atom to be cut into.
     ///
+    /// This is one of the four calls `Self::TMA_OK` binds: `N` must make a
+    /// legal box here, where it need not to merely exist.
+    ///
     /// # Safety
     ///
     /// `map` must describe a live global buffer whose box shape matches `[N]`,
-    /// and `sem` must be an initialized TMA barrier.
+    /// `sem` must be an initialized TMA barrier, and the vector must be
+    /// 128-byte aligned.
     #[inline(always)]
     pub unsafe fn tma_load(self, map: *const TmaDescriptor, start: i32, sem: Semaphore) {
+        #[allow(clippy::let_unit_value)]
+        let _ = Self::TMA_OK;
         unsafe { cp_async_bulk_tensor_1d_g2s(self.base, map, start, sem.raw()) }
     }
 
@@ -962,6 +1003,8 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
         minor: i32,
         sem: Semaphore,
     ) {
+        #[allow(clippy::let_unit_value)]
+        let _ = Self::TMA_OK;
         unsafe { cp_async_bulk_tensor_2d_g2s(self.base, map, start, minor, sem.raw()) }
     }
 
@@ -977,6 +1020,8 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     /// `fence.proxy.async.shared::cta` first.
     #[inline(always)]
     pub unsafe fn tma_store(self, map: *const TmaDescriptor, start: i32) {
+        #[allow(clippy::let_unit_value)]
+        let _ = Self::TMA_OK;
         unsafe { cp_async_bulk_tensor_1d_s2g(self.base, map, start) }
     }
 
@@ -987,6 +1032,8 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     /// As [`Self::tma_store`], for a box shape of `[N, 1]`.
     #[inline(always)]
     pub unsafe fn tma_store_2d(self, map: *const TmaDescriptor, start: i32, minor: i32) {
+        #[allow(clippy::let_unit_value)]
+        let _ = Self::TMA_OK;
         unsafe { cp_async_bulk_tensor_2d_s2g(self.base, map, start, minor) }
     }
 }
@@ -1107,16 +1154,16 @@ mod tests {
     #[test]
     fn the_partials_vector_is_the_smallest_legal_box() {
         // `SharedVec<F32, 4>` — a block reduction's four per-warp partials — is
-        // 16 bytes *exactly*, which is the TMA's line and so the minimum
-        // `BOX_OK` admits. It passes by zero margin, and one warp fewer does
-        // not pass at all, so this is worth an assertion rather than luck.
+        // 16 bytes *exactly*, which is the TMA's line and so the smallest box
+        // `BOX_OK` admits. It passes by zero margin, which is worth an
+        // assertion rather than luck.
         assert_eq!(SharedVec::<F32, 4>::BYTES, 16);
         assert_eq!(SharedVec::<F32, 8>::BYTES, 32);
-        // Constructing it is what forces `BOX_OK` and `LENGTH_OK`: they are
-        // post-monomorphization asserts, invisible to a type-check, and this is
-        // the host's half of the evidence that they admit this shape. The
-        // device half is `cargo oxide build --arch sm_100a`, which is the only
-        // thing that codegens the kernel that calls it.
+        // Constructing it forces nothing, which is the point of moving the box
+        // rules onto the transfers: `from_raw` is a pointer and a shape, and
+        // the shapes an unswizzled *box* may have are a fact about the four
+        // calls that build one. So the same length that must be a whole number
+        // of 16-byte lines to be TMA'd is free to be a block's scratch.
         let partials = [0.0f32; 4];
         let vec = unsafe { SharedVec::<F32, 4>::from_raw(partials.as_ptr() as *mut u8) };
         for index in 0..4usize {
@@ -1125,6 +1172,42 @@ mod tests {
                 index * 4
             );
         }
+    }
+
+    #[test]
+    fn a_scratch_vector_shorter_than_a_box_still_constructs() {
+        // One and two warps: 4 and 8 bytes, neither a whole 16-byte line, and
+        // both illegal as a TMA box. Under the old placement of `BOX_OK` on
+        // `from_raw` these failed at codegen and a 1- or 2-warp block simply
+        // could not hold a block reduction's partials — an arbitrary
+        // restriction, since that scratch never becomes a box. The addressing
+        // is the same flat stride at every length.
+        let one = [7.0f32];
+        let vec = unsafe { SharedVec::<F32, 1>::from_raw(one.as_ptr() as *mut u8) };
+        assert_eq!(unsafe { vec.get(0) }, 7.0);
+        assert_eq!(SharedVec::<F32, 1>::BYTES, 4);
+
+        let two = [1.0f32, 2.0];
+        let vec = unsafe { SharedVec::<F32, 2>::from_raw(two.as_ptr() as *mut u8) };
+        assert_eq!(unsafe { vec.get(0) }, 1.0);
+        assert_eq!(unsafe { vec.get(1) }, 2.0);
+        assert_eq!(SharedVec::<F32, 2>::BYTES, 8);
+
+        // And a bf16 vector of 4, the shape `global`'s own test uses to show
+        // `check_driver_requirements` rejecting an 8-byte box: illegal as a
+        // box, legal as a handle, and the two facts now live in the two places
+        // they belong to.
+        //
+        // The other direction is not expressible here — `tma_store` on this
+        // same vector is a *compile* error, not a failing assertion, so no test
+        // can call it. Checked by hand against this exact shape, and the error
+        // names the instantiation: "evaluation of `SharedVec::<Bf16, 4>::
+        // BOX_OK` failed ... while instantiating `SharedVec::<Bf16, 4>::
+        // tma_store`". Making it a permanent case needs `trybuild`, which the
+        // crate does not depend on.
+        assert_eq!(SharedVec::<Bf16, 4>::BYTES, 8);
+        let narrow = [0u16; 4];
+        let _ = unsafe { SharedVec::<Bf16, 4>::from_raw(narrow.as_ptr() as *mut u8) };
     }
 
     #[test]

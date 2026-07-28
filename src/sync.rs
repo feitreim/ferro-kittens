@@ -284,13 +284,14 @@ impl<const N: usize> SemaphoreRing<N> {
 /// overtake the first's readers. Calling it twice in a row — mean, then
 /// variance — needs nothing at the call site.
 ///
-/// `WARPS` has to be a multiple of four, and not because of anything here:
-/// [`SharedVec`]'s `BOX_OK` wants a whole number of the TMA's 16-byte lines,
-/// which at 4 bytes an element makes 4 warps — 16 bytes exactly — the narrowest
-/// scratch that constructs. A 128-thread block is the smallest one that can
-/// take this reduction, and a 1- or 2-warp block fails at codegen inside
-/// [`SharedVec::from_raw`]. The rule is a statement about a TMA box, and a
-/// scratch vector is the one use of the type that never meets the engine.
+/// `WARPS` is free: any block width from one warp up. It was briefly a
+/// multiple of four, because [`SharedVec`] forced its TMA box rules at
+/// construction and four fp32 is the narrowest legal box — a rule about a
+/// descriptor, binding a vector that never becomes one. Those asserts now sit
+/// on the four transfer methods, so a two-warp block's 8-byte scratch is a
+/// handle like any other. A one-warp block is legal too, and degenerate: the
+/// fold is over a single slot and [`crate::reg::warp_reduce`] is the same
+/// answer without the barriers.
 ///
 /// The bound is [`ReduceOp`] rather than [`crate::reg::BinaryOp`] for the
 /// reason `row_reduce` takes one: the warps' partials arrive in slot order,
@@ -413,6 +414,8 @@ mod tests {
         // of being wrong.
         assert_eq!(fold::<Add, 4>([1.0, 8.0, 64.0, 512.0]), 585.0);
         assert_eq!(fold::<Add, 8>([1.0; 8]), 8.0);
+        assert_eq!(fold::<Add, 1>([7.0]), 7.0);
+        assert_eq!(fold::<Add, 2>([1.0, 8.0]), 9.0);
     }
 
     #[test]
@@ -422,20 +425,27 @@ mod tests {
         assert_eq!(fold::<Mul, 4>([1.0, 2.0, 4.0, 8.0]), 64.0);
         assert_eq!(fold::<Max, 4>([-3.0, -1.0, -7.0, -2.0]), -1.0);
         assert_eq!(fold::<Max, 8>([f32::NEG_INFINITY; 8]), f32::NEG_INFINITY);
+        // A one-warp block folds one slot against the identity — degenerate,
+        // and the case that says the loop needs no lower bound.
+        assert_eq!(fold::<Mul, 1>([5.0]), 5.0);
+        assert_eq!(fold::<Max, 1>([-4.0]), -4.0);
     }
 
     #[test]
-    fn the_widths_a_partials_vector_can_have() {
-        // Not every warp count is expressible, and the reason has nothing to do
-        // with the fold: `SharedVec::BOX_OK` wants a whole number of the TMA's
-        // 16-byte lines, so at 4 bytes an element `WARPS` must be a multiple of
-        // four. A 4-warp block — `groupnorm_tile`'s, and every 128-thread
-        // kernel's — is the smallest legal one, at 16 bytes exactly; a 1- or
-        // 2-warp block cannot construct the scratch at all, and would fail at
-        // codegen inside `SharedVec::from_raw` rather than here.
+    fn every_warp_count_is_a_scratch_this_can_use() {
+        // These four instantiations are the test. Two of them — one warp at 4
+        // bytes and two at 8 — were codegen failures until `SharedVec`'s box
+        // asserts moved off `from_raw` onto the transfers, and the rule that
+        // rejected them is about a TMA descriptor a block reduction's scratch
+        // never builds. Nothing about the fold ever cared.
+        assert_eq!(SharedVec::<F32, 1>::BYTES, 4);
+        assert_eq!(SharedVec::<F32, 2>::BYTES, 8);
         assert_eq!(SharedVec::<F32, 4>::BYTES, 16);
-        assert!(SharedVec::<F32, 4>::BYTES.is_multiple_of(16));
-        assert!(!(size_of::<f32>() * 2).is_multiple_of(16));
+        assert_eq!(SharedVec::<F32, 8>::BYTES, 32);
+        assert_eq!(fold::<Add, 1>([1.0]), 1.0);
+        assert_eq!(fold::<Add, 2>([1.0, 1.0]), 2.0);
+        assert_eq!(fold::<Add, 4>([1.0; 4]), 4.0);
+        assert_eq!(fold::<Add, 8>([1.0; 8]), 8.0);
     }
 
     #[test]

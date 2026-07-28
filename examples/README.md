@@ -1,12 +1,13 @@
 # examples
 
 Four kernels written the way we want them to read, and a header on each saying
-whether it runs, whether it only compiles, or whether it is aspirational.
+whether it runs or whether it only compiles. All four compile as of #3; two run.
 
-The value of this crate is the **diff** between what the kernels want to say and
-what `kittens` can express. An aspirational example is not a placeholder — it is
-a statement of a missing API in the only terms that matter, which is what a
-kernel author has to type. This file collects that diff across all four.
+The value of this crate was the **diff** between what the kernels wanted to say
+and what `kittens` could express. An aspirational example — one naming API that
+did not exist yet — is not a placeholder but a statement of a missing API in the
+only terms that matter, which is what a kernel author has to type. That diff is
+now empty, and this file is the record of what it produced while it was not.
 
 Its own workspace, like `device-tests`, so `cargo` at the repo root never sees
 it. (The root `Cargo.toml` also needs `autoexamples = false`: `examples/` is one
@@ -22,6 +23,15 @@ target *of the library*.)
 | [`softmax`](src/softmax.rs) | **runs** — within 2⁻⁸ of a CPU reference | — |
 | [`flash_forward`](src/flash_forward.rs) | **compiles** — no launcher yet | — |
 | [`layernorm`](src/layernorm.rs) | **compiles** — both kernels, no launcher yet | — |
+
+All four are in the default build and this crate has **no cargo features left**.
+That is not tidying: `cargo oxide build kittens-examples --arch sm_100a` — which
+is `modal run modal_app.py::build`, and CI tier 2 — compiles the *default*
+feature set, so a gated kernel was never codegened by the thing that codegens
+this crate. `flash_forward` is the example with the most library surface in it
+(both MMA layouts, the swizzled `P` staging tile, `online_rescale`, masking,
+both memory ends), and until #3 it was the one example nothing could catch a
+regression in. The gate was standing in for a claim a real build makes better.
 
 Two of the four **run** rather than merely compile, which is a strictly stronger
 claim and the one worth holding the rest to: a launcher, a CPU reference, and an
@@ -74,8 +84,9 @@ promoted whole: #13 took `layernorm_rows` out of the gate and left
 `groupnorm_tile` behind it, because its statistic spans four warps and #13
 supplied only the storage half of what that needs. #3 supplied the other half
 and the split is over — both kernels are in the default build and both get a
-real `sm_100a` compile. The `layernorm` cargo feature is **gone**, not left
-empty: a feature that gates nothing only makes `gaps` print a blank section.
+real `sm_100a` compile. The `layernorm` cargo feature went with it, and so did
+`flash`: see the status table above for why a feature gating a kernel that
+compiles is worse than no feature at all.
 
 No arithmetic entry is open any more. `RegTile::add_assign` was the last one
 and **#31** landed it, along with an `_assign` twin for every other map on all
@@ -84,46 +95,49 @@ the API it shipped, and § "in-place versus by-value" below is rewritten around
 it.
 
 ```sh
-cargo oxide build kittens-examples --arch sm_100a   # the default set: gemm, softmax, both layernorms
+cargo oxide build kittens-examples --arch sm_100a   # all four kernels
 cargo oxide run kittens-examples                    # and run the ones with launchers, on a B200
-cargo check --features flash                        # read flash's gap list
 ```
 
-From the repo root: `modal run modal_app.py::build` for the first,
-`modal run modal_app.py::examples` for the second, and
-`modal run modal_app.py::gaps` for the third — it prints the gap list and never
-fails, since an empty one is a finding rather than an error.
+From the repo root: `modal run modal_app.py::build` for the first and
+`modal run modal_app.py::examples` for the second.
 
-One kernel is still behind a feature, and it is `flash_forward`, which is there
-for want of a launcher rather than for want of API. Everything else is in the
-default build and genuinely compiles. Turning the feature on prints whatever
-API is still missing as compiler errors, at the call sites that want it.
-Verified: historically every error was `unresolved import`, `no method named`,
-or an unsatisfied `FragmentLayout` bound — nothing in these files ever failed
-for a reason other than the API not existing.
+## The gap lists, and why there is no longer a command for them
 
-That list is read off `modal run modal_app.py::gaps`, which checks each feature
-on its own so an error belongs to a known kernel. Both entries below were read
-off a run of it, not off these files:
+`modal run modal_app.py::gaps` is **retired** (#3). It turned each aspirational
+kernel's cargo feature on and printed the resulting compiler errors, which is
+the right instrument while a kernel names API that does not exist: the missing
+surface *is* the error list, at the call sites that want it, read off a compiler
+rather than off the last person's memory. It is gone because **every list
+reached empty and the features are gone with them** — and an empty section is
+not a finding, it is a command with nothing to say.
 
-- **`flash_forward`** — **empty**, which is the interesting outcome for a gap
-  list. It stays behind its feature only for want of a launcher and a CPU
-  reference; nothing in it reaches past the library any more. The list was
-  three errors until #23 landed, two until #11 and #31 landed together, and how
-  the third went is worth keeping: `make_causal_at` (#7) was wanted all along
-  and never appeared as its own error, because it is called on the `[32, 64]`
-  band whose `FragmentLayout` bound already failed, and an unsatisfied bound on
-  the receiver suppresses method resolution on it. Counting errors would have
-  said #7 had landed.
-- **`layernorm`** — **gone**, and that is the stronger outcome than empty. Its
-  one error was `sync::block_reduce_sum` (#3); with the reduction in the
-  library `groupnorm_tile` left the gate, the feature had nothing left to hold
-  back, and it was deleted rather than kept as a section that prints nothing.
-  A kernel in the default build is checked by `build`'s real `sm_100a` codegen,
-  which is a stronger claim than a `cargo check` that finds no errors — a
-  post-monomorphization `const { assert!(..) }` is invisible to the second and
-  not to the first, and `SharedVec<F32, 4>`'s box assert is exactly one of
-  those.
+What replaced it is stronger rather than weaker. All four kernels are in the
+default build, so `build` codegens each one for real `sm_100a`, and that catches
+what a `cargo check` cannot: a post-monomorphization `const { assert!(..) }` is
+invisible to a type-check and fires only at codegen. `SharedVec<F32, 4>`'s box
+assert was exactly one of those.
+
+The two lists as they stood at the end, both read off the last run of `gaps`
+before it was retired, and kept because *how* each emptied is the useful part:
+
+- **`flash_forward`** — **empty**, which was the interesting outcome for a gap
+  list. Nothing in it reaches past the library; it wants a launcher and a CPU
+  reference. The list was three errors until #23 landed, two until #11 and #31
+  landed together, and how the third went is worth keeping: `make_causal_at`
+  (#7) was wanted all along and never appeared as its own error, because it is
+  called on the `[32, 64]` band whose `FragmentLayout` bound already failed, and
+  an unsatisfied bound on the receiver suppresses method resolution on it.
+  Counting errors would have said #7 had landed.
+- **`layernorm`** — one error, `sync::block_reduce_sum` (#3), in
+  `groupnorm_tile` only; `layernorm_rows` had left the gate with #13. #3 closed
+  it, and the feature went with the kernel.
+
+If a new aspirational kernel is ever written, the instrument is worth rebuilding
+exactly as it was — a feature per kernel, checked on its own so an error belongs
+to a known kernel, non-zero exit reported rather than raised. What is not worth
+keeping is the gate on a kernel that compiles, because a gated kernel is one the
+`sm_100a` build never sees.
 
 Nothing named `scale`, `shift` or `rsqrt` is in either list any more (#38),
 nothing named `add_assign` (#31), and nothing named `FragmentLayout` or
@@ -684,13 +698,25 @@ Three things about the reduction are decisions rather than transcription:
   establishes; this one was chosen so that back-to-back calls are self-sufficient
   by construction.
 
-What it does **not** widen: `WARPS` has to be a multiple of four. `SharedVec`'s
-`BOX_OK` wants a whole number of the TMA's 16-byte lines, so four fp32 — 16
-bytes exactly, the minimum legal box — is the narrowest scratch that
-constructs, and a 1- or 2-warp block cannot take this reduction at all. That
-rule is a statement about a *TMA box*, and a scratch vector is the one use of
-the type that never meets the engine; whether the assert belongs on `from_raw`
-or on the four TMA methods is a live question this issue did not answer.
+And one thing it moved on the way. `WARPS` was briefly forced to a multiple of
+four: `SharedVec::BOX_OK` wants a whole number of the TMA's 16-byte lines, so
+four fp32 — 16 bytes exactly, as predicted, the minimum legal box — was the
+narrowest scratch that would *construct*, and a 1- or 2-warp block could not
+take the reduction at all. But that rule is a statement about a **TMA box**, and
+a block reduction's scratch is the one use of `SharedVec` that never becomes
+one: it is written by `set`, read by `get`, and never handed to a descriptor. So
+`BOX_OK` and `LENGTH_OK` moved off `from_raw` and onto the four transfer
+methods, where they still fire at codegen for every caller they genuinely bind —
+verified by hand, and the error names the instantiation:
+`SharedVec::<Bf16, 4>::BOX_OK` failed *while instantiating*
+`SharedVec::<Bf16, 4>::tma_store`. Nothing was relying on the construction-time
+placement; the host side already rejects the same shapes when a tensor map is
+built, with a better message, in `check_driver_requirements`.
+
+The lesson is narrower than the fix. An assert on a constructor reads as a
+statement about the type, and this one was a statement about four of its
+methods — `SharedVec` was saying "I am a thing the TMA can deliver" when what it
+is, is a run of elements that *may* be delivered.
 
 > The note that decided the shape, kept because it is the argument. A finding
 > from writing #6: **`Scope` as filed cannot express the block reduction.** A
@@ -929,8 +955,8 @@ actually needs from it is the address space. Filed as a correction on #24.
 ## What the examples confirm already works
 
 Worth recording, because the promotion of an example from aspirational to
-compiling is the thing that proves an issue is finished, and half of this
-library is already at that bar:
+compiling is the thing that proved an issue finished, and every kernel here has
+now made that promotion:
 
 - **The MMA layer.** `mma_abt`, `mma_ab` and `mma_walk_cg2` covered every
   multiply in four kernels, in the layouts they wanted, with no gaps. Each

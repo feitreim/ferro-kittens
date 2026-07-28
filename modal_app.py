@@ -204,40 +204,26 @@ def build() -> None:
     # exists only on Blackwell -- pin it or the artifact fails to compile.
     _run([*STUB_ENV, "cargo", "oxide", "build", "device-tests", "--arch", "sm_100a"],
          cwd=HARNESS_DIR)
-    # The examples crate, same treatment. Only the kernels marked *runs* or
-    # *compiles* are in the default feature set, so this is what keeps that
-    # claim honest: a post-monomorphization `const { assert!(..) }` in a tile
-    # shape is invisible to `cargo check` and shows up only in a real device
-    # build. Its host launchers are ordinary Rust and get ordinary lints.
+    # The examples crate, same treatment, and since #3 this is all four of its
+    # kernels rather than the subset that was not behind a feature. That is the
+    # point of them having no features left: a post-monomorphization
+    # `const { assert!(..) }` in a tile shape is invisible to `cargo check` and
+    # shows up only in a real device build, and a gated kernel never reached
+    # this line at all. Its host launchers are ordinary Rust and get ordinary
+    # lints.
     _run(["cargo", "clippy", "--all-targets"], cwd=EXAMPLES_DIR)
     _run([*STUB_ENV, "cargo", "oxide", "build", "kittens-examples", "--arch", "sm_100a"],
          cwd=EXAMPLES_DIR)
 
 
-@app.function(cpu=8, timeout=1800)
-def gaps() -> None:
-    """The aspirational examples' gap lists, as compiler errors.
-
-    `examples/README.md` claims each aspirational kernel's remaining errors by
-    name, and that claim is only worth anything if it is read off a compiler
-    rather than off the last person's memory. Turning a feature on makes the
-    missing API surface *be* the error list, at the call sites that want it.
-    Each feature is checked on its own so an error belongs to a known kernel,
-    and a non-zero exit is the expected outcome -- reported rather than raised.
-    An empty list is the interesting case: the kernel is ready to leave its
-    gate, which is a finding and not an error.
-
-    `layernorm` was the second feature here until #3. Both of that file's
-    kernels are in the default build now, so the feature is gone and `build`
-    is what holds them -- an empty gap list stops being a finding once there is
-    no gate left for it to be about."""
-    for feature in ("flash",):
-        print(f"\n=== cargo check --features {feature} ===", flush=True)
-        checked = subprocess.run(
-            ["cargo", "check", "--features", feature, "--message-format", "short"],
-            cwd=EXAMPLES_DIR,
-        )
-        print(f"=== exit {checked.returncode} ===", flush=True)
+# `gaps` lived here until #3, and printed each aspirational kernel's remaining
+# errors by turning its cargo feature on: the missing API surface *was* the
+# error list, at the call sites that wanted it, read off a compiler rather than
+# off the last person's memory. It is retired because every list reached empty
+# and the features are gone -- `build` above now codegens all four kernels for
+# real `sm_100a`, which is the stronger claim the gate was standing in for.
+# `examples/README.md` keeps what the lists said and how to read one, for
+# whenever the next aspirational kernel is written.
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=1800)
