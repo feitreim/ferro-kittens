@@ -20,12 +20,17 @@
 //!   per stack level. [`SharedTile::tma_store`] walks the same boxes the other
 //!   way, and completes through a wholly different mechanism —
 //!   [`tma_store_commit`] and the two waits, not a [`Semaphore`].
+//!
+//! [`SharedVec`] is the other shape shared memory holds, and it deliberately
+//! shares none of that machinery: a vector is one flat run of elements, no
+//! swizzle, one box. The reasoning is on the type.
 
 use core::marker::PhantomData;
 
 use cuda_device::tcgen05::{Tcgen05ElementType, cvt_f32x2_bf16x2};
 use cuda_device::tma::{
-    TmaDescriptor, cp_async_bulk_commit_group, cp_async_bulk_tensor_2d_g2s,
+    TmaDescriptor, cp_async_bulk_commit_group, cp_async_bulk_tensor_1d_g2s,
+    cp_async_bulk_tensor_1d_s2g, cp_async_bulk_tensor_2d_g2s,
     cp_async_bulk_tensor_2d_g2s_multicast_cg2, cp_async_bulk_tensor_2d_s2g,
     cp_async_bulk_tensor_3d_g2s, cp_async_bulk_tensor_3d_s2g, cp_async_bulk_wait_group,
     cp_async_bulk_wait_group_read,
@@ -66,6 +71,33 @@ pub trait Element {
     /// [`Self::pack`] for every element narrower than fp32 — widening loses
     /// nothing, so a load path is free of the rounding the store side has.
     fn unpack(word: u32) -> Self::Unpacked;
+
+    /// Read one element of shared memory as the fp32 a register holds.
+    ///
+    /// The scalar half of the trait, beside [`Self::pack`]'s word half, and
+    /// what a [`SharedVec`] is addressed with: a vector's consumers index
+    /// *elements* — one column's parameter, one warp's partial — where a
+    /// tile's move whole 32-bit words through `ldmatrix`. [`Self::Unpacked`]
+    /// is an opaque `Copy` type with no way to pick a lane out of it, so the
+    /// word form cannot serve an element index however the caller bounds it.
+    ///
+    /// # Safety
+    ///
+    /// `at` must point at a live element of `Self`, aligned to
+    /// [`Self::BYTES`].
+    unsafe fn read(at: *const u8) -> f32;
+
+    /// Write one fp32 as a single element, rounding exactly as [`Self::pack`]
+    /// does.
+    ///
+    /// A byte pointer rather than a word so a narrow element's neighbours are
+    /// untouched: two lanes writing adjacent elements of a vector must not
+    /// read-modify-write one word and lose each other's value.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::read`], and writable.
+    unsafe fn write(at: *mut u8, value: f32);
 }
 
 /// Element types a tcgen05 MMA accepts as an operand.
@@ -110,6 +142,20 @@ impl Element for Bf16 {
             f32::from_bits(word << 16),
             f32::from_bits(word & 0xffff_0000),
         ]
+    }
+
+    /// The same widening shift as [`Self::unpack`], off a 2-byte load — and
+    /// host-testable for the same reason.
+    #[inline(always)]
+    unsafe fn read(at: *const u8) -> f32 {
+        f32::from_bits((unsafe { *(at as *const u16) } as u32) << 16)
+    }
+
+    /// [`Self::pack`]'s low half, so a value stored one at a time and a value
+    /// stored two at a time round identically. Device-only, as `pack` is.
+    #[inline(always)]
+    unsafe fn write(at: *mut u8, value: f32) {
+        unsafe { *(at as *mut u16) = cvt_f32x2_bf16x2(value, value) as u16 }
     }
 }
 
@@ -647,6 +693,189 @@ impl<E: Element> SwizzledChunks<E> {
     }
 }
 
+/// `N` elements of `E` in shared memory, contiguous and **unswizzled** — the
+/// shape a parameter vector, a per-column statistic or a set of per-warp
+/// partials has. Like [`SharedTile`] the handle is a base pointer plus a
+/// compile-time length, and like it the shared plan belongs to the kernel.
+///
+/// # Why this does not go through [`Swizzle`]
+///
+/// Swizzling exists to keep a *2-D* tile's 16-byte chunks off the same banks
+/// when successive rows are read together; the XOR is over the row index, and
+/// a vector has one row for the phase to come from. So the layout question is
+/// not "which mode" but "an atom is the wrong unit here at all", and the two
+/// jobs [`Swizzle::ATOM_BYTES`] does make that concrete. It is the swizzle
+/// period *and* the width of a TMA box, and an unswizzled vector wants
+/// neither: its box is `N` wide, a number no mode marker can carry, and any
+/// atom small enough to divide a short vector splits it into stacked subtiles
+/// the engine would then fetch one instruction each. A 128-byte atom is worse
+/// still — the narrowest bf16 tile it admits is 64 columns, which is the
+/// padding per row this type exists to avoid.
+///
+/// Adding a `SwizzleNone` mode is therefore not the same job and is left to
+/// #14, which owns *tiles* under narrower and absent swizzles: an unswizzled
+/// `[R, C]` staging tile does need a `Swizzle` impl, and it needs `ATOM_BYTES`
+/// to stop meaning "box width" first. A vector needs none of that, and
+/// borrowing the mode marker to get one would have decided #14's question by
+/// accident.
+///
+/// The TMA still delivers it: the box is `[N]` (or `[N, 1]` at higher rank)
+/// with `CU_TENSOR_MAP_SWIZZLE_NONE`, which the engine writes contiguously —
+/// the same bytes [`Self::at`] addresses. That agreement is what the
+/// [`crate::global::TileBox`] impl states.
+pub struct SharedVec<E: Element, const N: usize> {
+    base: *mut u8,
+    _marker: PhantomData<E>,
+}
+
+impl<E: Element, const N: usize> Clone for SharedVec<E, N> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<E: Element, const N: usize> Copy for SharedVec<E, N> {}
+
+impl<E: Element, const N: usize> SharedVec<E, N> {
+    /// Bytes of the whole vector — what a TMA load of it charges via
+    /// [`Semaphore::expect_tx`], and the stride to the next object in a
+    /// kernel's shared plan.
+    pub const BYTES: usize = N * E::BYTES;
+
+    /// An unswizzled TMA box's innermost dimension is measured in bytes and
+    /// must be a whole number of 16-byte lines; there is no swizzle atom to
+    /// round it up to, so the length itself has to be legal.
+    const BOX_OK: () = assert!(
+        Self::BYTES.is_multiple_of(16),
+        "an unswizzled vector's bytes must be a multiple of the TMA's 16-byte line"
+    );
+
+    /// A box dimension is a `u32` field capped at 256 by the descriptor
+    /// format, and a vector is a single box by construction.
+    const LENGTH_OK: () = assert!(N <= 256, "a TMA box dimension is at most 256 elements");
+
+    /// Wrap a raw shared-memory base (a `DynamicSharedArray` offset or a
+    /// `SharedArray` static).
+    ///
+    /// # Safety
+    ///
+    /// `base` must point to at least `Self::BYTES` bytes of shared memory,
+    /// 128-byte aligned (the TMA engine's destination alignment), living as
+    /// long as every use of the vector.
+    #[inline(always)]
+    pub const unsafe fn from_raw(base: *mut u8) -> Self {
+        #[allow(clippy::let_unit_value)]
+        let _ = (Self::BOX_OK, Self::LENGTH_OK);
+        Self {
+            base,
+            _marker: PhantomData,
+        }
+    }
+
+    /// The vector's base address.
+    #[inline(always)]
+    pub const fn base(self) -> *mut u8 {
+        self.base
+    }
+
+    /// Address of element `index` — a flat stride, with no phase to fold in.
+    ///
+    /// # Safety
+    ///
+    /// `index < N`.
+    #[inline(always)]
+    pub const unsafe fn at(self, index: usize) -> *mut u8 {
+        unsafe { self.base.add(index * E::BYTES) }
+    }
+
+    /// Element `index` widened to the fp32 a register holds.
+    ///
+    /// # Safety
+    ///
+    /// `index < N`, and the bytes must already be visible to the generic
+    /// proxy — a TMA load needs its barrier waited on, another thread's
+    /// [`Self::set`] needs a barrier between the write and this read.
+    #[inline(always)]
+    pub unsafe fn get(self, index: usize) -> f32 {
+        unsafe { E::read(self.at(index)) }
+    }
+
+    /// Write one fp32 into element `index`, rounding to `E`.
+    ///
+    /// One element, not one word, so lanes writing neighbouring indices do not
+    /// clobber each other — which is the whole point for a block reduction,
+    /// where warp `w` owns index `w` and nothing else.
+    ///
+    /// # Safety
+    ///
+    /// `index < N`, no other thread writes the same index concurrently, and
+    /// the caller owes a `fence.proxy.async.shared::cta` before the TMA engine
+    /// or an MMA reads the vector.
+    #[inline(always)]
+    pub unsafe fn set(self, index: usize, value: f32) {
+        unsafe { E::write(self.at(index), value) }
+    }
+
+    /// TMA the vector from a rank-1 [`crate::global::GlobalLayout`]: one box,
+    /// `N` elements wide, starting at element `start`. Completion lands on
+    /// `sem`; the caller charges [`Self::BYTES`] via [`Semaphore::expect_tx`].
+    ///
+    /// One instruction, unlike [`SharedTile::tma_load`]'s one per subtile —
+    /// an unswizzled box has no atom to be cut into.
+    ///
+    /// # Safety
+    ///
+    /// `map` must describe a live global buffer whose box shape matches `[N]`,
+    /// and `sem` must be an initialized TMA barrier.
+    #[inline(always)]
+    pub unsafe fn tma_load(self, map: *const TmaDescriptor, start: i32, sem: Semaphore) {
+        unsafe { cp_async_bulk_tensor_1d_g2s(self.base, map, start, sem.raw()) }
+    }
+
+    /// [`Self::tma_load`] against a rank-2 map — one *row* of a `[N, rows]`
+    /// buffer, which is how a batch of parameter vectors is stored. The box is
+    /// `[N, 1]`, so `minor` selects the row and nothing about the shared side
+    /// changes.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::tma_load`], for a box shape of `[N, 1]`.
+    #[inline(always)]
+    pub unsafe fn tma_load_2d(
+        self,
+        map: *const TmaDescriptor,
+        start: i32,
+        minor: i32,
+        sem: Semaphore,
+    ) {
+        unsafe { cp_async_bulk_tensor_2d_g2s(self.base, map, start, minor, sem.raw()) }
+    }
+
+    /// TMA the vector out to a rank-1 map, the coordinate read the way
+    /// [`Self::tma_load`] reads it.
+    ///
+    /// # Safety
+    ///
+    /// As [`SharedTile::tma_store`], every clause — completion is
+    /// [`tma_store_commit`] plus a wait and never a [`Semaphore`], the vector
+    /// must stay unwritten until that wait, and contents that arrived through
+    /// the generic proxy ([`Self::set`]) owe a
+    /// `fence.proxy.async.shared::cta` first.
+    #[inline(always)]
+    pub unsafe fn tma_store(self, map: *const TmaDescriptor, start: i32) {
+        unsafe { cp_async_bulk_tensor_1d_s2g(self.base, map, start) }
+    }
+
+    /// [`Self::tma_store`] against the rank-2 map [`Self::tma_load_2d`] reads.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::tma_store`], for a box shape of `[N, 1]`.
+    #[inline(always)]
+    pub unsafe fn tma_store_2d(self, map: *const TmaDescriptor, start: i32, minor: i32) {
+        unsafe { cp_async_bulk_tensor_2d_s2g(self.base, map, start, minor) }
+    }
+}
+
 /// `N` same-shaped tiles backing a pipeline ring: tile `i` lives in stage
 /// `i % N`. The parity arithmetic for the matching barriers lives in
 /// [`crate::sync::SemaphoreRing`].
@@ -924,6 +1153,51 @@ mod tests {
                 mn.chunk_descriptor(chunk),
                 expected(chunk as u64 * 2048, 8192)
             );
+        }
+    }
+
+    type Params = SharedVec<Bf16, 128>;
+
+    #[test]
+    fn a_vectors_elements_are_flat_and_disjoint() {
+        // The whole of the layout: element i at i * BYTES, no phase, no atom.
+        // A collision or an escape here is a wrong stride, and there is
+        // nothing else the addressing could get wrong.
+        let base = 0x3000usize;
+        let vec = unsafe { Params::from_raw(base as *mut u8) };
+        let mut seen = [false; 128];
+        for index in 0..128usize {
+            let offset = unsafe { vec.at(index) } as usize - base;
+            assert_eq!(offset, index * Bf16::BYTES);
+            assert!(offset < Params::BYTES, "element {index} escaped");
+            assert!(!seen[offset / Bf16::BYTES], "slot {offset} twice");
+            seen[offset / Bf16::BYTES] = true;
+        }
+        assert!(seen.iter().all(|&slot| slot));
+        assert_eq!(Params::BYTES, 128 * 2);
+    }
+
+    #[test]
+    fn a_vector_costs_no_padding_where_a_tile_would() {
+        // The reason this is not a one-row SharedTile. A 32-column bf16 tile
+        // is not even expressible (WIDTH_OK wants a whole 64-column subtile),
+        // and the narrowest one that is spends a 128-byte atom on its single
+        // row; the vector spends its elements and nothing else.
+        assert_eq!(SharedVec::<Bf16, 32>::BYTES, 64);
+        assert_eq!(SharedTile::<Bf16, 1, 64, Swizzle128B>::BYTES, 128);
+        assert_eq!(SharedVec::<Bf16, 64>::BYTES, 128);
+    }
+
+    #[test]
+    fn reading_a_vector_widens_the_element_at_that_index() {
+        // Bf16::read against real bytes — the one half of the scalar pair that
+        // holds on the host, since widening needs no instruction. Each element
+        // names its own index, so a wrong stride reads a neighbour.
+        let elements: Vec<u16> = (0..128u16).map(|index| 0x4000 | index).collect();
+        let vec = unsafe { Params::from_raw(elements.as_ptr() as *mut u8) };
+        for index in 0..128usize {
+            let value = unsafe { vec.get(index) };
+            assert_eq!(value.to_bits(), (0x4000u32 | index as u32) << 16);
         }
     }
 
