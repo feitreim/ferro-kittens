@@ -5,19 +5,18 @@
 //!
 //! Blocked on:
 //!
-//! - **#11** (global ↔ register) — the epilogue writes fp32 out of registers.
-//!   Today that means packing to bf16, `stmatrix` into a shared tile, and a
-//!   TMA store (#9): a precision loss the epilogue never asked for.
+//! **Nothing.** #11 and #31 were the last two entries and landed together,
+//! from opposite ends of the kernel.
 //!
-//! **#31 has landed**, and it is the last arithmetic entry this file had.
-//! `RegTile::add_assign` is the accumulate below; every by-value map now has
-//! an in-place twin generated from the same `op_methods!` table. What #31
-//! measured on the way is worth carrying: at this kernel's `[32, 128]`
-//! accumulator the in-place *accumulate* is not cheaper in registers than the
-//! by-value one, because that call site rebinds and its input is already
-//! dead. The place the in-place form is worth 87 registers/thread is the
-//! rescale — `row_map::<Mul>` against `scale_rows`, which is now
-//! `row_map_assign::<Mul>` and reaches the hand-written number exactly.
+//! **#31** shipped `RegTile::add_assign` — the accumulate below — along with
+//! an in-place twin for every by-value map, generated from the same
+//! `op_methods!` table. What it measured on the way is worth carrying and is
+//! not what the issue predicted: at this kernel's `[32, 128]` accumulator the
+//! in-place *accumulate* is **not** cheaper than the by-value one, because
+//! that call site rebinds and its input is already dead. The place an
+//! in-place form is worth 87 registers/thread is the rescale —
+//! `row_map::<Mul>` against `scale_rows`, which is now `row_map_assign::<Mul>`
+//! and reaches the hand-written number exactly.
 //!
 //! **#23 and #7 have landed**, together, because they were the same blocker
 //! from two sides: this kernel could not name its `[32, 64]` score band, and
@@ -25,6 +24,13 @@
 //! the error list. `FragmentLayout` is now a blanket impl over the row and
 //! column extents, so the band is a type an out-of-tree crate may write, and
 //! the mask takes the coordinate origin a tiled kernel has to give it.
+//!
+//! **#11 has landed too**, and it is what took this list to one entry. The
+//! epilogue writes fp32 out of registers through
+//! [`kittens::global::store_rows`], with no shared tile in the way — the
+//! round trip it used to owe (pack to bf16, `stmatrix`, TMA out) was a
+//! precision loss it never asked for, and the allocation was one this
+//! kernel's shared plan could not spare either.
 //!
 //! ## What already works
 //!
@@ -34,15 +40,16 @@
 //! running-max correction, the one genuinely subtle piece of flash — are all
 //! first-class. And the whole register-side body — drain, mask, scale,
 //! row-reduce, correct, accumulate, restage — is now the library's own API,
-//! line for line, with no index arithmetic left in this file. What remains is
-//! at one end only: how the output leaves registers (#11).
+//! line for line, with no index arithmetic left in this file. Both ends are
+//! library API too: the drain in, the fp32 store out. Nothing in this file
+//! reaches past the library any more.
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread, warp};
 
-use kittens::global::store_rows;
+use kittens::global::{GlobalRows, store_rows};
 use kittens::ldst::store_tile;
 use kittens::mma::{MmaShape, commit, mma_ab, mma_abt};
 use kittens::reg::{BaseLdtm, RegTile, RegVec, online_rescale};
@@ -234,9 +241,18 @@ pub mod kernels {
             // The softmax denominator, broadcast down the rows (#5).
             let out_acc = out_acc.div_row(running_sum);
 
-            // WANT (#11): fp32 straight out of registers, at the coordinates
-            // the fragment layout already knows.
-            store_rows(&mut out, out_acc, query_base + 32 * warp_id, lane);
+            // fp32 straight out of registers, at the coordinates the fragment
+            // layout already knows (#11). The output is packed `[_, HEAD]`, so
+            // the cursor's stride is the band's own width and its column base
+            // is zero — the degenerate case of the stride the GEMM's epilogue
+            // needs, spelled the same way.
+            store_rows(
+                GlobalRows::from_slice(&mut out, HEAD),
+                query_base + 32 * warp_id,
+                0,
+                lane,
+                out_acc,
+            );
 
             thread::sync_threads();
             if leader {

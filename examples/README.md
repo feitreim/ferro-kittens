@@ -18,9 +18,9 @@ target *of the library*.)
 
 | Kernel | Status | Blocked on |
 | --- | --- | --- |
-| [`gemm`](src/gemm.rs) | **runs** — exact against a CPU reference | — (two gaps worked around in-file, both marked) |
+| [`gemm`](src/gemm.rs) | **runs** — exact against a CPU reference | — (and no gap worked around in-file any more) |
 | [`softmax`](src/softmax.rs) | **runs** — within 2⁻⁸ of a CPU reference | — |
-| [`flash_forward`](src/flash_forward.rs) | aspirational | #11 |
+| [`flash_forward`](src/flash_forward.rs) | **compiles** — no launcher yet | — |
 | [`layernorm`](src/layernorm.rs) | `layernorm_rows` **compiles**; `groupnorm_tile` aspirational | #3 (and #2 under it), for `groupnorm_tile` only |
 
 Two of the four **run** rather than merely compile, which is a strictly stronger
@@ -50,9 +50,13 @@ composition on top of them, in both directions and against both memories, and
 — flash could not name its `[32, 64]` band, and the unsatisfied bound on that
 band was what kept `make_causal` off the error list, so shipping either alone
 would have left a confusing state. **#31** closed the in-place half of the map
-mechanism, which was the last arithmetic entry on any of these lists. What
-remains across the four is the global ↔ register path (#11) and one structural
-gap (#3, layernorm's block-scope statistic) — neither of them arithmetic.
+mechanism, the last arithmetic entry on any of these lists. **#11** closed the
+last mover, the one with no engine behind it: `global::load_rows`/`store_rows`
+address a plain pitched buffer from the fragment layout's own coordinates,
+which is what took the GEMM's epilogue from twelve lines of index math to one
+call. Those two landed together and between them took `flash_forward` from
+aspirational to compiling. What remains across the four is one structural gap
+(#3, layernorm's block-scope statistic) — and it is the only one left.
 
 `layernorm` is the first example to be **split** by a landed issue rather than
 promoted whole, and the split is the honest reading of what #13 bought.
@@ -88,21 +92,20 @@ error is `unresolved import`, `no method named`, or an unsatisfied
 `FragmentLayout` bound — there is nothing in these files that fails for any
 reason other than the API not existing.
 
-Two kernels are still behind a feature — `flash_forward` and `groupnorm_tile`,
-the second of which shares a file with a kernel that is not — and their error
-lists are now short enough to write out. Both are read off
+One kernel is still behind a feature — `groupnorm_tile`, which shares a file
+with one that is not — and it is down to a single error. That list is read off
 `modal run modal_app.py::gaps`, which checks each feature on its own so an
 error belongs to a known kernel:
 
-- **`flash_forward`** — `global::store_rows` (#11), and nothing else. One
-  error, at the very end of the kernel: everything from the score band
-  arriving in registers to the accumulated output being divided by the softmax
-  denominator is library API now. The list was three errors until #23 landed
-  and two until #31, and how the third went is worth keeping: `make_causal_at`
-  (#7) was wanted all along and never appeared as its own error, because it is
-  called on the `[32, 64]` band whose `FragmentLayout` bound already failed,
-  and an unsatisfied bound on the receiver suppresses method resolution on it.
-  Counting errors would have said #7 had landed.
+- **`flash_forward`** — **empty**, which is the interesting outcome for a gap
+  list. It stays behind its feature only for want of a launcher and a CPU
+  reference; nothing in it reaches past the library any more. The list was
+  three errors until #23 landed, two until #11 and #31 landed together, and how
+  the third went is worth keeping: `make_causal_at` (#7) was wanted all along
+  and never appeared as its own error, because it is called on the `[32, 64]`
+  band whose `FragmentLayout` bound already failed, and an unsatisfied bound on
+  the receiver suppresses method resolution on it. Counting errors would have
+  said #7 had landed.
 - **`layernorm`** — `sync::block_reduce_sum` (#3), and nothing else. One error,
   in `groupnorm_tile` only; `layernorm_rows` left the feature gate with #13.
   Verified by running the check, not by reading the file.
@@ -293,10 +296,47 @@ cuda-oxide at the pinned revision in every form, so that one is a `ptx_asm!`
 intrinsic here or an upstream contribution — and nothing in the plain store
 path prejudges which.
 
-**#11 — global ↔ register.** Flash's epilogue and the GEMM's. The GEMM's is the
-one worth reading: it is fifteen lines of open-coded `RegTile::coordinate`
-arithmetic inside a `GAP` fence, and it is exactly the index math this library
-exists to delete.
+**#11 — global ↔ register. Landed.** Flash's epilogue and the GEMM's, and the
+GEMM's was the one worth reading: twelve lines of open-coded
+`RegTile::coordinate` arithmetic inside a `GAP` fence, exactly the index math
+this library exists to delete. Both are now
+`global::store_rows(GlobalRows::from_slice(&mut c, ldc), row, column, lane,
+band)` — a cursor holding the destination's leading dimension, and a mover
+that walks the fragment layout's own coordinates.
+
+Three things about it are decisions rather than transcription:
+
+- **It lives in `global.rs`, not `ldst.rs`.** `ldst` is the swizzled-fragment
+  path: both its directions share one address derivation over `ldmatrix` and
+  `stmatrix`, and this shares none of it. It also cannot be called
+  `store_tile`, because `flash_forward` imports `ldst::store_tile` in the same
+  file and would then have two of them.
+- **It is fp32 and not generic over `Element`.** The type parameter belongs
+  there and cannot go there yet: `Element` is implemented for `Bf16` alone
+  (#2), so `GlobalRows<E>` would have exactly one instantiation and it would
+  be the wrong one — a `RegTile` *is* fp32, and this path exists to move one
+  without rounding. When #2 lands it is a bound and two `E::read`/`E::write`
+  calls.
+- **It is the only mover generic over `FragmentLayout`.** `ldmatrix`,
+  `stmatrix` and LDTM each fix a lane map in hardware, so every other mover in
+  the crate is pinned to `BaseLdtm`. A plain `st.global` fixes nothing, so
+  these two take any `L` — which is the first place a second layout would pay
+  off, whenever one exists.
+
+It also costs nothing, which was not a given at 128 columns. `regcount`'s
+`global_copy_probe_*` price the movers against the loop they delete, both
+directions, at both widths:
+
+| | 32 columns | 128 columns |
+| --- | --- | --- |
+| open-coded, `RegTile::coordinate` per value | 56 regs, 0 B stack | 168 regs, 1040 B stack |
+| `load_rows` + `store_rows` | 48 regs, 0 B stack | 44 regs, 528 B stack |
+
+Neither spills at either width. The direction is #22's again — the API is
+*cheaper* than the hand-written loop, not merely free — and the likely reason
+is the one thing the movers do that a call site never bothers to: the row
+address is formed once per slot and the values indexed off it, so a `[32, 128]`
+band costs four multiplies by the leading dimension instead of 128.
 
 **#13 — shared vectors. Landed**, and it is what promoted `layernorm_rows`.
 `kittens::shared::SharedVec<E, N>` is one flat run of elements with its own

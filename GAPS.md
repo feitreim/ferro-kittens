@@ -117,12 +117,31 @@ Same `[16, 16]` granularity as 2.1, composed into a band by `ldst::load_tile`
 and `ldst::store_tile` (#22) out of the same helpers the TMEM side uses, at any
 width the cursor can describe (#25).
 
-### 2.2 No global ↔ register path
+### 2.2 Global ↔ register — done (#11)
 
-TK has `global_to_register.cuh` (`load`/`store`) at both warp and group scope —
-the non-TMA path for small, irregular, or unaligned accesses. We only reach
-global memory through TMA into shared. Any epilogue that wants to write fp32
-straight out of registers currently has to round-trip through a shared tile.
+TK's `global_to_register.cuh` (`load`/`store`): `global::load_rows` and
+`global::store_rows` over a `GlobalRows` cursor — a base address and a leading
+dimension, which is all a thread needs to compute its own addresses when there
+is no engine to describe the buffer to. Each thread stores the values its
+fragment layout gives it, at `L::row_of`/`L::col_of`, one `st.global.f32`
+apiece; the row address is formed once per slot, so a band costs one multiply
+by the leading dimension per owned row rather than per value. Measured against
+the loop it replaces (`regcount`'s `global_copy_probe_*`) it is *cheaper* at
+both probe widths — 48 against 56 registers at 32 columns, 44 against 168 at
+128 — which is #22's result again.
+
+The two are also the only movers here generic over `FragmentLayout` rather
+than pinned to `BaseLdtm`: `ldmatrix`, `stmatrix` and LDTM each fix a lane map
+in hardware, and a plain global store fixes nothing.
+
+Two things this deliberately is not. It is **fp32 only**, because the element
+parameter belongs to `Element` and that is bf16-only until #2 — and fp32 out
+of registers without a rounding step is the whole point of the entry. And it
+**bounds-checks nothing**: the extents a TMA descriptor carries are absent
+rather than forgotten, since predicating every value would be paid by the
+epilogues that do divide. TK's ragged-tail loads want them back, and that is
+what is left of this entry, along with the vector shapes (`RegVec`/`ColVec`
+straight out of global memory) and group scope (1.1).
 
 ### 2.3 TMA store side — plain stores landed (#9), reductions absent
 
@@ -267,17 +286,22 @@ Missing from `prototype/`:
 ## 6. Missing infrastructure (not a TK gap, a repo gap)
 
 - **Host tests are address arithmetic only.** TK has `tests/` with a generated
-  harness over the type/layout cross product. We have 19 `#[cfg(test)]` unit
-  tests, all of them pure coordinate and pointer math — they prove the crate is
-  self-consistent, not that it agrees with silicon.
-- **Device tests cover four paths.** `device-tests/` (a separate kernel crate,
+  harness over the type/layout cross product. We have 73 `#[cfg(test)]` unit
+  tests (`cargo test --features host`), all of them pure coordinate and pointer
+  math — they prove the crate is self-consistent, not that it agrees with
+  silicon.
+- **Device tests cover five paths.** `device-tests/` (a separate kernel crate,
   run on a B200 through `modal_app.py`) checks the SWIZZLE_128B round trip
   against the TMA engine, `BaseLdtm`'s fragment ownership map against a
   position-encoding MMA at all three layout shapes, the `stmatrix` store path,
-  and STTM — as a register round trip through TMEM, and by restaging a probed
-  accumulator into a second column band and re-draining it. Everything else — the phase-parity rules, the pipeline scaffold, the
-  cluster/multicast paths, the MMA walks beyond the single `M128_N64` the probe
-  issues — is still verified only by downstream kernels being numerically
+  STTM — as a register round trip through TMEM, and by restaging a probed
+  accumulator into a second column band and re-draining it — and `load_rows`,
+  the one case whose source reaches registers with no descriptor between them.
+  The matching *store* is checked by `examples/gemm.rs` instead, whose whole
+  epilogue is one `store_rows` compared elementwise against an exact CPU
+  reference. Everything else — the phase-parity rules, the pipeline scaffold,
+  the cluster/multicast paths, the MMA walks beyond the single `M128_N64` the
+  probe issues — is still verified only by downstream kernels being numerically
   correct.
 - **No CI.** Nothing runs `cargo check` on the device surface automatically, let
   alone `--features host` on a CUDA box or the device tests on a GPU.

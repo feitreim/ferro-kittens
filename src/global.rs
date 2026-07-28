@@ -1,6 +1,8 @@
-//! Global-memory layouts and their TMA tensor maps.
+//! Global memory: the TMA-descriptor path, and the direct one.
 //!
-//! The device side of a global operand is just a `*const TmaDescriptor` kernel
+//! # Through a descriptor
+//!
+//! The device side of a TMA operand is just a `*const TmaDescriptor` kernel
 //! parameter; what the type system can hold is the *host* side. A
 //! [`GlobalLayout`] is everything `cuTensorMapEncodeTiled` needs about the
 //! buffer — base address, per-dimension extents, per-dimension byte strides,
@@ -22,6 +24,316 @@
 //!
 //! Host-only (`feature = "host"`): `cuTensorMapEncodeTiled` lives in
 //! cuda-core, and the device crates never see it.
+//!
+//! # Without one
+//!
+//! [`GlobalRows`], [`load_rows`] and [`store_rows`] are the other path —
+//! ThunderKittens' `global_to_register.cuh`, and the reason a descriptor is
+//! not the only way out of a kernel. An epilogue holding fp32 in registers has
+//! no fp32 tile to stage it in ([`crate::shared::Element`] is bf16-only), so
+//! through shared memory its choices are to round or to widen; and a small
+//! irregular operand — a bias row, a lookup table, a ragged tail — is not
+//! worth a descriptor built on the host in the first place.
+//!
+//! There is no engine here and nothing asynchronous: a thread computes the
+//! address of each value it owns from the fragment layout's own
+//! `(lane, slot, value) -> (row, column)` map and stores it. Which is why the
+//! movers are the only ones in the crate generic over
+//! [`FragmentLayout`](crate::reg::FragmentLayout) rather than pinned to
+//! [`BaseLdtm`](crate::reg::BaseLdtm) — `ldmatrix`, `stmatrix` and LDTM each
+//! fix a lane map in hardware, and a plain `st.global` fixes nothing.
+
+use crate::reg::{FragmentLayout, RegTile};
+use cuda_device::DisjointSlice;
+
+/// A row-major window of global memory: a base address and the elements per
+/// row that separate one row from the next.
+///
+/// The device-side counterpart of [`GlobalLayout`], and deliberately much less
+/// than one. A descriptor describes a whole tensor because the TMA engine
+/// bounds-checks against it; this describes only what address arithmetic
+/// needs, because the arithmetic is the calling thread's and nothing checks
+/// it. Extents are therefore absent rather than forgotten — see
+/// [`store_rows`]' safety contract for what the caller owes instead.
+///
+/// **fp32 only.** The element type belongs in a parameter and cannot go there
+/// yet: [`crate::shared::Element`] is implemented for `Bf16` alone (#2), so
+/// `GlobalRows<E>` would have exactly one instantiation and it would be the
+/// wrong one — a register tile *is* fp32, and this path exists to move it
+/// without rounding. When `Element` gains an fp32 impl the parameter is a
+/// bound and two `E::read`/`E::write` calls.
+#[derive(Clone, Copy)]
+pub struct GlobalRows {
+    base: *mut f32,
+    stride: usize,
+}
+
+impl GlobalRows {
+    /// Wrap a base address and a row stride in elements — a matrix's leading
+    /// dimension, which is `columns` for a packed buffer and larger for a
+    /// window into one.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be a device address, aligned for `f32`, of a live buffer
+    /// that outlives every use of the cursor. Nothing here dereferences it;
+    /// the movers' contracts say which elements they touch.
+    ///
+    /// A read-only source — a `&[f32]` kernel parameter — may be wrapped by
+    /// casting its pointer, provided [`load_rows`] is the only thing issued on
+    /// the cursor: a write through a pointer derived from a shared reference
+    /// is undefined however this type spells it.
+    #[inline(always)]
+    pub const unsafe fn from_raw(base: *mut f32, stride: usize) -> Self {
+        Self { base, stride }
+    }
+
+    /// The same, from the [`DisjointSlice`] a kernel's output parameter
+    /// arrives as.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::from_raw`], and the cursor is `Copy` where the slice is
+    /// borrowed: it carries none of `DisjointSlice`'s uniqueness proof, so
+    /// the disjointness of what the threads write is the mover's contract to
+    /// keep and no longer the slice's.
+    #[inline(always)]
+    pub unsafe fn from_slice<Space>(
+        slice: &mut DisjointSlice<'_, f32, Space>,
+        stride: usize,
+    ) -> Self {
+        unsafe { Self::from_raw(slice.as_mut_ptr(), stride) }
+    }
+
+    /// Elements per row — the leading dimension the cursor was built with.
+    #[inline(always)]
+    pub const fn stride(self) -> usize {
+        self.stride
+    }
+
+    /// Index of `(row, column)` from the cursor's base, in elements.
+    ///
+    /// The whole of the address map, split out from [`Self::at`] so it is a
+    /// pure function a host test can call — the same split
+    /// [`crate::ldst::fragment_address`] makes on the shared side, and for the
+    /// same reason.
+    #[inline(always)]
+    pub const fn index(self, row: u32, column: u32) -> usize {
+        row as usize * self.stride + column as usize
+    }
+
+    /// Address of `(row, column)`.
+    ///
+    /// # Safety
+    ///
+    /// `(row, column)` must be inside the buffer `base` names.
+    #[inline(always)]
+    pub const unsafe fn at(self, row: u32, column: u32) -> *mut f32 {
+        unsafe { self.base.add(self.index(row, column)) }
+    }
+}
+
+/// Write a whole `[M, N]` register tile to `(row, column)` of a row-major
+/// global buffer, each thread storing the values its fragment layout gives it.
+///
+/// The global twin of [`crate::ldst::store_tile`], and the direct answer to an
+/// fp32 epilogue: no shared tile, no descriptor, no packing step, and the
+/// destination's leading dimension is a runtime number the cursor carries. One
+/// `st.global.f32` per owned value, addressed by
+/// `L::row_of`/`L::col_of` — the same coordinates
+/// [`RegTile::coordinate`] reports, so a kernel that used to open-code this
+/// loop against them gets the identical stores.
+///
+/// A thread's row address is formed once per slot and its values indexed off
+/// it, which is what makes the inner loop a run of offsets from one register
+/// rather than a multiply each. Under [`BaseLdtm`](crate::reg::BaseLdtm) the
+/// four values of a 16-column block sit at column offsets `{0, 1, 8, 9}`, so
+/// they are two adjacent pairs; whether ptxas widens each pair into one
+/// `st.global.v2.f32` is its call, and it can only take it when the row's
+/// alignment is provable — which a runtime stride is not.
+///
+/// Nothing here is warp-collective, which is the one way this mover differs
+/// from every other one in the crate: `stmatrix` is one instruction fed by 16
+/// lanes' addresses, and this is 32 threads each storing their own values. So
+/// a lane that does not call it leaves its own values unwritten rather than
+/// making an instruction ill-formed — the rectangle is covered when all 32
+/// lanes call, and short by exactly one lane's share when one does not.
+///
+/// # Safety
+///
+/// The rectangle `row..row + M` by `column..column + N` must lie inside the
+/// buffer `dest` names, at `dest.stride()` elements per row.
+///
+/// The threads write disjoint elements exactly when `L`'s map is injective
+/// across the warp, which is a property of the layout and not of this loop —
+/// `BaseLdtm`'s is
+/// (`base_ldtm_covers_each_coordinate_once`). A layout that replicated a
+/// coordinate would have every holder write the same value, so the store
+/// stays idempotent, as [`crate::ldst::store_vec`]'s does; what it would not
+/// be is a single writer per element.
+#[inline(always)]
+pub unsafe fn store_rows<const M: usize, const N: usize, L: FragmentLayout<M, N>>(
+    dest: GlobalRows,
+    row: u32,
+    column: u32,
+    lane: u32,
+    tile: RegTile<M, N, L>,
+) {
+    unsafe {
+        let mut slot = 0usize;
+        while slot < L::SLOTS {
+            let start = dest.at(row + L::row_of(lane, slot), column);
+            let mut value = 0usize;
+            while value < L::VALUES {
+                start
+                    .add(L::col_of(lane, value) as usize)
+                    .write(tile.get(slot, value));
+                value += 1;
+            }
+            slot += 1;
+        }
+    }
+}
+
+/// Read an `[M, N]` rectangle at `(row, column)` of a row-major global buffer
+/// into registers — the inverse of [`store_rows`], over the same addresses.
+///
+/// What a small or irregular operand takes to reach a kernel that has no
+/// reason to build a descriptor for it. A tile this arrives in is an ordinary
+/// [`RegTile`]: it can be masked, reduced or mapped, but it is *not* an MMA
+/// operand — those come from shared memory, and staging one still means a TMA
+/// or a [`crate::ldst::store_tile`].
+///
+/// # Safety
+///
+/// As [`store_rows`], reading instead of writing: the rectangle must lie
+/// inside the buffer, and no other thread may be writing it.
+#[inline(always)]
+pub unsafe fn load_rows<const M: usize, const N: usize, L: FragmentLayout<M, N>>(
+    src: GlobalRows,
+    row: u32,
+    column: u32,
+    lane: u32,
+) -> RegTile<M, N, L> {
+    unsafe {
+        let mut tile = RegTile::<M, N, L>::zero();
+        let mut slot = 0usize;
+        while slot < L::SLOTS {
+            let start = src.at(row + L::row_of(lane, slot), column);
+            let mut value = 0usize;
+            while value < L::VALUES {
+                tile.set(
+                    slot,
+                    value,
+                    start.add(L::col_of(lane, value) as usize).read(),
+                );
+                value += 1;
+            }
+            slot += 1;
+        }
+        tile
+    }
+}
+
+#[cfg(test)]
+mod rows_tests {
+    use super::*;
+    use crate::reg::{BaseLdtm, ColLayout, RowLayout};
+
+    /// A device address is never dereferenced host-side; `index` is pure
+    /// arithmetic on it, which is the whole of the map.
+    const BASE: *mut f32 = 0x7f00_0000 as *mut f32;
+
+    fn cursor(stride: usize) -> GlobalRows {
+        unsafe { GlobalRows::from_raw(BASE, stride) }
+    }
+
+    /// Every index a `[M, N]` band's threads form, in dump order.
+    fn band_indices<const M: usize, const N: usize>(
+        rows: GlobalRows,
+        row: u32,
+        column: u32,
+    ) -> Vec<usize>
+    where
+        BaseLdtm: FragmentLayout<M, N>,
+    {
+        let mut indices = Vec::new();
+        for lane in 0..32u32 {
+            for slot in 0..<BaseLdtm as RowLayout<M>>::SLOTS {
+                for value in 0..<BaseLdtm as ColLayout<N>>::VALUES {
+                    let (r, c) = RegTile::<M, N, BaseLdtm>::coordinate(lane, slot, value);
+                    indices.push(rows.index(row + r, column + c));
+                }
+            }
+        }
+        indices
+    }
+
+    #[test]
+    fn a_row_is_the_leading_dimension_apart_from_the_next() {
+        let rows = cursor(1024);
+        assert_eq!(rows.index(0, 0), 0);
+        assert_eq!(rows.index(0, 7), 7);
+        assert_eq!(rows.index(1, 0), 1024);
+        assert_eq!(rows.index(3, 5), 3 * 1024 + 5);
+        // A packed buffer is the same thing with the stride at the width.
+        assert_eq!(cursor(64).index(3, 5), 3 * 64 + 5);
+    }
+
+    /// The property the store rests on: a warp's threads between them name
+    /// every element of the destination rectangle exactly once, so the stores
+    /// are disjoint and the rectangle is fully covered.
+    #[test]
+    fn a_bands_threads_cover_its_rectangle_exactly_once() {
+        const STRIDE: usize = 320;
+        let rows = cursor(STRIDE);
+        for (row, column) in [(0u32, 0u32), (32, 128), (96, 64)] {
+            let mut seen = band_indices::<32, 128>(rows, row, column);
+            seen.sort_unstable();
+            let mut expected: Vec<usize> = (row..row + 32)
+                .flat_map(|r| (column..column + 128).map(move |c| rows.index(r, c)))
+                .collect();
+            expected.sort_unstable();
+            assert_eq!(seen, expected, "band at ({row}, {column})");
+        }
+    }
+
+    /// The stride is what separates a window from a packed buffer, and it is
+    /// the one thing an epilogue gets wrong silently: with `stride == N` a
+    /// band's rows are contiguous and every wrong-stride bug hides. At a
+    /// wider stride the gaps are the columns this band does not own.
+    #[test]
+    fn a_wider_stride_leaves_the_columns_between_bands_untouched() {
+        const STRIDE: usize = 256;
+        let rows = cursor(STRIDE);
+        let touched: std::collections::HashSet<usize> =
+            band_indices::<32, 128>(rows, 0, 128).into_iter().collect();
+        assert_eq!(touched.len(), 32 * 128);
+        for row in 0..32 {
+            for column in 0..128 {
+                assert!(!touched.contains(&(row * STRIDE + column)), "left half");
+                assert!(touched.contains(&(row * STRIDE + 128 + column)), "right");
+            }
+        }
+    }
+
+    /// Each thread's values within a slot are a run of offsets from one row
+    /// address — the form the mover's inner loop is written in, and the reason
+    /// the row multiply happens once per slot rather than once per value.
+    #[test]
+    fn values_of_a_slot_are_offsets_from_that_slots_row() {
+        let rows = cursor(1024);
+        for lane in 0..32u32 {
+            for slot in 0..<BaseLdtm as RowLayout<32>>::SLOTS {
+                let start = rows.index(7 + BaseLdtm::row(lane, slot), 64);
+                for value in 0..<BaseLdtm as ColLayout<64>>::VALUES {
+                    let (r, c) = RegTile::<32, 64, BaseLdtm>::coordinate(lane, slot, value);
+                    assert_eq!(rows.index(7 + r, 64 + c), start + c as usize);
+                }
+            }
+        }
+    }
+}
 
 #[cfg(feature = "host")]
 pub use host::{GlobalLayout, PanelMap, TensorMap, TensorMapElement, TileBox, encode_bf16_panels};

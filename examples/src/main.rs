@@ -84,7 +84,7 @@ fn examples() -> Vec<Example> {
     #[cfg(feature = "flash")]
     examples.push(Example {
         name: "flash_forward",
-        status: "aspirational (#7, #11, #22, #23, #31)",
+        status: "aspirational (#31)",
         threads: flash_forward::THREADS,
         shared_bytes: flash_forward::SHARED_BYTES,
     });
