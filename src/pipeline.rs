@@ -243,10 +243,12 @@ pub trait Job {
 /// that the tail of the grid would alias, which is a wrong `C` and not a slow
 /// one.
 ///
-/// # Panics
-///
-/// Nothing is checked on the device. `group` must be at least 1, `rows` and
-/// `columns` at least 1, and `item` less than `rows * columns`.
+/// **Preconditions, none of them checked**: `group`, `rows` and `columns` at
+/// least 1, and `item` less than `rows * columns`. This is ordinary arithmetic
+/// and cannot itself be unsound, but a caller that breaks them gets a
+/// coordinate off its own tile grid — so on the device the fault lands in
+/// whatever `unsafe` addresses `C` with the answer, which is why the launcher
+/// rejects a zero width rather than passing it through.
 #[inline(always)]
 pub fn grouped(item: u32, rows: u32, columns: u32, group: u32) -> (u32, u32) {
     let span = group * columns;
