@@ -32,7 +32,10 @@
 //! closest pair of them is 9% apart, against a tolerance of 0.4%. A swapped
 //! column, a swapped row, a wrong plane, a row normalized against another row's
 //! sum — all of them are off by more than an order of magnitude more than
-//! rounding can account for.
+//! rounding can account for. So is a whole CTA band read from the wrong place,
+//! which is the one row error this seed used to reproduce exactly rather than
+//! catch (#56); [`permutation`] carries that argument and states what is left
+//! over.
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
@@ -140,15 +143,91 @@ pub const CHECK_ROWS: usize = 2 * ROWS;
 /// Planes it covers: two, so `blockIdx.y` is as well.
 pub const CHECK_PLANES: usize = 2;
 
+/// Column strides the row axis cycles through, one per CTA band. Odd, and that
+/// is the whole point — see [`permutation`].
+const STRIDES: usize = 63;
+
 /// Which multiple of 1/8 sits at `(plane, row, column)`.
 ///
 /// Within a row the exponent walks every multiple of 1/8 below 16 in a
-/// stride-11 permutation — 11 is odd, so it is a bijection mod 128 — which
-/// makes all 128 values of a row distinct and therefore all 128 outputs
-/// distinct. `plane` and `row` rotate the permutation, so a wrong plane or a
-/// wrong row is a wholly different set of numbers rather than a plausible one.
+/// stride-`s` permutation, `s` odd and so a bijection mod 128, which makes all
+/// 128 values of a row distinct and therefore all 128 outputs distinct.
+/// `plane` and `row` rotate that permutation and the band chooses `s`, so a
+/// wrong plane, a wrong row or a wrong band is a wholly different set of
+/// numbers rather than a plausible one.
+///
+/// ## Why the band chooses the stride (#56)
+///
+/// This used to be `(53·plane + 37·row + 11·column) % 128`, and the row axis
+/// of it was blind to exactly one thing: a whole CTA band. 37 is odd, so
+/// `37·row` walks all 128 residues — and then repeats, because a step of `ROWS`
+/// rows changes it by `37·128 ≡ 0 (mod 128)`. Any row error that was a multiple
+/// of `ROWS` produced bit-identical expected values.
+///
+/// Neither obvious repair works, and the reason is structural rather than
+/// arithmetic. A seed of the form `(a·row + b·column + c) % 128` is an affine
+/// map of the column axis, and those form a group of order 2¹³ under
+/// composition — a 2-group, whose exponent is exactly 128 (checked by
+/// enumeration). So *every* row-affine seed has a period in `row` that divides
+/// 128, which is one band, and no choice of multiplier can reach past it:
+///
+/// - `37 → 39`, or any other odd multiplier, already has the maximum period an
+///   affine row term can have. It changes nothing at all.
+/// - Letting the stride follow the row, `(11 + 2·row)`, is worse than nothing:
+///   the stride's period is 64 and the offset's is 128, they turn together, and
+///   the whole seed still repeats every 128 rows. It also costs the row axis
+///   its rotation-only errors, dropping a one-row error from *every* cell wrong
+///   by ≥ 1.0 to every cell wrong by ≥ 0.083.
+///
+/// What the 2-group cannot supply is an **odd** period, so the band supplies
+/// one: `row / ROWS % 63` picks the stride, and two rows agree only if they
+/// agree both mod 128 (the offset) and mod 63 bands (the stride). 63 is the
+/// largest odd cycle available — the strides must be distinct mod 128 and there
+/// are only 64 odd residues, so a longer cycle would repeat a stride and hand
+/// the blindness straight back.
+///
+/// ## What that buys, in numbers
+///
+/// A kernel whose load row and store row diverge by `δ` rows is caught this
+/// loudly, against a tolerance of 2⁻⁸ = 0.0039. The bounds are exhaustive over
+/// every offset shift and every one of the 63² band pairs, not sampled:
+///
+/// | `δ` | columns of a row wrong | each wrong by at least |
+/// | --- | --- | --- |
+/// | `128 ∤ δ` | ≥ 64 of 128 | 0.083 — 21× the tolerance |
+/// | `δ = 128k`, `63 ∤ k` | ≥ 64 of 128 | 0.159 — 41× the tolerance |
+/// | `δ = 128k`, `63 \| k` | 0 | invisible |
+///
+/// The four errors worth naming all sit far above those floors, over the
+/// `CHECK_PLANES · CHECK_ROWS · COLUMNS` = 65,536 cells of the check: a
+/// one-row shift makes every cell wrong, a 32-row one (a warp band) 65,280, a
+/// one-band one 64,512, and every CTA loading band 0 — the positive control
+/// this issue asked for — 32,256, which is 126 of the 128 columns of every row
+/// that read the wrong band.
+///
+/// The plane axis is untouched and its strength does not depend on any of
+/// this: a plane error shifts the *value* at every cell by `53·Δplane`
+/// (mod 128) whatever the stride is, which is a factor of `2^(53/8) ≈ 99` or
+/// `2^(-75/8)` when it wraps — a relative error of at least 0.9985, 255× the
+/// tolerance. All the stride does is make the column rotation that carries it
+/// differ from band to band.
+///
+/// ## The residual, stated rather than hoped for
+///
+/// A constant row displacement is invisible exactly when it is a multiple of
+/// `63 · ROWS` = 8064 rows. That is a rule and not an accident: 63 divides no
+/// power of two, every grid dimension and band offset in this file is a power
+/// of two, and every size the project runs is a power of two — so no
+/// displacement band arithmetic can produce here is a multiple of 8064.
+///
+/// Two smaller ones, for the same reason. A band displacement of `k ≡ ±32
+/// (mod 63)` leaves half of each row's columns matching, the most any non-blind
+/// `k` leaves; the other half are wrong by ≥ 0.996. And column 0 of every row
+/// is `53·plane + 37·row` whatever the stride, so that one column on its own
+/// cannot see a band error — the other 127 can.
 fn permutation(plane: usize, row: usize, column: usize) -> usize {
-    (53 * plane + 37 * row + 11 * column) % 128
+    let stride = 11 + 2 * (row / ROWS % STRIDES);
+    (53 * plane + 37 * row + stride * column) % 128
 }
 
 /// The input at `(plane, row, column)`. Every value is a multiple of 1/8 below
@@ -208,6 +287,13 @@ fn nothing_after(
 /// room to spare and is still forty times tighter than the gap between two
 /// neighbouring outputs of a row, which is what a misplaced element would have
 /// to hide inside.
+///
+/// Measured rather than argued: the worst relative error over the checked run
+/// is 1.97e-3, a hair past the 2⁻⁹ = 1.95e-3 that rounding the output to bf16
+/// costs on its own. So the tolerance is 2.0× what a correct kernel actually
+/// needs, and 46× below the 2^(1/8) − 1 = 9.05% gap between neighbouring
+/// outputs — the band the check has to separate a right answer from a wrong
+/// one in.
 fn run<T>(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     rows: usize,

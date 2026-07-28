@@ -38,10 +38,10 @@
 //! There is no engine here and nothing asynchronous: a thread computes the
 //! address of each value it owns from the fragment layout's own
 //! `(lane, slot, value) -> (row, column)` map and stores it. Which is why the
-//! movers are the only ones in the crate generic over
-//! [`FragmentLayout`](crate::reg::FragmentLayout) rather than pinned to
-//! [`BaseLdtm`](crate::reg::BaseLdtm) — `ldmatrix`, `stmatrix` and LDTM each
-//! fix a lane map in hardware, and a plain `st.global` fixes nothing.
+//! movers are the only ones in the crate generic over [`FragmentLayout`]
+//! rather than pinned to [`BaseLdtm`](crate::reg::BaseLdtm) — `ldmatrix`,
+//! `stmatrix` and LDTM each fix a lane map in hardware, and a plain
+//! `st.global` fixes nothing.
 
 use crate::reg::{FragmentLayout, RegTile};
 use cuda_device::DisjointSlice;
