@@ -5,12 +5,25 @@
 //! every product and every partial sum is exact and the comparison is `==`
 //! rather than a tolerance — a mismatch is a wrong index, never rounding.
 //!
-//! A pair of CTAs forms a cluster and shares one `M256_N128` UMMA. Both
+//! A pair of CTAs forms a cluster and shares one `M256_N256` UMMA. Both
 //! operands are split across the pair — each CTA stages its own 128 rows of
-//! `A` and its own 64 columns of `B` at the *same* shared offsets, and the
+//! `A` and its own 128 columns of `B` at the *same* shared offsets, and the
 //! instruction reads both CTAs' shared memory over the cluster interconnect.
 //! The accumulator splits the same way along M, so each CTA drains its own
-//! `[128, 128]` band of `C`.
+//! `[128, 256]` band of `C`.
+//!
+//! **The pair tile and the pipeline depth are const parameters now** (#87).
+//! [`Tile`] takes the pair's columns and `STAGES`, [`RUNGS`] is the sweep those
+//! two were chosen by, and [`SHIPPED`] names this rung. `[256, 256]` at three
+//! stages measured **+11.6% at 8192³ and +21.6% at 16384³** against the
+//! `[256, 128]` tile this file carried through #102, which is 1457.1 and
+//! **1622.5 TFLOP/s** and 0.826 and **0.886 of cuBLASLt**. The mechanism is
+//! arithmetic intensity and nothing else: re-running `gemm-depth` on the new
+//! tile moves the fit's *slope* 21–23% and moves its intercept the wrong way,
+//! so the "half the tiles, half the item boundaries" argument — which looks
+//! like the stronger one — is worth less than nothing here. `examples/README.md`
+//! §7 has the four losing rungs, the control that separates the two, and the
+//! small sizes this cost.
 //!
 //! K is software-pipelined `STAGES` deep over a [`SharedTileRing`] pair, with
 //! [`SemaphoreRing`] owning the `index → (stage, parity)` arithmetic on both
@@ -66,6 +79,16 @@
 //! §7 for the point-selection table, for why the fit's residuals rule *out* the
 //! obvious pipeline-fill explanation, and for the other two sweeps — the
 //! aspect-ratio one is worth 23% and belongs to #89.
+//!
+//! **Every number in the paragraph above belongs to a kernel that no longer
+//! exists**, and it is kept because two later sections are quoted against it.
+//! #91 halved the boundary, #102 moved the mid-`K` rows, and #87 changed the
+//! tile the whole sweep was run at. Re-fitted on this kernel the same sweep
+//! gives **1826–1862 TFLOP/s of steady state and 21.5–27.2 µs a tile**, and the
+//! boundary is *larger* per tile than it was, on a third fewer tiles. §7 has
+//! both fits side by side; the one thing that survives unchanged is that the
+//! intercept is everything not scaling with `K`, which after #102 is no longer
+//! only the item boundary.
 //!
 //! ## The item map is grouped, not row-major
 //!
@@ -147,9 +170,26 @@ use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
 /// Rows of `C` one CTA owns. The pair covers `2 * BLOCK_M`, which is the `M`
 /// the instruction descriptor names.
 const BLOCK_M: usize = 128;
-/// Columns of `C` the *pair* computes, split `BLOCK_N / 2` per CTA along the
-/// operand's N axis.
-const BLOCK_N: usize = 128;
+/// Columns of `C` the *pair* computes in the kernel this file ships, split
+/// `BLOCK_N / 2` per CTA along the operand's N axis.
+///
+/// Since #87 this is one value of a swept parameter rather than the only one
+/// the file knows: [`Tile`] takes the pair's columns and the pipeline depth as
+/// const parameters, [`RUNGS`] is the sweep, and this names the rung the
+/// headline entry points are built at.
+///
+/// **It was 128 through #102 and the sweep moved it.** `[256, 256]` at three
+/// stages measured **+11.6% at 8192³ and +21.6% at 16384³** against `[256,
+/// 128]` at three, taking the kernel to 1457.1 and **1622.5 TFLOP/s** and from
+/// 0.740 to 0.826 and 0.728 to **0.886 of cuBLASLt**. It costs one CTA an SM
+/// and no registers, and `examples/README.md` §7 has the four losing rungs and
+/// the control that separates the two mechanisms.
+///
+/// **What it also costs is generality, and that is not free.** A launch must
+/// now have `n % 256 == 0` where 128 used to do, so this kernel computes a
+/// narrower set of shapes than it did — the direction #92 already named as
+/// where a like-for-like rate against a general library flatters us.
+const BLOCK_N: usize = 256;
 /// This CTA's half of `B`.
 const HALF_N: usize = BLOCK_N / 2;
 /// K per pipeline stage: one 128-byte swizzle atom of bf16, the only width
@@ -157,10 +197,21 @@ const HALF_N: usize = BLOCK_N / 2;
 const BLOCK_K: usize = 64;
 /// Chained MMAs per stage.
 const CHUNKS: usize = BLOCK_K / 16;
-/// Pipeline depth over K.
+/// Pipeline depth over K, in the shipped kernel.
 const STAGES: usize = 3;
 /// One warp per 32 accumulator rows, which is what a `[32, N]` drain wants.
 pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32;
+/// Accumulator columns one warp drains in a single band.
+///
+/// A `RegTile<32, N, BaseLdtm>` is `32 * N / 32` fp32 values a thread, so a
+/// warp draining 256 columns at once would want **256 registers** before any
+/// of the kernel's own live state — past the 255 the architecture has, and the
+/// whole of what a `BLOCK_N = 256` pair tile costs that #87's table does not
+/// mention. 128 is the widest band that fits, so a 256-column tile drains in
+/// two of them and a 128-column tile drains in the one band it always did:
+/// the loop below is a single iteration at `BLOCK_N = 128` and the shipped
+/// kernel's codegen is unchanged, which `regcount` is what confirms.
+const DRAIN_N: usize = 128;
 /// CTAs in the cluster. Also the multiplier on a stage's transaction charge:
 /// both ranks stage the same two tile types at the same shared offsets, so the
 /// whole stage is one rank's charge twice over.
@@ -170,37 +221,65 @@ const PAIR: u16 = ((1u32 << RANKS) - 1) as u16;
 /// The rank that owns the pair's MMA, its accumulator and its stage barriers.
 const LEADER: u32 = 0;
 
-/// This CTA's `A` rows, K-major.
+/// This CTA's `A` rows, K-major. The one operand tile no rung moves: the
+/// pair's `M` is fixed at 256 by the widest `MmaShape` there is.
 type ATile = SharedTile<Bf16, BLOCK_M, BLOCK_K, Swizzle128B>;
 /// This CTA's `B` columns, also K-major — so the MMA carries no transpose
 /// bits and computes `A·Bᵀ`.
-type BTile = SharedTile<Bf16, HALF_N, BLOCK_K, Swizzle128B>;
-type ARing = SharedTileRing<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>;
-type BRing = SharedTileRing<Bf16, HALF_N, BLOCK_K, Swizzle128B, STAGES>;
+type BTile<const HALF_N: usize> = SharedTile<Bf16, HALF_N, BLOCK_K, Swizzle128B>;
+type ARing<const STAGES: usize> = SharedTileRing<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>;
+type BRing<const HALF_N: usize, const STAGES: usize> =
+    SharedTileRing<Bf16, HALF_N, BLOCK_K, Swizzle128B, STAGES>;
 /// This CTA's half of the pair's accumulator: 128 TMEM lanes by `BLOCK_N`
-/// fp32 columns.
-type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
-/// One warp's band of it, drained.
-type Band = RegTile<32, BLOCK_N, BaseLdtm>;
+/// fp32 columns. The column count is what charges tensor memory, so it is also
+/// the `512 / columns` half of the residency this kernel gets.
+type Accumulator<const BLOCK_N: usize> = TmemTile<BLOCK_M, BLOCK_N>;
+/// One warp's band of it, drained — [`DRAIN_N`] columns at a time.
+type Band = RegTile<32, DRAIN_N, BaseLdtm>;
 
 /// Barriers, the TMEM staging word and the scheduler's queue, in the tail of
-/// the shared plan: the two `STAGES`-deep rings, the MMA-complete semaphore,
-/// one `u32`, and [`ClcQueue::BYTES`] for the hardware work queue.
-const SCRATCH_BYTES: usize = 2 * STAGES * 8 + 8 + 8 + ClcQueue::BYTES;
-/// Where the work queue sits, and the one thing about it a constant has to
-/// say: `try_cancel` writes a `.b128`, so the offset has to be aligned for one.
-/// This assert fires at codegen, which is the only place the ring byte counts
-/// under it are known.
-const QUEUE_OFFSET: usize = ARing::BYTES + BRing::BYTES + 2 * STAGES * 8 + 8 + 8;
-const _: () = assert!(QUEUE_OFFSET % ClcQueue::ALIGNMENT == 0);
-/// Dynamic shared memory the launch must provide.
+/// the shared plan: the two `stages`-deep rings' semaphores, the MMA-complete
+/// semaphore, one `u32`, and [`ClcQueue::BYTES`] for the hardware work queue.
+const fn scratch_bytes(stages: usize) -> usize {
+    2 * stages * 8 + 8 + 8 + ClcQueue::BYTES
+}
+
+/// Dynamic shared memory a `[2·BLOCK_M, block_n]` pair tile `stages` deep asks
+/// for: the two operand rings and the scratch tail.
+///
+/// Stated as arithmetic because `#[launch_contract]` takes a literal and a
+/// host-side rung table needs the same number outside any monomorphization.
+/// It is not trusted: [`attach`] carries a codegen-time assert that this agrees
+/// with the rings' own `BYTES`, per rung, which is the only place the two
+/// could ever drift.
+pub const fn shared_plan(block_n: usize, stages: usize) -> usize {
+    let a = BLOCK_M * BLOCK_K * 2 * stages;
+    let b = (block_n / 2) * BLOCK_K * 2 * stages;
+    a + b + scratch_bytes(stages)
+}
+
+/// The UMMA shape a pair tile of `block_n` columns issues.
+///
+/// `M` is 256 in both — the pair's rows, and the widest `M` tcgen05 has, which
+/// is why the tile sweep can only move `N`. A rung whose columns name no shape
+/// fails at codegen rather than issuing the wrong descriptor into the right
+/// accumulator, which does not fault and computes wrong numbers.
+const fn pair_shape(block_n: usize) -> MmaShape {
+    match block_n {
+        128 => MmaShape::M256_N128,
+        256 => MmaShape::M256_N256,
+        _ => panic!("no cta_group::2 MmaShape covers this pair tile's columns"),
+    }
+}
+
+/// Dynamic shared memory the shipped kernel's launch must provide.
 ///
 /// Every scheduler below launches with the *same* plan, including the static
 /// one that never touches the queue. Twenty-four bytes is not worth a second
 /// envelope, and paying them on both sides is what keeps the A/B a comparison
 /// of schedules rather than of residencies — 73 816 B still admits the three
 /// CTAs per SM that #84 counted at 73 792.
-pub const SHARED_BYTES: usize = ARing::BYTES + BRing::BYTES + SCRATCH_BYTES;
+pub const SHARED_BYTES: usize = shared_plan(BLOCK_N, STAGES);
 
 /// `#[launch_contract]` takes literals, so the envelope is written twice; this
 /// is what keeps the two in step. The contract is not decoration: 72 KiB is
@@ -212,7 +291,7 @@ pub const SHARED_BYTES: usize = ARing::BYTES + BRing::BYTES + SCRATCH_BYTES;
 /// zero blocks per SM at 144. `cluster_launch` has nothing to do with it.
 /// [`kittens::launch::admit_shared_plan`] is the same opt-in for a kernel
 /// whose output partition no contract describes.
-const _: () = assert!(THREADS == 128 && SHARED_BYTES == 73_816);
+const _: () = assert!(THREADS == 128 && SHARED_BYTES == 98_392);
 
 /// SMs on the device this project targets and measures on — a B200, as
 /// `modal run modal_app.py::bench` prints in its header.
@@ -244,15 +323,30 @@ const SMS: u32 = 148;
 /// throughput curve on a real GEMM and timestamps from a nine-register probe,
 /// landing on one integer is much stronger evidence than either alone.
 ///
-/// The census also says *which* resource sets it, which the bisection could
-/// not: 128 columns of tensor memory would admit 4 CTAs an SM and this
-/// kernel's 73792 B shared plan admits 3, so **shared memory caps this kernel
-/// and `tcgen05` does not**. It priced `alloc_cluster` against `alloc_block` at
+/// The census also says *which* resource set it, which the bisection could
+/// not: 128 columns of tensor memory would admit 4 CTAs an SM and that
+/// kernel's 73792 B shared plan admitted 3, so **shared memory capped it and
+/// `tcgen05` did not**. It priced `alloc_cluster` against `alloc_block` at
 /// equal columns too and found them identical, so none of this is a cluster
 /// effect. And a query *can* describe a cluster launch —
 /// `cuOccupancyMaxActiveClusters` takes the shape the block query has no
 /// argument for. It was never called here; it is not that nothing could answer.
-const CTAS_PER_SM: u32 = 3;
+///
+/// **All of the above is about the kernel this file shipped through #102, and
+/// it is 2 now, for a different reason.** #87 widened the pair tile to
+/// `[256, 256]`, which is **256 accumulator columns**, and `512 / 256` is 2
+/// before shared memory is consulted at all. So this is the first kernel in
+/// this repo whose residency is set by the *tensor memory* half of
+/// `min(512 / columns, shared per SM / plan)` — every one before it was capped
+/// by the shared half. The census counts 2 at the 98392 B plan, agreeing.
+///
+/// The step down from 3 was paid for and the sweep is what says at what price.
+/// #98 priced a 3 → 2 step at **13.6–16.1%** on bytes no code touched; here the
+/// bytes are a third of a wider pipeline and a wider tile, and the net is
+/// **+11.6% at 8192³ and +21.6% at 16384³**. `examples/README.md` §7 separates
+/// the two with `[256, 128] @ STAGES = 4` — the same 2 CTAs an SM at the *old*
+/// tile — which lands at −7.7% and +2.1%.
+const CTAS_PER_SM: u32 = 2;
 /// Clusters the persistent grid launches at most, past which a cluster takes a
 /// second work item rather than the scheduler holding a pair back.
 ///
@@ -270,7 +364,7 @@ const CTAS_PER_SM: u32 = 3;
 /// grid is the tile count and the residency is the scheduler's business. This
 /// constant survives here only for as long as the static path is the control.
 const MAX_CLUSTERS: u32 = SMS * CTAS_PER_SM / RANKS;
-const _: () = assert!(MAX_CLUSTERS == 222);
+const _: () = assert!(MAX_CLUSTERS == 148);
 
 /// Tile-rows the item map walks before moving right — [`pipeline::grouped`]'s
 /// width, and this kernel's answer to #89.
@@ -314,6 +408,163 @@ impl Scheduler {
     }
 }
 
+/// Which entry point a rung is compiled into.
+///
+/// A rung is a pair tile and a pipeline depth, and both are const parameters
+/// of [`Tile`] — but `#[launch_contract]` takes a literal shared plan, so each
+/// combination is its own `#[kernel]` and this is the host's name for it. The
+/// four sweep entries are static-only; [`Scheduler::Stealing`] exists on the
+/// shipped rung alone, because a scheduler comparison at a moving tile would
+/// be two variables.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Entry {
+    /// `gemm_cg2` / `gemm_cg2_clc` — `[256, 256] @ STAGES = 3` since #87, the
+    /// kernel this file ships and the only rung with a stealing twin.
+    Shipped,
+    N128S2,
+    /// The kernel this file shipped through #102, kept as the control.
+    N128S3,
+    N128S4,
+    N256S2,
+    /// A rung the table computes and no kernel implements — see [`UNBUILT`].
+    /// Launching it is an error rather than a missing arm, because the reason
+    /// it is not built is a measurement and not an oversight.
+    Unbuilt,
+}
+
+/// One point of #87's tile and depth sweep.
+///
+/// The two numbers that move are the pair tile's columns and the pipeline's
+/// depth over K. Everything else about a rung — its shared plan, its tensor
+/// memory, the residency those two admit, its arithmetic intensity and how
+/// many output tiles a problem has — is arithmetic on them, which is the whole
+/// reason this is a table and not six kernels written out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Rung {
+    /// Columns of `C` the *pair* computes, and this CTA's accumulator columns.
+    pub block_n: usize,
+    /// Pipeline depth over K.
+    pub stages: usize,
+    pub entry: Entry,
+}
+
+impl Rung {
+    /// Dynamic shared memory this rung's launch declares.
+    pub const fn shared(self) -> usize {
+        shared_plan(self.block_n, self.stages)
+    }
+
+    /// **Arithmetic intensity**, `M·N/(M+N)` over the pair tile: flops per
+    /// operand byte the tile reads, which is what a wider `N` buys.
+    ///
+    /// Doubling `N` buys 1.5× and not 2×, because `M·N/(M+N)` is not linear in
+    /// `N`. `M` is 256 in every rung — the widest `M` tcgen05 has — so `N` is
+    /// the only axis this sweep can move at all.
+    pub fn intensity(self) -> f64 {
+        let (m, n) = ((2 * BLOCK_M) as f64, self.block_n as f64);
+        m * n / (m + n)
+    }
+
+    /// CTAs of this rung an SM holds: **#84's `min(512 / columns, shared per
+    /// SM / plan)`**, predicted from the two per-CTA resources.
+    ///
+    /// Predicted, and the sweep prints `device-tests`' *counted* figure beside
+    /// it rather than instead of it — #84 found the formula exact at fourteen
+    /// rungs, and predicted and counted disagreeing would be a finding rather
+    /// than a rounding error. `shared_per_sm` is queried from the driver and
+    /// not written down: the number matters to the column and a constant that
+    /// is only nearly right would move rungs across a step.
+    ///
+    /// The `512 / columns` term has never bound anything in this repo. At
+    /// `block_n = 256` it does.
+    pub fn ctas_per_sm(self, shared_per_sm: usize) -> u32 {
+        let tmem = 512 / self.block_n;
+        let shared = shared_per_sm / self.shared();
+        tmem.min(shared) as u32
+    }
+
+    /// Clusters this rung's persistent grid launches at most — the same
+    /// `SMS * CTAS_PER_SM / RANKS` the shipped kernel uses, at the residency
+    /// this rung actually gets.
+    ///
+    /// Sizing the grid from the rung's own residency is what makes the sweep a
+    /// comparison of tiles rather than of grids: a rung held at 222 clusters
+    /// while the device admits 296 of it would be measured on a schedule
+    /// chosen for a different kernel.
+    pub fn max_clusters(self, shared_per_sm: usize) -> u32 {
+        SMS * self.ctas_per_sm(shared_per_sm) / RANKS
+    }
+
+    /// What the table calls it.
+    pub fn name(self) -> String {
+        format!("[256,{}] s{}", self.block_n, self.stages)
+    }
+}
+
+/// The kernel this file ships, as a rung: `[256, 256] @ STAGES = 3` (#87).
+pub const SHIPPED: Rung = Rung {
+    block_n: BLOCK_N,
+    stages: STAGES,
+    entry: Entry::Shipped,
+};
+
+/// #87's sweep, and the losers stay in it.
+///
+/// Five of the issue's six rungs are here. The sixth, `[256, 256] @ STAGES =
+/// 4`, is [`UNBUILT`]: it is one CTA an SM, and #98 measured that step at a
+/// further 25–44% under a step already worth 14–16%, so it is computed and not
+/// launched. Booking a B200 on a rung whose answer two prior measurements
+/// already give is how a sweep spends money to confirm itself.
+pub const RUNGS: [Rung; 5] = [
+    Rung {
+        block_n: 128,
+        stages: 2,
+        entry: Entry::N128S2,
+    },
+    CONTROL,
+    Rung {
+        block_n: 128,
+        stages: 4,
+        entry: Entry::N128S4,
+    },
+    Rung {
+        block_n: 256,
+        stages: 2,
+        entry: Entry::N256S2,
+    },
+    SHIPPED,
+];
+
+/// The kernel this file shipped through #102 — `[256, 128] @ STAGES = 3`, and
+/// the control every #87 row is read against.
+pub const CONTROL: Rung = Rung {
+    block_n: 128,
+    stages: 3,
+    entry: Entry::N128S3,
+};
+
+/// The rung this sweep computes and does not build — see [`RUNGS`].
+pub const UNBUILT: Rung = Rung {
+    block_n: 256,
+    stages: 4,
+    entry: Entry::Unbuilt,
+};
+
+/// The shared plans the four sweep entry points declare, against the
+/// arithmetic every host table reads.
+///
+/// `#[launch_contract]` takes a literal, so each rung's plan is written twice —
+/// once there and once as [`shared_plan`]. `attach` asserts the arithmetic
+/// against the *rings'* own byte counts at codegen; this asserts it against the
+/// literals, which is the other half of the same join.
+const _: () = {
+    assert!(shared_plan(128, 2) == 49_224);
+    assert!(shared_plan(128, 4) == 98_408);
+    assert!(shared_plan(256, 2) == 65_608);
+    assert!(shared_plan(256, 3) == 98_392);
+    assert!(shared_plan(256, 4) == 131_176);
+};
+
 /// One output tile of `C`, as the persistent grid's work item.
 ///
 /// Every field is what the item needs and does not depend on *which* item it
@@ -325,9 +576,9 @@ impl Scheduler {
 /// per *cluster* and answered in groups of [`GROUP`] tile-rows rather than
 /// row-major.
 #[derive(Clone, Copy)]
-struct Tile {
-    a_ring: ARing,
-    b_ring: BRing,
+struct Tile<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
+    a_ring: ARing<STAGES>,
+    b_ring: BRing<HALF_N, STAGES>,
     /// Filled by the TMA, drained by the MMA. In the leader's copy the whole
     /// pair's four tiles complete on one barrier; the peer's own copy is
     /// unused, and initialized anyway because the plan is symmetric.
@@ -338,7 +589,7 @@ struct Tile {
     done: Semaphore,
     a_map: *const TmaDescriptor,
     b_map: *const TmaDescriptor,
-    accumulator: Accumulator,
+    accumulator: Accumulator<BLOCK_N>,
     /// `C` with `ldc` in it — built once, since a persistent CTA writes bands
     /// of the same output through every item it runs.
     c: GlobalRows,
@@ -357,7 +608,9 @@ struct Tile {
     lane: u32,
 }
 
-impl Job for Tile {
+impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
+    for Tile<BLOCK_N, HALF_N, STAGES>
+{
     /// The pair shares one barrier set — the peer aims its TMA at the leader's
     /// stage barrier and the leader's MMA arrives in the peer's `free` and
     /// `done` — so the item boundary that re-arms them has to be the cluster's.
@@ -427,10 +680,17 @@ impl Job for Tile {
             // cancelled, and a bijection of either is still every tile once.
             let (tile_m, tile_n) = pipeline::grouped(item, tiles_m, tiles_n, group);
 
-            // `M` is the pair's 256 rows and `N` its 128 columns. The rest of
+            // `M` is the pair's 256 rows and `N` its own columns. The rest of
             // the descriptor is the walk's: both operands are K-major, so the
             // MMA takes no transpose bits, and bf16 comes from the tiles.
-            let shape = MmaShape::M256_N128;
+            //
+            // `MmaShape` is a re-export of `Tcgen05MmaShape` and
+            // `mma_walk_cg2` takes the shape as a value, so widening the pair
+            // tile needs nothing from `src/mma.rs` — every shape from
+            // `M128_N64` to `M256_N256` is already there.
+            // In a `const` block so a rung whose columns name no shape is a
+            // codegen error rather than a `panic!` lowered into device code.
+            let shape = const { pair_shape(BLOCK_N) };
 
             if warp_id == 0 && lane == 0 {
                 // Producer. Both CTAs load their own halves, and all four
@@ -496,19 +756,27 @@ impl Job for Tile {
             done.wait(0);
             thread::sync_threads();
 
-            // The whole band in one call (#22): this warp's 32 TMEM lanes by
-            // every column of the accumulator, composed out of the `[16, 16]`
-            // blocks LDTM delivers.
-            let band: Band = accumulator.tile(32 * warp_id, 0);
-
             // The fp32 epilogue, straight out of registers (#11). `ldc` is the
             // destination's leading dimension and `C` is wider than this
-            // tile's columns, so the cursor carries the stride and the band
+            // tile's columns, so the cursor carries the stride and each band
             // lands at its own `(row, column)` origin — no shared staging
             // tile, no descriptor, and no rounding to bf16 on the way out.
+            //
+            // A band at a time rather than the whole accumulator at once, and
+            // [`DRAIN_N`] is why: 256 columns in one `RegTile` is 256 fp32 a
+            // thread. At `BLOCK_N = 128` this is the single band (#22) it has
+            // always been, and the loop folds away.
             let row_base = 2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * rank + 32 * warp_id;
             let column_base = BLOCK_N as u32 * tile_n;
-            store_rows(c, row_base, column_base, lane, band);
+            let mut column = 0u32;
+            while column < BLOCK_N as u32 {
+                // This warp's 32 TMEM lanes by `DRAIN_N` columns of the
+                // accumulator, composed out of the `[16, 16]` blocks LDTM
+                // delivers.
+                let band: Band = accumulator.tile(32 * warp_id, column);
+                store_rows(c, row_base, column_base + column, lane, band);
+                column += DRAIN_N as u32;
+            }
         }
     }
 }
@@ -531,7 +799,7 @@ pub mod kernels {
     /// item loop walks, and `c` must hold `ldc` columns for every row of it.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn attach(
+    unsafe fn attach<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize>(
         a_map: *const TmaDescriptor,
         b_map: *const TmaDescriptor,
         tiles_m: u32,
@@ -540,21 +808,52 @@ pub mod kernels {
         k_blocks: u32,
         ldc: u32,
         c: &mut DisjointSlice<f32>,
-    ) -> (Tile, ClcQueue) {
+    ) -> (Tile<BLOCK_N, HALF_N, STAGES>, ClcQueue) {
+        // Everything a rung has to be true about, fired at codegen — which is
+        // the only place the ring byte counts are known, and the reason `cargo
+        // check` cannot stand in for `modal_app.py::build`.
+        //
+        // `HALF_N` is a second parameter rather than `BLOCK_N / 2` because a
+        // const parameter cannot be arithmetic on another one without
+        // `generic_const_exprs`; the assert is what keeps the two in step.
+        // `shared_plan` is host-side arithmetic and the rings' `BYTES` are the
+        // library's own count of the same bytes, so the third assert is what
+        // says a `#[launch_contract]` literal describes the plan `attach` lays
+        // out. And the queue's offset must be aligned for the `.b128`
+        // `try_cancel` writes.
+        const {
+            assert!(BLOCK_N == 2 * HALF_N);
+            assert!(BLOCK_N % DRAIN_N == 0);
+            assert!(
+                shared_plan(BLOCK_N, STAGES)
+                    == ARing::<STAGES>::BYTES
+                        + BRing::<HALF_N, STAGES>::BYTES
+                        + scratch_bytes(STAGES)
+            );
+            assert!(
+                (ARing::<STAGES>::BYTES + BRing::<HALF_N, STAGES>::BYTES + 2 * STAGES * 8 + 8 + 8)
+                    % ClcQueue::ALIGNMENT
+                    == 0
+            );
+        };
         unsafe {
+            let rings = ARing::<STAGES>::BYTES + BRing::<HALF_N, STAGES>::BYTES;
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let scratch = smem.add(ARing::BYTES + BRing::BYTES);
+            let scratch = smem.add(rings);
             let tmem_slot = scratch.add(2 * STAGES * 8 + 8) as *mut u32;
 
             let tile = Tile {
-                a_ring: ARing::attach(smem),
-                b_ring: BRing::attach(smem.add(ARing::BYTES)),
+                a_ring: ARing::<STAGES>::attach(smem),
+                b_ring: BRing::<HALF_N, STAGES>::attach(smem.add(ARing::<STAGES>::BYTES)),
                 load: SemaphoreRing::<STAGES>::attach(scratch as *mut Barrier),
                 free: SemaphoreRing::<STAGES>::attach((scratch as *mut Barrier).add(STAGES)),
                 done: Semaphore::attach((scratch as *mut Barrier).add(2 * STAGES)),
                 a_map,
                 b_map,
-                accumulator: Accumulator::from_raw(alloc_cluster(tmem_slot, BLOCK_N as u32)),
+                accumulator: Accumulator::<BLOCK_N>::from_raw(alloc_cluster(
+                    tmem_slot,
+                    BLOCK_N as u32,
+                )),
                 c: GlobalRows::from_slice(c, ldc as usize),
                 tiles_m,
                 tiles_n,
@@ -564,7 +863,10 @@ pub mod kernels {
                 warp_id: warp::warp_id(),
                 lane: warp::lane_id(),
             };
-            (tile, ClcQueue::attach(smem.add(QUEUE_OFFSET)))
+            (
+                tile,
+                ClcQueue::attach(smem.add(rings + 2 * STAGES * 8 + 8 + 8)),
+            )
         }
     }
 
@@ -583,7 +885,9 @@ pub mod kernels {
     /// Every thread of every rank must arrive, with the accumulator's last
     /// reader retired.
     #[inline(always)]
-    unsafe fn release(tile: &Tile) {
+    unsafe fn release<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize>(
+        tile: &Tile<BLOCK_N, HALF_N, STAGES>,
+    ) {
         unsafe {
             tcgen05_fence_before_thread_sync();
             cluster::cluster_sync();
@@ -622,7 +926,7 @@ pub mod kernels {
     #[launch_contract(
         domain = 1,
         block = (128, 1, 1),
-        dynamic_shared = 73_816,
+        dynamic_shared = 98_392,
         dynamic_shared_alignment = 128
     )]
     #[allow(clippy::too_many_arguments)]
@@ -637,8 +941,9 @@ pub mod kernels {
         mut c: DisjointSlice<f32>,
     ) {
         unsafe {
-            let (mut tile, _) =
-                attach(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let (mut tile, _) = attach::<BLOCK_N, HALF_N, STAGES>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
             pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }
@@ -670,7 +975,7 @@ pub mod kernels {
     #[launch_contract(
         domain = 1,
         block = (128, 1, 1),
-        dynamic_shared = 73_816,
+        dynamic_shared = 98_392,
         dynamic_shared_alignment = 128
     )]
     #[allow(clippy::too_many_arguments)]
@@ -685,9 +990,182 @@ pub mod kernels {
         mut c: DisjointSlice<f32>,
     ) {
         unsafe {
-            let (mut tile, queue) =
-                attach(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let (mut tile, queue) = attach::<BLOCK_N, HALF_N, STAGES>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
             pipeline::run_stealing(&mut tile, queue);
+            release(&tile);
+        }
+    }
+
+    // #87's sweep is the four entry points below: the static schedule on the
+    // same `Tile`, at one `(BLOCK_N, STAGES)` each. The only reason they are
+    // written out rather than swept from a parameter is that
+    // `#[launch_contract]`'s `dynamic_shared` takes a literal — so a rung's
+    // shared plan is spelled twice and `attach`'s codegen assert is what holds
+    // the two spellings together.
+    //
+    // `[256, 256] @ STAGES = 4` is deliberately **not** here. It is 131 176 B,
+    // which is one CTA an SM, and #98 measured that step at a further 25–44%
+    // under a step already worth 14–16%. `RUNGS` computes it and no B200 time
+    // is booked on it.
+
+    /// `[256, 128]` two stages deep — 49 224 B, and the only rung in the sweep
+    /// that steps residency *up*: four CTAs an SM where the shipped kernel
+    /// holds three. Tensor memory admits four at 128 columns too, so nothing
+    /// is left binding but the pipeline being a stage shallower.
+    ///
+    /// # Safety
+    ///
+    /// As [`gemm_cg2`].
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 49_224,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_256x128_s2(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let (mut tile, _) =
+                attach::<128, 64, 2>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            pipeline::run(&mut tile, tiles_m * tiles_n);
+            release(&tile);
+        }
+    }
+
+    /// `[256, 128]` four stages deep — 98 408 B, two CTAs an SM.
+    ///
+    /// **The control that makes the rest of the sweep readable.** It is one
+    /// occupancy step down at *unchanged* pair tile, unchanged arithmetic
+    /// intensity and unchanged tile count, so whatever it costs is the step
+    /// and the fourth stage together and nothing else. #98 priced the same step
+    /// on bytes no code touched; here the bytes are a live pipeline stage, so
+    /// the two together say what a stage is worth against what it costs.
+    ///
+    /// # Safety
+    ///
+    /// As [`gemm_cg2`].
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 98_408,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_256x128_s4(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let (mut tile, _) =
+                attach::<128, 64, 4>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            pipeline::run(&mut tile, tiles_m * tiles_n);
+            release(&tile);
+        }
+    }
+
+    /// `[256, 256]` two stages deep — 65 608 B, **the rung where tensor memory
+    /// binds first**.
+    ///
+    /// Shared memory admits three CTAs here and 256 accumulator columns admit
+    /// two, so this is the first kernel in this repo whose residency is set by
+    /// the `512 / columns` half of `min(512 / columns, shared per SM / plan)`.
+    /// `src/tmem.rs` makes a sharper prediction than the count alone: the third
+    /// CTA is *admitted* and parks inside `tcgen05.alloc`, so the census should
+    /// read three resident against two holding — the first rung in this repo
+    /// where those two columns differ.
+    ///
+    /// # Safety
+    ///
+    /// As [`gemm_cg2`].
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 65_608,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_256x256_s2(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let (mut tile, _) =
+                attach::<256, 128, 2>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            pipeline::run(&mut tile, tiles_m * tiles_n);
+            release(&tile);
+        }
+    }
+
+    /// `[256, 128]` three stages deep — 73 816 B, three CTAs an SM. **The
+    /// kernel this file shipped through #102, kept as the sweep's control.**
+    ///
+    /// It is no longer [`gemm_cg2`]: #87 moved the pair tile to `[256, 256]`,
+    /// and this entry point is what every table in `examples/README.md` before
+    /// that was measured on. Keeping it launchable is what makes the tile
+    /// comparison a measurement against the previous kernel rather than
+    /// against a number remembered from another session — and #98's own method
+    /// is the argument, since it found a 2.9% drift between containers large
+    /// enough to change a verdict.
+    ///
+    /// It is also the rung that pairs with [`gemm_256x128_s4`] to price the
+    /// occupancy step at unchanged tile, and with [`gemm_cg2`] to price the
+    /// tile at unchanged everything else.
+    ///
+    /// # Safety
+    ///
+    /// As [`gemm_cg2`].
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 73_816,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_256x128_s3(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let (mut tile, _) =
+                attach::<128, 64, 3>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }
     }
@@ -788,14 +1266,14 @@ pub(crate) fn stage(rows: usize, k: usize, value: impl Fn(usize, usize) -> f32) 
 /// Tiles of `C` a `[m, n]` output has along each axis — the grid
 /// [`pipeline::grouped`] walks, and the pair of numbers the kernel needs
 /// because a grouped walk has to know where the tile-rows run out.
-fn tile_grid(m: usize, n: usize) -> (u32, u32) {
-    ((m / (2 * BLOCK_M)) as u32, (n / BLOCK_N) as u32)
+fn tile_grid(m: usize, n: usize, block_n: usize) -> (u32, u32) {
+    ((m / (2 * BLOCK_M)) as u32, (n / block_n) as u32)
 }
 
 /// Tiles of `C` a `[m, n]` output has, which is the item count the persistent
 /// grid walks: one per `2·BLOCK_M` by `BLOCK_N` tile.
-fn tiles(m: usize, n: usize) -> u32 {
-    let (rows, columns) = tile_grid(m, n);
+fn tiles(m: usize, n: usize, block_n: usize) -> u32 {
+    let (rows, columns) = tile_grid(m, n, block_n);
     rows * columns
 }
 
@@ -819,9 +1297,15 @@ fn tiles(m: usize, n: usize) -> u32 {
 /// Returns the tile-rows and tile-columns a wave spans, the distinct bytes that
 /// comes to, and the reuse — bytes requested over bytes distinct, so 1.0 would
 /// be a wave that shares nothing.
-fn wave_reuse(m: usize, n: usize, group: u32) -> (usize, usize, f64, f64) {
-    let (rows, columns) = tile_grid(m, n);
-    let wave = MAX_CLUSTERS.min(rows * columns);
+fn wave_reuse(
+    m: usize,
+    n: usize,
+    group: u32,
+    block_n: usize,
+    clusters: u32,
+) -> (usize, usize, f64, f64) {
+    let (rows, columns) = tile_grid(m, n, block_n);
+    let wave = clusters.min(rows * columns);
     let (mut spans_row, mut spans_column) =
         (vec![false; rows as usize], vec![false; columns as usize]);
     for item in 0..wave {
@@ -832,8 +1316,8 @@ fn wave_reuse(m: usize, n: usize, group: u32) -> (usize, usize, f64, f64) {
     let spanned = |flags: &[bool]| flags.iter().filter(|&&hit| hit).count();
     let (walked_rows, walked_columns) = (spanned(&spans_row), spanned(&spans_column));
     let depth = (BLOCK_K * 2) as f64;
-    let distinct = (walked_rows * 2 * BLOCK_M + walked_columns * BLOCK_N) as f64 * depth;
-    let requested = wave as f64 * (2 * BLOCK_M + BLOCK_N) as f64 * depth;
+    let distinct = (walked_rows * 2 * BLOCK_M + walked_columns * block_n) as f64 * depth;
+    let requested = wave as f64 * (2 * BLOCK_M + block_n) as f64 * depth;
     (walked_rows, walked_columns, distinct, requested / distinct)
 }
 
@@ -847,15 +1331,19 @@ pub struct Plan {
     pub scheduler: Scheduler,
     /// [`pipeline::grouped`]'s width in tile-rows. `1` is row-major.
     pub group: u32,
+    /// The pair tile and pipeline depth to launch — #87's variable, and the
+    /// one #89's `GROUP` is only measured *at*.
+    pub rung: Rung,
 }
 
 impl Plan {
     /// The kernel as it ships: whichever schedule `scheduler` names, walked at
-    /// the measured [`GROUP`].
+    /// the measured [`GROUP`], on the [`SHIPPED`] rung.
     fn new(scheduler: Scheduler) -> Self {
         Plan {
             scheduler,
             group: GROUP,
+            rung: SHIPPED,
         }
     }
 }
@@ -869,7 +1357,7 @@ impl Plan {
 /// the extra tiles arrive as extra *items*, which is the whole difference
 /// between this kernel and the one that launched a pair per tile.
 pub fn grid(m: usize, n: usize) -> u32 {
-    grid_for(Scheduler::Static, m, n)
+    grid_for(Scheduler::Static, m, n, SHIPPED, MAX_CLUSTERS)
 }
 
 /// Blocks a `scheduler`'s launch asks for, which is the one host-visible
@@ -881,10 +1369,10 @@ pub fn grid(m: usize, n: usize) -> u32 {
 /// tile would leave items nothing can reach. This is the shape of the
 /// deletion — one branch reads a measured constant and the other reads the
 /// problem.
-pub fn grid_for(scheduler: Scheduler, m: usize, n: usize) -> u32 {
+pub fn grid_for(scheduler: Scheduler, m: usize, n: usize, rung: Rung, cap: u32) -> u32 {
     let clusters = match scheduler {
-        Scheduler::Static => tiles(m, n).min(MAX_CLUSTERS),
-        Scheduler::Stealing => tiles(m, n),
+        Scheduler::Static => tiles(m, n, rung.block_n).min(cap),
+        Scheduler::Stealing => tiles(m, n, rung.block_n),
     };
     RANKS * clusters
 }
@@ -894,14 +1382,26 @@ pub fn grid_for(scheduler: Scheduler, m: usize, n: usize) -> u32 {
 /// This is the entire quantity CLC has to win back, and it is worth computing
 /// rather than measuring against: a cluster's item takes the same time whoever
 /// scheduled it, so the static stride's only loss is the clusters idle through
-/// the ragged last wave. At [`MAX_CLUSTERS`] the efficiency is 57.7% at 2048³,
-/// 76.9% at 4096³, 92.3% at 8192³ and **99.7% at 16384³** — so the predicted
-/// gain runs from 23% down to nothing across the sweep, and the largest size,
-/// the one a peak claim would be made on, predicts nothing.
+/// the ragged last wave.
+///
+/// #87 moved every number here, and in the favourable direction: at the
+/// `[256, 128]` tile's 222 clusters the efficiency ran 57.7% at 2048³, 76.9% at
+/// 4096³, 92.3% at 8192³ and 99.7% at 16384³; at `[256, 256]`'s 148 it is
+/// **98.8% at both 8192³ and 16384³**, because halving the tiles and halving
+/// the clusters leaves a wave that divides the work much more evenly. That is a
+/// confound in #87's own sweep rather than a win to claim — #97 measured the
+/// ragged wave as worth ~1% of the *time* where it is 8% of the grid — and §7
+/// says so beside the table.
 pub fn wave_efficiency(m: usize, n: usize) -> (u32, f64) {
-    let tiles = tiles(m, n);
-    let waves = tiles.div_ceil(MAX_CLUSTERS);
-    (waves, tiles as f64 / (waves * MAX_CLUSTERS) as f64)
+    wave_efficiency_of(m, n, SHIPPED, MAX_CLUSTERS)
+}
+
+/// [`wave_efficiency`] at a rung's own tile and grid cap — the two things #87
+/// moves, and both of them move this.
+fn wave_efficiency_of(m: usize, n: usize, rung: Rung, cap: u32) -> (u32, f64) {
+    let tiles = tiles(m, n, rung.block_n);
+    let waves = tiles.div_ceil(cap);
+    (waves, tiles as f64 / (waves * cap) as f64)
 }
 
 /// The `then` a run that is only being checked passes: nothing follows the
@@ -946,10 +1446,12 @@ fn run<T>(
     // `2·BLOCK_M` by `BLOCK_N` tile and a stage is a whole `BLOCK_K`, and the
     // kernel bounds-checks none of it. A size that does not divide is rejected
     // rather than launched into somebody else's memory.
-    if m % (2 * BLOCK_M) != 0 || n % BLOCK_N != 0 || k % BLOCK_K != 0 {
+    let rung = plan.rung;
+    if m % (2 * BLOCK_M) != 0 || n % rung.block_n != 0 || k % BLOCK_K != 0 {
         return Err(format!(
-            "{m}x{n}x{k} does not divide the {}x{BLOCK_N}x{BLOCK_K} tiling",
-            2 * BLOCK_M
+            "{m}x{n}x{k} does not divide the {}x{}x{BLOCK_K} tiling",
+            2 * BLOCK_M,
+            rung.block_n
         )
         .into());
     }
@@ -974,60 +1476,103 @@ fn run<T>(
         )
     };
     let a_map = a_layout.tensor_map::<ATile>(&stream)?;
-    let b_map = b_layout.tensor_map::<BTile>(&stream)?;
+    // The `B` tile is the one operand type a rung moves, and its box comes off
+    // the type — so the descriptor a `[256, 256]` rung loads through is the
+    // library's arithmetic on `BTile<128>` and not a number written here.
+    let b_map = match rung.block_n {
+        128 => b_layout.tensor_map::<BTile<64>>(&stream)?,
+        256 => b_layout.tensor_map::<BTile<128>>(&stream)?,
+        columns => return Err(format!("no rung has {columns} pair columns").into()),
+    };
 
     let mut c = DeviceBuffer::<f32>::zeroed(&stream, m * n)?;
-    // All three are prepared and one is launched. Preparing is a driver call
-    // opting the entry point into its 72 KiB, and doing it for the entry points
-    // this call will not use costs nothing measurable and keeps the dispatch
-    // below a `match` over launches rather than over types the kernel macro
-    // named.
-    let config =
-        |scheduler| LaunchConfig1D::new(grid_for(scheduler, m, n), THREADS, SHARED_BYTES as u32);
-    let static_launch = module.prepare_gemm_cg2(config(Scheduler::Static))?;
-    let clc_launch = module.prepare_gemm_cg2_clc(config(Scheduler::Stealing))?;
-    let (tiles_m, tiles_n) = tile_grid(m, n);
+    let cap = rung.max_clusters(shared_per_sm(context)?);
+    let blocks = grid_for(plan.scheduler, m, n, rung, cap);
+    let (tiles_m, tiles_n) = tile_grid(m, n, rung.block_n);
     let k_blocks = (k / BLOCK_K) as u32;
-    let launch_once = |c: &mut DeviceBuffer<f32>| -> Result<(), Box<dyn Error>> {
-        // SAFETY: both maps describe live buffers covering the walk the grid
-        // above takes, and `c` holds `n` columns for every row of it. The
-        // stealing entries additionally take a grid of exactly one cluster per
-        // tile, which is what `grid_for` gives them.
-        unsafe {
-            match plan.scheduler {
-                Scheduler::Static => module.gemm_cg2(
-                    &stream,
-                    &static_launch,
-                    a_map.as_ptr(),
-                    b_map.as_ptr(),
-                    tiles_m,
-                    tiles_n,
-                    plan.group,
-                    k_blocks,
-                    n as u32,
-                    c,
-                )?,
-                Scheduler::Stealing => module.gemm_cg2_clc(
-                    &stream,
-                    &clc_launch,
-                    a_map.as_ptr(),
-                    b_map.as_ptr(),
-                    tiles_m,
-                    tiles_n,
-                    plan.group,
-                    k_blocks,
-                    n as u32,
-                    c,
-                )?,
-            }
-        };
-        Ok(())
+    let config = LaunchConfig1D::new(blocks, THREADS, rung.shared() as u32);
+
+    // One prepared launch per call, boxed because the handle's type is the
+    // kernel's. Preparing is a driver call opting the entry point into its
+    // >48 KiB plan; it happens once, outside the clock, and what the timed
+    // closure does is a launch.
+    //
+    // SAFETY (every arm): both maps describe live buffers covering the walk
+    // the grid takes, and `c` holds `n` columns for every row of it. The
+    // stealing entry additionally takes a grid of exactly one cluster per
+    // tile, which is what `grid_for` gives it.
+    //
+    // The closure borrows the stream and the module and *owns* the prepared
+    // handle, which is why the pointers are taken out of the descriptors here:
+    // the descriptors are locals of this function and outlive the closure, and
+    // a raw pointer is `Copy` where they are not.
+    let (stream_ref, module_ref) = (&stream, &module);
+    let (a_ptr, b_ptr) = (a_map.as_ptr(), b_map.as_ptr());
+    macro_rules! launcher {
+        ($prepare:ident, $launch:ident) => {{
+            let prepared = module_ref.$prepare(config)?;
+            let launch = move |c: &mut DeviceBuffer<f32>| -> Result<(), Box<dyn Error>> {
+                unsafe {
+                    module_ref.$launch(
+                        stream_ref, &prepared, a_ptr, b_ptr, tiles_m, tiles_n, plan.group,
+                        k_blocks, n as u32, c,
+                    )?
+                };
+                Ok(())
+            };
+            Box::new(launch) as Box<dyn Fn(&mut DeviceBuffer<f32>) -> Result<(), Box<dyn Error>>>
+        }};
+    }
+    let launch_once = match (rung.entry, plan.scheduler) {
+        (Entry::Shipped, Scheduler::Static) => launcher!(prepare_gemm_cg2, gemm_cg2),
+        (Entry::Shipped, Scheduler::Stealing) => launcher!(prepare_gemm_cg2_clc, gemm_cg2_clc),
+        (Entry::N128S2, Scheduler::Static) => launcher!(prepare_gemm_256x128_s2, gemm_256x128_s2),
+        (Entry::N128S4, Scheduler::Static) => launcher!(prepare_gemm_256x128_s4, gemm_256x128_s4),
+        (Entry::N128S3, Scheduler::Static) => launcher!(prepare_gemm_256x128_s3, gemm_256x128_s3),
+        (Entry::N256S2, Scheduler::Static) => launcher!(prepare_gemm_256x256_s2, gemm_256x256_s2),
+        (Entry::Unbuilt, _) => {
+            return Err("[256,256] s4 is one CTA an SM and is computed, not built".into());
+        }
+        // Only the shipped rung has a stealing twin, and deliberately: a
+        // scheduler comparison at a moving tile would be two variables.
+        (entry, Scheduler::Stealing) => {
+            return Err(format!("{entry:?} has no work-stealing entry point").into());
+        }
     };
     launch_once(&mut c)?;
     check_c(&c.to_host_vec(&stream)?, m, n, k)?;
 
     let after = then(&stream, &mut || launch_once(&mut c))?;
     Ok((format!("{m}x{n}x{k} exact"), after))
+}
+
+/// Bytes of shared memory an SM divides between its resident CTAs — the
+/// denominator of #84's `shared per SM / plan`, **queried rather than written
+/// down**.
+///
+/// #87 asks for it to be derived, and the reason is not tidiness: it is 233 472
+/// on a B200, and a rung's residency is a floor division by it, so a figure
+/// that is only nearly right moves a rung across an occupancy step and changes
+/// the answer rather than the third digit.
+fn shared_per_sm(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+) -> Result<usize, Box<dyn Error>> {
+    let mut bytes = 0i32;
+    // SAFETY: the attribute is an `int` and `context` names a live device.
+    let status = unsafe {
+        cuda_core::sys::cuDeviceGetAttribute(
+            &mut bytes,
+            cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
+            context.cu_device(),
+        )
+    };
+    if status != cuda_core::sys::cudaError_enum_CUDA_SUCCESS {
+        return Err(format!(
+            "cuDeviceGetAttribute(MAX_SHARED_MEMORY_PER_MULTIPROCESSOR) = {status}"
+        )
+        .into());
+    }
+    Ok(bytes as usize)
 }
 
 /// Compare an observed `[m, n]` row-major fp32 `C` against the CPU reference
@@ -1127,18 +1672,49 @@ const CHECK_GROUPS: [u32; 3] = [1, 3, 6];
 /// reference is the only thing that sees either.
 pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String, Box<dyn Error>> {
     let mut notes = Vec::new();
+    let per_sm = shared_per_sm(context)?;
     for (m, n, k) in [(M, N, K), (ITEMS_M, ITEMS_N, ITEMS_K)] {
-        let (rows, _) = tile_grid(m, n);
+        let (rows, _) = tile_grid(m, n, BLOCK_N);
         for scheduler in SCHEDULERS {
             for group in CHECK_GROUPS {
-                run(context, m, n, k, Plan { scheduler, group }, nothing_after)?;
+                let plan = Plan {
+                    scheduler,
+                    group,
+                    rung: SHIPPED,
+                };
+                run(context, m, n, k, plan, nothing_after)?;
             }
-            let clusters = grid_for(scheduler, m, n) / RANKS;
+            let clusters = grid_for(scheduler, m, n, SHIPPED, MAX_CLUSTERS) / RANKS;
             notes.push(format!(
                 "{m}x{n}x{k} exact on {} at groups {CHECK_GROUPS:?} of {rows} tile-rows \
                  ({} tiles over {clusters} clusters)",
                 scheduler.name(),
-                tiles(m, n)
+                tiles(m, n, BLOCK_N)
+            ));
+        }
+        // #87's rungs, on the static schedule they are swept on. A wider pair
+        // tile is a different item map, a different accumulator and a
+        // different epilogue loop, and every way those go wrong is a wrong `C`
+        // rather than a fault — so no rung reaches a clock without passing the
+        // same element-by-element `==` the shipped kernel does. The traversal
+        // widths go with them, because `grouped`'s short last group is a
+        // function of `tiles_m`, which a rung's `block_n` moves.
+        for rung in RUNGS.into_iter().filter(|rung| *rung != SHIPPED) {
+            for group in CHECK_GROUPS {
+                let plan = Plan {
+                    scheduler: Scheduler::Static,
+                    group,
+                    rung,
+                };
+                run(context, m, n, k, plan, nothing_after)?;
+            }
+            notes.push(format!(
+                "{m}x{n}x{k} exact on {} at groups {CHECK_GROUPS:?} \
+                 ({} tiles, {} B, {} CTAs/SM)",
+                rung.name(),
+                tiles(m, n, rung.block_n),
+                rung.shared(),
+                rung.ctas_per_sm(per_sm)
             ));
         }
     }
@@ -1232,7 +1808,7 @@ pub fn compare(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<(), B
         println!(
             "{:<18}{:>7}{:>7}{:>9.1}%{:>11.1}%{:>11.4}{:>11.4}{:>10.1}%",
             shape,
-            tiles(m, n),
+            tiles(m, n, BLOCK_N),
             waves,
             100.0 * efficiency,
             100.0 * (1.0 - efficiency),
@@ -1295,6 +1871,212 @@ fn tflops(shape: Shape, milliseconds: f64) -> f64 {
 
 fn same(left: Shape, right: Shape) -> bool {
     (left.m, left.n, left.k) == (right.m, right.n, right.k)
+}
+
+/// Traversal widths the headline `[256, 256]` rung is re-swept at.
+///
+/// [`GROUP`] was measured at `[256, 128]`, and a wider pair tile halves
+/// `tiles_n` and changes how many clusters a wave holds — both inputs to
+/// [`wave_reuse`] — so carrying 8 across would be assuming the answer this
+/// sweep exists to move. Four widths rather than [`GROUPS`]' six, because each
+/// one is a staged 8192³ and the two ends of that range are already known to
+/// lose.
+const TILE_GROUPS: [u32; 4] = [1, 4, 8, 16];
+
+/// #87's tile and depth sweep — `modal run modal_app.py::bench --case tile`.
+///
+/// Three tables, and the design is what makes them separable. #87 argues for
+/// `[256, 256]` on **arithmetic intensity** — 128.0 FLOP/byte against 85.3, a
+/// 1.5× cut in operand traffic. There is a second mechanism the issue does not
+/// name and which is probably the stronger one: a wider tile **halves the
+/// output tile count**, and therefore halves the number of item boundaries,
+/// which is the term #90 and #94 priced. The two are confounded in the obvious
+/// experiment, because both scale with `N`.
+///
+/// What separates them is `[256, 128] @ STAGES = 4`. It has the *same* shared
+/// plan as `[256, 256] @ STAGES = 3` (98 408 B against 98 392) and therefore
+/// the same two CTAs per SM, at unchanged intensity and unchanged tile count.
+/// So the step down in occupancy is priced by that rung on its own, and what
+/// the `[256, 256]` rung has over it is exactly the two tile mechanisms and
+/// nothing else.
+///
+/// The other prediction stated in advance: `[256, 256] @ STAGES = 2` is the
+/// first rung in this repo whose residency is set by **tensor memory**. Shared
+/// memory admits three CTAs there and 256 accumulator columns admit two, so
+/// `src/tmem.rs` says the census should read *three resident against two
+/// holding* — a CTA admitted and parked inside a blocking `tcgen05.alloc`.
+/// Every rung in this repo so far has had those two columns equal.
+///
+/// Every row is checked against the CPU reference before it is timed, by the
+/// same [`run`] the rest of the harness uses. The losers stay in the table.
+pub fn tile_sweep(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    baseline: Option<crate::bench::Baseline>,
+) -> Result<(), Box<dyn Error>> {
+    let per_sm = shared_per_sm(context)?;
+    println!(
+        "gemm pair tile and pipeline depth (#87) — min ms over 30 timed launches, every row\n\
+         checked against the CPU reference first, static schedule throughout.\n\
+         `CTA/SM` is min(512/columns, {per_sm}/plan) — #84's formula, with the shared\n\
+         memory an SM divides *queried* rather than written down. It is predicted; the\n\
+         counted figure is `device-tests`' `tmem residency census`, and predicted and\n\
+         counted disagreeing is a finding rather than a rounding error.\n\
+         `intensity` is the pair tile's M*N/(M+N), flops per operand byte."
+    );
+
+    println!("\n1. the rungs, and what each one costs before anything is launched");
+    println!(
+        "{:<16}{:>8}{:>10}{:>12}{:>10}{:>10}{:>12}",
+        "rung", "stages", "shared B", "TMEM cols", "CTA/SM", "clusters", "intensity"
+    );
+    for rung in RUNGS.into_iter().chain([UNBUILT]) {
+        let built = if rung == UNBUILT { "  (not built)" } else { "" };
+        println!(
+            "{:<16}{:>8}{:>10}{:>12}{:>10}{:>10}{:>12.1}{built}",
+            rung.name(),
+            rung.stages,
+            rung.shared(),
+            rung.block_n,
+            rung.ctas_per_sm(per_sm),
+            rung.max_clusters(per_sm),
+            rung.intensity()
+        );
+    }
+
+    println!(
+        "\n2. the sweep, at the two sizes every other table here is quoted at.\n\
+         wave eff moves with the rung and is not a nuisance to divide out: a residency\n\
+         step resizes the persistent grid, so the ragged last wave moves with it — here\n\
+         in the *favourable* direction for the rungs that lose residency, which means\n\
+         this table if anything understates what an occupancy step costs them."
+    );
+    println!(
+        "{:<16}{:<18}{:>8}{:>7}{:>10}{:>9}{:>11}{:>12}{:>9}",
+        "rung", "shape", "tiles", "waves", "wave eff", "reuse", "min ms", "TFLOP/s", "vs #102"
+    );
+    let mut measured: Vec<(Rung, Shape, f64)> = Vec::new();
+    for &shape in &HEADLINE {
+        // The control first at every size, so the `vs #102` column has its
+        // denominator from the row above rather than from a later one. The
+        // reference is the kernel that shipped *before* this sweep, which is
+        // what makes every delta a comparison against something measured many
+        // times rather than against the sweep's own winner.
+        let order = [CONTROL]
+            .into_iter()
+            .chain(RUNGS.into_iter().filter(|rung| *rung != CONTROL));
+        for rung in order {
+            let cap = rung.max_clusters(per_sm);
+            let plan = Plan {
+                scheduler: Scheduler::Static,
+                group: GROUP,
+                rung,
+            };
+            eprintln!("{shape} on {}: staging and checking", rung.name());
+            let (_, timings) = run(context, shape.m, shape.n, shape.k, plan, time)?;
+            let milliseconds = timings.min();
+            measured.push((rung, shape, milliseconds));
+            let (waves, efficiency) = wave_efficiency_of(shape.m, shape.n, rung, cap);
+            let (_, _, _, reuse) = wave_reuse(shape.m, shape.n, GROUP, rung.block_n, cap);
+            let reference = measured
+                .iter()
+                .find(|row| row.0 == CONTROL && same(row.1, shape))
+                .map(|row| row.2);
+            println!(
+                "{:<16}{:<18}{:>8}{:>7}{:>9.1}%{:>8.1}x{:>11.4}{:>12.1}{:>9}",
+                rung.name(),
+                shape,
+                tiles(shape.m, shape.n, rung.block_n),
+                waves,
+                100.0 * efficiency,
+                reuse,
+                milliseconds,
+                tflops(shape, milliseconds),
+                match reference {
+                    Some(before) => format!("{:+.1}%", 100.0 * (before / milliseconds - 1.0)),
+                    None => "—".to_string(),
+                }
+            );
+        }
+    }
+
+    println!(
+        "\n3. the traversal width at the widest rung, at {SWEEP}.\n\
+         GROUP = {GROUP} was measured at [256,128] (#89) and a wider pair tile halves\n\
+         tiles_n and changes a wave's cluster count, so carrying it across would assume\n\
+         the answer. The [256,128] row is the control."
+    );
+    println!(
+        "{:<16}{:>8}{:>11}{:>11}{:>9}{:>12}{:>12}",
+        "rung", "group", "wave rows", "wave cols", "reuse", "min ms", "TFLOP/s"
+    );
+    for rung in [CONTROL, SHIPPED] {
+        let cap = rung.max_clusters(per_sm);
+        for group in TILE_GROUPS {
+            let plan = Plan {
+                scheduler: Scheduler::Static,
+                group,
+                rung,
+            };
+            eprintln!(
+                "{SWEEP} on {} at group {group}: staging and checking",
+                rung.name()
+            );
+            let (_, timings) = run(context, SWEEP.m, SWEEP.n, SWEEP.k, plan, time)?;
+            let milliseconds = timings.min();
+            let (rows, columns, _, reuse) = wave_reuse(SWEEP.m, SWEEP.n, group, rung.block_n, cap);
+            println!(
+                "{:<16}{:>8}{:>11}{:>11}{:>8.1}x{:>12.4}{:>12.1}",
+                rung.name(),
+                group,
+                rows,
+                columns,
+                reuse,
+                milliseconds,
+                tflops(SWEEP, milliseconds)
+            );
+        }
+    }
+
+    println!(
+        "\n4. against cuBLASLt on the same device in the same container — the denominator,\n\
+         and the drift control (#98) that says how much of a delta above is the session."
+    );
+    println!(
+        "{:<18}{:>14}{:>14}{:>16}{:>16}",
+        "shape", "cuBLASLt ms", "theirs TF/s", "#102/theirs", "shipped/theirs"
+    );
+    for &shape in &HEADLINE {
+        let Some(baseline) = baseline else {
+            println!(
+                "no cuBLASLt column: built without --features cublas. modal_app.py::bench\n\
+                 turns it on, and a ratio is the point of this table."
+            );
+            break;
+        };
+        eprintln!("{shape}: staging and checking {}", baseline.name);
+        let theirs = (baseline.bench)(context, shape)?.0.min();
+        let at = |rung: Rung| {
+            measured
+                .iter()
+                .find(|row| row.0 == rung && same(row.1, shape))
+                .map(|row| row.2)
+        };
+        println!(
+            "{:<18}{:>14.4}{:>14.1}{:>16}{:>16}",
+            shape,
+            theirs,
+            tflops(shape, theirs),
+            match at(CONTROL) {
+                Some(ours) => format!("{:.3}", theirs / ours),
+                None => "—".to_string(),
+            },
+            match at(SHIPPED) {
+                Some(ours) => format!("{:.3}", theirs / ours),
+                None => "—".to_string(),
+            }
+        );
+    }
+    Ok(())
 }
 
 /// The traversal sweep — `cargo oxide run kittens-examples -- bench swizzle`,
@@ -1362,6 +2144,7 @@ pub fn swizzle(
             Plan {
                 scheduler: Scheduler::Static,
                 group,
+                rung: SHIPPED,
             },
         )?;
         let clc_ms = timed(
@@ -1370,9 +2153,11 @@ pub fn swizzle(
             Plan {
                 scheduler: Scheduler::Stealing,
                 group,
+                rung: SHIPPED,
             },
         )?;
-        let (rows, columns, distinct, reuse) = wave_reuse(SWEEP.m, SWEEP.n, group);
+        let (rows, columns, distinct, reuse) =
+            wave_reuse(SWEEP.m, SWEEP.n, group, BLOCK_N, MAX_CLUSTERS);
         println!(
             "{:<8}{:>11}{:>11}{:>12.2}{:>8.1}x{:>12.4}{:>12.1}{:>12.4}{:>12.1}",
             group,
@@ -1416,7 +2201,15 @@ pub fn swizzle(
                     Scheduler::Stealing => clc_ms,
                 });
             }
-            timed(context, shape, Plan { scheduler, group })
+            timed(
+                context,
+                shape,
+                Plan {
+                    scheduler,
+                    group,
+                    rung: SHIPPED,
+                },
+            )
         };
 
     println!(
@@ -1469,9 +2262,9 @@ pub fn swizzle(
     for &shape in crate::bench::GEMM_FOOTPRINT_SIZES {
         let row_major = measured(shape, 1, Scheduler::Static)?;
         let grouped = measured(shape, best, Scheduler::Static)?;
-        let (_, columns) = tile_grid(shape.m, shape.n);
-        let (_, _, _, was) = wave_reuse(shape.m, shape.n, 1);
-        let (_, _, _, now) = wave_reuse(shape.m, shape.n, best);
+        let (_, columns) = tile_grid(shape.m, shape.n, BLOCK_N);
+        let (_, _, _, was) = wave_reuse(shape.m, shape.n, 1, BLOCK_N, MAX_CLUSTERS);
+        let (_, _, _, now) = wave_reuse(shape.m, shape.n, best, BLOCK_N, MAX_CLUSTERS);
         println!(
             "{:<18}{:>9}{:>8.1}x{:>12.4}{:>12.1}{:>8.1}x{:>12.4}{:>12.1}{:>9.1}%",
             shape,

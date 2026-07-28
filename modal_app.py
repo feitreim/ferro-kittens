@@ -25,6 +25,11 @@ Local usage:
     modal run modal_app.py::bench --case gemm-depth
                                       # one table of that sweep; --m/--n/--k
                                       # narrows it further to a single row
+    modal run modal_app.py::bench --case swizzle
+                                      # gemm's item traversal, tile held fixed
+    modal run modal_app.py::bench --case tile
+                                      # gemm's pair tile and pipeline depth,
+                                      # traversal held fixed (#87)
     modal run modal_app.py::profile   # one launch under Nsight Compute (see
                                       # the note there: no counters on Modal)
     modal run modal_app.py::doctor    # env / GPU sanity check

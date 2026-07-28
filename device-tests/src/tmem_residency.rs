@@ -197,6 +197,23 @@ const GEMM_PLAN_TWO: u32 = GEMM_PLAN + 8_192;
 /// different answers, so both steps get counted.
 const GEMM_PLAN_ONE: u32 = GEMM_PLAN + 49_152;
 
+/// #87's four built rungs, as the shared plans their launches declare.
+///
+/// Spelled here rather than imported for the same reason [`GEMM_SHARED`] is —
+/// `device-tests` does not depend on the examples crate — and they are the
+/// arithmetic `examples/src/gemm.rs`'s `shared_plan` states: two operand rings
+/// `stages` deep over a `[128, 64]` `A` tile and a `[block_n / 2, 64]` `B`
+/// tile, bf16, plus the barrier and work-queue tail.
+///
+/// The last two are why this file gained a 256-column cluster rung. 65 608 B
+/// admits three CTAs an SM and 256 accumulator columns admit two, so that is
+/// the first envelope here where **tensor memory** and not shared memory is
+/// what caps a kernel.
+const TILE_N128_S2: u32 = 49_224;
+const TILE_N128_S4: u32 = 98_408;
+const TILE_N256_S2: u32 = 65_608;
+const TILE_N256_S3: u32 = 98_392;
+
 /// How far the achieved hold may sit under [`HOLD_NS`] before the harness
 /// calls the spin broken rather than the residency low. A CTA that exited on
 /// [`CENSUS_SPIN_GUARD`](crate::CENSUS_SPIN_GUARD) instead of on the clock
@@ -395,6 +412,57 @@ fn rungs() -> Vec<Rung> {
             true,
             GEMM_PLAN_ONE
         ),
+        // #87's tile and depth sweep, at the envelopes its four built rungs
+        // actually declare. The sweep prints a *predicted* residency from the
+        // same `min(512 / columns, shared per SM / plan)` these rows count, and
+        // a throughput table whose occupancy column was predicted rather than
+        // counted is a table that cannot tell a tile effect from a residency
+        // one.
+        //
+        // The last two are the reason this block exists. `[256, 256]` allocates
+        // 256 columns, which admit **two** CTAs an SM — and at two stages its
+        // 65 608 B plan admits three, so it is the first envelope in this repo
+        // where tensor memory is the tighter resource rather than shared
+        // memory. `budget` already computes the `min` of the two; this is the
+        // first rung where the two arguments differ in that direction, so it is
+        // also the first time that half of the formula is on trial.
+        rung!(
+            "#87 [256,128] s2",
+            residency_census_cluster_128,
+            Some(128),
+            2,
+            true,
+            TILE_N128_S2
+        ),
+        rung!(
+            "#87 [256,128] s4",
+            residency_census_cluster_128,
+            Some(128),
+            2,
+            true,
+            TILE_N128_S4
+        ),
+        rung!(
+            "#87 [256,256] s2",
+            residency_census_cluster_256,
+            Some(256),
+            2,
+            true,
+            TILE_N256_S2
+        ),
+        // The plan `gemm_cg2` declares since #87 — the shipped envelope, and
+        // the row that has to be right for the persistent grid to be sized
+        // correctly. The three `gemm plan` rows above it are the envelope it
+        // shipped through #102, kept because #98's occupancy prices are quoted
+        // against them.
+        rung!(
+            "#87 [256,256] s3 (gemm)",
+            residency_census_cluster_256,
+            Some(256),
+            2,
+            true,
+            TILE_N256_S3
+        ),
     ]
 }
 
@@ -470,6 +538,9 @@ fn census(
             }
             (2, Some(128), true) => {
                 module.residency_census_cluster_128(stream, config, HOLD_NS, &mut out)?
+            }
+            (2, Some(256), true) => {
+                module.residency_census_cluster_256(stream, config, HOLD_NS, &mut out)?
             }
             (2, Some(512), true) => {
                 module.residency_census_cluster_512(stream, config, HOLD_NS, &mut out)?
