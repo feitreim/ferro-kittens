@@ -51,6 +51,11 @@ struct Example {
     status: &'static str,
     threads: u32,
     shared_bytes: usize,
+    /// The PTX entry name, for the occupancy query — `None` for a kernel the
+    /// query cannot describe. `cuOccupancyMaxActiveBlocksPerMultiprocessor`
+    /// takes a block shape and no cluster, so a `#[cluster_launch]` kernel
+    /// would get an answer about a launch it never performs.
+    entry: Option<&'static str>,
 }
 
 /// `mut` is used only when an aspirational feature is on, which is the default
@@ -63,12 +68,14 @@ fn examples() -> Vec<Example> {
             status: "runs",
             threads: gemm::THREADS,
             shared_bytes: gemm::SHARED_BYTES,
+            entry: None,
         },
         Example {
             name: "softmax",
             status: "runs",
             threads: softmax::THREADS,
             shared_bytes: softmax::SHARED_BYTES,
+            entry: Some("softmax_rows"),
         },
         Example {
             name: "layernorm",
@@ -79,6 +86,7 @@ fn examples() -> Vec<Example> {
             },
             threads: layernorm::THREADS,
             shared_bytes: layernorm::SHARED_BYTES,
+            entry: Some("layernorm_rows"),
         },
     ];
     #[cfg(feature = "flash")]
@@ -87,8 +95,49 @@ fn examples() -> Vec<Example> {
         status: "aspirational (#31)",
         threads: flash_forward::THREADS,
         shared_bytes: flash_forward::SHARED_BYTES,
+        entry: None,
     });
     examples
+}
+
+/// Blocks per SM the driver says each kernel's own launch envelope admits, and
+/// the warps that comes to.
+///
+/// A register count off `ptxas` is half an occupancy argument; this is the
+/// other half, and it is the half that depends on the launch rather than on the
+/// code. #47 is the reason it is printed: a kernel can be slow because it is
+/// waiting, or because too few of it fit on an SM to have anything to wait
+/// *with*, and those want opposite fixes. The driver is asked rather than the
+/// arithmetic reproduced here, because the shared-memory carveout it picks is
+/// its own business and not a number this file can derive.
+fn occupancy(context: &std::sync::Arc<cuda_core::CudaContext>) {
+    let Ok(module) = cuda_host::load_embedded_module(context, env!("CARGO_PKG_NAME")) else {
+        return;
+    };
+    println!("\noccupancy at each kernel's own launch envelope, per SM:");
+    println!(
+        "{:<16}{:>8}{:>14}{:>12}{:>11}",
+        "kernel", "threads", "shared", "blocks/SM", "warps/SM"
+    );
+    for example in examples() {
+        let blocks = example.entry.and_then(|entry| {
+            let function = module.load_function(entry).ok()?;
+            function
+                .max_active_blocks_per_multiprocessor(example.threads, example.shared_bytes as u32)
+                .ok()
+        });
+        let (blocks, warps) = match blocks {
+            Some(blocks) => (
+                blocks.to_string(),
+                (blocks * example.threads / 32).to_string(),
+            ),
+            None => ("cluster".to_string(), "—".to_string()),
+        };
+        println!(
+            "{:<16}{:>8}{:>12} B{:>12}{:>11}",
+            example.name, example.threads, example.shared_bytes, blocks, warps
+        );
+    }
 }
 
 /// Every kernel with a launcher, run and checked. `Err` is a wrong number and
@@ -133,6 +182,8 @@ fn main() -> ExitCode {
         println!("\nno CUDA device: kernels built, not run");
         return ExitCode::SUCCESS;
     };
+
+    occupancy(&context);
 
     println!();
     let mut failures = 0usize;

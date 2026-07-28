@@ -15,12 +15,52 @@
 //! It used to write the `[16, 16]` block-composition loop twice, once per
 //! direction, for want of a band-shaped mover. [`kittens::ldst::load_tile`] and
 //! [`kittens::ldst::store_tile`] (#22) are that mover, and the two loops are
-//! gone: the body below is four calls and four lines of arithmetic.
+//! gone: the body below is calls and arithmetic.
 //!
 //! Note what is *not* in that list, and never was: nothing about layouts,
 //! swizzles, semaphores, the fragment map, or the arithmetic. The missing
 //! surface was shallow and wide, not deep, and this is the example that said so
 //! first.
+//!
+//! ## Why it walks the row in chunks (#47)
+//!
+//! The body used to hold a whole `[32, 128]` band — 128 fp32 a thread — and
+//! say the algorithm in three lines over it. It computed the right answer at
+//! 367 GB/s, and the reason was not the memory protocol the issue blamed:
+//! `ptxas` never put that band in registers. It priced the kernel at **39
+//! registers and a 1024-byte stack frame**, which is the same table's way of
+//! saying the band is in *local* memory, and every pass over it was a
+//! round trip to the same hierarchy the TMA was already saturating.
+//!
+//! [`CHUNK`] is the fix and it is one number: the row is walked 32 columns at
+//! a time, which the register ladder says is the widest `[32, N]` rung `ptxas`
+//! gives a zero stack frame. The reductions carry across chunks instead of
+//! being taken over one wide band, and the launch geometry — one `[128, 128]`
+//! tile per CTA, one TMA in, one TMA out, both waited on — is untouched, so
+//! what changed between the two numbers is only where the band lives. It is
+//! 66 registers on a 256-byte frame now, and 367 → 952 GB/s.
+//!
+//! Three things the issue proposed are ruled out by that, and they are worth
+//! naming because each would have been a much larger change:
+//!
+//! - **Occupancy did not move.** `cuOccupancyMaxActiveBlocksPerMultiprocessor`
+//!   (printed by `main`) says 6 blocks and 24 warps an SM, and it said the
+//!   same before: shared memory caps this kernel at 6 either way, and neither
+//!   39 nor 66 registers a thread is what binds it. The 2.6× arrived with
+//!   occupancy held constant.
+//! - **Nothing was put in flight.** There is still exactly one TMA load and
+//!   one TMA store per CTA, and both still block — the same `tma_store_wait`
+//!   rather than `tma_store_wait_read`, the same one-deep barrier. The six
+//!   resident CTAs were always six loads in flight per SM.
+//! - **The floor was not the launch.** It is 23.0 µs at two blocks now, and
+//!   the GEMM's floor at two blocks is 22.3 µs. What is left is a cost every
+//!   launch on this harness pays, and it is not this kernel's to fix.
+//!
+//! What is left over is stated rather than hoped for: 952 GB/s is still well
+//! under HBM, and it is not instruction issue either — see the note on
+//! `div_row` below, which is the control for that. At 24 of 64 warp slots,
+//! shared-memory-capped, the next lever is bytes per CTA, and that is a launch
+//! geometry change and a different issue.
 //!
 //! ## What the numbers can prove
 //!
@@ -36,6 +76,13 @@
 //! which is the one row error this seed used to reproduce exactly rather than
 //! catch (#56); [`permutation`] carries that argument and states what is left
 //! over.
+//!
+//! The column walk [`CHUNK`] introduced is under that check and not merely
+//! beside it, and the control says so rather than the argument: pinning the
+//! third pass's `column` to 0 — every chunk of a row written from the first
+//! 32 columns — fails 65,408 of the check's 65,536 cells, by up to a relative
+//! 1.0 against a 3.9e-3 tolerance. The check the seed was strengthened for
+//! (#56, #61) sees a misplaced *column* exactly as loudly as a misplaced row.
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
@@ -47,7 +94,7 @@ use crate::bench::{Shape, Timings, time};
 use std::error::Error;
 
 use kittens::ldst::{load_tile, store_tile};
-use kittens::reg::{BaseLdtm, RegTile};
+use kittens::reg::{BaseLdtm, RegTile, RegVec};
 use kittens::shared::{Bf16, SharedTile, Swizzle128B, tma_store_commit, tma_store_wait};
 use kittens::sync::Semaphore;
 
@@ -55,10 +102,24 @@ use kittens::sync::Semaphore;
 const ROWS: usize = 128;
 /// Columns the softmax runs over. One row of the tile is one distribution.
 const COLUMNS: usize = 128;
+/// Columns a warp holds in registers at once, and the whole of #47.
+///
+/// A `[32, N]` band is `N` fp32 a thread, and `ptxas` stops promoting one to
+/// registers long before it stops compiling: on the register ladder
+/// (`modal run modal_app.py::regcount`) `[32, 32]` is the widest rung with a
+/// **zero** stack frame, and every wider one keeps the band addressable in
+/// local memory instead — `[32, 128]`, which this kernel used to hold whole,
+/// at 1024 bytes a thread. So the row is walked four chunks at a time and the
+/// reductions carry across them.
+const CHUNK: usize = 32;
+/// Chunks a row is walked in.
+const CHUNKS: usize = COLUMNS / CHUNK;
 
 type Tile = SharedTile<Bf16, ROWS, COLUMNS, Swizzle128B>;
-/// One warp's 32 rows of it.
-type Band = RegTile<32, COLUMNS, BaseLdtm>;
+/// One warp's 32 rows by [`CHUNK`] columns of it.
+type Band = RegTile<32, CHUNK, BaseLdtm>;
+/// A per-row scalar of those 32 rows — the maximum, then the denominator.
+type Rows = RegVec<32, BaseLdtm>;
 
 pub const SHARED_BYTES: usize = Tile::BYTES + 32;
 pub const THREADS: u32 = (ROWS / 32) as u32 * 32;
@@ -103,17 +164,51 @@ pub mod kernels {
             thread::sync_threads();
 
             let chunks = tile.chunk_writer();
-            let x: Band = load_tile(chunks, row_base, 0, lane);
 
-            // The whole algorithm, in the real API. `row_max`/`row_sum` (#6)
-            // fold a thread's own 32 values and then the quad holding the rest
-            // of the row; the broadcasts back down each row are shuffle-free,
-            // because the fragment map already gives a thread every one of its
-            // rows' values.
-            let x = x.sub_row(x.row_max()).exp2();
-            let x = x.div_row(x.row_sum());
+            // Three passes over the shared tile, each holding one [`CHUNK`]-wide
+            // band at a time. `row_max`/`row_sum` (#6) fold a thread's own
+            // values and then the quad holding the rest of the chunk, and a
+            // chunk's quad is the same four lanes whatever the chunk, so the
+            // per-chunk results combine slotwise with no shuffle of their own.
+            let mut peak = Rows::splat(f32::NEG_INFINITY);
+            let mut chunk = 0usize;
+            while chunk < CHUNKS {
+                let x: Band = load_tile(chunks, row_base, (CHUNK * chunk) as u32, lane);
+                peak.max_assign(x.row_max());
+                chunk += 1;
+            }
 
-            store_tile(chunks, row_base, 0, lane, x);
+            let mut total = Rows::splat(0.0);
+            chunk = 0;
+            while chunk < CHUNKS {
+                let x: Band = load_tile(chunks, row_base, (CHUNK * chunk) as u32, lane);
+                total.add_assign(x.sub_row(peak).exp2().row_sum());
+                chunk += 1;
+            }
+
+            // The third pass re-reads the input and recomputes `exp2` rather
+            // than keeping the second pass's result: the tile is bf16, so
+            // parking the numerator there and dividing it afterwards would
+            // round twice and spend the whole 2⁻⁸ tolerance on doing so. The
+            // exponential is arithmetic and the round trip is memory.
+            //
+            // `div_row` is one `div.rn.f32` for each of a thread's 128 values,
+            // and there is no fast-math flag on this build to make it anything
+            // cheaper. Reciprocating per *row* instead — `total.recip()` then
+            // `mul_row`, four divides a thread rather than 128 — was measured
+            // and is not here because it did not pay: 952.5 against 952.1 GB/s
+            // at the largest size, and 622 against 647 in the middle of the
+            // sweep. That is the control on what binds this kernel now.
+            // Removing 124 of every 128 divides is worth nothing, so the
+            // remaining distance to HBM is not instruction issue.
+            chunk = 0;
+            while chunk < CHUNKS {
+                let column = (CHUNK * chunk) as u32;
+                let x: Band = load_tile(chunks, row_base, column, lane);
+                let x = x.sub_row(peak).exp2().div_row(total);
+                store_tile(chunks, row_base, column, lane, x);
+                chunk += 1;
+            }
             // `stmatrix` writes through the generic proxy; the TMA engine reads
             // through the async one.
             fence_proxy_async_shared_cta();
@@ -311,7 +406,7 @@ fn run<T>(
     const TOLERANCE: f32 = 1.0 / 256.0;
 
     // One CTA owns a whole `ROWS` band and the kernel bounds-checks nothing.
-    if rows % ROWS != 0 || planes == 0 {
+    if !rows.is_multiple_of(ROWS) || planes == 0 {
         return Err(
             format!("{rows} rows x {planes} planes does not divide {ROWS} rows a CTA").into(),
         );
@@ -373,6 +468,11 @@ fn run<T>(
                 let expected = (weight[permutation(plane, row, column)] / total) as f32;
                 let error = (value - expected).abs() / expected;
                 worst = worst.max(error);
+                // Negated rather than `error > TOLERANCE`, and that is the
+                // point: a NaN compares false either way, so only this spelling
+                // counts one as wrong. A kernel that wrote NaN passing its own
+                // check is the failure mode worth spending a lint allow on.
+                #[allow(clippy::neg_cmp_op_on_partial_ord)]
                 if !(error <= TOLERANCE) {
                     wrong += 1;
                     if sample.len() < 8 {

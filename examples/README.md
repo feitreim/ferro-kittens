@@ -39,7 +39,11 @@ reference *before* it is timed — there is no path through `bench.rs` that prin
 a throughput figure for a launch it did not verify. The metric follows what the
 kernel is bound by, TFLOP/s for the GEMM and GB/s for the memory-bound softmax,
 and the sizes are picked to cross a regime rather than to be large, so what the
-table shows is the shape of a curve and not one headline number.
+table shows is the shape of a curve and not one headline number. The shape of
+that curve is what produced **#47**, the first performance finding this project
+got from measuring rather than from reading ThunderKittens — and it is written
+up under the register ladder below, because that is where the cause turned out
+to be.
 
 Nothing on the remaining lists is arithmetic, and nothing on them is a mover.
 #5 and #6 between them closed every elementwise op and every reduction the four
@@ -317,6 +321,66 @@ advice, and at the one shape flash actually uses (`[32, 128]`) it is still
 worth 84 registers. It is advice about a shape, though, and not a law — and
 whether an in-place form that trades 220 registers for a local-memory band is
 faster is a question `ptxas` cannot answer and a timed kernel can.
+
+#### the timed kernel answered it — #47
+
+**A local-memory band costs 2.6× on a real kernel.** #47 was filed as a
+latency problem: `softmax` held a flat ~51 µs floor out to 64 blocks and
+saturated at 362 GB/s, and the issue read "nothing is ever in flight" off the
+kernel's one blocking TMA load and one blocking TMA store. The register table
+says otherwise before any device is involved, and this is the reading the
+sweep above exists to make possible — `regcount` now prices the examples crate
+as well as the harness:
+
+| `softmax_rows` | regs | spill | stack |
+| --- | --- | --- | --- |
+| `[32, 128]` band, whole row at once | 39 | — | **1024** |
+| `[32, 32]` band, row walked in four | 66 | — | 256 |
+
+39 registers cannot hold 128 fp32, and the frame beside them is where they
+were: `ptxas` never promoted the band. The register column on its own reads
+that as the *cheapest* kernel in the file, which is exactly the trap the stack
+frame is printed to catch.
+
+Walking the row 32 columns at a time — the widest `[32, N]` rung above with a
+zero frame — and carrying `row_max`/`row_sum` across the chunks is the whole
+change. The launch geometry, the barrier protocol, and both TMA waits are
+untouched, so it is a controlled swap of where the band lives:
+
+| rows × 128 × 2 planes | blocks | before, GB/s | after, GB/s |
+| --- | --- | --- | --- |
+| 128 | 2 | 2.5 | 5.7 |
+| 512 | 8 | 10.2 | 22.4 |
+| 4096 | 64 | 81.2 | 174.8 |
+| 32768 | 512 | 280.6 | 646.9 |
+| 262144 | 4096 | 346.9 | 922.9 |
+| 524288 | 8192 | 367.1 | **952.1** |
+
+Every size checked before it was timed, on the same B200 in the same session.
+The flat floor went with it: 52.3 µs → 23.0 µs at two blocks, against the
+GEMM's own 22.3 µs at two blocks. What is left there is a fixed cost every
+launch on this harness pays, not something `softmax` does.
+
+Three controls, because a number that moves is not yet an explanation.
+**Occupancy did not change**: `main` now prints
+`cuOccupancyMaxActiveBlocksPerMultiprocessor` per kernel, which says 6 blocks
+and 24 warps an SM, and shared memory caps it at 6 either way — neither 39 nor
+66 registers a thread is the binding constraint. (The same table reads 2 blocks
+for `layernorm_rows` at nearly identical shared memory, which is its 255
+registers, so the query is demonstrably register-sensitive and the 6 is not a
+constant.) **It is not instruction issue either**: replacing `div_row`'s 128
+`div.rn.f32` a thread with one `recip` per row and a `mul_row` — four divides
+instead of 128 — measured 952.5 against 952.1 GB/s, and slightly *worse* in the
+middle of the sweep, so it is not in the tree. And **the check sees the column
+walk the change introduced**: pinning the third pass to column 0 fails 65,408
+of the check's 65,536 cells by up to a relative 1.0.
+
+So the issue named the right symptom and the wrong cause, and the residual is
+worth stating rather than rounding off. 952 GB/s is still well under HBM, it is
+not latency (nothing was put in flight and it went 2.6× faster), and it is not
+issue (the reciprocal control). At 24 of 64 warp slots, shared-memory-capped,
+what is left points at bytes per CTA — which is a launch-geometry change and a
+different issue.
 
 **#6 — reductions. Landed.** `row_reduce`/`col_reduce`/`tile_reduce` over a
 `ReduceOp` (a `BinaryOp` with an identity), with `row_max`/`row_min`/`row_sum`/`row_prod`, the `col_*` mirrors,
