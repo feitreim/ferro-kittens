@@ -1800,6 +1800,67 @@ can build does not require a devel CUDA toolkit to link, and
 offsets against the real headers under `-fsyntax-only` in the CPU gate, so a
 wrong constant fails there rather than on a B200.
 
+##### and the hardware's own scheduler, which does not pay for itself (#88)
+
+Blackwell has a work-stealing scheduler in silicon. `clusterlaunchcontrol.try_cancel`
+launches a full grid — one cluster per output tile — and a cluster that finishes
+*cancels* one the scheduler has not launched yet and runs its tile instead.
+`pipeline::run_stealing` is that, behind the same `Job` the static stride uses,
+and it exists for a reason that is not speed: **the grid becomes the problem's
+own tile count, so `SMS` and `CTAS_PER_SM` have nothing left to do.** #84
+established that the second of those is measured and underivable, so a persistent
+grid picked from it is right for a B200 and cannot be known to be right for
+anything else.
+
+The ceiling was stated before it was built, and it is the ragged last wave the
+capped grid idles through. Min ms over 30 timed launches, all three schedulers on
+**one shared plan** — the static path carries the 24 unused bytes of the work
+queue too, so what follows compares schedules and not residencies:
+
+| shape | tiles | waves | wave eff | predicted | static | clc (prefetched) | clc (serial) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2048³ | 128 | 1 | 57.7% | 42.3% | 0.0361 | 0.0371 | 0.0362 |
+| 4096³ | 512 | 3 | 76.9% | 23.1% | 0.1517 | 0.1503 | **0.1497** |
+| 8192³ | 2048 | 10 | 92.3% | 7.7% | 0.9075 | 0.9015 | **0.8974** |
+| 16384³ | 8192 | 37 | 99.7% | 0.3% | 6.9275 | 7.3399 | **6.7643** |
+
+**The predicted gain does not arrive.** Where the model says 23% the measurement
+says 1.3%; where it says 7.7% it says 1.1%. The model is not wrong about the
+idle clusters — it is wrong that they are the term that matters. #90 and #94
+priced the *item boundary* at 18–30 µs per output tile and 20–36% of the launch,
+and a dynamic schedule does not remove a single item boundary. It moves which
+cluster pays them. The one number the ragged-wave model does predict correctly is
+16384³'s nothing, and it is right there for the wrong reason.
+
+**Prefetching the steal is a regression, and #88 predicted the opposite.** The
+response arrives on an mbarrier, so the request can be issued before the current
+item's MMA and harvested after — the latency hides, and "a steal on the critical
+path would be a regression" is what the issue expected. It is backwards at all
+four sizes, by 8.5% at 16384³ (7.3399 against 6.7643), which is far outside the
+0.6% this file's own numbers repeat to. The plausible mechanism is that
+prefetching makes every cluster claim its next tile *before* finishing its
+current one, so the order tiles are handed out in stops tracking the order
+clusters actually become free — which is the tail problem CLC is for,
+reintroduced by the optimization meant to hide its latency. That is a hypothesis
+with one measurement behind it, not a finding.
+
+What is left is real but small: the serial steal is 1.1–2.4% ahead of the static
+stride at the three large sizes, which is at the edge of what this file can
+resolve. **So CLC's case here is portability and not throughput**, and it should
+be adopted on that basis or not at all.
+
+`device-tests`' **`clc work stealing`** is what says the mechanism does what the
+scheduler assumes, asked of the instruction rather than of a GEMM built on it.
+Over a 4096-cluster grid: **2222 clusters ran and 1874 were cancelled and never
+launched — 4096 exactly, each cluster once.** Both ranks of every cluster were
+told the same thing, and every stolen coordinate was cluster-aligned. Each rank
+waits on a deadline rather than on the barrier, so the failure this case exists
+to catch reports itself instead of hanging — which matters, because the two
+questions it settles both fail silently. It also settles a polarity that
+`cuda_device::clc` documents two ways: `is_canceled == 1` means *work is
+available*, as the function's own doc says and its module-level usage example
+does not.
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all

@@ -83,13 +83,14 @@
 //! item count at all, and how many clusters are *resident* is a thing the
 //! hardware decides rather than a number this repo writes down.
 //!
-//! **What it is worth, stated before the argument for it.** The static stride's
-//! only loss is the ragged last wave, and at `MAX_CLUSTERS = 222` with the
-//! GEMM's `[256, 128]` tiles that is 23% at 4096³, 8% at 8192³ and **0.3% at
-//! 16384³**. At the sizes a peak-throughput claim would be made on, the static
-//! stride is already 99.7% efficient and there is nothing here to win. This is
-//! a fix for mid-sized problems and ragged tails and it is not a route to peak;
-//! a measurement showing nothing at 16384³ is the predicted result.
+//! **What it is worth, and what it turned out to be worth.** The static
+//! stride's only loss is the ragged last wave, and at `MAX_CLUSTERS = 222` with
+//! the GEMM's `[256, 128]` tiles that is 23% at 4096³, 8% at 8192³ and 0.3% at
+//! 16384³. Measured, it is **1.3%, 1.1% and 2.4%** — the model is not wrong
+//! about the idle clusters, it is wrong that they are the term that matters.
+//! #90 and #94 priced the *item boundary* at a fifth to a third of the launch,
+//! and a dynamic schedule removes no item boundaries at all; it only moves
+//! which cluster pays them. `examples/README.md` §7 carries the table.
 //!
 //! **The reason to want it anyway is that it deletes the constants.** Picking a
 //! persistent grid needs `SMS` and `CTAS_PER_SM`, and #84 established that the
@@ -110,17 +111,28 @@
 //! item is a fact the cluster agrees on by construction rather than by a
 //! rendezvous someone has to remember to write.
 //!
-//! ## The steal is prefetched, because it is allowed to be
+//! ## The steal can be prefetched, and should not be
 //!
 //! The response arrives on an mbarrier, so the request does not have to be
-//! anywhere near the point the answer is needed. [`run_stealing`] issues the
+//! anywhere near the point the answer is needed. `PREFETCH = true` issues the
 //! request for the *next* item before the current item's `work` runs and
-//! harvests it after — the whole of a tile's K pipeline sits between the
-//! `try_cancel` and the wait, and a steal on the critical path never happens.
-//! `PREFETCH` is a const parameter rather than a hard-coded `true` so that the
-//! critical-path form is a thing that can be *run* rather than a claim: it is
-//! the same loop with the request moved next to the harvest, identical in
-//! barrier count, differing in exactly the one thing under test.
+//! harvests it after, putting a whole tile's K pipeline between the
+//! `try_cancel` and the wait so that no steal is ever on the critical path.
+//! #88 expected that to be the fast form and the critical-path form to be a
+//! regression.
+//!
+//! **It is the other way round, at every size measured.** `examples/README.md`
+//! §7 has the table; the gap is 8.5% at 16384³, against numbers that repeat to
+//! 0.6%. The mechanism is not the latency — it is that prefetching makes every
+//! cluster claim its next tile *before* finishing its current one, so the order
+//! tiles are handed out in stops tracking the order clusters become free. That
+//! is the ragged tail this whole mechanism exists to fix, reintroduced by the
+//! optimization meant to hide its latency.
+//!
+//! `PREFETCH` stays a const parameter for now so the surprising row can be
+//! reproduced rather than taken on trust. It is one measurement, and the honest
+//! end state is to delete `true` and keep the serial form — not to carry a knob
+//! whose answer is known.
 //!
 //! ## What orders a read of the response against the next request
 //!
