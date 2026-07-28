@@ -174,6 +174,14 @@ def build() -> None:
     here; the B200 function is for running, not for finding typos."""
     _run(["cargo", "clippy", "--features", "host", "--all-targets"], cwd=PROJECT_DIR)
     _run(["cargo", "test", "--features", "host"], cwd=PROJECT_DIR)
+    # Docs link to `global`'s types from all over the crate, and those types
+    # exist only under `host`. CI's device-only `cargo doc` allows the dangling
+    # links (see lib.rs); this is the build where they must actually resolve.
+    _run(
+        ["env", "RUSTDOCFLAGS=-D warnings",
+         "cargo", "doc", "--no-deps", "--features", "host"],
+        cwd=PROJECT_DIR,
+    )
     # The harness only typechecks where cuda.h is, so its lints live here too.
     _run(["cargo", "clippy", "--all-targets"], cwd=HARNESS_DIR)
     # `build` (unlike `run`) does not auto-detect the GPU arch, and tcgen05

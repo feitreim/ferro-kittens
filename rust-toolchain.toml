@@ -3,4 +3,4 @@
 # local tooling and the GPU builds agree.
 [toolchain]
 channel = "nightly-2026-04-03"
-components = ["rust-src", "rust-analyzer", "clippy"]
+components = ["rust-src", "rust-analyzer", "clippy", "rustfmt"]
