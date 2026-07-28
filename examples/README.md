@@ -1589,6 +1589,93 @@ the operand stream and asked which of HBM and L2 to attack; the answer is that
 on a kernel whose steady state is already at 67% of dense peak. The tile sweep
 that was queued behind this answer should stay queued behind #15 and #89 too.
 
+##### and a third of that boundary was one instruction — #91
+
+The section above priced the boundary and named its parts: the accumulator
+drain, `LDTM`, and `store_rows`' scattered scalar fp32 stores. The third part
+was the cheapest to remove.
+
+`BaseLdtm` puts a thread's four values of a 16-column block at column offsets
+`{0, 1, 8, 9}` — **two adjacent pairs**. So every even/odd value pair is one
+`st.global.v2.f32`, and a `[128, 128]` accumulator band drops from 512 scalar
+stores a lane to 256 paired ones. The pairing is stated on the layout
+(`ColLayout::CONTIGUOUS_VALUES`, default `1`) rather than read off `BaseLdtm`'s
+arithmetic in the mover, because #23 opened the shape set and a layout written
+later must not silently inherit stores that assume this formula.
+
+**The prediction this makes is specific, and it is what makes the result
+evidence rather than a throughput delta:** if the change hit the fixed per-tile
+cost and nothing else, then in the depth sweep's fit **the intercept moves and
+the slope does not.** Refitted by least squares on raw minimum milliseconds,
+over the same three point selections §7 reports, both trees measured in the same
+session pair on one B200:
+
+| points | fixed ms before → after | per tile µs | steady TFLOP/s before → after |
+| --- | ---: | ---: | ---: |
+| K = 8192, 32768 | 0.2778 → **0.1783** | 27.8 → **17.8** | 1481 → 1515 |
+| K = 2048, 8192, 32768 | 0.3299 → **0.1845** | 33.0 → **18.4** | 1511 → 1519 |
+| all four | 0.3598 → **0.1981** | 36.0 → **19.8** | 1530 → **1527** |
+
+**The intercept falls 36–45%; the slope moves −0.2% on the four-point fit.**
+The boundary's share of the 8192³ launch goes from 27–35% to **20–22%**.
+
+Two things corroborate it without any fit at all. The measured rows fall in
+exactly the order a fixed cost predicts — the shallower the reduction, the more
+of it the boundary was:
+
+| shape | before ms | after ms | before TFLOP/s | after TFLOP/s | gain |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 256x128x256 | 0.0238 | 0.0171 | — | — | −28% time |
+| 1024³ | 0.0280 | 0.0219 | 76.6 | 98.0 | +28% |
+| 2048³ | 0.0470 | 0.0371 | 365.5 | 463.6 | +27% |
+| 4096³ | 0.1919 | 0.1534 | 716.3 | 895.9 | +25% |
+| 8192³ | 1.0214 | 0.8987 | 1076.4 | **1223.4** | +14% |
+| 16384³ | 7.1955 | 6.8098 | 1222.4 | **1291.7** | +6% |
+
+And §7's item 3 — the small-size floor *is* one item boundary — moves with it:
+256x128x256 is **23.8 µs before and 17.1 µs after**, a 6.7 µs drop against the
+10 µs the fit says a tile's boundary lost. One cluster running one item, with
+nothing to amortize and no fit involved.
+
+Why it is worth more than the halved instruction count suggests: under
+`BaseLdtm` a single scalar store has a warp's 32 lanes writing eight rows of
+`C`, four four-byte words each at columns `0, 2, 4, 6` — **8 sectors carrying 16
+useful bytes each.** The pair store touches *the same eight sectors* and fills
+them. So it halves the instructions and doubles the sector utilization, which is
+why the effect is bigger than "half as many stores" would buy.
+
+**The register column went the other way, and did not decide anything.**
+`gemm_cg2` goes from **40 to 167 registers, with zero spill and an unchanged
+528-byte frame**, which still admits 3 CTAs/SM — 65536 registers an SM over 128
+threads and 3 CTAs leaves 170. That is the fifth time here the register count
+has ordered time backwards (#47, #63, #67, #76). The obvious cause — the inline
+asm's `clobber("memory")` blocking LLVM from sinking the LDTM drain into the
+store loop, which is #63's "register cost is liveness" — **was measured and
+refuted**: deleting both clobbers gives byte-identical counts. What in the asm
+lowering costs the registers is not established. Worth recording because the
+headroom is now thin: 167 against 170, with shared memory already capping
+residency at 3, so both resources are at the limit.
+
+**The alternative was priced and not built.** TMEM → shared → TMA store (#9) is
+the route `softmax` already uses, and `tma_store_wait_read` releases the shared
+buffer as soon as the engine has read it, which is what an overlapping epilogue
+needs. It costs shared memory this kernel does not have. The residency census in
+`device-tests` measures **3 CTAs/SM at 73792 B a CTA against 233472 B an SM** —
+221376 used, leaving **4032 B a CTA** of headroom. One warp's `[32, 128]` fp32
+band is 16384 B and the whole tile is 65536 B, so the staging buffer takes
+residency to **2 CTAs/SM, or 1**. Against a steady state already at 67% of dense
+peak, cutting concurrency by a third to recover a term now worth 20–22% is a
+losing trade — and it was already close *before* this change, at 27–36%.
+
+The one version that could pay reuses an existing ring slot (an `ARing` stage is
+16384 B, exactly one band) so the plan does not grow. That serializes the next
+item's first loads against the store unless the schedule changes with it, which
+makes it a scheduling change entangled with #15 and #88 rather than an epilogue
+change. It also needs plumbing that does not exist: `TensorMapElement` is
+`Bf16`-only, there is no fp32 `SharedTile` swizzle, and `stmatrix` is b16, so
+getting fp32 registers into a swizzled shared tile is plain indexed stores plus
+a proxy fence. Its own issue, queued behind #15 and #89 — not this one.
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all
