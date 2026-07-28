@@ -326,31 +326,39 @@ def _parse_ptxas(log: str) -> dict[str, dict[str, int]]:
     return kernels
 
 
+# Crates that emit PTX, as `(package, directory)`. The harness carries the
+# probes and the ladder; the examples carry the kernels a *launch* configures,
+# and their register and shared-memory counts are what an occupancy argument
+# about a real kernel has to be made of (#47).
+PTX_CRATES = (("device-tests", HARNESS_DIR), ("kittens-examples", EXAMPLES_DIR))
+
+
 def _measure(arch: str) -> dict[tuple[str, str], dict[str, int]]:
-    """Build the harness and price every emitted entry function, keyed by
-    `(ptx file, kernel)`. Building is idempotent, so a caller that wants a
-    *fresh* measurement has to invalidate the artifacts first."""
-    _run([*STUB_ENV, "cargo", "oxide", "build", "device-tests", "--arch", arch], cwd=HARNESS_DIR)
-
-    ptx_files = sorted(Path(HARNESS_DIR).rglob("*.ptx"))
-    if not ptx_files:
-        listing = sorted(p for p in Path(HARNESS_DIR, "target").rglob("*") if p.is_file())
-        raise RuntimeError(
-            "no PTX under the harness target dir; cargo-oxide's artifact layout "
-            f"must have moved. Files found:\n" + "\n".join(map(str, listing[:200]))
-        )
-
+    """Build every PTX-emitting crate and price every emitted entry function,
+    keyed by `(ptx file, kernel)`. Building is idempotent, so a caller that
+    wants a *fresh* measurement has to invalidate the artifacts first."""
     measured: dict[tuple[str, str], dict[str, int]] = {}
-    for ptx in ptx_files:
-        compiled = subprocess.run(
-            ["ptxas", "-v", f"-arch={arch}", "-o", "/dev/null", str(ptx)],
-            capture_output=True,
-            text=True,
-        )
-        if compiled.returncode != 0:
-            raise RuntimeError(f"ptxas failed on {ptx}:\n{compiled.stderr}")
-        for name, counts in _parse_ptxas(compiled.stderr).items():
-            measured[(str(ptx.relative_to(HARNESS_DIR)), name)] = counts
+    for package, directory in PTX_CRATES:
+        _run([*STUB_ENV, "cargo", "oxide", "build", package, "--arch", arch], cwd=directory)
+
+        ptx_files = sorted(Path(directory).rglob("*.ptx"))
+        if not ptx_files:
+            listing = sorted(p for p in Path(directory, "target").rglob("*") if p.is_file())
+            raise RuntimeError(
+                f"no PTX under {package}'s target dir; cargo-oxide's artifact layout "
+                f"must have moved. Files found:\n" + "\n".join(map(str, listing[:200]))
+            )
+
+        for ptx in ptx_files:
+            compiled = subprocess.run(
+                ["ptxas", "-v", f"-arch={arch}", "-o", "/dev/null", str(ptx)],
+                capture_output=True,
+                text=True,
+            )
+            if compiled.returncode != 0:
+                raise RuntimeError(f"ptxas failed on {ptx}:\n{compiled.stderr}")
+            for name, counts in _parse_ptxas(compiled.stderr).items():
+                measured[(str(ptx.relative_to(PROJECT_DIR)), name)] = counts
     return measured
 
 
@@ -482,14 +490,20 @@ def _print_ladder(measured: dict[tuple[str, str], dict[str, int]]) -> None:
 
 @app.function(cpu=8, timeout=1800)
 def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) -> None:
-    """Register pressure of every kernel the harness emits, from `ptxas -v`.
+    """Register pressure of every kernel the harness and the examples emit,
+    from `ptxas -v`.
 
     Register count is *the* performance number for this library — a tile
     abstraction that costs registers has failed at the thing it exists for, and
     "ptxas says otherwise" is the escape hatch the README promises. `ptxas` is a
-    host compiler, so this needs no GPU: build the harness, feed the emitted PTX
-    back through `ptxas -v`, and print a sorted table. Run it before and after a
-    change and diff the two.
+    host compiler, so this needs no GPU: build both PTX-emitting crates, feed
+    the emitted PTX back through `ptxas -v`, and print a sorted table. Run it
+    before and after a change and diff the two.
+
+    The examples are here because a register count is only half an occupancy
+    argument and the other half is a launch: `THREADS` and registers per thread
+    together say how many CTAs of a *real* kernel fit on an SM, which is what
+    #47 turned out to be about. Probes have no launch and cannot say it.
 
     Only kernels that are actually monomorphized appear — an op no kernel calls
     emits no PTX and measures nothing, so a codegen probe in `device-tests` is
@@ -499,12 +513,12 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     the second table below is that sweep with the cliff located — the widths
     and *row extents* at which each spelling of the same step starts to spill.
 
-    `--determinism` measures the same tree twice, with the harness' artifacts
+    `--determinism` measures the same tree twice, with both crates' artifacts
     thrown away in between, and asserts the two tables are identical. It is not
     ceremony: a diff of this table is only evidence if the table is a function
     of the tree, and #31 attributed a surprise 71 -> 32 register swing to its own
     refactor rather than to noise on exactly this control. It costs a second
-    build of the harness crate (its dependencies stay compiled).
+    build of those two crates (their dependencies stay compiled).
     """
     subprocess.run(["ptxas", "--version"], check=True)
     measured = _measure(arch)
@@ -520,9 +534,11 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     # than a re-read: a build that skipped codegen would hand back the same
     # file and pass this control without having tested anything. `_measure`
     # raises if the artifacts do not come back.
-    for ptx in Path(HARNESS_DIR).rglob("*.ptx"):
-        ptx.unlink()
-    _run(["cargo", "clean", "-p", "device-tests"], cwd=HARNESS_DIR)
+    for _, directory in PTX_CRATES:
+        for ptx in Path(directory).rglob("*.ptx"):
+            ptx.unlink()
+    for package, directory in PTX_CRATES:
+        _run(["cargo", "clean", "-p", package], cwd=directory)
     again = _measure(arch)
 
     differences = [
