@@ -75,8 +75,10 @@ missing API any more**. All four compile against the real library, and what
 separates the two that *run* from the two that do not is a launcher and a CPU
 reference. What is still open is on the other list, the one that came from
 writing kernels rather than from ThunderKittens' feature set: a cluster
-geometry for multicast, a work-item map that knows about clusters, and the
-`expect_tx` byte accounting. None of them blocks a kernel in this directory.
+geometry for multicast, and the `expect_tx` byte accounting. None of them
+blocks a kernel in this directory. The work-item map that knows about clusters
+is closed by #51 — and §7 below is worth reading for the half that is *not* the
+API, since the GEMM adopted the scaffold, computed exactly, and was slower.
 
 `layernorm` was the first example to be **split** by a landed issue rather than
 promoted whole: #13 took `layernorm_rows` out of the gate and left
@@ -1149,26 +1151,97 @@ own-bit mask that used to sit open-coded in `gemm.rs`;
 `tma_load_2d_multicast_cg2` keeps the mask and is now the replication form
 alone (#49).
 
-#### 7. `pipeline::run` cannot schedule a cluster
+#### 7. ~~`pipeline::run` cannot schedule a cluster~~ (#51) — **scaffold closed, and the GEMM is not adopting it**
 
-The work-item map is `blockIdx.x` strided by `gridDim.x`, so the two CTAs of a
-cluster get *different* items. The GEMM therefore does not use the persistent
-scaffold at all — it is one cluster per output tile with the K loop as its
-pipeline. `prototype::lcf` predates clusters in ThunderKittens too, so this is
-not a porting oversight; the scaffold needs a way to say who a work item
-belongs to, and `blockIdx.x` is not it.
+The work-item map was `blockIdx.x` strided by `gridDim.x`, so the two CTAs of a
+cluster got *different* items. `prototype::lcf` predates clusters in
+ThunderKittens too, so this was not a porting oversight; the scaffold needed a
+way to say who a work item belongs to, and `blockIdx.x` was not it.
 
-This entry used to name #3's `Scope` as the missing piece. #3 shipped a block
-reduction instead and no `Scope`, so what is wanted here is unfiled: a cluster
-rank in the work-item map, which is a `%cluster_ctarank` and a divisor, not a
-trait. Nothing about the block reduction bears on it.
+Shipped as `%clusterid` strided by `%nclusterid`, plus `Job::RANKS`. The map is
+a strict generalization and not a second scheduler: a launch that declares no
+cluster runs clusters of one CTA, where `%clusterid` *is* `%ctaid` and
+`%nclusterid` *is* `%nctaid`, so a block-scope job provably gets back the loop
+it had rather than a parallel code path. `RANKS` (default 1) says whether the
+job's barriers are shared across the pair and so whether the item boundary has
+to be `barrier.cluster` rather than `bar.sync` — which is what per-item barrier
+re-initialization needs across a cluster, since otherwise a leader re-arms a
+barrier its peer is still filling. The barrier *count* is unchanged.
 
-Related, and cheaper: #15's `lcsf` was filed as depending on #9, which has now
-landed with the wait it needs — `tma_store_wait_read` releases the shared buffer
-as soon as the engine has read it, without blocking on global visibility, which
-is exactly what lets an epilogue overlap the next tile's first K loads. The
-GEMM shows the second reason to want it: with the store folded into `finish`, a
-persistent GEMM cannot overlap those today.
+This entry used to name #3's `Scope` as the missing piece, and #3 shipped a
+block reduction and no `Scope`. It turns out nothing was owed: the rank half is
+`cluster::block_rank()`, a `%cluster_ctarank` read with no storage, no
+collective and no barrier in it — precisely what #6 found `Scope` *could* not
+supply for the block-reduction half. The two halves separate cleanly, and
+wrapping a special register in a trait would add a name without adding a fact.
+No rank API was added.
+
+##### The GEMM adopted it, computed exactly, and got slower
+
+This is the half worth reading. `gemm.rs` was ported to a `Tile: Job` — one
+output tile per item, `RANKS = 2`, TMEM allocated once outside the loop — and
+it is **correct**: `pass gemm 512x256x256 exact, 4096x4096x256 exact` on a
+B200, and `::bench` checks every sweep size against the CPU reference before
+timing it, so the numbers below all belong to launches that computed. The port
+is in this PR's history rather than in the tree, because it is also slower, at
+every size where the persistent grid's cap actually binds.
+
+Min ms over 30 timed launches, B200, 148 SMs. The cap is in clusters; a cluster
+is 2 CTAs. **Rows where the problem has fewer tiles than the cap are marked `=`:
+there the grid is byte-identical to the launch-per-tile grid and each cluster
+runs exactly one item, so they are a free control on the scaffold itself.**
+
+| shape | launch per tile | cap 74 | cap 148 |
+| --- | ---: | ---: | ---: |
+| 256x128x256 | 0.0224 | `=` 0.0223 | `=` 0.0234 |
+| 512x256x256 | 0.0225 | `=` 0.0225 | `=` 0.0251 |
+| 1024x1024x1024 | 0.0283 | `=` 0.0268 | `=` 0.0284 |
+| 2048x2048x2048 | 0.0451 | 0.0593 | `=` 0.0478 |
+| 4096x4096x4096 | 0.1891 | 0.2808 | 0.2059 |
+| 8192x8192x8192 | **1.0169** | **2.1036** | **1.2130** |
+
+As TFLOP/s at 8192³: 1081 launch-per-tile, 523 at cap 74, 906 at cap 148.
+
+Two things the control rows earn. First, **the scaffold costs nothing**: at an
+identical grid and one item per cluster the three (four at cap 148) control
+rows are within noise of the launch-per-tile kernel. Second, they carry the
+run-to-run offset, which is not negligible and would otherwise be invisible —
+the cap-148 run's controls sit 0.4% to 11.6% above baseline, about 5% on
+average, so its 8192³ figure is nearer 13% slow than 19%.
+
+##### The reading, which is not "persistent kernels are slow"
+
+`lcf` with one item per cluster **is** the launch-per-tile kernel: same rings,
+same barriers, same prologue, same epilogue, drained the same way at the same
+points. So the only thing a persistent grid changes here is *how many clusters
+exist*, and the control rows confirm nothing else moved. The regression is
+therefore entirely the cap, and the cap is a residency question.
+
+Which the repo cannot currently answer for this kernel.
+`cuOccupancyMaxActiveBlocksPerMultiprocessor` takes a block shape and no
+cluster, so `main.rs` prints `cluster` in the GEMM's occupancy row — the honest
+absence #70 built that column to preserve. The one figure available is #77's,
+and it predicts **1** CTA/SM for anything touching `tcgen05.alloc`.
+
+**The clock refutes that extrapolation for this kernel.** Capping at one CTA per
+SM costs 2.07× at 8192³, and that cannot happen if the device could only ever
+hold that many CTAs — the two schedules would then *be* the same schedule.
+Doubling the cap recovers most of it (973 → 1688 tiles/ms, sublinear and still
+climbing), so residency is at least 2 CTAs/SM and the curve points at the 3 that
+shared memory would admit at 228 KiB / 72 KiB. **222 clusters is the value that
+was predicted and never measured**: the Modal workspace hit its spend limit
+before that run. Shipping a cap on an extrapolation is exactly the mistake the
+table above is a record of, so the GEMM keeps its launch-per-tile grid and the
+scaffold lands on its own.
+
+Two follow-ups have their subject sharpened by this. **#78** asks whether the
+GEMM is at 1 CTA/SM like `flash_forward`; the answer here is no, by at least a
+factor of two, measured on a clock because the query cannot see it. And **#15**'s
+`lcsf` is what would make persistence pay for something rather than merely break
+even: under `lcf` the epilogue is inside the item, so `store_rows` and the next
+tile's first K loads are separated by a boundary that drains the pipeline, and a
+persistent GEMM buys a saved launch and nothing else. `tma_store_wait_read` (#9,
+landed) is the wait that would let them cross.
 
 #### 8. Multicast has no geometry to live in
 
