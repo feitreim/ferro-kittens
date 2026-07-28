@@ -27,6 +27,7 @@
 
 use core::marker::PhantomData;
 
+use cuda_device::cluster;
 use cuda_device::tcgen05::{Tcgen05ElementType, cvt_f32x2_bf16x2, tcgen05_mma_shared};
 use cuda_device::tma::{
     TmaDescriptor, cp_async_bulk_commit_group, cp_async_bulk_tensor_1d_g2s,
@@ -36,7 +37,7 @@ use cuda_device::tma::{
     cp_async_bulk_wait_group_read,
 };
 
-use crate::sync::Semaphore;
+use crate::sync::{ClusterSemaphore, Semaphore};
 
 /// Element marker for tile types: the byte width every shape constant derives
 /// from, plus how fp32 register values pack into the 32-bit words device code
@@ -452,22 +453,56 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
         }
     }
 
+    /// [`Self::tma_load_2d`] completing on another CTA's barrier: the boxes
+    /// land in *this* CTA's tile as always, and the transaction bytes are
+    /// counted at `sem` — any rank's copy of a stage barrier, named by
+    /// [`Semaphore::at_rank`].
+    ///
+    /// It is a cta_group::2 multicast whose mask is the calling CTA's own bit
+    /// and nothing else, which looks like a contradiction and is not. Nothing
+    /// is replicated: one bit, one destination. What the multicast form
+    /// supplies that the plain one cannot is the `.shared::cluster` barrier
+    /// operand. A plain `cp.async.bulk.tensor` completes on a barrier in the
+    /// *issuing* CTA's own shared memory, so a peer staging its half of a
+    /// cluster operand has no way to say "my bytes, the leader's barrier", and
+    /// the leader waits forever for a count it charged and nobody paid. That
+    /// deadlock is the whole reason this exists.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::tma_load_2d_multicast_cg2`], with `cta_mask` this CTA's own
+    /// bit.
+    #[inline(always)]
+    pub unsafe fn tma_load_2d_arriving_at(
+        self,
+        map: *const TmaDescriptor,
+        leading: i32,
+        minor: i32,
+        sem: ClusterSemaphore,
+    ) {
+        unsafe {
+            self.tma_load_2d_multicast_cg2(map, leading, minor, sem, 1 << cluster::block_rank())
+        }
+    }
+
     /// [`Self::tma_load_2d`] as a cta_group::2 multicast: every box lands in
-    /// the CTAs of `cta_mask`, completing on each CTA's own copy of the
-    /// barrier behind `sem` — pass [`Semaphore::multicast_alias`], not the
-    /// local handle.
+    /// the CTAs of `cta_mask`, completing on the cluster-addressed barrier
+    /// behind `sem`. The replication form — one fetch delivered to several
+    /// CTAs — which is why the mask is the caller's; a load that replicates
+    /// nothing and only wants the barrier's address space is
+    /// [`Self::tma_load_2d_arriving_at`].
     ///
     /// # Safety
     ///
     /// As [`Self::tma_load_2d`], and the block must run as a cluster whose
-    /// every masked CTA has an initialized barrier at the aliased address.
+    /// every masked CTA holds this tile's shared range and can receive it.
     #[inline(always)]
     pub unsafe fn tma_load_2d_multicast_cg2(
         self,
         map: *const TmaDescriptor,
         leading: i32,
         minor: i32,
-        sem: Semaphore,
+        sem: ClusterSemaphore,
         cta_mask: u16,
     ) {
         unsafe {

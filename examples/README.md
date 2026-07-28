@@ -74,10 +74,9 @@ block-scope statistic — and with it closed **no kernel here is blocked on
 missing API any more**. All four compile against the real library, and what
 separates the two that *run* from the two that do not is a launcher and a CPU
 reference. What is still open is on the other list, the one that came from
-writing kernels rather than from ThunderKittens' feature set: cluster-scope
-semaphore arrival, a cluster geometry for multicast, a work-item map that knows
-about clusters, and the `expect_tx` byte accounting. None of them blocks a
-kernel in this directory.
+writing kernels rather than from ThunderKittens' feature set: a cluster
+geometry for multicast, a work-item map that knows about clusters, and the
+`expect_tx` byte accounting. None of them blocks a kernel in this directory.
 
 `layernorm` was the first example to be **split** by a landed issue rather than
 promoted whole: #13 took `layernorm_rows` out of the gate and left
@@ -186,8 +185,9 @@ grounds that a 2-CTA UMMA replicates nothing. That is true and beside the
 point: the multicast form's barrier operand is `.shared::cluster`, which is the
 only way one CTA may name another's barrier. With the CTA's own bit as the
 whole mask it delivers to exactly one CTA and completes on the leader — no
-replication, right address space. `Semaphore::multicast_alias` was already in
-the library, filed under the opposite problem.
+replication, right address space. The primitive was already in the library,
+filed under the opposite problem; §6 below is where it acquired a name that
+says what it does.
 
 ---
 
@@ -776,7 +776,7 @@ argument.
 
 The most valuable output here. Ordered by how badly it hurts. Items 1–6 were
 filed as **#21**, **#22**, **#25**, **#23** and **#24** (which covers both
-cluster-scope entries); **1, 2, 3, 4 and 5 have since shipped**. The numbers are noted
+cluster-scope entries); **1, 2, 3, 4, 5 and 6 have since shipped**. The numbers are noted
 inline and the prose is kept as written, because it is the argument rather than
 the ticket.
 
@@ -881,23 +881,30 @@ Shipped as `tmem::alloc_cluster` / `tmem::dealloc_cluster` — `gemm.rs`'s own
 fixed body, moved rather than rewritten, since it is the version that ran on
 silicon.
 
-#### 6. No cluster-scope semaphore arrival (#24)
+#### 6. ~~No cluster-scope semaphore arrival~~ (#24) — **closed by #50**
 
 A 2-CTA MMA consumes four tiles staged by two CTAs, so the issuer needs one
 barrier that says *the whole stage is present* — the peer's TMA has to complete
-on the leader's copy. mbarrier addresses are cluster-mappable and this is the
-standard pair-wide producer handoff, but `Semaphore` is CTA-scoped by
-construction and says nothing about it. `Semaphore::multicast_alias` is the one
-cluster-aware thing in `sync.rs`, and it solves the opposite problem (one
-barrier per CTA, one transfer).
+on the leader's copy. `Semaphore` was CTA-scoped by construction and said
+nothing about it, and the GEMM got there through a multicast load with a
+degenerate mask.
 
-Note also that `Semaphore::expect_tx` lowers to `mbarrier.arrive.expect_tx
-… .shared::cta`, so it cannot charge a remote barrier even if handed one;
-upstream's `mbarrier_arrive_cluster` takes a remote address but carries no
-transaction bytes. The shape of the fix is a design question, not a
-transcription.
+Shipped as `Semaphore::at_rank(rank)`, which `mapa`s the barrier into a peer
+CTA and returns a `ClusterSemaphore` — a barrier that may be arrived at or
+handed to an engine, and may not be waited on or charged. The byte accounting
+question is answered rather than dodged, and the answer was forced:
+`mbarrier.arrive.expect_tx` is `.shared::cta` and
+`mbarrier.arrive … .shared::cluster` carries no transaction count, so a CTA can
+charge exactly one barrier, its own. **The waiter therefore charges the whole
+stage** — its own charge times the number of ranks, since a cluster stage is
+symmetric by construction. `sync.rs`'s module docs carry the argument, including
+why the per-rank alternative that would have kept the sum local (and pleased
+#29) is not worth a barrier and a spinning thread per rank per stage.
 
-Wanted: `Semaphore::at_rank(rank)`, and a decision about the byte accounting.
+The load half is `SharedTile::tma_load_2d_arriving_at`, which owns the
+own-bit mask that used to sit open-coded in `gemm.rs`;
+`tma_load_2d_multicast_cg2` keeps the mask and is now the replication form
+alone (#49).
 
 #### 7. `pipeline::run` cannot schedule a cluster
 
