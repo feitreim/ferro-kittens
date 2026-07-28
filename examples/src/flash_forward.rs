@@ -76,8 +76,46 @@
 //! and 256 where `softmax` goes 28/14/7/3 and `layernorm` 8/4/2/1. A ceiling
 //! that ignores both shared memory and warp count is a *per-CTA* resource, and
 //! the one this kernel holds that neither control does is TMEM: it and the
-//! GEMM are the only `tcgen05` entries here. So shrinking the rings is not the
-//! lever, and what the lever is wants its own issue rather than a guess.
+//! GEMM are the only `tcgen05` entries here.
+//!
+//! ## The 1 is tcgen05, and it is not this kernel's fault
+//!
+//! That last paragraph was a guess when #70 wrote it — a correlation over a
+//! sample of one, which is the shape #47 exists to warn about. #74 built the
+//! control it was missing, and it is `device-tests`' `tmem occupancy ladder`:
+//! a nine-register kernel whose entire content is `tcgen05.alloc`, against the
+//! byte-identical kernel with the allocator deleted. On a B200, blocks/SM at
+//! zero dynamic shared:
+//!
+//! | rung | 32 | 64 | 128 | 256 threads |
+//! | --- | --- | --- | --- | --- |
+//! | no tcgen05 | 32 | 32 | 16 | 8 |
+//! | `alloc` 32 columns | 1 | 1 | 1 | 1 |
+//! | `alloc` 64 / 128 / 192 / 256 / 512 | 1 | 1 | 1 | 1 |
+//!
+//! **The guess was right and its obvious remedy is wrong.** A CTA that touches
+//! the allocator is charged the SM's *whole* tensor memory — the smallest
+//! allocation the ISA defines costs exactly what the largest does. The 192 rung
+//! takes its column count as a *kernel argument*, so the driver is not reading
+//! a number `ptxas` recorded; it is pricing the allocator itself. And this
+//! kernel confirms it directly: cut to 32 columns and re-queried, it still
+//! answers 1.
+//!
+//! So none of the three levers anyone had in hand is one. Shrinking the rings
+//! buys nothing (#70 measured that), shrinking the TMEM allocation buys nothing
+//! (above), and there is no cluster shape to blame — `required_cluster_dimensions`
+//! is `None` on every rung of the ladder and tcgen05 implies no `cta_group::2`.
+//!
+//! **What is left is the only thing left: warps per CTA.** At 1 block/SM the
+//! CTA's own width is the entire occupancy of the SM, and this kernel is 128
+//! threads — 4 warps where its own `max_threads_per_block` is 512, and where
+//! the control above holds 32. That is not a tuning constant to raise: 4 warps
+//! is [`QUERIES`] / 32, one warp per 32 accumulator rows, so more warps means a
+//! different decomposition — a producer/consumer split with warps dedicated to
+//! the TMA and the MMA issue, which is what the shape of a tcgen05 kernel is
+//! *for*. This kernel has no launcher and no CPU reference, so that is a design
+//! to price rather than a change to make blind, and #74 is where it is written
+//! down.
 //!
 //! ## What already works
 //!
@@ -105,7 +143,7 @@ use kittens::mma::{MmaShape, commit, mm_ab, mm_abt};
 use kittens::reg::{BaseLdtm, RegTile, RegVec, online_rescale};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
-use kittens::tmem::{TmemTile, alloc_block};
+use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
 
 /// Queries per CTA — one `M128` MMA, four warps of 32 accumulator rows each.
 const QUERIES: usize = 128;
@@ -144,6 +182,29 @@ type ScoreBand = RegTile<32, KEYS, BaseLdtm>;
 type OutBand = RegTile<32, HEAD, BaseLdtm>;
 /// Row statistics of either band.
 type Rows = RegVec<32, BaseLdtm>;
+
+/// Columns of tensor memory the CTA allocates: the `[128, KEYS]` scores and
+/// the `[128, HEAD]` output beside them, rounded up to the allocator's grain.
+///
+/// `KEYS + HEAD` is 192 and **192 is not a legal `tcgen05.alloc`** — the
+/// operand must be a power of two in `[32, 512]` (cuda-oxide spells the set out
+/// as "32, 64, 128, 256, 512" on `TmemGuard`). This kernel asked for 192 from
+/// the day it was written and nothing caught it, because it has no launcher:
+/// the column count is an argument to an instruction, so no type and no
+/// `const` assertion was ever in a position to see it. The one below is.
+///
+/// Rounding up costs **nothing**, which is not obvious and is #74's finding:
+/// the driver charges a CTA the SM's *entire* tensor memory the moment it
+/// touches the allocator, at 32 columns exactly as at 512, so the 64 columns
+/// past `KEYS + HEAD` are free. Measured — see the module doc.
+const TMEM_COLUMNS: u32 = 256;
+const _: () = assert!(
+    TMEM_COLUMNS as usize >= KEYS + HEAD
+        && TMEM_COLUMNS.is_power_of_two()
+        && TMEM_COLUMNS >= 32
+        && TMEM_COLUMNS <= 512,
+    "tcgen05.alloc takes a power of two in [32, 512] that covers the scores and the output"
+);
 
 /// The two rings, `q_loaded`, `scored`, `accumulated`, and the TMEM staging
 /// word.
@@ -202,7 +263,7 @@ pub mod kernels {
             thread::sync_threads();
             // Scores and output share one allocation: `[128, KEYS]` then
             // `[128, HEAD]` beside it.
-            let tmem = alloc_block(tmem_slot, (KEYS + HEAD) as u32);
+            let tmem = alloc_block(tmem_slot, TMEM_COLUMNS);
             let scores = Scores::from_raw(tmem);
             let output: Output = scores.split_columns();
 
@@ -313,6 +374,15 @@ pub mod kernels {
             );
 
             thread::sync_threads();
+            // The columns go back. tcgen05 allocations are not scoped to the
+            // CTA the way shared memory is — a kernel that exits holding them
+            // is a `CUDA_ERROR_TENSOR_MEMORY_LEAK`, and the next CTA scheduled
+            // onto the SM is the one that pays. This kernel had no `dealloc`
+            // at all until #74 went looking at its allocator, which nothing
+            // could have caught: `device-tests`' `repeated launch` case is the
+            // standing guard for exactly this class, and a kernel with no
+            // launcher never reaches a guard that works by launching twice.
+            dealloc_block(tmem, TMEM_COLUMNS);
             if leader {
                 load.inval_all();
                 free.inval_all();

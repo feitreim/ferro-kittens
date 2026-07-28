@@ -85,6 +85,7 @@ use kittens::sync::{Semaphore, block_reduce, block_reduce_sum};
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block, store_wait};
 
 mod ladder_bench;
+mod tmem_occupancy;
 
 /// Edge of the square tiles the swizzle and `stmatrix` cases use: 64 bf16
 /// columns is exactly one 128-byte swizzle atom per row, so these tiles are a
@@ -207,6 +208,11 @@ const RELAUNCH_COLUMNS: usize = 512;
 /// Blocks in that probe's grid: twice the B200's 148 SMs, so the launch
 /// cannot fit in one wave at any occupancy.
 const RELAUNCH_BLOCKS: u32 = 296;
+/// What [`kernels::tmem_ladder_none`] leaves in its staging word where the
+/// allocator would have left an address. Any value distinguishable from a TMEM
+/// address will do; this one is a recognisable non-address.
+const TMEM_LADDER_SENTINEL: u32 = 0x7be5_0000;
+
 /// Launches of it in one process. The class of failure this case exists for
 /// is invisible to the first launch by construction, so one launch is not a
 /// test; the third is free and covers a resource that takes more than one CTA
@@ -1204,6 +1210,96 @@ pub mod kernels {
             thread::sync_threads();
             dealloc_block(tmem, RELAUNCH_COLUMNS as u32);
         }
+    }
+
+    /// One rung of the TMEM occupancy ladder (#74): allocate `columns` of
+    /// tensor memory, publish the address so nothing can fold the allocation
+    /// away, give the columns back.
+    ///
+    /// Deliberately the *smallest* kernel that holds a tcgen05 allocation.
+    /// Everything an occupancy query could otherwise blame is held fixed
+    /// across the ladder and matched by [`tmem_ladder_none`]: the same 32-byte
+    /// shared plan, the same block sync, the same single store. The one thing
+    /// that varies from rung to rung is the immediate operand of
+    /// `tcgen05.alloc`.
+    #[inline(always)]
+    unsafe fn tmem_ladder_probe(columns: u32, out: &mut DisjointSlice<u32>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tmem = alloc_block(smem as *mut u32, columns);
+            if thread::threadIdx_x() == 0 {
+                *out.get_unchecked_mut(0) = tmem;
+            }
+            thread::sync_threads();
+            dealloc_block(tmem, columns);
+        }
+    }
+
+    /// The ladder's control: [`tmem_ladder_probe`]'s shape with the allocator
+    /// removed, and nothing else changed.
+    ///
+    /// Warp 0 writes the staging word, a block sync publishes it, every thread
+    /// reads it back — which is `alloc_block`'s body with `tcgen05.alloc` and
+    /// the permit relinquish taken out. Whatever this rung answers is what a
+    /// kernel of this size and shape is worth on an SM *without* tcgen05, so
+    /// the gap between it and the rungs above is attributable to tcgen05 alone.
+    #[kernel]
+    pub unsafe fn tmem_ladder_none(mut out: DisjointSlice<u32>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            if warp::warp_id() == 0 {
+                *(smem as *mut u32) = TMEM_LADDER_SENTINEL;
+            }
+            thread::sync_threads();
+            let staged = *(smem as *const u32);
+            if thread::threadIdx_x() == 0 {
+                *out.get_unchecked_mut(0) = staged;
+            }
+            thread::sync_threads();
+        }
+    }
+
+    /// [`tmem_ladder_probe`] at the allocator's smallest unit.
+    #[kernel]
+    pub unsafe fn tmem_ladder_32(mut out: DisjointSlice<u32>) {
+        unsafe { tmem_ladder_probe(32, &mut out) }
+    }
+
+    /// [`tmem_ladder_probe`] at 64 columns.
+    #[kernel]
+    pub unsafe fn tmem_ladder_64(mut out: DisjointSlice<u32>) {
+        unsafe { tmem_ladder_probe(64, &mut out) }
+    }
+
+    /// [`tmem_ladder_probe`] at 128 columns — a quarter of the SM's tensor
+    /// memory, and `sttm_roundtrip`'s allocation.
+    #[kernel]
+    pub unsafe fn tmem_ladder_128(mut out: DisjointSlice<u32>) {
+        unsafe { tmem_ladder_probe(128, &mut out) }
+    }
+
+    /// [`tmem_ladder_probe`] at 256 columns.
+    #[kernel]
+    pub unsafe fn tmem_ladder_256(mut out: DisjointSlice<u32>) {
+        unsafe { tmem_ladder_probe(256, &mut out) }
+    }
+
+    /// [`tmem_ladder_probe`] at the whole SM's tensor memory.
+    #[kernel]
+    pub unsafe fn tmem_ladder_512(mut out: DisjointSlice<u32>) {
+        unsafe { tmem_ladder_probe(512, &mut out) }
+    }
+
+    /// [`tmem_ladder_probe`] with the column count arriving as a kernel
+    /// argument rather than as an immediate.
+    ///
+    /// This separates two mechanisms a flat ladder cannot: a driver reading a
+    /// column count `ptxas` recorded, and a driver that reserves tensor memory
+    /// for any kernel that touches the allocator at all. Only the first can
+    /// see a constant, and this rung has none to see.
+    #[kernel]
+    pub unsafe fn tmem_ladder_runtime(columns: u32, mut out: DisjointSlice<u32>) {
+        unsafe { tmem_ladder_probe(columns, &mut out) }
     }
 
     /// The fragment ownership probe, shared by every layout shape.
@@ -4650,6 +4746,15 @@ fn run() -> Result<usize, Box<dyn Error>> {
                 module.tma_store_recycle(stream, config, source, packed, pitched)
             })
         }),
+    ));
+    // What a tcgen05 allocation costs an SM (#74), against a control that is
+    // the same kernel with the allocator removed. Not a round trip through a
+    // library path like everything above it — the claim is about the *driver's*
+    // occupancy answer, which is why the probe is small enough that nothing in
+    // it can be the cause but the one line that varies.
+    cases.push((
+        "tmem occupancy ladder",
+        Box::new(|| tmem_occupancy::check(stream, module)),
     ));
     // Last, and not because it is the least interesting: it is the only case
     // that can take the process down (see `finish_or_abort`), so everything

@@ -487,6 +487,59 @@ that allocates TMEM. So **shrinking the K/V rings would buy nothing**, which is
 the opposite of what the 0 invited, and the register-versus-occupancy advice
 above applies to this kernel not at all until that per-CTA ceiling is named.
 
+#### and the per-CTA ceiling is tcgen05 itself (#74)
+
+That last sentence named a suspect on a correlation over a sample of one, and
+said so. The control it wanted is now `device-tests`' `tmem occupancy ladder`:
+a nine-register kernel whose whole content is one `tcgen05.alloc`, against the
+byte-identical kernel with the allocator deleted. Same 32-byte shared plan,
+same block sync, same store; the only thing that varies between rungs is the
+allocator's operand. Blocks/SM on a B200 at zero dynamic shared:
+
+| rung | columns | regs | cluster | 32 | 64 | 128 | 256 threads |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| no tcgen05 | — | 10 | none | 32 | 32 | 16 | 8 |
+| `alloc` | 32 | 9 | none | 1 | 1 | 1 | 1 |
+| `alloc` | 64 | 10 | none | 1 | 1 | 1 | 1 |
+| `alloc` | 128 | 10 | none | 1 | 1 | 1 | 1 |
+| `alloc` | 192 | 10 | none | 1 | 1 | 1 | 1 |
+| `alloc` | 256 | 10 | none | 1 | 1 | 1 | 1 |
+| `alloc` | 512 | 10 | none | 1 | 1 | 1 | 1 |
+
+**TMEM confirmed, and the fix everyone reached for refuted in the same table.**
+The control sits at the hardware's own warp ceiling — 2048 threads an SM, so
+32/32/16/8 — because at 10 registers and 32 bytes nothing else is binding. Add
+one `tcgen05.alloc` and it is 1, at *every* block width and at *every* legal
+column count. A CTA that touches the allocator is charged the SM's entire
+tensor memory, and the allocator's smallest unit costs exactly what all 512
+columns cost.
+
+Two things that table rules out, which a flat ladder alone could not. The 192
+rung takes its column count as a **kernel argument**, so there is no constant
+for the driver to have read: it is pricing the allocator, not a number `ptxas`
+recorded. And `required_cluster_dimensions` is `None` on every rung, so tcgen05
+implies no `cta_group::2` shape and the query is not quietly answering about a
+launch geometry the kernel never declares.
+
+`flash_forward` confirms it directly: cut from 192 columns to 32 and
+re-queried, it still answers 1 block/SM.
+
+So the 1 is not a defect in that kernel, and none of shared memory, registers,
+TMEM columns or cluster shape is the lever. **What is left is warps per CTA.**
+At 1 block/SM the CTA's own width *is* the SM's occupancy, and `flash_forward`
+is 128 threads — 4 warps, against its own `max_threads_per_block` of 512 and
+the control's 32. Those 4 warps are `QUERIES / 32`, one per 32 accumulator
+rows, so widening the CTA is a different decomposition rather than a constant
+to raise: warps dedicated to the TMA and to the MMA issue, which is the shape a
+tcgen05 kernel wants anyway. That is a design to price, and pricing it needs
+the launcher and the CPU reference `flash_forward` still does not have.
+
+This is also the general statement, not a fact about flash: **every** tcgen05
+kernel in this repo is 1 CTA/SM, and for a Blackwell tile library that is the
+occupancy model rather than a bug to fix. `gemm` pays it too — the occupancy
+column prints `cluster` for it because the query cannot describe a
+`#[cluster_launch]` kernel, not because it is exempt.
+
 Within a spelling choice at fixed shape, the ordering is small and stable:
 fully in place is fastest, one fused expression next, rebinding last. That
 ordering is worth 1–3% per warp. Which side of the streaming cliff the shape
