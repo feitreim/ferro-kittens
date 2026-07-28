@@ -17,6 +17,11 @@ Local usage:
     modal run modal_app.py::ladder_bench
                                       # four rungs of that ladder on a clock:
                                       # is a streamed band actually slower?
+    modal run modal_app.py::bench --case gemm-depth
+                                      # one table of that sweep; --m/--n/--k
+                                      # narrows it further to a single row
+    modal run modal_app.py::profile   # one launch under Nsight Compute (see
+                                      # the note there: no counters on Modal)
     modal run modal_app.py::doctor    # env / GPU sanity check
 """
 
@@ -243,8 +248,11 @@ def examples() -> None:
     _run(["cargo", "oxide", "run", "kittens-examples"], cwd=EXAMPLES_DIR)
 
 
-@app.function(gpu=DEFAULT_GPU, timeout=1800)
-def bench() -> None:
+# 5400 rather than 1800 since #86 put 16384^3 in the sweep: the *device* work is
+# eight milliseconds a launch, but staging it is 268 million host-side operand
+# values per matrix and the exact check compares 268 million elements of `C`.
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=5400)
+def bench(case: str = "", m: int = 0, n: int = 0, k: int = 0) -> None:
     """The same kernels, timed at several sizes, reporting achieved throughput.
 
     Separate from `examples` so the correctness path stays a few seconds: this
@@ -269,7 +277,16 @@ def bench() -> None:
         ],
         cwd="/",
     )
-    _run(["cargo", "oxide", "run", "kittens-examples", "--", "bench"], cwd=EXAMPLES_DIR)
+    # `--case` narrows the sweep to one table, and `--m/--n/--k` to one row of
+    # it. Re-staging 16384^3 to re-read a diagnostic row costs more host time
+    # than the row does device time.
+    narrowed = [case] if case else []
+    if case and (m or n or k):
+        narrowed += [str(m), str(n), str(k)]
+    _run(
+        ["cargo", "oxide", "run", "kittens-examples", "--", "bench", *narrowed],
+        cwd=EXAMPLES_DIR,
+    )
 
 
 # `cpu=8` because on a cold container the *build* is a long pole in its own
@@ -310,6 +327,92 @@ def ladder_bench() -> None:
         cwd="/",
     )
     _run(["cargo", "oxide", "run", "device-tests", "--", "bench-ladder"], cwd=HARNESS_DIR)
+
+
+# Nsight Compute ships inside the CUDA 13 devel image already — the binary, the
+# chip support and the permissions are all here, and it still cannot read a
+# counter on this container. See `profile` below for which file is missing and
+# what #86 had to do instead.
+NCU = "/usr/local/cuda/bin/ncu"
+
+# Sections rather than a metric list, because a metric name is chip-specific and
+# a wrong one fails the whole run: a section asks the profiler for the metrics
+# *this* chip has under a heading. SpeedOfLight is the one that answers the
+# issue — compute and memory throughput each as a percentage of what the part
+# can sustain — and MemoryWorkloadAnalysis is the L1/L2/DRAM traffic table with
+# the hit rates in it.
+NCU_SECTIONS = (
+    "SpeedOfLight",
+    "MemoryWorkloadAnalysis",
+    "MemoryWorkloadAnalysis_Tables",
+    "ComputeWorkloadAnalysis",
+    "LaunchStats",
+    "Occupancy",
+    "SchedulerStats",
+    "WarpStateStats",
+)
+
+# One `bench` size stages the problem, checks it, warms up five launches and
+# times thirty. So the seventh launch is the first timed one, and profiling it
+# alone leaves the other thirty-five running at full speed.
+NCU_SKIP, NCU_COUNT = "6", "1"
+
+
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=5400)
+def profile(kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192) -> None:
+    """One launch of one kernel at one size, under Nsight Compute — issue #86.
+
+    **This does not currently work on Modal, and it is checked in anyway
+    because the reason is one missing file and worth writing down.** `ncu`
+    2025.3.0 is already in the CUDA 13 image at `/usr/local/cuda/bin/ncu`, it
+    lists `gb100` among the chips it knows, `libnvperf_target.so` is in the
+    install, `/proc/driver/nvidia/params` reports `RmProfilingAdminOnly: 0`, and
+    the profiler still says:
+
+        Failed to initialize the profiler: LibraryNotLoaded.
+        Check that a compatible driver library is loaded.
+
+    The injected driver set under `/usr/lib/x86_64-linux-gnu` carries
+    `libnvidia-ml`, `-nvvm`, `-ptxjitcompiler`, `-allocator`, `-gpucomp` and the
+    graphics libraries, and **no `libnvidia-pcc.so`** — the performance-counter
+    library, which the container runtime does not mount for the compute
+    capability set. It is not in the 580.95.05 `.run` package either, so it
+    cannot simply be fetched. So there is no counter on this harness, which is
+    why #86's L2 hit rate and DRAM byte count are answered by *interventions* —
+    `GEMM_FOOTPRINT_SIZES` and `GEMM_DEPTH_SIZES` in `examples/src/bench.rs`,
+    each holding everything constant but one thing — rather than by counters.
+    That is a weaker instrument for attribution and a stronger one for cause.
+
+    Whenever the library does appear, this is one command. `--clock-control
+    none` is deliberate: the default locks the clocks to base so that two runs
+    compare, which also means the duration it reports is not the duration
+    `bench` reports, and half the point is to divide a measured byte count by a
+    duration that belongs to the same table.
+    """
+    _run(
+        ["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
+         "--format=csv"],
+        cwd="/",
+    )
+    subprocess.run(
+        ["bash", "-lc", "ls /usr/lib/x86_64-linux-gnu/libnvidia-pcc* 2>/dev/null "
+         "|| echo 'libnvidia-pcc.so absent: the profiler will report LibraryNotLoaded'"],
+        check=False,
+    )
+    # Build first: `--target-processes all` would otherwise follow the compiler
+    # around for ten minutes looking for a context it never creates.
+    _run(["cargo", "oxide", "build", "kittens-examples", "--arch", "sm_100a"], cwd=EXAMPLES_DIR)
+    _run(
+        [
+            NCU, "--target-processes", "all", "--clock-control", "none",
+            "--kernel-name", f"regex:{kernel}", "--launch-skip", NCU_SKIP,
+            "--launch-count", NCU_COUNT, "--print-details", "all",
+            *[argument for section in NCU_SECTIONS for argument in ("--section", section)],
+            "cargo", "oxide", "run", "kittens-examples", "--",
+            "bench", kernel, str(m), str(n), str(k),
+        ],
+        cwd=EXAMPLES_DIR,
+    )
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=600)
