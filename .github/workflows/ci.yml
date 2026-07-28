@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # No toolchain is named here on purpose. `rust-toolchain.toml` pins the
       # nightly and its components, rustup on the runner honours it, and a

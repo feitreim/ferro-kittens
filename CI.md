@@ -112,5 +112,9 @@ rebuilt only when `modal_app.py`'s recipe changes.
 
 ## Secrets
 
-`MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`, from `modal token new`. Tiers 2 and 3
-skip cleanly without them, so tier 1 gates the repo from the moment this merges.
+`MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`, from `modal token new`. Until they are
+set on the repo, tiers 2 and 3 fail on their first step with an error naming
+them — the `secrets` context is not readable from a job-level `if`, so an
+unconfigured repo cannot be turned into a skip, and a check that quietly passes
+when it did not run is worse than a red one. Tier 1 is unaffected and gates the
+repo from the moment this merges.

@@ -65,11 +65,24 @@ jobs:
         github.event.pull_request.head.repo.full_name == github.repository
       )
     steps:
-      - uses: actions/checkout@v4
+      # Before anything is allocated. The `secrets` context is not readable
+      # from a job-level `if`, so an unconfigured repo cannot be a skip; make
+      # it a legible failure rather than a Modal auth traceback.
+      - name: Modal credential is configured
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "::error::MODAL_TOKEN_ID / MODAL_TOKEN_SECRET are not set on this repository, so tier 3 cannot run. Get them from \`modal token new\`. See CI.md."
+            exit 1
+          fi
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
