@@ -36,7 +36,7 @@ mod host {
     use cuda_core::{CudaStream, DeviceBuffer};
     use cuda_device::tma::TmaDescriptor;
 
-    use crate::shared::{Bf16, Element, SharedTile, Swizzle, Swizzle128B};
+    use crate::shared::{Bf16, Element, SharedTile, SharedVec, Swizzle, Swizzle128B};
 
     /// An [`Element`] the TMA engine can name in a tensor map.
     ///
@@ -54,13 +54,22 @@ mod host {
             cuda_core::sys::CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
     }
 
-    /// The box a shared tile wants delivered, as the map has to state it.
+    /// The box a shared destination wants delivered, as the map has to state
+    /// it.
     ///
-    /// Implemented once, for [`SharedTile`], so the numbers in a descriptor
-    /// are the tile's own constants and cannot be restated wrong at a call
-    /// site. A tensor map's box is one *subtile*, not one tile:
-    /// [`SharedTile::tma_load`] issues one `cp.async.bulk.tensor` per stacked
-    /// subtile, lifting the leading coordinate by `SUBTILE_COLS` each time.
+    /// Implemented by the shared-memory types themselves, so the numbers in a
+    /// descriptor are the destination's own constants and cannot be restated
+    /// wrong at a call site. The two impls answer the same question
+    /// differently, which is the point of the trait rather than a wart:
+    ///
+    /// - [`SharedTile`] — the box is one *subtile*, not one tile.
+    ///   [`SharedTile::tma_load`] issues one `cp.async.bulk.tensor` per stacked
+    ///   subtile, lifting the leading coordinate by `SUBTILE_COLS` each time,
+    ///   and the box is swizzled because an MMA operand must be.
+    /// - [`SharedVec`] — the box is the whole vector, one row tall and
+    ///   unswizzled, delivered by a single instruction. A swizzle atom is the
+    ///   wrong unit for a one-row run of elements; see [`SharedVec`] for why
+    ///   that is a layout decision and not a missing `Swizzle` mode.
     pub trait TileBox {
         /// The element the tile is made of, which is also the map's.
         type Element: TensorMapElement;
@@ -79,6 +88,20 @@ mod host {
         const BOX_COLS: usize = Self::SUBTILE_COLS;
         const BOX_ROWS: usize = R;
         const SWIZZLE: CUtensorMapSwizzle = swizzle_mode(S::ATOM_BYTES);
+    }
+
+    /// A vector is one unswizzled box `N` elements wide and one row tall. The
+    /// row count is what lets a rank-1 layout describe it at all
+    /// ([`GlobalLayout::descriptor_shape`] asserts exactly that), and the
+    /// width is `N` itself rather than a constant of a swizzle mode — the
+    /// difference from the tile impl, and the reason `Swizzle` is not in the
+    /// picture.
+    impl<E: TensorMapElement, const N: usize> TileBox for SharedVec<E, N> {
+        type Element = E;
+        const BOX_COLS: usize = N;
+        const BOX_ROWS: usize = 1;
+        const SWIZZLE: CUtensorMapSwizzle =
+            cuda_core::sys::CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_NONE;
     }
 
     /// A swizzle atom's width is the mode, so the two cannot be stated apart.
@@ -289,6 +312,18 @@ mod host {
                     .into());
                 }
             }
+            // The engine moves the contiguous dimension in 16-byte lines, so a
+            // box whose innermost width is not a whole number of them has no
+            // legal transfer — the rule a swizzled box satisfies for free (its
+            // width *is* an atom) and an unswizzled one has to be checked for.
+            let innermost = box_shape[0] as u64 * E::BYTES as u64;
+            if !innermost.is_multiple_of(ALIGNMENT) {
+                return Err(format!(
+                    "box dimension 0 is {} bytes wide, not a multiple of 16",
+                    innermost
+                )
+                .into());
+            }
             for (dimension, (&extent, &box_extent)) in
                 extents.iter().zip(box_shape.iter()).enumerate()
             {
@@ -417,6 +452,58 @@ mod host {
             assert_eq!(extents, [64, 64, 1]);
             assert_eq!(layout.strides[1..], [64 * 2, 64 * 64 * 2]);
             assert_eq!(shape, [64, 64, 1]);
+        }
+
+        #[test]
+        fn a_vectors_box_is_its_whole_length_at_one_row() {
+            // The shape agreement `SharedVec::tma_load` rests on: one box, `N`
+            // wide, one instruction. Rank 1 is the shape a bare parameter
+            // vector has, and `descriptor_shape`'s assert admits it only
+            // because BOX_ROWS is 1.
+            let layout = unsafe { GlobalLayout::<Bf16, 1>::packed(BASE, [128]) };
+            let (extents, shape) = layout.descriptor_shape::<SharedVec<Bf16, 128>>();
+            assert_eq!(extents, [128]);
+            assert_eq!(shape, [128]);
+            // The same vector out of a `[128, rows]` batch: the row is
+            // selected by a coordinate, so the box gains a dimension of 1 and
+            // the shared side is unchanged.
+            let batched = unsafe { GlobalLayout::<Bf16, 2>::packed(BASE, [128, 64]) };
+            let (extents, shape) = batched.descriptor_shape::<SharedVec<Bf16, 128>>();
+            assert_eq!(extents, [128, 64]);
+            assert_eq!(shape, [128, 1]);
+        }
+
+        #[test]
+        fn a_vectors_box_is_unswizzled_where_a_tiles_is_not() {
+            // The decision, as the descriptor states it. A tile's swizzle also
+            // caps its box at one atom, which is exactly what a vector must
+            // not inherit: 128 bf16 in one box, not two boxes of 64.
+            assert_eq!(
+                <SharedVec<Bf16, 128> as TileBox>::SWIZZLE,
+                cuda_core::sys::CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_NONE
+            );
+            assert_eq!(
+                <Panel as TileBox>::SWIZZLE,
+                cuda_core::sys::CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_128B
+            );
+            assert_eq!(<SharedVec<Bf16, 128> as TileBox>::BOX_COLS, 128);
+            assert_eq!(<Panel as TileBox>::BOX_COLS, 64);
+        }
+
+        #[test]
+        fn an_unswizzled_box_must_still_be_a_whole_number_of_16_byte_lines() {
+            // A swizzled box satisfies this by being an atom wide; a vector's
+            // is its own length, so it is the one box shape that can violate
+            // it. 8 bf16 is 16 bytes and legal, 4 is not.
+            let layout = unsafe { GlobalLayout::<Bf16, 1>::packed(BASE, [64]) };
+            let (extents, legal) = layout.descriptor_shape::<SharedVec<Bf16, 8>>();
+            assert!(layout.check_driver_requirements(&extents, &legal).is_ok());
+            let (_, narrow) = layout.descriptor_shape::<SharedVec<Bf16, 4>>();
+            let error = layout
+                .check_driver_requirements(&extents, &narrow)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("box dimension 0 is 8 bytes"), "{error}");
         }
 
         #[test]

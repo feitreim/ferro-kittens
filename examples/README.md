@@ -21,7 +21,7 @@ target *of the library*.)
 | [`gemm`](src/gemm.rs) | **runs** — exact against a CPU reference | — (two gaps worked around in-file, both marked) |
 | [`softmax`](src/softmax.rs) | **runs** — within 2⁻⁸ of a CPU reference | — |
 | [`flash_forward`](src/flash_forward.rs) | aspirational | #11, #31 |
-| [`layernorm`](src/layernorm.rs) | aspirational | #3, #13 |
+| [`layernorm`](src/layernorm.rs) | `layernorm_rows` **compiles**; `groupnorm_tile` aspirational | #3 (and #2 under it), for `groupnorm_tile` only |
 
 Two of the four **run** rather than merely compile, which is a strictly stronger
 claim and the one worth holding the rest to: a launcher, a CPU reference, and an
@@ -44,13 +44,22 @@ table shows is the shape of a curve and not one headline number.
 Nothing on the remaining lists is arithmetic, and nothing on them is a mover.
 #5 and #6 between them closed every elementwise op and every reduction the four
 kernels asked for and **#38** closed the scalar-operand forms they left behind;
-#21 and #25 closed both halves of the shared ↔ register path, and #22 closed the
-composition on top of them, in both directions and against both memories.
-**#23 and #7 closed together** — flash could not name its `[32, 64]` band, and
-the unsatisfied bound on that band was what kept `make_causal` off the error
-list, so shipping either alone would have left a confusing state. What remains
-across the four is the global ↔ register path (#11), one in-place form (#31),
-and one structural gap (#3 + #13, layernorm's block-scope statistic).
+#21 and #25 closed both halves of the shared ↔ register path, #22 closed the
+composition on top of them, in both directions and against both memories, and
+**#13** closed the vector shape of shared memory. **#23 and #7 closed together**
+— flash could not name its `[32, 64]` band, and the unsatisfied bound on that
+band was what kept `make_causal` off the error list, so shipping either alone
+would have left a confusing state. What remains across the four is the global ↔
+register path (#11), one in-place form (#31), and one structural gap (#3,
+layernorm's block-scope statistic).
+
+`layernorm` is the first example to be **split** by a landed issue rather than
+promoted whole, and the split is the honest reading of what #13 bought.
+`layernorm_rows` is in the default build and gets a real `sm_100a` compile;
+`groupnorm_tile` beside it keeps the `layernorm` feature and its `WANT` block,
+because its statistic spans four warps. The `#[cfg]` sits on the *kernel* — the
+`#[cuda_module]` macro honours it — so the file that documents the gap is the
+file that builds, and one aspirational kernel does not gate a finished one.
 
 The one arithmetic entry still open is `RegTile::add_assign`, and it is **#31**
 rather than a leftover: it is an *in-place* form, and #31 exists to land every
@@ -58,14 +67,16 @@ in-place map variant at once. #38 deliberately did not add a one-off. See §
 "in-place versus by-value" below for what #38 measured about it.
 
 ```sh
-cargo oxide build kittens-examples --arch sm_100a   # the default set: gemm, softmax
-cargo oxide run kittens-examples                    # and run them, on a B200
+cargo oxide build kittens-examples --arch sm_100a   # the default set: gemm, softmax, layernorm_rows
+cargo oxide run kittens-examples                    # and run the ones with launchers, on a B200
 cargo check --features flash                        # read flash's gap list
-cargo check --features aspirational                 # both of them
+cargo check --features aspirational                 # every gated kernel's
 ```
 
 From the repo root: `modal run modal_app.py::build` for the first,
-`modal run modal_app.py::examples` for the second.
+`modal run modal_app.py::examples` for the second, and
+`modal run modal_app.py::gaps` for the last two — it prints both gap lists and
+never fails, since an empty one is a finding rather than an error.
 
 Each aspirational kernel is behind its own feature and off by default, so
 everything in the default build genuinely compiles and the two kinds are
@@ -75,16 +86,24 @@ error is `unresolved import`, `no method named`, or an unsatisfied
 `FragmentLayout` bound — there is nothing in these files that fails for any
 reason other than the API not existing.
 
-Only two kernels are still behind a feature, and their error lists are now two
-errors each — read off `modal run modal_app.py::gaps`, which checks each
-feature on its own so an error belongs to a known kernel:
+Two kernels are still behind a feature — `flash_forward` and `groupnorm_tile`,
+the second of which shares a file with a kernel that is not — and their error
+lists are now short enough to write out. Both are read off
+`modal run modal_app.py::gaps`, which checks each feature on its own so an
+error belongs to a known kernel:
 
 - **`flash_forward`** — `global::store_rows` (#11), `RegTile::add_assign`
-  (#31). Both are at the ends of the kernel; everything between the score
-  band arriving in registers and the probabilities going back to shared is now
-  library API.
-- **`layernorm`** — `SharedVec` (#13), and `sync::block_reduce_sum` (#3), the
-  latter only in `groupnorm_tile`.
+  (#31). Both are at the ends of the kernel; everything between the score band
+  arriving in registers and the probabilities going back to shared is now
+  library API. The list was three errors until #23 landed, and how the third
+  went is worth keeping: `make_causal_at` (#7) was wanted all along and never
+  appeared as its own error, because it is called on the `[32, 64]` band whose
+  `FragmentLayout` bound already failed, and an unsatisfied bound on the
+  receiver suppresses method resolution on it. Counting errors would have said
+  #7 had landed.
+- **`layernorm`** — `sync::block_reduce_sum` (#3), and nothing else. One error,
+  in `groupnorm_tile` only; `layernorm_rows` left the feature gate with #13.
+  Verified by running the check, not by reading the file.
 
 Nothing named `scale`, `shift` or `rsqrt` is in either list any more (#38), and
 nothing named `FragmentLayout` or `make_causal` (#23 + #7). That last pair is
@@ -200,7 +219,7 @@ column, all five for a tile.
 
 All of it is **warp scope**. `tile_sum` folds one warp's band; layernorm's
 group-norm statistic spans four warps' bands and still needs them to agree,
-which is the #3 + #13 entry below.
+which is the #3 entry below — #13 has since supplied the storage half of it.
 
 **#7 — masking. Landed**, with the correction the examples surfaced. The issue
 as filed describes ThunderKittens' signature, which takes no coordinate origin;
@@ -246,13 +265,39 @@ one worth reading: it is fifteen lines of open-coded `RegTile::coordinate`
 arithmetic inside a `GAP` fence, and it is exactly the index math this library
 exists to delete.
 
-**#13 — shared vectors.** `gamma`/`beta` in layernorm: parameters shared by
-every row, wanted in shared memory with their own TMA path (a `[1, N]` box is
-not a tile, and making it one wastes a swizzle atom of padding per row).
+**#13 — shared vectors. Landed**, and it is what promoted `layernorm_rows`.
+`kittens::shared::SharedVec<E, N>` is one flat run of elements with its own
+single-box TMA path — rank 1 or a row of a rank-2 batch, both directions — and
+`ldst::load_vec`/`store_vec` are the `ColVec` broadcast on top of it.
+
+The decision worth recording is that it is **unswizzled and does not go through
+`Swizzle` at all**, rather than riding a new `SwizzleNone` mode. `ATOM_BYTES`
+does two jobs in `shared.rs` — swizzle period *and* TMA box width — and a
+vector wants neither: its box is `N` wide, which no mode marker can carry, and
+any atom small enough to divide a short vector would split it into stacked
+subtiles the engine fetches one instruction each. A 128-byte atom is the
+padding the issue was filed about. Making `SwizzleNone` fit would have meant
+deciding what `ATOM_BYTES` means for an unswizzled *tile*, which is #14's
+question; the vector needed none of it. `SharedVec<Bf16, 32>` is 64 bytes,
+where the narrowest tile that even typechecks spends 128 on its single row.
+
+`TileBox` now has its second impl, which is what #8 and #2 were both waiting
+on: `BOX_COLS = N`, `BOX_ROWS = 1`, `SWIZZLE = NONE`, so a rank-1
+`GlobalLayout` finally has something to hand a box to. Rank 1 is no longer
+"expressible but untried" — the `shared vector round trip` device case runs one.
 
 **#3 — scope parameterization.** Layernorm's whole-tile statistic, and the one
 demand #6 deliberately did not meet. A tile owned by four warps needs the warps
 to agree.
+
+> The storage half of the note below is now answered. `SharedVec` is a type a
+> block-reduction signature can name, and its scalar access is deliberately per
+> *element* rather than per packed word — warp `w` writing index `w` must not
+> read-modify-write a neighbour's value, which is exactly the case a word-wide
+> `Element::pack` could not serve. What #3 still owes is the fold itself, and
+> what it owes *under* #3 is **#2**: `Element` is implemented only for `Bf16`,
+> so `SharedVec<F32, 4>` — the shape a partial actually has — does not exist
+> yet. The type is generic over `E: Element` and needs no change when it does.
 
 > A finding from writing #6 against this, worth having before #3 is picked up:
 > **`Scope` as filed cannot express the block reduction.** The proposed trait is
@@ -264,6 +309,11 @@ to agree.
 > block reduction's signature is either "take a scratch pointer" (not scope
 > parameterization at all) or "take #13's `SharedVec`". #3 and #13 have to be
 > sequenced together, and #6 does not force either.
+>
+> **Settled by #13**: the second one. A `SharedVec` is a type the signature can
+> name, and it is still the *kernel's* allocation — `from_raw` takes a base
+> pointer like every shared type here — so nothing about the shared plan moved
+> into the library.
 
 **#8 — global layout.** ~~Not reachable from a kernel at all~~ — **closed**, and
 it is why this crate now has a launcher at all. `kittens::global::GlobalLayout<E,
@@ -274,8 +324,12 @@ the data type off the `SharedTile` the map is paired with — the agreement
 `gemm::check` builds both operands' maps from it and differs only in extents.
 
 What #8 does *not* close: `GlobalLayout` is bf16-only, because `Element` is
-implemented only for `Bf16` (#2 owns that), so layernorm's fp32 parameter
-vectors still cannot be described. Rank 1 is expressible but untried.
+implemented only for `Bf16` (#2 owns that), so an fp32 buffer still cannot be
+described. Two of the three things that entry used to say have since gone:
+`TileBox` has a second impl (#13), so a layout has something to hand a
+non-tile box to, and rank 1 is no longer untried — the `shared vector round
+trip` device case builds one and moves a vector through it. What remains is
+only the element type, which is #2 and is ~15 lines.
 
 **#12 — MMA coverage.** Not demanded. `mma_abt`, `mma_ab` and `mma_walk_cg2`
 covered every multiply in all four kernels. Worth recording as a negative

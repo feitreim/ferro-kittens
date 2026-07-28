@@ -196,9 +196,12 @@ def gaps() -> None:
 
     `examples/README.md` claims each aspirational kernel's remaining errors by
     name, and that claim is only worth anything if it is read off a compiler
-    rather than off the last person's memory. Each feature is checked on its
-    own so an error belongs to a known kernel; a non-zero exit is the expected
-    outcome and is reported rather than raised."""
+    rather than off the last person's memory. Turning a feature on makes the
+    missing API surface *be* the error list, at the call sites that want it.
+    Each feature is checked on its own so an error belongs to a known kernel,
+    and a non-zero exit is the expected outcome -- reported rather than raised.
+    An empty list is the interesting case: the kernel is ready to leave its
+    gate, which is a finding and not an error."""
     for feature in ("flash", "layernorm"):
         print(f"\n=== cargo check --features {feature} ===", flush=True)
         checked = subprocess.run(

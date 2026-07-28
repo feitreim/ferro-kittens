@@ -13,7 +13,7 @@
 //! | [`gemm`] | runs — checked against a CPU reference by [`gemm::check`] |
 //! | [`softmax`] | runs — checked against a CPU reference by [`softmax::check`] |
 //! | `flash_forward` | aspirational — `--features flash` |
-//! | `layernorm` | aspirational — `--features layernorm` |
+//! | [`layernorm`] | `layernorm_rows` compiles; `groupnorm_tile` aspirational — `--features layernorm` |
 //!
 //! Each aspirational kernel sits behind its own feature and is off by default,
 //! so anything in the default build genuinely compiles and a reader can tell
@@ -34,12 +34,15 @@ use std::process::ExitCode;
 
 pub mod bench;
 pub mod gemm;
+// One of its two kernels compiles in the default build; the `layernorm`
+// feature adds the other, which is still aspirational (#3). The gate is on the
+// kernel rather than the module, so the file that documents the gap is the
+// file that builds.
+pub mod layernorm;
 pub mod softmax;
 
 #[cfg(feature = "flash")]
 pub mod flash_forward;
-#[cfg(feature = "layernorm")]
-pub mod layernorm;
 
 /// A kernel's launch envelope, as the example derives it from the library's
 /// own shape constants — the numbers a host launcher would need.
@@ -67,6 +70,16 @@ fn examples() -> Vec<Example> {
             threads: softmax::THREADS,
             shared_bytes: softmax::SHARED_BYTES,
         },
+        Example {
+            name: "layernorm",
+            status: if cfg!(feature = "layernorm") {
+                "compiles; groupnorm_tile aspirational (#3)"
+            } else {
+                "compiles (layernorm_rows)"
+            },
+            threads: layernorm::THREADS,
+            shared_bytes: layernorm::SHARED_BYTES,
+        },
     ];
     #[cfg(feature = "flash")]
     examples.push(Example {
@@ -74,13 +87,6 @@ fn examples() -> Vec<Example> {
         status: "aspirational (#7, #11, #22, #23, #31)",
         threads: flash_forward::THREADS,
         shared_bytes: flash_forward::SHARED_BYTES,
-    });
-    #[cfg(feature = "layernorm")]
-    examples.push(Example {
-        name: "layernorm",
-        status: "aspirational (#3, #13, #22)",
-        threads: layernorm::THREADS,
-        shared_bytes: layernorm::SHARED_BYTES,
     });
     examples
 }
