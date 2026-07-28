@@ -30,6 +30,16 @@ function of tile *shape*, and it is not a smooth one. `--determinism` measures
 the same tree twice and asserts an identical table, which is what makes a diff
 of two runs evidence.
 
+One thing there does fail the run, and only one: the **occupancy step**. For
+each kernel that states an exact block shape and the CTAs per SM its grid is
+sized for, `regcount` derives the most registers a thread may use and still
+hold that many — from the launch and the 64 K register file, checked against the
+toolkit's own `cuda_occupancy.h` on every run — and goes red when `ptxas` went
+over. At 128 threads that number is **168**, not the 170 the naive
+`file / threads / CTAs` gives: registers are allocated per warp in units of 256,
+across four sub-partitions. `gemm_cg2` is at 167. It is a gate on *occupancy*
+and nothing else — see below for why a register count is not a ranking.
+
 **And read that table as allocation, not as a ranking.** `modal run
 modal_app.py::ladder_bench` puts a clock on four of those rungs — the first
 timed register claim in this repo, on a B200 — and none of registers, stack
