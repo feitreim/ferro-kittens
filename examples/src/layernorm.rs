@@ -1,9 +1,8 @@
 //! # Layernorm over a tile, and the whole-tile reduction next to it
 //!
-//! **Status: [`kernels::layernorm_rows`] compiles** and is in the default
-//! build; [`kernels::groupnorm_tile`] beside it is still aspirational and sits
-//! behind `--features layernorm`. The two kernels differ in exactly one thing —
-//! the axis their statistic is taken over — and that is what separated them.
+//! **Status: both kernels compile** and both are in the default build. They
+//! differ in exactly one thing — the axis their statistic is taken over — and
+//! that is what kept them apart for two issues.
 //!
 //! `layernorm_rows` was blocked on **#13**: `gamma`/`beta` are parameters, not
 //! activations. They are loaded once, shared by every row, and belong in shared
@@ -12,27 +11,25 @@
 //! elements with its own single-box TMA path, unswizzled because a swizzle
 //! atom is a statement about a tile's *rows* and a vector has one — and
 //! [`kittens::ldst::load_vec`] broadcasts it into the `ColVec` `mul_col`
-//! consumes. Nothing in this kernel is a workaround any more.
+//! consumes.
 //!
 //! [`kernels::groupnorm_tile`] normalizes over the *whole* tile rather than per
-//! row, and that is the one place a landed #6 does not reach.
+//! row, and that was the one place a landed #6 did not reach.
 //! `RegTile::tile_sum` is warp scope: it folds a warp's own band across all 32
 //! lanes and stops. A `[128, COLUMNS]` tile is four warps' bands, so the warps
-//! have to agree, and that needs a shared staging buffer and a block barrier —
-//! storage, not a shuffle. **#3**'s `Scope` (`WARPS`, `THREADS`, `rank`,
-//! `sync`) supplies none of it.
+//! have to agree — and warps cannot shuffle to each other, so what closes the
+//! gap is *storage* plus a block barrier rather than another butterfly.
 //!
-//! What #13 changed for that kernel is the *shape of the answer*, not its
-//! status. The open question on #3 was whether a block reduction takes a
-//! scratch pointer or a shared vector; a `SharedVec<F32, WARPS>` is now a type
-//! a signature can name, and `set(warp, partial)` / `get(w)` is exactly the
-//! access a fold over four partials needs. Two things are still missing and
-//! both belong to #3: the reduction itself (`sync::block_reduce_sum`), and an
-//! `impl Element for F32` (**#2**) without which the partials cannot be fp32.
-//! The `partials` pointer below is this kernel guessing at both.
+//! **#3** shipped both halves of that: [`kittens::sync::block_reduce_sum`]
+//! folds one warp-uniform value per warp into one block-uniform value through
+//! a `SharedVec<F32, WARPS>`, and the `impl Element for F32` under it is what
+//! lets four fp32 partials be a shared vector at all. The two calls below are
+//! back to back on the same scratch with no barrier between them, which is a
+//! property of the collective and not an accident: it syncs on both sides, so
+//! the variance pass cannot overtake the mean pass's readers.
 //!
-//! Blocked on: **#3** (and, under it, #2) — for [`kernels::groupnorm_tile`]
-//! only.
+//! Neither kernel has a launcher or a CPU reference yet, which is the only
+//! thing between this file and **runs**.
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
@@ -40,16 +37,17 @@ use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, thread, warp};
 
 use kittens::ldst::{load_tile, load_vec, store_tile};
-#[cfg(feature = "layernorm")]
-use kittens::reg::rsqrt;
-use kittens::reg::{BaseLdtm, ColVec, RegTile};
-use kittens::shared::{Bf16, SharedTile, SharedVec, Swizzle128B, tma_store_commit, tma_store_wait};
-use kittens::sync::Semaphore;
-#[cfg(feature = "layernorm")]
-use kittens::sync::block_reduce_sum;
+use kittens::reg::{BaseLdtm, ColVec, RegTile, rsqrt};
+use kittens::shared::{
+    Bf16, F32, SharedTile, SharedVec, Swizzle128B, tma_store_commit, tma_store_wait,
+};
+use kittens::sync::{Semaphore, block_reduce_sum};
 
 const ROWS: usize = 128;
 const COLUMNS: usize = 128;
+/// Warps a CTA runs, and so the number of partials a whole-tile statistic is
+/// folded from — one band each.
+const WARPS: usize = ROWS / 32;
 
 type Tile = SharedTile<Bf16, ROWS, COLUMNS, Swizzle128B>;
 /// One warp's 32 rows of it.
@@ -61,9 +59,15 @@ type Columns = ColVec<COLUMNS, BaseLdtm>;
 /// vector's own length, where a one-row `SharedTile` would have spent a whole
 /// 128-byte swizzle atom to hold 64 of them.
 type Parameters = SharedVec<Bf16, COLUMNS>;
+/// The four warps' partial statistics, between the two barriers a block
+/// reduction is made of. fp32 and not bf16: a partial rounded on its way
+/// through shared memory would lose eight bits of the sum, and the variance
+/// pass would inherit the error of the mean pass. 16 bytes — one TMA line, and
+/// the narrowest vector [`SharedVec`] admits.
+type Partials = SharedVec<F32, WARPS>;
 
 pub const SHARED_BYTES: usize = Tile::BYTES + 2 * Parameters::BYTES + 64;
-pub const THREADS: u32 = (ROWS / 32) as u32 * 32;
+pub const THREADS: u32 = (WARPS * 32) as u32;
 
 #[cuda_module]
 pub mod kernels {
@@ -156,8 +160,9 @@ pub mod kernels {
     ///
     /// # Safety
     ///
-    /// As [`layernorm_rows`], minus the parameter vectors.
-    #[cfg(feature = "layernorm")]
+    /// As [`layernorm_rows`], minus the parameter vectors. The block is 1-D and
+    /// exactly [`THREADS`] threads, which is what makes each warp's slot in
+    /// `partials` its own.
     #[kernel]
     pub unsafe fn groupnorm_tile(
         source: *const TmaDescriptor,
@@ -167,8 +172,11 @@ pub mod kernels {
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
             let tile = Tile::from_raw(smem);
-            let loaded = Semaphore::attach(smem.add(Tile::BYTES) as *mut Barrier);
-            let partials = smem.add(Tile::BYTES + 32) as *mut f32;
+            // The partials first, because `Tile::BYTES` is the only offset in
+            // this plan a vector's 128-byte alignment is promised at; the
+            // barrier behind it needs eight.
+            let partials = Partials::from_raw(smem.add(Tile::BYTES));
+            let loaded = Semaphore::attach(smem.add(Tile::BYTES + Partials::BYTES) as *mut Barrier);
 
             let lane = warp::lane_id();
             let row_base = 32 * warp::warp_id();
@@ -189,20 +197,19 @@ pub mod kernels {
 
             let x: Band = load_tile(tile.chunk_writer(), row_base, 0, lane);
 
-            // `tile_sum` (#6) folds this warp's band to one f32, warp-uniform.
-            //
-            // WANT (#3): and then the four warps have to agree. #13 supplied
-            // the storage half — `SharedVec<F32, 4>` is a type this signature
-            // could take, and `set(warp, partial)` writes one element without
-            // touching its neighbours, which is why the vector's scalar access
-            // is per element and not per packed word. What is still missing is
-            // the fold itself, and an `Element` impl for fp32 (#2) to hold it.
-            // `partials` below is this kernel guessing at both.
+            // `tile_sum` (#6) folds this warp's band to one f32, warp-uniform,
+            // and `block_reduce_sum` (#3) folds the four warps' to one that is
+            // block-uniform — the shuffle butterfly stops at 32 lanes, so the
+            // second step is a staged write and two barriers rather than more
+            // shuffles.
             let mean = block_reduce_sum(partials, x.tile_sum()) * scale;
-            // `shift`/`scale` against a warp-uniform `f32` (#38), and the free
+            // `shift`/`scale` against a block-uniform `f32` (#38), and the free
             // `rsqrt` beside them: this statistic never becomes a vector, so
             // there was nothing for `RegVec::rsqrt` to ride on.
             let x = x.shift(-mean);
+            // The same scratch again, immediately, with no barrier here: the
+            // reduction syncs after its own read, so this warp cannot overwrite
+            // a slot another warp has not folded yet.
             let variance = block_reduce_sum(partials, x.mul(x).tile_sum()) * scale;
             let x = x.scale(rsqrt(variance + epsilon));
 

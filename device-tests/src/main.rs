@@ -35,6 +35,12 @@
 //! whatever it is handed — and `mma transpose control`, which is the same
 //! operands under the *untransposed* walk and is required to disagree.
 //!
+//! `block reduction` is the one case whose subject is more than one warp.
+//! Everything else here launches 32 or 128 threads and checks a claim about
+//! *one* warp's registers; a block reduction is the only thing in the library
+//! that no warp can compute alone, so it is the only case where the answer
+//! depends on four warps having met at a barrier in the right order.
+//!
 //! Run it with `modal run modal_app.py` (see `modal_app.py` at the repo root);
 //! it exits non-zero if any case fails.
 
@@ -68,12 +74,14 @@ use kittens::global::{GlobalLayout, GlobalRows, encode_bf16_panels, load_rows, s
 use kittens::ldst::{load_fragment, load_tile, load_vec, store_fragment, store_tile};
 use kittens::mma::{self, MmaShape, mm_ab, mm_abt, mm_atb, mm_atbt, mma_abt};
 use kittens::reg::{
-    BaseLdtm, ColLayout, ColVec, Fragment, FragmentLayout, Mul, RegTile, RegVec, online_rescale,
+    BaseLdtm, ColLayout, ColVec, Fragment, FragmentLayout, Max, Mul, RegTile, RegVec,
+    online_rescale,
 };
 use kittens::shared::{
-    Bf16, SharedTile, SharedVec, Swizzle128B, tma_store_commit, tma_store_wait, tma_store_wait_read,
+    Bf16, F32, SharedTile, SharedVec, Swizzle128B, tma_store_commit, tma_store_wait,
+    tma_store_wait_read,
 };
-use kittens::sync::Semaphore;
+use kittens::sync::{Semaphore, block_reduce, block_reduce_sum};
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block, store_wait};
 
 mod ladder_bench;
@@ -129,6 +137,14 @@ const VECTOR_ROWS: usize = 4;
 const VECTOR_ROW: usize = 2;
 
 type Params = SharedVec<Bf16, VECTOR>;
+/// The block reduction's staging buffer: one fp32 per warp, which at four
+/// warps is 16 bytes — the TMA's own line, and so the narrowest vector
+/// `SharedVec::BOX_OK` admits. fp32 and not bf16 because a partial rounded on
+/// its way through shared memory is a wrong sum, not a wrong layout.
+type Partials = SharedVec<F32, BLOCK_WARPS>;
+/// One warp's band in that case. `[32, 64]` is 2048 values, the divisor
+/// [`block_partial`]'s seeds are scaled by.
+type BlockBand = RegTile<32, BLOCK_BAND_COLUMNS, BaseLdtm>;
 /// The vector's plan: itself plus the same scratch tail the tiles use.
 /// `Params::BYTES` is 128-byte aligned, so the barrier lands where a barrier
 /// may.
@@ -256,6 +272,27 @@ const REDUCTION_COLUMNS: usize = COLUMNS / 4;
 /// Per-lane stride of that dump: the row sums, the column sums, the wide
 /// band's max and the narrow band's sum.
 const REDUCTION_STRIDE: usize = REDUCTION_ROWS + REDUCTION_COLUMNS + 2;
+
+/// Warps the block-reduction case runs — the width of the only block scope
+/// [`SharedVec`] can hold partials for, since four fp32 is 16 bytes and a
+/// narrower vector is not a legal box.
+const BLOCK_WARPS: usize = 4;
+/// One warp's band in that case, and the source of its partial: 2048 values,
+/// so a seed of `8^w / 2048` folds to exactly `8^w` with every partial sum
+/// along the way an exact fp32.
+const BLOCK_BAND_COLUMNS: usize = 64;
+const BLOCK_BAND_VALUES: f32 = (32 * BLOCK_BAND_COLUMNS) as f32;
+/// The three statistics [`kernels::block_reduce_probe`] dumps per thread: the
+/// sum, the sum of the doubled partials, and the max.
+const BLOCK_REDUCE_STRIDE: usize = 3;
+
+/// Warp `w`'s partial in that case — a distinct power of eight, so the base-8
+/// digits of any fold over them say exactly which slots were read and how many
+/// times. A warp reading its own slot, a slot read twice and a slot skipped are
+/// three different numbers rather than three ways of being wrong.
+fn block_partial(warp: usize) -> f32 {
+    8f32.powi(warp as i32)
+}
 
 /// Which spelling of the online-softmax step [`kernels::softmax_probe`]
 /// compiles. Only the codegen probe reads these; see its doc comment.
@@ -2952,6 +2989,49 @@ pub mod kernels {
             }
         }
     }
+
+    /// The block reduction against silicon: the one collective in this library
+    /// that spans warps, and the only one no shuffle can implement.
+    ///
+    /// Each warp's band is a splat of the seed the host wrote for *that warp*,
+    /// so `tile_sum` hands `block_reduce_sum` a warp-uniform partial the same
+    /// way `groupnorm_tile` does — the composition under test is the whole
+    /// two-step fold, not the block half alone. The seeds are distinct powers
+    /// of eight ([`block_partial`]), so the host reads the returned number as
+    /// base-8 digits and says which slot was read how many times.
+    ///
+    /// Three calls, back to back on the same scratch with no barrier between
+    /// them, which is the reuse rule the collective claims. The second folds
+    /// the *doubled* partials: if it read the first call's staging instead of
+    /// its own, every digit comes back a 1 where a 2 was wanted, per slot. The
+    /// third is a `Max` rather than a sum, so the `Op` parameter and the
+    /// identity a fold starts from are on the same silicon as the rest.
+    ///
+    /// Every thread dumps all three by its own `(warp, lane)`, so
+    /// block-uniformity is a claim about 128 threads and not about one.
+    ///
+    /// Launch with `BLOCK_WARPS * 32` threads and [`Partials::BYTES`] of shared
+    /// memory.
+    #[kernel]
+    pub unsafe fn block_reduce_probe(seeds: &[f32], mut out: DisjointSlice<f32>) {
+        unsafe {
+            let partials = Partials::from_raw(DynamicSharedArray::<u8, 128>::get_raw());
+            let warp = warp::warp_id() as usize;
+            let thread = thread::threadIdx_x() as usize;
+
+            let band = BlockBand::splat(*seeds.get_unchecked(warp));
+            let mine = band.tile_sum();
+
+            let sum = block_reduce_sum(partials, mine);
+            let doubled = block_reduce_sum(partials, 2.0 * mine);
+            let largest = block_reduce::<Max, BLOCK_WARPS>(partials, mine);
+
+            let base = thread * BLOCK_REDUCE_STRIDE;
+            *out.get_unchecked_mut(base) = sum;
+            *out.get_unchecked_mut(base + 1) = doubled;
+            *out.get_unchecked_mut(base + 2) = largest;
+        }
+    }
 }
 
 /// The layout shapes with a [`FragmentLayout`] impl, one line each — adding a
@@ -3474,6 +3554,109 @@ fn check_shared_vec_row(
     } else {
         Err(format!("{mismatches} of {VECTOR} elements wrong{report}").into())
     }
+}
+
+/// A fold over the per-warp partials, read back as which slots it touched.
+///
+/// The partials are distinct powers of eight, so an observed sum's base-8
+/// digits are the multiplicity of each slot: `[1, 1, 1, 1]` is the fold that
+/// was asked for, `[0, 0, 1, 0]` is a warp that read only its own slot, and a
+/// 2 is a slot folded twice. `None` if the value is not a whole number in
+/// range, which is what a partial that never reached shared memory looks like.
+fn block_digits(value: f32) -> Option<[u32; BLOCK_WARPS]> {
+    if value < 0.0 || value.fract() != 0.0 || value >= 8f32.powi(BLOCK_WARPS as i32) {
+        return None;
+    }
+    let mut left = value as u32;
+    let mut digits = [0u32; BLOCK_WARPS];
+    for digit in digits.iter_mut() {
+        *digit = left % 8;
+        left /= 8;
+    }
+    Some(digits)
+}
+
+/// Do four warps agree, and does the same scratch survive being folded through
+/// three times?
+///
+/// The host writes one seed per warp and applies the fold itself; the kernel
+/// carries no expected total, and every one of its 128 threads reports its own
+/// answer, so "block-uniform" is checked rather than sampled. A failure names
+/// the slots the fold actually read — see [`block_digits`] — which separates
+/// the three ways this can be wrong that all return a plausible number: a warp
+/// reading its own slot, a slot read twice, and the second call reading the
+/// first call's staging.
+fn check_block_reduce(
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<String, Box<dyn Error>> {
+    // Seeded so that `tile_sum` over a splat band is exactly `block_partial`:
+    // every value is a power of two times a power of eight, and every partial
+    // sum on the way is an exact fp32 integer multiple of the seed.
+    let seeds: Vec<f32> = (0..BLOCK_WARPS)
+        .map(|warp| block_partial(warp) / BLOCK_BAND_VALUES)
+        .collect();
+    let threads = BLOCK_WARPS * 32;
+    let device_seeds = DeviceBuffer::from_host(stream, &seeds)?;
+
+    let mut out = DeviceBuffer::<f32>::zeroed(stream, threads * BLOCK_REDUCE_STRIDE)?;
+    unsafe {
+        module.block_reduce_probe(
+            stream,
+            launch_config(threads as u32, Partials::BYTES as u32),
+            &device_seeds,
+            &mut out,
+        )?
+    };
+    let observed = out.to_host_vec(stream)?;
+
+    let sum: f32 = (0..BLOCK_WARPS).map(block_partial).sum();
+    let largest = block_partial(BLOCK_WARPS - 1);
+    let wanted = [
+        ("sum", sum, [1u32; BLOCK_WARPS]),
+        ("doubled sum", 2.0 * sum, [2u32; BLOCK_WARPS]),
+        ("max", largest, [0, 0, 0, 1]),
+    ];
+
+    let mut report = String::new();
+    let mut mismatches = 0usize;
+    for thread in 0..threads {
+        for (offset, (name, expected, digits)) in wanted.iter().enumerate() {
+            let got = observed[thread * BLOCK_REDUCE_STRIDE + offset];
+            if got == *expected {
+                continue;
+            }
+            mismatches += 1;
+            if mismatches <= 8 {
+                let _ = match block_digits(got) {
+                    Some(read) => write!(
+                        report,
+                        "\n    warp {} lane {} {name}: wanted {expected} (slots {digits:?}), \
+                         got {got} (slots {read:?})",
+                        thread / 32,
+                        thread % 32
+                    ),
+                    None => write!(
+                        report,
+                        "\n    warp {} lane {} {name}: wanted {expected}, got {got}, \
+                         which is no fold of the four partials",
+                        thread / 32,
+                        thread % 32
+                    ),
+                };
+            }
+        }
+    }
+    if mismatches == 0 {
+        return Ok(format!(
+            "{BLOCK_WARPS} partials folded three ways, identical in {threads} threads"
+        ));
+    }
+    Err(format!(
+        "{mismatches} of {} statistics wrong{report}",
+        threads * BLOCK_REDUCE_STRIDE
+    )
+    .into())
 }
 
 /// Does `ldmatrix` hand each register the element [`BaseLdtm`] says it owns?
@@ -4453,6 +4636,12 @@ fn run() -> Result<usize, Box<dyn Error>> {
     cases.push((
         "shared vector row",
         Box::new(|| check_shared_vec_row(stream, module)),
+    ));
+    // The fold no shuffle can do (#3): four warps, one shared vector, three
+    // reductions in a row on it.
+    cases.push((
+        "block reduction",
+        Box::new(|| check_block_reduce(stream, module)),
     ));
     cases.push((
         "tma store early recycle",

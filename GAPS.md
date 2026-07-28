@@ -22,7 +22,7 @@ layer in a Rust world, and left unmarked where it is a genuine hole.
 
 These change type signatures across the crate, so they are cheapest to do early.
 
-### 1.1 No group/scope parameterization
+### 1.1 No group/scope parameterization — retired as filed (#3)
 
 TK's `group<N>` templates every memory, register, shared, and MMA op over warp
 count, with `warp = group<1>` and `warpgroup = group<4>` as aliases. One
@@ -37,6 +37,16 @@ WARPS: usize; }` with the lane/warp arithmetic behind associated consts. Worth
 doing before the op surface grows, because retrofitting it means touching every
 signature. **~150 lines + a mechanical sweep.**
 
+**#3 did not do this**, and closed on the argument against it. The window the
+"before the op surface grows" clause names has passed — #5, #6, #7, #31 and #38
+roughly tripled the surface — and, more to the point, a `Scope` of
+`{ WARPS, THREADS, rank(), sync() }` cannot express the one op that actually
+wanted block scope. Warps cannot shuffle to each other, so a fold across them
+needs *storage* between two barriers, which no such trait has. What shipped is
+`sync::block_reduce::<Op, WARPS>` over a `SharedVec<F32, WARPS>` — the specific
+collective, not the parameterization. The scope of every other op is still
+baked into its index math, and naming it in the types is unfiled.
+
 ### 1.2 Single element type
 
 | | TK | ferro-kittens |
@@ -47,10 +57,13 @@ signature. **~150 lines + a mechanical sweep.**
 
 `Element` now carries the byte width, the fp32 → element pack, and (via
 `MmaElement`) the tcgen05 operand kind, so shape math, `ldst`'s pack, and
-`mma`'s bounds are all generic — but `Bf16` is still the only impl (issue #2
-did the trait work; #16 adds fp8). One bf16 fact remains hardcoded behind an
-assert rather than guessed at: `mma`'s K=16 chunk geometry assumes 32 bytes
-per chunk. The *instruction* left that list with #12 — the walks issue through
+`mma`'s bounds are all generic — but `Bf16` is still the only *operand* impl
+(issue #2 did the trait work; #16 adds fp8). `F32` is the second `Element`
+since #3, and deliberately not an `MmaElement`: it exists so a statistic can be
+staged in shared memory without rounding, which is a storage question and not
+an operand one. One bf16 fact remains hardcoded behind an assert rather than
+guessed at: `mma`'s K=16 chunk geometry assumes 32 bytes per chunk. The
+*instruction* left that list with #12 — the walks issue through
 `MmaElement::mma`, which routes tcgen05's `KIND` off the element. FP8 is the
 consequential one: it
 changes the swizzle atom's element count, needs a store path whose `stmatrix`
@@ -395,7 +408,7 @@ they change signatures across the crate and get expensive to retrofit.
 | --- | --- | --- |
 | 1 | Generalize `RegTile` to a logical shape with a layout parameter | 1.3 |
 | 2 | `Element` carries MMA kind and conversion, ready for sub-bf16 | 1.2 |
-| 3 | Scope parameterization | 1.1 |
+| 3 | Block-scope reductions (filed as scope parameterization) | 1.1 |
 | 4 | Device test harness | 6 |
 | 5 | Generic map mechanism and the standard elementwise op set | 3.1 |
 | 6 | Reductions: column-wise, whole-tile, generic reduce | 3.2 |

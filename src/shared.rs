@@ -232,6 +232,55 @@ impl MmaElement for Bf16 {
     }
 }
 
+/// fp32 — the element a *statistic* is held at, not one an MMA reads.
+///
+/// The register side of this crate is fp32 throughout, so this is the element
+/// whose [`Element::pack`] and [`Element::unpack`] are the identity and whose
+/// [`Element::read`]/[`Element::write`] are a plain load and store. It carries
+/// no rounding, which is exactly why a [`SharedVec<F32, N>`] is what a block
+/// reduction stages its per-warp partials in
+/// ([`crate::sync::block_reduce`]): a partial that went through shared memory
+/// as bf16 would come back with eight bits of the sum gone, and the second of
+/// two chained statistics would inherit the error of the first.
+///
+/// Deliberately not an [`MmaElement`]: tcgen05 reads fp32 operands as tf32,
+/// which is a different element with a different mantissa, and giving this one
+/// an `MMA_KIND` would let a `[R, C]` fp32 tile be staged as an operand it is
+/// not the bits of.
+pub struct F32;
+
+impl Element for F32 {
+    /// One value a word, where bf16's is two — the packed word *is* the value.
+    /// The `Element<Unpacked = [f32; 2]>` bound `ldst`'s `stmatrix`/`ldmatrix`
+    /// paths carry is what stops this element reaching them, since a b16
+    /// matrix instruction has nothing to do with a 4-byte element.
+    type Unpacked = [f32; 1];
+    const BYTES: usize = 4;
+
+    #[inline(always)]
+    fn pack(values: [f32; 1]) -> u32 {
+        values[0].to_bits()
+    }
+
+    #[inline(always)]
+    fn unpack(word: u32) -> [f32; 1] {
+        [f32::from_bits(word)]
+    }
+
+    /// A plain 4-byte load. Unlike [`Bf16::read`] there is no widening to do,
+    /// and unlike [`Bf16::write`] the store side is exact — so both halves hold
+    /// on the host and the pair is host-testable end to end.
+    #[inline(always)]
+    unsafe fn read(at: *const u8) -> f32 {
+        unsafe { *(at as *const f32) }
+    }
+
+    #[inline(always)]
+    unsafe fn write(at: *mut u8, value: f32) {
+        unsafe { *(at as *mut f32) = value }
+    }
+}
+
 /// Swizzle mode marker. Only `SWIZZLE_128B` is implemented: it is the only
 /// mode the validated kernels use, and the subtile scheme depends on its
 /// 128-byte atom.
@@ -1026,6 +1075,55 @@ mod tests {
                 assert_eq!(first.to_bits(), low << 16);
                 assert_eq!(second.to_bits(), high << 16);
             }
+        }
+    }
+
+    #[test]
+    fn f32_packs_one_value_a_word_and_rounds_nothing() {
+        assert_eq!(F32::BYTES, 4);
+        // One, where bf16's is two — the number `SharedVec::at`'s stride and
+        // every `Element` consumer that assumed a pair has to survive.
+        assert_eq!(F32::PER_WORD, 1);
+        // Unlike bf16's, *both* halves of this element are ordinary bit math,
+        // so the round trip is checkable here rather than only on a GPU. It is
+        // the identity on the bits, which is the property a partial staged
+        // through shared memory needs: nothing of the sum is lost on the way.
+        for value in [0.0f32, 1.0, -1.0, 1e-30, 3.402_823_5e38, 585.0, 0.1] {
+            assert_eq!(F32::unpack(F32::pack([value])), [value]);
+            assert_eq!(F32::pack([value]), value.to_bits());
+        }
+        // Through memory, the pair `SharedVec::get`/`set` is made of.
+        let mut storage = [0u32; 4];
+        let at = storage.as_mut_ptr() as *mut u8;
+        for (index, value) in [1.0f32, -0.5, 1e8, 0.1].iter().enumerate() {
+            unsafe { F32::write(at.add(4 * index), *value) };
+            assert_eq!(unsafe { F32::read(at.add(4 * index)) }, *value);
+        }
+        // Neighbours untouched: four elements, four distinct words.
+        assert_eq!(storage[0], 1.0f32.to_bits());
+        assert_eq!(storage[3], 0.1f32.to_bits());
+    }
+
+    #[test]
+    fn the_partials_vector_is_the_smallest_legal_box() {
+        // `SharedVec<F32, 4>` — a block reduction's four per-warp partials — is
+        // 16 bytes *exactly*, which is the TMA's line and so the minimum
+        // `BOX_OK` admits. It passes by zero margin, and one warp fewer does
+        // not pass at all, so this is worth an assertion rather than luck.
+        assert_eq!(SharedVec::<F32, 4>::BYTES, 16);
+        assert_eq!(SharedVec::<F32, 8>::BYTES, 32);
+        // Constructing it is what forces `BOX_OK` and `LENGTH_OK`: they are
+        // post-monomorphization asserts, invisible to a type-check, and this is
+        // the host's half of the evidence that they admit this shape. The
+        // device half is `cargo oxide build --arch sm_100a`, which is the only
+        // thing that codegens the kernel that calls it.
+        let partials = [0.0f32; 4];
+        let vec = unsafe { SharedVec::<F32, 4>::from_raw(partials.as_ptr() as *mut u8) };
+        for index in 0..4usize {
+            assert_eq!(
+                unsafe { vec.at(index) } as usize - partials.as_ptr() as usize,
+                index * 4
+            );
         }
     }
 

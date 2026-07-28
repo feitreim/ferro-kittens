@@ -53,7 +53,7 @@ carries both tables and reads them against each other.
 | `tmem` | TMEM accumulator views (`base + (row << 16) + column`) |
 | `mma` | Chained tcgen05 MMA walks over shared-tile operands |
 | `ldst` | Warp-scope register↔shared movers (`stmatrix` on swizzled chunks) |
-| `sync` | Semaphores over mbarrier intrinsics — phase parity, first-class |
+| `sync` | Semaphores over mbarrier intrinsics, and the block-scope fold warps cannot shuffle |
 | `pipeline` | Persistent-grid harness (ThunderKittens' `prototype::lcf` shape) |
 | `global` | Global layouts and their TMA tensor maps (host-only) |
 

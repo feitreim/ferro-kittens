@@ -225,8 +225,13 @@ def gaps() -> None:
     Each feature is checked on its own so an error belongs to a known kernel,
     and a non-zero exit is the expected outcome -- reported rather than raised.
     An empty list is the interesting case: the kernel is ready to leave its
-    gate, which is a finding and not an error."""
-    for feature in ("flash", "layernorm"):
+    gate, which is a finding and not an error.
+
+    `layernorm` was the second feature here until #3. Both of that file's
+    kernels are in the default build now, so the feature is gone and `build`
+    is what holds them -- an empty gap list stops being a finding once there is
+    no gate left for it to be about."""
+    for feature in ("flash",):
         print(f"\n=== cargo check --features {feature} ===", flush=True)
         checked = subprocess.run(
             ["cargo", "check", "--features", feature, "--message-format", "short"],

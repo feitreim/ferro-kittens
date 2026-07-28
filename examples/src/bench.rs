@@ -278,19 +278,16 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// Examples with no row above, and why. Both are aspirational and sit behind
-/// their own cargo feature, so they are not even compiled into the default
-/// build — the status table `main` prints is the same claim from the other
-/// side. Neither is missing here because it is slow.
+/// Examples with no row above, and why. Both compile and neither has a
+/// launcher or a CPU reference, and there is no path through this file that
+/// times a launch it did not first check — so the missing reference is what
+/// keeps them out, not their speed.
 const SKIPPED: &[(&str, &str)] = &[
     (
         "layernorm",
-        "aspirational (#3, #13) — would report GB/s, memory-bound like softmax",
+        "no launcher yet — would report GB/s, memory-bound like softmax",
     ),
-    (
-        "flash_forward",
-        "aspirational (#7, #11, #23, #31) — would report TFLOP/s",
-    ),
+    ("flash_forward", "no launcher yet — would report TFLOP/s"),
 ];
 
 fn report(context: &Arc<CudaContext>, case: &Case) -> usize {

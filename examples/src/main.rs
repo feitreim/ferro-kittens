@@ -12,8 +12,8 @@
 //! | --- | --- |
 //! | [`gemm`] | runs — checked against a CPU reference by [`gemm::check`] |
 //! | [`softmax`] | runs — checked against a CPU reference by [`softmax::check`] |
-//! | `flash_forward` | aspirational — `--features flash` |
-//! | [`layernorm`] | `layernorm_rows` compiles; `groupnorm_tile` aspirational — `--features layernorm` |
+//! | `flash_forward` | compiles — `--features flash`, no launcher yet |
+//! | [`layernorm`] | compiles — both kernels, in the default build |
 //!
 //! Each aspirational kernel sits behind its own feature and is off by default,
 //! so anything in the default build genuinely compiles and a reader can tell
@@ -34,10 +34,9 @@ use std::process::ExitCode;
 
 pub mod bench;
 pub mod gemm;
-// One of its two kernels compiles in the default build; the `layernorm`
-// feature adds the other, which is still aspirational (#3). The gate is on the
-// kernel rather than the module, so the file that documents the gap is the
-// file that builds.
+// Both its kernels are in the default build since #3 — `groupnorm_tile` was
+// the last thing behind the `layernorm` feature, and the feature is gone with
+// it.
 pub mod layernorm;
 pub mod softmax;
 
@@ -79,11 +78,9 @@ fn examples() -> Vec<Example> {
         },
         Example {
             name: "layernorm",
-            status: if cfg!(feature = "layernorm") {
-                "compiles; groupnorm_tile aspirational (#3)"
-            } else {
-                "compiles (layernorm_rows)"
-            },
+            // Kept inside the table's 38-column status field, which a longer
+            // string silently pushes the shared-memory column out of.
+            status: "compiles (both kernels)",
             threads: layernorm::THREADS,
             shared_bytes: layernorm::SHARED_BYTES,
             entry: Some("layernorm_rows"),
@@ -92,7 +89,7 @@ fn examples() -> Vec<Example> {
     #[cfg(feature = "flash")]
     examples.push(Example {
         name: "flash_forward",
-        status: "aspirational (#31)",
+        status: "compiles (no launcher yet)",
         threads: flash_forward::THREADS,
         shared_bytes: flash_forward::SHARED_BYTES,
         entry: None,
