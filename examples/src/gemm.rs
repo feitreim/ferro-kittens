@@ -1631,9 +1631,13 @@ pub(crate) fn check_c(
 /// sees them:
 ///
 /// - a **dropped tile** — a steal that succeeded and was read as "no work
-///   left", so the cancelled cluster's item is computed by nobody. The
-///   `is_canceled` polarity is exactly this bug, and cuda-oxide's own module
-///   doc has the sense inverted against its function doc and its lowering.
+///   left", so the cancelled cluster's item is computed by nobody. Reading the
+///   `is_canceled` polarity backwards produces exactly this, which is why the
+///   probe in `device-tests` establishes it by counting rather than by trusting
+///   a doc. (An earlier version of this comment said cuda-oxide's module doc
+///   had the sense inverted. It did, at v0.2.1; upstream fixed it before the
+///   revision we pin, and that claim was read off a stale cargo checkout.
+///   `examples/README.md` §7 has the correction.)
 /// - a **tile computed twice**, which is only visible through the tile it
 ///   displaces, since the epilogue stores rather than accumulates.
 /// - a **split pair** — #51 again, if the two CTAs of a cluster ever steal

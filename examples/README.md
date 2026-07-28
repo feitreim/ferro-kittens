@@ -1885,10 +1885,29 @@ launched — 4096 exactly, each cluster once.** Both ranks of every cluster were
 told the same thing, and every stolen coordinate was cluster-aligned. Each rank
 waits on a deadline rather than on the barrier, so the failure this case exists
 to catch reports itself instead of hanging — which matters, because the two
-questions it settles both fail silently. It also settles a polarity that
-`cuda_device::clc` documents two ways: `is_canceled == 1` means *work is
-available*, as the function's own doc says and its module-level usage example
-does not.
+questions it settles both fail silently. It also settles the polarity on its
+own evidence: `is_canceled == 1` means *work is available*.
+
+**A correction to what this section originally claimed.** It said
+`cuda_device::clc` documents that polarity two ways, with the module-level usage
+example inverted against the function's own doc. That was true of a revision and
+is not true of ours. Upstream fixed it in `61f4a563` on 2026-06-29 — along with
+the flow diagram and all three `clc_query_get_first_ctaid_*` docs, which were
+wrong the same way — and then replaced the hand-written module doc with a
+generated one, so the pinned `b099f64c` ships a thirteen-line `clc.rs` with no
+usage example to be wrong. The claim traced to a **stale sibling cargo
+checkout**: `~/.cargo/git/checkouts/cuda-oxide-…/4514af2` is v0.2.1 from
+2026-06-10, and of the six checkouts in that directory it is the only one still
+carrying the bug. The file cited as settling it, `crates/mir-lower/…/clc.rs`,
+exists at no upstream revision at all.
+
+Nothing here needs changing — `!= 0` was and is right, and the probe above is
+why we know it rather than the doc. But the mechanism is worth naming, because
+it is #65's failure mode with a new surface: **a `~/.cargo` checkout is not a
+citation.** Revisions accumulate there and cargo does not remove the old ones,
+so reading one proves nothing about what the build compiles against without
+`git log -1` on that specific directory. An upstream claim in this repo should
+name the revision it was read at.
 
 ##### and one CTA an SM is worth 14–16%, not a third — the premise, measured (#98)
 
