@@ -19,7 +19,10 @@
 //! The [`SharedVec`] cases are the one family whose subject is the *absence*
 //! of a layout: an unswizzled box is the shape nothing else here builds, so
 //! they are what says the engine writes a vector contiguously rather than
-//! saying a phase was computed right.
+//! saying a phase was computed right. `global rows map` is the one case whose
+//! subject is the absence of an *engine*: its source is a plain pitched fp32
+//! matrix, addressed by the calling thread, with no descriptor between it and
+//! the registers.
 //!
 //! Run it with `modal run modal_app.py` (see `modal_app.py` at the repo root);
 //! it exits non-zero if any case fails.
@@ -43,7 +46,7 @@ use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, thread, warp};
 
-use kittens::global::{GlobalLayout, encode_bf16_panels};
+use kittens::global::{GlobalLayout, GlobalRows, encode_bf16_panels, load_rows, store_rows};
 use kittens::ldst::{load_fragment, load_tile, load_vec, store_fragment, store_tile};
 use kittens::mma::{self, MmaShape, mma_abt};
 use kittens::reg::{
@@ -256,6 +259,37 @@ const CAUSAL: u32 = 1;
 /// The same mask open-coded against `RegTile::coordinate`, which is what a
 /// kernel writes without #7 — and what `flash_forward`'s gap note describes.
 const BY_HAND: u32 = 2;
+
+/// How [`kernels::global_copy_probe`] moves a band between global memory and
+/// registers — issue #11. Both arms read and write the same elements, so a
+/// difference in the `regcount` table is the spelling and nothing else.
+///
+/// The address math a kernel writes without the movers: `RegTile::coordinate`
+/// per value, the leading dimension multiplied out at the call site. This is
+/// `gemm.rs`'s deleted epilogue, and the load half it never had.
+const OPEN_CODED: u32 = 0;
+/// [`load_rows`] and [`store_rows`] over a [`GlobalRows`] cursor — the API.
+const MOVERS: u32 = 1;
+
+/// Rows of the plain fp32 matrix the global ↔ register case addresses, and its
+/// leading dimension. The pitch is wider than the band read out of it and is
+/// not a multiple of that band's width, so a mover stepping rows by the band's
+/// own width would land on a different element in every row but the first.
+const GLOBAL_ROWS: usize = 64;
+const GLOBAL_PITCH: usize = 192;
+/// The origin of the band [`kernels::global_rows_map`] reads. Neither
+/// coordinate is zero and the column is not a multiple of 16: a rectangle of
+/// global memory is addressed elementwise, so nothing about the fragment's
+/// 16-column blocks should make the origin prefer a block boundary.
+const GLOBAL_ROW: u32 = 16;
+const GLOBAL_COLUMN: u32 = 40;
+
+/// The matrix's value at `(row, column)` — its own flat index, unique over the
+/// buffer and an exact fp32 integer well under 2^24, so a value that reaches
+/// the wrong register names the element it was actually read from.
+fn global_cell(row: usize, column: usize) -> f32 {
+    (row * GLOBAL_PITCH + column) as f32
+}
 
 /// Which lane-passing convention [`kernels::lane_probe`] compiles — issue #27.
 /// Today's convention: `warp::lane_id()` read once by the caller and threaded
@@ -740,6 +774,169 @@ pub mod kernels {
                 row += stride;
             }
         }
+    }
+
+    /// Read a `[32, WIDE]` band out of an ordinary pitched fp32 matrix with
+    /// [`load_rows`] and dump it by thread coordinate.
+    ///
+    /// **What this proves.** There is no descriptor, no swizzle and no packing
+    /// anywhere in this chain — the source is a plain row-major buffer the host
+    /// staged, and every element of it carries its own flat index. The band's
+    /// origin is neither the buffer's corner nor a 16-column block boundary,
+    /// and the matrix's leading dimension is not the band's width, so a value
+    /// arriving in the register the host expects means `load_rows` walked all
+    /// three of those independently. Nothing else in the harness reaches global
+    /// memory without the TMA engine.
+    ///
+    /// The *store* direction is covered by `gemm` in the examples crate rather
+    /// than by a case here: its epilogue is `store_rows` at a runtime `ldc`
+    /// wider than the band, at a non-zero column origin, across four warps, and
+    /// every one of its `512 * 256` fp32 outputs is compared for equality
+    /// against a CPU reference. A case here could only restate that with fewer
+    /// warps.
+    ///
+    /// Launch with one warp: a band belongs to one, and its 32 lanes between
+    /// them own every element of it. Not because the mover is collective —
+    /// alone among the movers here it issues no warp-wide instruction, so a
+    /// missing lane costs its own values and nothing else.
+    #[kernel]
+    pub unsafe fn global_rows_map(source: &[f32], mut out: DisjointSlice<f32>) {
+        unsafe {
+            let lane = warp::lane_id();
+            // SAFETY: read-only — `load_rows` is the only thing issued on this
+            // cursor, which is what `GlobalRows::from_raw` asks of a caller
+            // that reached it by casting away a shared reference.
+            let rows = GlobalRows::from_raw(source.as_ptr().cast_mut(), GLOBAL_PITCH);
+            let band: RegTile<32, WIDE, BaseLdtm> =
+                load_rows(rows, GLOBAL_ROW, GLOBAL_COLUMN, lane);
+            dump_band(band, 0, lane, &mut out);
+        }
+    }
+
+    /// What the global ↔ register movers cost against the index math they
+    /// delete (#11), at both probe widths.
+    ///
+    /// Each step copies one `[32, N]` rectangle of a pitched fp32 matrix into
+    /// the same rectangle of another — a GEMM epilogue with the MMA taken out,
+    /// and the liveness that decides register pressure (#38) is the one a real
+    /// epilogue has: a single band, live from where it is defined to where it
+    /// is stored.
+    ///
+    /// `pitch` is a runtime parameter for the reason `gemm.rs` has `ldc` as
+    /// one: a destination's leading dimension is not known when the kernel is
+    /// compiled, and a probe that folded it would be pricing a store no
+    /// epilogue can issue.
+    #[inline(always)]
+    unsafe fn global_copy_probe<const N: usize, const FORM: u32>(
+        source: &[f32],
+        steps: u32,
+        pitch: u32,
+        out: &mut DisjointSlice<f32>,
+    ) where
+        BaseLdtm: FragmentLayout<32, N>,
+    {
+        unsafe {
+            let slots = RegTile::<32, N, BaseLdtm>::SLOTS;
+            let values = RegTile::<32, N, BaseLdtm>::VALUES;
+            let lane = warp::lane_id();
+
+            let mut step = 0u32;
+            while step < steps {
+                let column = N as u32 * step;
+                let band = if FORM == MOVERS {
+                    load_rows(
+                        GlobalRows::from_raw(source.as_ptr().cast_mut(), pitch as usize),
+                        0,
+                        column,
+                        lane,
+                    )
+                } else {
+                    let mut band = RegTile::<32, N, BaseLdtm>::zero();
+                    let mut slot = 0usize;
+                    while slot < slots {
+                        let mut value = 0usize;
+                        while value < values {
+                            let (row, own) =
+                                RegTile::<32, N, BaseLdtm>::coordinate(lane, slot, value);
+                            let index = row as usize * pitch as usize + (column + own) as usize;
+                            band.set(slot, value, *source.get_unchecked(index));
+                            value += 1;
+                        }
+                        slot += 1;
+                    }
+                    band
+                };
+
+                if FORM == MOVERS {
+                    store_rows(
+                        GlobalRows::from_slice(out, pitch as usize),
+                        0,
+                        column,
+                        lane,
+                        band,
+                    );
+                } else {
+                    let mut slot = 0usize;
+                    while slot < slots {
+                        let mut value = 0usize;
+                        while value < values {
+                            let (row, own) =
+                                RegTile::<32, N, BaseLdtm>::coordinate(lane, slot, value);
+                            let index = row as usize * pitch as usize + (column + own) as usize;
+                            *out.get_unchecked_mut(index) = band.get(slot, value);
+                            value += 1;
+                        }
+                        slot += 1;
+                    }
+                }
+                step += 1;
+            }
+        }
+    }
+
+    /// [`global_copy_probe`] at a 32-wide band, open-coded.
+    #[kernel]
+    pub unsafe fn global_copy_probe_32_open_coded(
+        source: &[f32],
+        steps: u32,
+        pitch: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { global_copy_probe::<32, OPEN_CODED>(source, steps, pitch, &mut out) }
+    }
+
+    /// [`global_copy_probe`] at 32 wide, through the movers.
+    #[kernel]
+    pub unsafe fn global_copy_probe_32_movers(
+        source: &[f32],
+        steps: u32,
+        pitch: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { global_copy_probe::<32, MOVERS>(source, steps, pitch, &mut out) }
+    }
+
+    /// [`global_copy_probe`] at the epilogue width both examples use,
+    /// open-coded.
+    #[kernel]
+    pub unsafe fn global_copy_probe_128_open_coded(
+        source: &[f32],
+        steps: u32,
+        pitch: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { global_copy_probe::<128, OPEN_CODED>(source, steps, pitch, &mut out) }
+    }
+
+    /// [`global_copy_probe`] at 128 wide, through the movers.
+    #[kernel]
+    pub unsafe fn global_copy_probe_128_movers(
+        source: &[f32],
+        steps: u32,
+        pitch: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { global_copy_probe::<128, MOVERS>(source, steps, pitch, &mut out) }
     }
 
     /// Write a warp's band to `out` indexed by `(warp, lane, slot, value)`
@@ -2470,6 +2667,77 @@ fn check_band_roundtrip(
     compare_tile(&out.to_host_vec(stream)?, &expected, words)
 }
 
+/// Does [`load_rows`] read the elements the fragment layout says it does?
+///
+/// The one case in this harness whose source never touches the TMA engine: a
+/// pitched fp32 matrix staged by the host, seeded so every element's value is
+/// its own flat index, read straight into registers at an origin inside it.
+/// The kernel dumps by `(lane, slot, value)` and the host applies
+/// [`BaseLdtm`]'s map, so a misplaced value reports the element it actually
+/// came from — and because the identity *is* the flat index, a wrong stride, a
+/// dropped row origin and a dropped column origin each name a different one.
+///
+/// See [`kernels::global_rows_map`] for why the store direction is left to
+/// `gemm`.
+fn check_global_rows(
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<String, Box<dyn Error>> {
+    let staged: Vec<f32> = (0..GLOBAL_ROWS)
+        .flat_map(|row| (0..GLOBAL_PITCH).map(move |column| global_cell(row, column)))
+        .collect();
+    let source = DeviceBuffer::from_host(stream, &staged)?;
+
+    type Band = RegTile<32, WIDE, BaseLdtm>;
+    let (slots, values) = (Band::SLOTS, Band::VALUES);
+    let mut out = DeviceBuffer::<f32>::zeroed(stream, 32 * slots * values)?;
+    unsafe { module.global_rows_map(stream, launch_config(32, 0), &source, &mut out)? };
+    let observed = out.to_host_vec(stream)?;
+
+    let mut report = String::new();
+    let mut mismatches = 0usize;
+    for lane in 0..32u32 {
+        for slot in 0..slots {
+            for value in 0..values {
+                let (row, column) = Band::coordinate(lane, slot, value);
+                let (row, column) = (
+                    GLOBAL_ROW as usize + row as usize,
+                    GLOBAL_COLUMN as usize + column as usize,
+                );
+                let got = observed[dump_index(0, lane, slot, value, slots, values)];
+                if got == global_cell(row, column) {
+                    continue;
+                }
+                mismatches += 1;
+                if mismatches <= 8 {
+                    let named = if got >= 0.0 && got.fract() == 0.0 && got < staged.len() as f32 {
+                        let index = got as usize;
+                        format!("({}, {})", index / GLOBAL_PITCH, index % GLOBAL_PITCH)
+                    } else {
+                        format!("{got}, which names no element")
+                    };
+                    let _ = write!(
+                        report,
+                        "\n    lane {lane} slot {slot} value {value}: map says \
+                         ({row}, {column}), memory delivered {named}"
+                    );
+                }
+            }
+        }
+    }
+    if mismatches == 0 {
+        return Ok(format!(
+            "[32, {WIDE}] at ({GLOBAL_ROW}, {GLOBAL_COLUMN}) of a {GLOBAL_ROWS}x{GLOBAL_PITCH} \
+             matrix, all at BaseLdtm's coordinates"
+        ));
+    }
+    Err(format!(
+        "{mismatches} of {} values misplaced{report}",
+        observed.len()
+    )
+    .into())
+}
+
 /// Does a [`SharedVec`] survive the whole loop — global, shared, registers,
 /// shared, global — with every element where the library says it is?
 ///
@@ -3226,6 +3494,12 @@ fn run() -> Result<usize, Box<dyn Error>> {
                 module.tma_store_roundtrip_wide(stream, config, source, packed, pitched)
             })
         }),
+    ));
+    // The path with no descriptor in it (#11). Only the load direction: the
+    // store's is `gemm`'s epilogue, checked exactly.
+    cases.push((
+        "global rows map",
+        Box::new(|| check_global_rows(stream, module)),
     ));
     // The vector shape (#13): an unswizzled box, at rank 1 and rank 2.
     cases.push((

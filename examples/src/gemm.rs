@@ -20,11 +20,16 @@
 //!
 //! ## What this kernel had to reach past the library for
 //!
-//! One `GAP` block below, with no open issue behind it:
-//!
-//! - **global stores from registers.** The epilogue is open-coded index math
-//!   against `RegTile::coordinate`, which is the arithmetic this library
-//!   exists to delete (#11).
+//! **Nothing.** There is no `GAP` block left in this file, and the last one to
+//! go is worth recording because it was the most arithmetic of the three. The
+//! epilogue was twelve lines of open-coded index math against
+//! `RegTile::coordinate` — the library reached global memory only through TMA
+//! into shared, so an fp32 band either round-tripped through bf16 or was
+//! addressed by hand. It is now one [`kittens::global::store_rows`] over a
+//! [`kittens::global::GlobalRows`] cursor holding `ldc` (#11), and the exact
+//! CPU check below is what says the two address the same elements: every one
+//! of `M * N` is compared, so a coordinate this kernel no longer computes is
+//! still a coordinate the reference would catch.
 //!
 //! The cluster-scope TMEM allocation that used to sit beside it is now
 //! [`kittens::tmem::alloc_cluster`] / [`kittens::tmem::dealloc_cluster`]
@@ -33,7 +38,7 @@
 //! and they are hardware facts about a cluster accumulator rather than
 //! anything this kernel chose.
 //!
-//! A third one is gone, and how it went is worth recording. The pair's four
+//! The third is gone too, and how it went is worth recording. The pair's four
 //! TMA loads have to complete on *one* barrier for the leader to know the
 //! whole stage is present, and this file used to map the leader's barrier by
 //! hand and call it a missing `Semaphore::at_rank`. That deadlocks: a plain
@@ -59,6 +64,7 @@ use cuda_device::{
 use crate::bench::{Shape, Timings, time};
 use std::error::Error;
 
+use kittens::global::{GlobalRows, store_rows};
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
@@ -246,32 +252,20 @@ pub mod kernels {
             // blocks LDTM delivers.
             let band: Band = accumulator.tile(32 * warp_id, 0);
 
-            // ---- GAP (#11, direct global ↔ register store) -----------------
-            // What the next twelve lines want to be:
-            //
-            //     store_tile(c_layout, band, row_base, column_base, lane);
-            //
-            // The library reaches global memory only through TMA into shared,
-            // so an fp32 epilogue either round-trips through a shared tile
-            // (losing precision to bf16 on the way) or open-codes the address
-            // arithmetic below. This is exactly the index math the library
-            // exists to delete, and `RegTile::coordinate` being public is the
-            // library admitting it.
+            // The fp32 epilogue, straight out of registers (#11). `ldc` is the
+            // destination's leading dimension and `C` is wider than this
+            // tile's columns, so the cursor carries the stride and the band
+            // lands at its own `(row, column)` origin — no shared staging
+            // tile, no descriptor, and no rounding to bf16 on the way out.
             let row_base = 2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * rank + 32 * warp_id;
             let column_base = BLOCK_N as u32 * tile_n;
-            let mut slot = 0usize;
-            while slot < Band::SLOTS {
-                let mut value = 0usize;
-                while value < Band::VALUES {
-                    let (row, column) = Band::coordinate(lane, slot, value);
-                    let index =
-                        (row_base + row) as usize * ldc as usize + (column_base + column) as usize;
-                    *c.get_unchecked_mut(index) = band.get(slot, value);
-                    value += 1;
-                }
-                slot += 1;
-            }
-            // ---- end GAP ---------------------------------------------------
+            store_rows(
+                GlobalRows::from_slice(&mut c, ldc as usize),
+                row_base,
+                column_base,
+                lane,
+                band,
+            );
 
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
