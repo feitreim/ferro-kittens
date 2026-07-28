@@ -67,6 +67,23 @@
 //! obvious pipeline-fill explanation, and for the other two sweeps — the
 //! aspect-ratio one is worth 23% and belongs to #89.
 //!
+//! ## The item map is grouped, not row-major
+//!
+//! That aspect-ratio sweep is what #89 was started from, and it is worth
+//! restating why it is evidence rather than a suggestion. Five shapes, every one
+//! of them identical in flops, tiles, waves, grid, `C` bytes, operand bytes and
+//! arithmetic intensity, differing only in `M : N` — and throughput moved
+//! **1123.7 → 915.7 TFLOP/s**, with the best and worst rows exact transposes of
+//! each other. Nothing but the order the output is walked in can explain a 23%
+//! swing across rows that request the same bytes from the same memory system.
+//!
+//! So the item map is [`pipeline::grouped`] at [`GROUP`] tile-rows rather than
+//! `(item / tiles_n, item % tiles_n)`. What that changes is the *working set of
+//! a wave*: 222 clusters walked row-major sit on `ceil(222 / tiles_n)` rows of
+//! tiles and span as much of `N` as the shape allows, where grouped they sit on
+//! a block whose shape the aspect ratio no longer controls. [`swizzle`] sweeps
+//! the width and keeps the losers, and `examples/README.md` §7 has both.
+//!
 //! ## What this kernel had to reach past the library for
 //!
 //! **Nothing.** There is no `GAP` block left in this file, and the last one to
@@ -1186,9 +1203,15 @@ const COMPARE_SIZES: &[Shape] = &[
 /// stated number rather than as a result looking for an explanation. Every size
 /// is checked against the CPU reference under every scheduler before it is
 /// timed, by the same entry point the rest of the harness uses.
+///
+/// **Both columns now walk at [`GROUP`], where #97's ran row-major**, so the
+/// absolute milliseconds here are not comparable to that table and the
+/// *difference* between the columns still is — which is what this table is for.
+/// [`swizzle`] is where the traversal is the variable.
 pub fn compare(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<(), Box<dyn Error>> {
     println!(
-        "gemm schedulers — min ms over 30 timed launches, both on one shared plan\n\
+        "gemm schedulers — min ms over 30 timed launches, both on one shared plan,\n\
+         both walking pipeline::grouped at width {GROUP} (#89) rather than row-major.\n\
          `predicted` is the ragged last wave the static grid idles through, which is the\n\
          whole of what a dynamic schedule has to win back: 1 - tiles/(waves x {MAX_CLUSTERS})."
     );
