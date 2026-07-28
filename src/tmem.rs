@@ -11,6 +11,78 @@
 //! MMA shapes with phantom rows (`M128` over 64-row tiles) still
 //! type the *drained* shape: `R`/`C` describe what the kernel reads back,
 //! not what the instruction touches.
+//!
+//! # How many columns you ask for is how many CTAs fit on the SM
+//!
+//! An SM has **512 columns** of tensor memory and the allocator divides them.
+//! `512 / columns` CTAs hold allocations on one SM at the same time:
+//!
+//! | columns | CTAs an SM | who asks for it |
+//! | ---: | ---: | --- |
+//! | 32 | 16 | the allocator's smallest unit |
+//! | 64 | 8 | |
+//! | 128 | 4 | `gemm`, through [`alloc_cluster`] |
+//! | 256 | 2 | `flash_forward`, through [`alloc_block`] |
+//! | 512 | 1 | the whole SM |
+//!
+//! Tensor memory is one of two per-CTA resources an SM divides, and residency
+//! is **whichever of the two is tighter**: `min(512 / columns, shared per SM /
+//! shared plan)`. Both of this repo's tcgen05 kernels are capped by the shared
+//! side rather than this one — `gemm` at 3 CTAs where its columns would allow 4,
+//! `flash_forward` at 1 where its columns would allow 2 — so read the table
+//! above as a ceiling that another resource may be sitting under.
+//!
+//! Measured on a B200 by `device-tests`' `tmem residency census`, which counts
+//! CTAs rather than asking about them: every CTA writes down its `%smid` and
+//! timestamps both ends of its allocation off `%globaltimer`, and the host
+//! sweeps the intervals for the most that were ever open at once on one SM. The
+//! counted figure is `512 / columns` exactly, at every legal column count.
+//!
+//! **`cta_group::2` is charged the same way.** A pair does *not* split the
+//! allocation: each rank is charged its full column count against its own SM's
+//! 512, so [`alloc_cluster`] at 128 columns leaves room for four CTAs an SM
+//! exactly as [`alloc_block`] at 128 does. That was the leading hypothesis for
+//! why `gemm` and `flash_forward` might differ (#78) and it is refuted.
+//!
+//! ## Do not use the occupancy query to predict this
+//!
+//! `cuOccupancyMaxActiveBlocksPerMultiprocessor` returns **1** for any kernel
+//! whose code contains a `tcgen05.alloc` — at every column count, at every
+//! block width, and even for a kernel that allocates and *releases* before
+//! doing any work at all. It is not tracking a resource the CTA holds; it is
+//! reacting to the instruction being present. `cuOccupancyMaxActiveClusters`
+//! does the same for a `#[cluster_launch]` kernel. Both queries are accurate on
+//! kernels with no allocator in them (32 and 8 CTAs an SM respectively, matched
+//! by the census to the CTA), which is what makes the 1 easy to believe.
+//!
+//! #74 and #77 read that 1 as hardware and concluded that the allocation size
+//! could not be a lever and that warps per CTA was all that was left. #51 then
+//! measured `gemm` losing 2.07× to a one-CTA-per-SM grid cap, which is
+//! impossible if one CTA per SM were the ceiling, and #83 bisected that kernel's
+//! true residency to 3 — a figure the census reproduces exactly at the same
+//! envelope, from timestamps rather than from a throughput curve.
+//!
+//! So **shrinking an allocation to the next legal power of two doubles the CTAs
+//! tensor memory will hold**, and that is a real lever where #74 and #77 said
+//! there was none. It is only worth pulling while tensor memory is the tighter
+//! of the two resources, which for both kernels here it currently is not: the
+//! thing to shrink is the shared plan.
+//!
+//! The same trap is worth naming once. #70 tried to price `flash_forward`'s
+//! shared plan by querying occupancy at 147536 B, 73792, 32800 and zero, got 1
+//! block/SM at every one of them, and concluded shared memory was not the
+//! lever. Every one of those answers was the allocator pinning the query at 1.
+//! Shared memory is in fact the *only* thing capping that kernel.
+//!
+//! ## The extra CTA, and what a blocking allocator looks like
+//!
+//! The census counts one *more* CTA resident on the SM than is holding columns
+//! — 3 resident against 2 holders at 256 columns, 5 against 4 at 128. That CTA
+//! is admitted and parked inside `tcgen05.alloc`, which blocks until the
+//! columns it asked for come free. It costs a CTA slot and its warps make no
+//! progress, so it is neither absent nor working. Nothing that reads occupancy
+//! off a throughput curve can see the difference, which is why the census
+//! timestamps `entered` and `allocated` separately.
 
 use cuda_device::cusimd::{CuSimd, TmemRegs4};
 use cuda_device::tcgen05::{
@@ -93,6 +165,12 @@ pub unsafe fn dealloc_block(address: u32, columns: u32) {
 /// The `cluster_sync` is what publishes the staging words across the pair; a
 /// caller that stages barriers for its peer before allocating gets that
 /// publication out of the same sync.
+///
+/// Each rank is charged `columns` against **its own SM's 512**, so the pair
+/// costs residency exactly as two independent [`alloc_block`] calls would —
+/// see the module docs. A `cta_group::2` allocation is not a half-share of one
+/// SM's tensor memory, and the pair's two CTAs are on two different SMs in any
+/// case.
 ///
 /// # Safety
 ///
