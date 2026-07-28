@@ -253,7 +253,70 @@ on the cliff for four of the six forms above, so at 252–255 the spill bytes
 carry the signal and the register count carries almost none; the 168 is well
 clear of it and is the one to trust. And every number in this section is from
 `regcount`, which was confirmed deterministic while #31 was measured — the
-same tree twice gave the same 45 kernels to the byte.
+same tree twice gave the same 45 kernels to the byte. `regcount --determinism`
+is that control as a flag now, so it is a thing you run rather than a thing you
+remember (#60).
+
+#### the same question, swept — #60
+
+Everything above is two widths, because until #60 every width was a
+hand-written probe. `device-tests`' `ladder!` generates one per (shape,
+spelling), and the sweep says the two-point reading was right about less than
+it looked. Registers, with spill store bytes, from `regcount`:
+
+| per thread | shape | fused | assign | open-coded | rebound | all in place |
+| --- | --- | --- | --- | --- | --- | --- |
+| 16 | `[32, 16]` | 32 | 32 | 32 | 32 | 32 |
+| 32 | `[32, 32]` | 48 | 48 | 48 | 48 | 48 |
+| 32 | `[16, 64]` | 56 | 56 | 56 | 55 | 56 |
+| 48 | `[32, 48]` | 72 | 72 | 72 | 72 | 72 |
+| 64 | `[32, 64]` | 94 | 96 | 96 | 96 | 39 |
+| 64 | `[16, 128]` | 96 | 127 | 127 | 105 | 32 |
+| 96 | `[32, 96]` | 128 | 47 | 47 | 251 | 32 |
+| 96 | `[48, 64]` | 128 | 40 | 40 | 202 | 32 |
+| 128 | `[32, 128]` | **168** | 252 | 252 | 255, 60 B | 32 |
+| 128 | `[64, 64]` | 162 | 32 | 32 | 168 | 32 |
+| 192 | `[32, 192]` | 255, 900 B | 255, 1012 B | 255, 1012 B | 255, 1096 B | 251 |
+| 192 | `[48, 128]` | 255, 836 B | 255, 996 B | 255, 996 B | 255, 1868 B | 168 |
+| 256 | `[32, 256]` | 255, 1704 B | 255, 976 B | 255, 976 B | 255, 2672 B | 255 |
+| 256 | `[64, 128]` | 255, 1352 B | 255, 1584 B | 255, 1584 B | 255, 2904 B | 96 |
+
+The first four columns are `scalar_map_probe`'s own forms, so the `[32, 128]`
+row *is* the table above it, reproduced. The fifth is new: the accumulate
+written in place too, which nothing in `scalar_map_probe` does.
+
+**In place costs nothing, at fourteen shapes.** `assign` and `open_coded` —
+the API and the `get`/`set` loop it replaces — agree on every counter at every
+rung, including the ones that spill a kilobyte. That is #31's headline claim,
+and it is now the best-supported thing in this section.
+
+**Rows are not columns.** `[64, 64]` and `[32, 128]` are both 128 fp32 a
+thread; `assign` is 32 registers at one and 252 at the other. Nothing before
+this ladder could have caught that, because nothing before it varied `M` at
+all — every probe in the repo is 32 rows. A register cost measured at one
+extent does not transfer to the other.
+
+**And "one expression is the floor" does not survive.** At `[32, 96]`,
+`[48, 64]` and `[64, 64]` the in-place forms are 81 to 130 registers *under*
+the fused one. What is happening there is visible in the stack frames the
+sweep prints beside the registers: those rungs keep a frame as large as the
+form they beat, or larger (`[32, 96]` is 47 registers on 1920 bytes against
+128 on 1536). They did not fit the band — ptxas left it addressable in local
+memory and streamed it.
+
+So materialization-between-statements is real and it is one-directional:
+rebinding is at least as expensive as the in-place spelling of the same two
+ops at every rung above 48 values a thread, and dearer than the fused one at
+every rung but `[16, 64]`, where it wins by a single register. What it does not
+do is order the whole table, because whether the band reaches registers at all
+switches on shape, and where the two disagree the shape effect is bigger.
+
+Which leaves the rule above intact but narrower: *say the step in one
+expression where you can, and write it in place where you cannot* is still the
+advice, and at the one shape flash actually uses (`[32, 128]`) it is still
+worth 84 registers. It is advice about a shape, though, and not a law — and
+whether an in-place form that trades 220 registers for a local-memory band is
+faster is a question `ptxas` cannot answer and a timed kernel can.
 
 **#6 — reductions. Landed.** `row_reduce`/`col_reduce`/`tile_reduce` over a
 `ReduceOp` (a `BinaryOp` with an identity), with `row_max`/`row_min`/`row_sum`/`row_prod`, the `col_*` mirrors,

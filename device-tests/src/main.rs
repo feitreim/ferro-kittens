@@ -31,6 +31,13 @@
 // each states that in its own doc; a `# Safety` section per entry point would
 // be five lines of ceremony saying the same thing.
 #![allow(clippy::missing_safety_doc)]
+// What lets `ladder!` name a kernel after the shape it compiles. A PTX entry
+// symbol is its bare function name, so every rung of the sweep needs a
+// distinct identifier, and without identifier concatenation each one has to be
+// written out by hand — which is exactly why the register table had two widths
+// (#60). This crate is nightly-only and pinned to the toolchain the codegen
+// backend was built against, so the feature is no new constraint on anything.
+#![feature(macro_metavar_expr_concat)]
 
 use std::error::Error;
 use std::fmt::Write as _;
@@ -247,6 +254,34 @@ const CHAINED: u32 = 4;
 /// nothing rebound at all, which under the liveness reading should be the
 /// most expensive form here.
 const ONE_EXPRESSION: u32 = 5;
+
+/// How [`kernels::ladder_probe`] spells the step it sweeps — the spellings
+/// [`scalar_map_probe`](kernels::scalar_map_probe) prices at two widths, kept
+/// as the sweep's only non-shape axis. All five compute the same tile, so a
+/// difference across a row of the ladder table is the spelling and nothing
+/// else, and the first four differ only in how the two *scales* are written.
+///
+/// The whole step as one expression, `out_acc.scale(k).add(block.scale(k))`:
+/// nothing rebound, no whole band materialized between statements. This is
+/// [`ONE_EXPRESSION`].
+const LADDER_FUSED: u32 = 0;
+/// Both scales through `scale_assign`, then the by-value accumulate the flash
+/// call site writes — [`SCALE_ASSIGN`], #31's form.
+const LADDER_ASSIGN: u32 = 1;
+/// Both scales by value with each result rebound to its input — one whole band
+/// materialized per statement, [`SCALED`] and #31's expensive form.
+const LADDER_REBOUND: u32 = 2;
+/// Both scales as `get`/`set` passes, no library op in them at all —
+/// [`IN_PLACE`], statement for statement what [`LADDER_ASSIGN`] compiles, and
+/// the floor that form has to reach.
+const LADDER_OPEN_CODED: u32 = 3;
+/// [`LADDER_ASSIGN`] with the accumulate in place too, so *no* statement in
+/// the step materializes a band. The one spelling on this ladder with no twin
+/// in `scalar_map_probe`, which shares the by-value `add` across all six of
+/// its forms — and the one that shows what the by-value `add` was holding in
+/// registers, since without it ptxas is free to leave the band in local memory
+/// and stream it.
+const LADDER_ALL_IN_PLACE: u32 = 4;
 
 /// How [`kernels::mask_probe`] masks its score band — issue #7. The three
 /// compute the same tile, so a difference in the `regcount` table is the
@@ -1831,6 +1866,273 @@ pub mod kernels {
         unsafe { scalar_map_probe::<128, ONE_EXPRESSION>(scores, steps, k, &mut out) }
     }
 
+    /// **A codegen probe, not a test.** [`scalar_map_probe`]'s step, swept
+    /// over tile *shape* instead of measured at two widths — issue #60.
+    ///
+    /// Every register claim in this repo was measured at 32 and 128 columns,
+    /// not because a width is expensive to measure (`ptxas` is a host compiler
+    /// and the whole sweep is seconds of it) but because each width was a
+    /// hand-written probe. `ladder!` generates them, so a rung costs one
+    /// line, and what that buys is the shape of the curve rather than two
+    /// points on it.
+    ///
+    /// The step is the flash inner loop's accumulate, in five spellings that
+    /// compute the same tile — [`LADDER_FUSED`], [`LADDER_ASSIGN`],
+    /// [`LADDER_REBOUND`], [`LADDER_OPEN_CODED`], [`LADDER_ALL_IN_PLACE`] — so
+    /// a row of the table varies only in how many whole bands get materialized
+    /// between statements, which is the axis #31 found orders register cost.
+    /// The first four are [`scalar_map_probe`]'s own forms, line for line, and
+    /// reproduce its two-width table where they meet it. `steps` is a runtime
+    /// bound so the accumulator stays live across iterations.
+    ///
+    /// A thread of an `[M, N]` warp tile holds `M * N / 32` fp32 values —
+    /// `SLOTS * VALUES` — and the row extent enters that count exactly as the
+    /// column extent does. Whether it enters the *cost* the same way is what
+    /// the row half of this ladder is here to ask, and it does not: see below.
+    /// The ladder is a column sweep at the warp's 32 rows, plus a
+    /// row sweep at two widths, chosen so that four rungs pair off at equal
+    /// per-thread volume and different aspect ratio: `[16, 128]` against
+    /// `[32, 64]`, `[64, 64]` against `[32, 128]`, `[48, 128]` against
+    /// `[32, 192]`, `[64, 128]` against `[32, 256]`. `[32, 256]` and
+    /// `[64, 128]` are 256 values a thread, one past the register file, and
+    /// are in the ladder because a shape that spills is the informative one.
+    ///
+    /// `modal run modal_app.py::regcount` prints the sweep as one table and
+    /// the per-spelling cliff — the first rung whose spill goes non-zero —
+    /// under it; the ladder is written out once more there so a rung that
+    /// stops building is reported as missing rather than quietly dropped.
+    ///
+    /// **What it measured** (`regcount`, sm_100a; registers/thread, spill
+    /// store bytes and stack frame bytes; `per thread` is `M * N / 32`):
+    ///
+    /// ```text
+    ///                      fused        assign    open_coded       rebound  all_in_place
+    ///  [32,  16]   16       32/0          32/0          32/0          32/0          32/0
+    ///  [32,  32]   32       48/0          48/0          48/0          48/0          48/0
+    ///  [32,  48]   48       72/0          72/0          72/0          72/0          72/0
+    ///  [32,  64]   64       94/0          96/0          96/0          96/0          39/0
+    ///  [32,  96]   96      128/0          47/0          47/0         251/0          32/0
+    ///  [32, 128]  128      168/0         252/0         252/0        255/60          32/0
+    ///  [32, 192]  192    255/900      255/1012      255/1012      255/1096         251/0
+    ///  [32, 256]  256   255/1704       255/976       255/976      255/2672         255/0
+    ///  [16,  64]   32       56/0          56/0          56/0          55/0          56/0
+    ///  [48,  64]   96      128/0          40/0          40/0         202/0          32/0
+    ///  [64,  64]  128      162/0          32/0          32/0         168/0          32/0
+    ///  [16, 128]   64       96/0         127/0         127/0         105/0          32/0
+    ///  [48, 128]  192    255/836       255/996       255/996      255/1868         168/0
+    ///  [64, 128]  256   255/1352      255/1584      255/1584      255/2904          96/0
+    ///
+    ///  stack frame bytes
+    ///  [32,  16]   16          0             0             0             0             0
+    ///  [32,  32]   32          0             0             0             0             0
+    ///  [32,  48]   48        208           208           208           208           208
+    ///  [32,  64]   64        272           272           272           272           768
+    ///  [32,  96]   96       1536          1920          1920          1536          1152
+    ///  [32, 128]  128       2560          2560          2560          2624          1536
+    ///  [32, 192]  192       4656          4632          4632          4936          2304
+    ///  [32, 256]  256       6760          6056          6056          7704          3072
+    ///  [16,  64]   32        144           144           144           144           144
+    ///  [48,  64]   96       1536          1920          1920          1536          1152
+    ///  [64,  64]  128       2560          2560          2560          2560          1536
+    ///  [16, 128]   64       1280          1280          1280          1280           768
+    ///  [48, 128]  192       4656          4648          4648          5152          2304
+    ///  [64, 128]  256       6384          6600          6600          7784          3072
+    /// ```
+    ///
+    /// Four results, and only the first is the one #60 was filed expecting.
+    ///
+    /// **`assign` and `open_coded` are identical at all fourteen rungs**, every
+    /// counter, including the three where the pair sits 80 to 200 registers
+    /// below every other spelling. #31 claimed the `_assign` API compiles to
+    /// the loop it replaces on two measurements; this is the same claim on
+    /// fourteen, over shapes that spill, and it is the cleanest column here.
+    ///
+    /// **The row extent is not the column extent.** `[64, 64]` and `[32, 128]`
+    /// are both 128 fp32 a thread and they are not the same shape to compile:
+    /// `assign` is 32 registers at one and 252 at the other, on the same 2560
+    /// bytes of frame. `[16, 128]` against `[32, 64]` and `[48, 64]` against
+    /// `[32, 96]` split the same way, smaller. `M * N` is the first-order
+    /// variable and the aspect ratio is a strong second one, so a cost read off
+    /// one extent does not transfer — which nothing before this ladder could
+    /// have said, because nothing before it varied `M`.
+    ///
+    /// **#31's ordering holds where #31 measured and not everywhere.**
+    /// `rebound` is the dearest or joint-dearest spelling at every rung where
+    /// the spellings differ at all except the two 16-row ones, where it is the
+    /// cheapest of the by-value forms — and at `[32, 128]` the ladder
+    /// reproduces [`scalar_map_probe`]'s 168/252/252/255+60 exactly. But
+    /// `fused` is *not* the floor: at `[32, 96]`, `[48, 64]` and `[64, 64]` the
+    /// in-place forms are 81 to 130 registers under it. Materialization between
+    /// statements orders the by-value spellings; it does not order the table.
+    ///
+    /// **What orders the table is whether the band is in registers at all**,
+    /// and that switches on shape. Read the frames beside the registers: at
+    /// each of those three rungs the cheap pair keeps a frame at least as
+    /// large as the form it beat — `[32, 96]` is 47 registers on 1920 bytes
+    /// against `fused`'s 128 on 1536. They did not fit the band; ptxas left it
+    /// addressable in local memory and streamed it, and a streamed band is
+    /// cheap in the counter this probe reports and not free in fact.
+    /// [`LADDER_ALL_IN_PLACE`] is that outcome on purpose — nothing in its
+    /// step materializes a band, the accumulate included — and it is 32
+    /// registers at six of fourteen rungs on half to three-quarters the frame
+    /// of the others from 96 values a thread up. Lower on both counters is
+    /// still not a proof of faster: a frame is a *size*, and what a streamed
+    /// band costs is local-memory *traffic*, which `ptxas -v` does not report
+    /// and only a timed kernel can price.
+    ///
+    /// The cliff, for the record: `rebound` first spills at 128 values a
+    /// thread (128 columns at 32 rows), the other three at
+    /// 192, and `all_in_place` at no rung on this ladder. Nothing at all is
+    /// visible below 64 values a thread — every spelling is identical at
+    /// `[32, 16]`, `[32, 32]` and `[32, 48]`, which is why a 32-wide probe
+    /// could sit through a change worth 87 registers at 128 (#5) and report
+    /// nothing.
+    #[inline(always)]
+    unsafe fn ladder_probe<const M: usize, const N: usize, const FORM: u32>(
+        scores: &[f32],
+        steps: u32,
+        k: f32,
+        out: &mut DisjointSlice<f32>,
+    ) where
+        BaseLdtm: FragmentLayout<M, N>,
+    {
+        unsafe {
+            let slots = RegTile::<M, N, BaseLdtm>::SLOTS;
+            let values = RegTile::<M, N, BaseLdtm>::VALUES;
+            let lane = warp::lane_id();
+
+            let mut out_acc = RegTile::<M, N, BaseLdtm>::zero();
+
+            let mut step = 0u32;
+            while step < steps {
+                let mut block = RegTile::<M, N, BaseLdtm>::zero();
+                let mut slot = 0usize;
+                while slot < slots {
+                    let mut value = 0usize;
+                    while value < values {
+                        let (row, column) =
+                            RegTile::<M, N, BaseLdtm>::coordinate(lane, slot, value);
+                        let index = step as usize * M * N + row as usize * N + column as usize;
+                        block.set(slot, value, *scores.get_unchecked(index));
+                        value += 1;
+                    }
+                    slot += 1;
+                }
+
+                if FORM == LADDER_FUSED {
+                    out_acc = out_acc.scale(k).add(block.scale(k));
+                } else {
+                    if FORM == LADDER_REBOUND {
+                        block = block.scale(k);
+                        out_acc = out_acc.scale(k);
+                    } else if FORM == LADDER_OPEN_CODED {
+                        // Two passes, not one fused pass, for
+                        // `scalar_map_probe`'s reason: a floor that fused them
+                        // would be measuring the fusion and not the spelling.
+                        let mut slot = 0usize;
+                        while slot < slots {
+                            let mut value = 0usize;
+                            while value < values {
+                                block.set(slot, value, block.get(slot, value) * k);
+                                value += 1;
+                            }
+                            slot += 1;
+                        }
+                        let mut slot = 0usize;
+                        while slot < slots {
+                            let mut value = 0usize;
+                            while value < values {
+                                out_acc.set(slot, value, out_acc.get(slot, value) * k);
+                                value += 1;
+                            }
+                            slot += 1;
+                        }
+                    } else {
+                        block.scale_assign(k);
+                        out_acc.scale_assign(k);
+                    }
+                    // The accumulate every form but [`LADDER_ALL_IN_PLACE`]
+                    // shares, so that four of the five columns differ in the
+                    // *scales* alone and the fifth differs in this line alone.
+                    if FORM == LADDER_ALL_IN_PLACE {
+                        out_acc.add_assign(block);
+                    } else {
+                        out_acc = out_acc.add(block);
+                    }
+                }
+                step += 1;
+            }
+
+            // The accumulator has to reach memory or the loop above is dead
+            // and the register counts describe nothing.
+            let base = lane as usize * slots * values;
+            let mut slot = 0usize;
+            while slot < slots {
+                let mut value = 0usize;
+                while value < values {
+                    *out.get_unchecked_mut(base + slot * values + value) = out_acc.get(slot, value);
+                    value += 1;
+                }
+                slot += 1;
+            }
+        }
+    }
+
+    /// One rung: one spelling of [`ladder_probe`] at one `[M, N]`, as a
+    /// `#[kernel]` named after the shape it compiles.
+    ///
+    /// A PTX entry symbol is the bare function name, so every rung needs a
+    /// distinct identifier and there is no generic way around writing one —
+    /// `${concat}` is what turns that into a shape rather than a signature.
+    macro_rules! ladder_rung {
+        ($m:literal, $n:literal, $spelling:ident, $form:ident) => {
+            #[kernel]
+            pub unsafe fn ${concat(ladder_probe_, $m, x, $n, _, $spelling)}(
+                scores: &[f32],
+                steps: u32,
+                k: f32,
+                mut out: DisjointSlice<f32>,
+            ) {
+                unsafe { ladder_probe::<$m, $n, $form>(scores, steps, k, &mut out) }
+            }
+        };
+    }
+
+    /// The ladder: one line per shape, the five spellings generated. Both
+    /// extents must be multiples of 16 (`BaseLdtm` has an impl per extent);
+    /// beyond that a rung costs a line here and nothing else, which is the
+    /// whole of #60.
+    macro_rules! ladder {
+        ($(($m:literal, $n:literal)),* $(,)?) => {$(
+            ladder_rung!($m, $n, fused, LADDER_FUSED);
+            ladder_rung!($m, $n, assign, LADDER_ASSIGN);
+            ladder_rung!($m, $n, rebound, LADDER_REBOUND);
+            ladder_rung!($m, $n, open_coded, LADDER_OPEN_CODED);
+            ladder_rung!($m, $n, all_in_place, LADDER_ALL_IN_PLACE);
+        )*};
+    }
+
+    ladder!(
+        // The column sweep, at the warp's 32 rows: 16 values a thread up to
+        // 256, which is one past the register file.
+        (32, 16),
+        (32, 32),
+        (32, 48),
+        (32, 64),
+        (32, 96),
+        (32, 128),
+        (32, 192),
+        (32, 256),
+        // The row sweep, at two widths, so four of these pair off with a
+        // column rung at equal per-thread volume and a different shape.
+        (16, 64),
+        (48, 64),
+        (64, 64),
+        (16, 128),
+        (48, 128),
+        (64, 128),
+    );
+
     /// **A codegen probe, not a test.** Masking is pure lane-local coordinate
     /// arithmetic and is checked exhaustively on the host, across all 32
     /// lanes, in `reg.rs`; what only silicon's compiler can answer is what it
@@ -2038,10 +2340,10 @@ pub mod kernels {
     ///
     /// ```text
     ///                    regs   stack
-    /// 128 hoisted         198    2816
+    /// 128 hoisted         168    2816
     /// 128 per_op          168    2816
     /// 128 per_query       168    2816
-    ///  32 hoisted          72     256
+    ///  32 hoisted          56     384
     ///  32 per_op           40     512
     ///  32 per_query        40     512
     /// ```
@@ -2050,13 +2352,22 @@ pub mod kernels {
     /// the emitted PTX holds exactly *one* `%laneid` move in all six kernels —
     /// so the count of `warp::lane_id()` calls is free, and reading the
     /// register inside an op costs nothing over receiving it. What is left is
-    /// where the value is *defined*: hoisting it into the entry block makes the
-    /// whole coordinate map loop-invariant, which ptxas pays for in live
-    /// registers (+30 at 128, on a PTX body 5 instructions from identical) and
-    /// is repaid in instructions at 32 (517 against 643) and half the local
-    /// traffic. That is an allocator trade, not a property of the convention;
-    /// this probe exists so it stays visible if the backend's `lane_id`
-    /// lowering ever stops being a CSE-able pure read.
+    /// where the value is *defined*: hoisting it into the entry block makes
+    /// the whole coordinate map loop-invariant, which ptxas pays for in live
+    /// registers at 32 (+16) and is repaid in half the local traffic. That is
+    /// an allocator trade, not a property of the convention; this probe exists
+    /// so it stays visible if the backend's `lane_id` lowering ever stops
+    /// being a CSE-able pure read.
+    ///
+    /// Three cells of this table drifted between #27 and #60 — it recorded
+    /// 198 registers for `128 hoisted` and 72/256 for `32 hoisted`, and the
+    /// tree measures 168 and 56/384. The re-measurement is #60's, and *only*
+    /// the `regcount` columns are re-measured: the instruction counts #27 read
+    /// off the emitted PTX are left as its own. What the drift costs is the
+    /// 128-column half of the finding — hoisting is free at that width now,
+    /// where #27 measured it at 30 registers, so the trade is visible only at
+    /// 32 and the direction of the whole result is the same as #60's ladder:
+    /// the wide probe sits high enough that everything reads alike.
     #[inline(always)]
     unsafe fn lane_probe<const N: usize, const CONVENTION: u32>(
         scores: &[f32],
