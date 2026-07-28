@@ -265,9 +265,16 @@ pub const CUBLASLT: Option<Baseline> = None;
 /// `C` is 1 GiB of fp32 — against the 180 GiB a B200 carries, so the size is
 /// bounded by host staging time and not by the device.
 const GEMM_SIZES: &[Shape] = &[
+    // The smallest shape that is **one cluster running exactly one item**, and
+    // therefore §7's "the small-size floor is one item boundary" row. It was
+    // `256x128x256` through #102; #87 widened the pair tile to `[256, 256]`, so
+    // `n = 128` no longer divides the tiling and the one-item shape is now this
+    // one. The row measures the same thing — a single item's cost, undivided —
+    // and the absolute microseconds are not comparable across that change,
+    // because the item it is one of has twice the columns.
     Shape {
         m: 256,
-        n: 128,
+        n: 256,
         k: 256,
     },
     Shape {
@@ -803,6 +810,22 @@ pub fn main() -> ExitCode {
         && name == "swizzle"
     {
         return match gemm::swizzle(&context, CUBLASLT) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // `bench tile` is the same kind of thing one lever further down: #87's
+    // pair tile and pipeline depth with the size held fixed, where `swizzle`
+    // holds the tile and moves the traversal. It rides this argument for the
+    // same reason.
+    if let Some((name, _)) = &selected
+        && name == "tile"
+    {
+        return match gemm::tile_sweep(&context, CUBLASLT) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 println!("FAIL  {error}");

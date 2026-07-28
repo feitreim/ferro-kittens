@@ -1633,6 +1633,24 @@ pub mod kernels {
         unsafe { census_cluster_probe(128, hold_ns, &mut out) }
     }
 
+    /// [`census_cluster_probe`] at the 256 columns a `[256, 256]` pair tile
+    /// allocates — #87's rung, and the first envelope in this repo where
+    /// **tensor memory is the tighter of the two per-CTA resources**.
+    ///
+    /// Every `cta_group::2` rung so far has been capped by shared memory, so
+    /// `512 / columns` has never actually bound anything and its half of the
+    /// residency formula has never been tested where it decides. At 256
+    /// columns it admits two, and a `[256, 256]` kernel two stages deep
+    /// declares 65 608 B, which admits three. The prediction this makes is
+    /// sharper than the count: the third CTA should be *admitted* and park
+    /// inside `tcgen05.alloc`, so `resident` reads three where `holding` reads
+    /// two — the first rung here where the census's two columns differ.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    pub unsafe fn residency_census_cluster_256(hold_ns: u64, mut out: DisjointSlice<u64>) {
+        unsafe { census_cluster_probe(256, hold_ns, &mut out) }
+    }
+
     /// [`census_cluster_probe`] at the whole SM's tensor memory — the cluster
     /// side's positive control, and the rung that says whether a `cta_group::2`
     /// allocation is charged to each rank or split across the pair.

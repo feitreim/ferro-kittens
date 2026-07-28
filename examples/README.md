@@ -2268,6 +2268,319 @@ section's `group 1` control are the same kernel, and they agree.** 0.8965 ms /
 baselines landing on the same number is what makes both sets of deltas readable
 against each other.
 
+##### and the re-fit that ranks the rest, on the post-#102 kernel — #87
+
+The section above ends by invalidating the fit everything queued behind it was
+ranked off, and asks for `gemm-depth` to be re-run before #15 or #87 is ordered.
+This is that re-run, on `7ef5685`, one B200, every row checked against the CPU
+reference before it was timed.
+
+| K | K blocks per item | min ms | median | TFLOP/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 8 | 0.2731 | 0.2782 | 251.6 |
+| 2048 | 32 | 0.3700 | 0.3729 | 742.9 |
+| 8192 | 128 | 0.8296 | 0.8333 | 1325.4 |
+| 32768 | 512 | 3.0590 | 3.2067 | **1437.8** |
+
+8192³ reproduces #102's 1314.8 to 0.8%, which is what says this is the same
+kernel. Least squares on raw minimum milliseconds, **all three point selections
+stated** because #90 was sent back once for leaving that out:
+
+| points | fixed ms | per tile | steady TFLOP/s | share of 8192³ |
+| --- | ---: | ---: | ---: | ---: |
+| K = 8192, 32768 (preferred) | 0.0865 | **8.6 µs** | **1480** | **10.4%** |
+| K = 2048, 8192, 32768 | 0.1516 | 15.2 µs | 1518 | 18.3% |
+| all four | 0.1835 | 18.3 µs | 1538 | 22.1% |
+
+The marginal cost of a K block per item runs **0.404, 0.479, 0.581 µs** across
+the three intervals, against #90's 0.378, 0.503, 0.569 — still convex, so the
+two deepest points are still preferred for the reason #90 gives, and the
+L2-crossing caveat on the shallow rows is unchanged.
+
+**Three things, and one is a problem with the instrument.**
+
+**1. The steady state did not move.** 1480–1538 against #91's 1515–1527. #102
+bought 8.4% at `K = 8192` and lost 2.2% at `K = 32768`, so it moved the middle
+of this sweep and not its asymptote.
+
+**2. The ceiling suspicion the section above raised got stronger.** Four numbers
+by three unrelated routes now sit in **1437–1480**: this run's `K = 32768`
+(1437.8), #102's `K = 32768` (1443.9 row-major, 1412.6 grouped), #102's 16384³
+grouped (1466.3), and this fit's preferred asymptote (1480). Pre-#102 the
+deepest measured row sat 10.6% under the fitted asymptote (1369.9 against 1515);
+it now sits **2.9%** under it. A curve closing on its own asymptote is what a
+real ceiling looks like.
+
+> **It was not a ceiling, and the section below is what refutes it.** #87's
+> wider pair tile measures **1718.5 TFLOP/s** at `K = 32768` and 1622.5 at
+> 16384³, straight through the 1437–1480 band that four numbers by three routes
+> had converged on. What that band was is a property of the **`[256, 128]`
+> tile's arithmetic intensity**, not of the device and not of this kernel's
+> structure — so the convergence was real and the inference from it was wrong.
+> Three shapes agreeing is evidence that one *shared* term binds them, and it
+> does not say which term; every one of those three shapes had the same tile.
+
+**3. The fit is now a worse instrument for the item boundary than it was, and
+that is not a detail.** The boundary reads 10.4% to 22.1% depending on point
+selection — a 2.1× spread, where #90's 28.8%→35.7% was already enough to send it
+back. The cause is mechanical: the intercept is *everything that does not scale
+with `K`*, and #102 put a K-dependent, non-monotone locality term into that
+bucket. Rotating the `K = 8192` point down toward the line is most of why the
+two-point intercept halved. **So the 8.6 µs is not evidence that the epilogue
+got cheaper — nothing touched the epilogue.** The honest statement is 8.6–18.3
+µs per tile, and this fit cannot narrow it further.
+
+##### and the pair tile was worth 21%, against a prediction that it would lose — #87
+
+**The prediction, written down before the sweep ran, was that #87's headline
+rung would cost 9–13%.** The reasoning: `[256, 256] @ STAGES = 3` buys 1.5×
+arithmetic intensity for one occupancy step, #98 priced that step at 14–16%, and
+a kernel sitting 2.9% under its own fitted asymptote at three shapes is not
+waiting on operand delivery. The boundary-count half — a wider tile halves the
+tiles, so halves the item boundaries — was argued to be worth 2.5–5.5%, since
+#91's evidence says roughly half the boundary is the store loop and the store
+loop is proportional to `C` bytes, which a wider tile does not reduce.
+
+**It measured +11.6% and +21.6%, and the arithmetic above is wrong in a way the
+control identifies.** Min ms over 30 timed launches, static schedule, `GROUP =
+8`, one B200, every row checked element-by-element against the CPU reference
+before it was timed. `vs #102` is against `[256, 128] s3`, the kernel that
+shipped before this sweep.
+
+| rung | shared B | CTA/SM | shape | tiles | wave eff | reuse | min ms | TFLOP/s | vs #102 |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| [256,128] s3 | 73816 | 3 | 8192³ | 2048 | 92.3% | 15.1× | 0.8420 | 1305.9 | — |
+| [256,128] s2 | 49224 | **4** | 8192³ | 2048 | 98.8% | 16.8× | 1.3018 | 844.6 | **−35.3%** |
+| [256,128] s4 | 98408 | 2 | 8192³ | 2048 | 98.8% | 12.7× | 0.9117 | 1206.0 | −7.7% |
+| [256,256] s2 | 65608 | 2 | 8192³ | 1024 | 98.8% | 11.0× | 0.8555 | 1285.2 | −1.6% |
+| **[256,256] s3** | 98392 | 2 | 8192³ | 1024 | 98.8% | 11.0× | **0.7546** | **1457.1** | **+11.6%** |
+| [256,128] s3 | 73816 | 3 | 16384³ | 8192 | 99.7% | 15.1× | 6.5948 | 1333.8 | — |
+| [256,128] s2 | 49224 | **4** | 16384³ | 8192 | 98.8% | 16.8× | 9.4160 | 934.2 | **−30.0%** |
+| [256,128] s4 | 98408 | 2 | 16384³ | 8192 | 98.8% | 12.7× | 6.4605 | 1361.5 | +2.1% |
+| [256,256] s2 | 65608 | 2 | 16384³ | 4096 | 98.8% | 11.0× | 5.8492 | 1503.8 | +12.7% |
+| **[256,256] s3** | 98392 | 2 | 16384³ | 4096 | 98.8% | 11.0× | **5.4214** | **1622.5** | **+21.6%** |
+
+**1622.5 TFLOP/s is the fastest this kernel has ever been measured at** — past
+#102's 1466.3, and 72% of dense bf16 peak.
+
+**The control is what makes this readable, and it is the row #87's own table
+does not have.** `[256, 128] @ STAGES = 4` has the *same* shared plan as the
+winner (98408 B against 98392) and therefore the same two CTAs an SM, at
+unchanged pair tile, unchanged intensity and unchanged tile count. So it prices
+the occupancy step on its own, and the difference between it and the winner is
+the tile and nothing else:
+
+| | 8192³ | 16384³ |
+| --- | ---: | ---: |
+| occupancy step 3 → 2, at unchanged tile ([256,128] s4 vs s3) | **−7.7%** | **+2.1%** |
+| the tile, at fixed residency and shared plan ([256,256] s3 vs [256,128] s4) | **+20.8%** | **+19.2%** |
+| net | +11.6% | +21.6% |
+
+Two findings fall out, and neither is #87's argument.
+
+**A fourth pipeline stage very nearly pays for the CTA it costs.** #98 priced
+the 3 → 2 step at **13.6–16.1%** on bytes no code touched. Here the identical
+step, paid for with a live fourth stage, costs **7.7%** at 8192³ and **gains
+2.1%** at 16384³. Subtracting, the fourth stage is worth roughly 14–18% — about
+what the CTA it displaces was worth. That is a much more direct answer to "does
+depth substitute for residency" than anything here has had, and it says: nearly
+exactly, at this shape.
+
+**And the reverse trade is a catastrophe.** `[256, 128] @ STAGES = 2` steps
+residency *up*, to four CTAs an SM — the only rung here that does — and it is
+the worst row in the table by a wide margin, **−35.3% and −30.0%**. It also has
+the *best* wave efficiency and the *best* reuse of any rung. So a fourth CTA
+cannot cover what a third pipeline stage was covering, and residency and
+pipeline depth are not interchangeable currency even though both are bought with
+shared memory. This is the rung most likely to have been skipped on the grounds
+that "more occupancy is better", and it is the largest single number in the
+table.
+
+**Which of the two tile mechanisms, and the traversal is the evidence.** #89's
+`GROUP` was measured at `[256, 128]` and a wider tile halves `tiles_n`, so it was
+re-swept rather than carried across. At 8192³:
+
+| group | [256,128] s3 reuse | TFLOP/s | [256,256] s3 reuse | TFLOP/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 9.2× | 1210.5 | 8.0× | 1420.3 |
+| 4 | 10.4× | 1270.0 | 7.4× | 1425.1 |
+| 8 | 15.1× | **1307.1** | 11.0× | 1455.2 |
+| 16 | 14.5× | 1287.7 | 11.4× | **1455.9** |
+
+**The traversal is worth 8.0% at the old tile and 2.5% at the new one.** 8 and
+16 are a dead heat at the new tile — 0.05% apart — so `GROUP` stays 8 and the
+choice stopped mattering much. That is the mechanism evidence: the lever #102
+pulled acts on operand delivery, and the wider tile has absorbed most of what it
+was recovering. Note also that the winner's *wave reuse is lower* than the
+control's (11.0× against 12.7×) and it is 20% faster, so this is not L2 capture
+— it is the tile's own arithmetic intensity, which is a different quantity and
+the one #87 named.
+
+**The `[256, 256] @ STAGES = 3` rung is the standout for the reason #87 gives,
+and that reason is now measured.** Tensor memory caps the tile at two CTAs an SM
+whatever the depth, so the third stage costs shared memory that residency was
+not going to use. Against `STAGES = 2` at the same tile and the same counted
+residency it is worth **+13.4%** at 8192³ and **+7.9%** at 16384³ — a free
+third stage, and it is not a small thing.
+
+##### which mechanism, settled by re-running the same fit on the new tile
+
+The two mechanisms scale differently with `K`, which is what separates them:
+**arithmetic intensity is a property of the steady state and moves the fit's
+slope**, while **boundary count is a fixed per-launch cost and moves its
+intercept**. So `gemm-depth` was run again on the new tile, same B200, same
+verify-then-time path, and fitted the same three ways.
+
+`[256, 256] s3` at `M = N = 8192`: 0.2447 / 0.3422 / 0.7526 / **2.5592 ms** at
+`K` of 512 / 2048 / 8192 / 32768 — that is **280.8 / 803.2 / 1460.9 /
+1718.5 TFLOP/s**, and the last is **76.4% of dense bf16 peak**. Items on the
+critical path are 7 rather than 10, because 1024 tiles over 148 clusters is not
+2048 over 222.
+
+| points | steady TFLOP/s, `[256,128] s3` → `[256,256] s3` | fixed ms | per tile | share of 8192³ |
+| --- | ---: | ---: | ---: | ---: |
+| K = 8192, 32768 | 1480 → **1826** | 0.0865 → **0.1504** | 8.6 → **21.5 µs** | 10.4% → 20.0% |
+| K = 2048, 8192, 32768 | 1518 → **1850** | 0.1516 → 0.1779 | 15.2 → 25.4 µs | 18.3% → 23.6% |
+| all four | 1538 → **1862** | 0.1835 → 0.1903 | 18.3 → 27.2 µs | 22.1% → 25.3% |
+
+**The slope moved 21–23% and the intercept went the wrong way.** That is the
+answer, and it is unambiguous:
+
+- **Arithmetic intensity is the entire mechanism.** +21.1% to +23.4% on the
+  steady state, against the +19.2% to +20.8% the `[256, 128] s4` control
+  measured for the tile net of occupancy. Two instruments that share no
+  arithmetic agree, so #87's stated argument — the one the issue leads with — is
+  right and is worth all of the win.
+- **Boundary count is not a mechanism here, and it has the wrong sign.** The
+  fixed term rose from 0.0865 to 0.1504 ms, **+74%**. Halving the tiles did not
+  halve the boundaries on the critical path, for a reason the pre-registration
+  missed: the occupancy step halves the *clusters* too, so items per cluster
+  fall only 10 → 7, while a boundary that drains twice as many accumulator
+  columns costs more than twice as much. Two and a half times the cost over
+  seven tenths the count is a fixed term that grows.
+
+So the argument advanced before the run — that boundary count was the *stronger*
+of the two mechanisms and intensity would be worth nothing against a ceiling —
+was wrong on both halves, and wrong in opposite directions. Recording it because
+it is the most informative row here: the sweep's design was right and its
+prediction was not, and the design is what made the prediction falsifiable.
+
+It also explains the size dependence with no free parameters. At 8192³ the
+K-proportional part improves 23.4% (0.7431 → 0.6022 ms) and the fixed part
+worsens by 0.064 ms, netting **+10.2% predicted against +11.6% measured**. At
+16384³ there is four times as much arithmetic to amortize the same fixed
+regression over, so the net moves toward the slope — +21.6%, against a slope
+gain of 23.4%. The two sizes are the same decomposition seen at two amortization
+ratios.
+
+**One number to be careful with.** The fitted steady state is now 1826–1862
+TFLOP/s, which *brackets cuBLASLt's measured* 1741–1829. Nothing has run at
+1826; the fastest measured is **1718.5**, and that is the figure to hold anyone
+to. The derivation stacks the same two assumptions §7 has flagged twice.
+
+##### the TMEM half of the residency formula, binding for the first time
+
+Every rung above was *counted*, not predicted, by `device-tests`' `tmem
+residency census` at the four envelopes the sweep declares — and `shared per SM`
+is queried from the driver rather than written down, because a rung's residency
+is a floor division by it.
+
+| rung | columns | shared B | budget | resident | holding | wait µs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| [256,128] s2 | 128 | 49224 | 4 | 4 | 4 | 0.9 |
+| [256,128] s4 | 128 | 98408 | 2 | 2 | 2 | 0.9 |
+| **[256,256] s2** | 256 | 65608 | **2** | **3** | **2** | **100.0** |
+| [256,256] s3 (gemm) | 256 | 98392 | 2 | 2 | 2 | 0.9 |
+
+**Predicted and counted agree at all four, and the third row is the one worth
+the run.** It is the first rung in this repo where `resident` and `holding`
+differ, and the first where the `512 / columns` half of
+`min(512 / columns, shared per SM / plan)` is what binds: 65608 B admits three
+CTAs and 256 accumulator columns hold two. `src/tmem.rs` predicted exactly this
+— a CTA admitted and parked inside a blocking `tcgen05.alloc` — and the **wait
+column is the direct evidence**, 100.0 µs against 0.9 µs on every shared-bound
+rung. That CTA occupies a slot for the whole hold and makes no progress, which
+is also why the rung underperforms: its "extra" residency is a stalled warp.
+
+##### what it cost, which was no registers and some generality
+
+`ptxas -v -arch=sm_100a`, through `modal_app.py::regcount`, on every entry point
+in the sweep: **168 registers, 0 spill store, 0 spill load, 528 B stack frame** —
+identical across all six, and identical to what `gemm_cg2` measured before any
+of this. The register column, which #47, #63, #67, #76 and #94 have each ordered
+time backwards, has nothing to say here at all.
+
+That is not automatic and it is the one piece of real work `[256, 256]` costs
+that #87 does not mention. A warp's band of a 256-column accumulator is
+`RegTile<32, 256, BaseLdtm>` — **256 fp32 a thread**, past the 255-register
+architectural file before any of the kernel's own live state, and `regcount`'s
+own ladder in the same run says a `[32, 192]` band already spills in four of the
+five spellings. So the epilogue drains in two sequential 128-column bands
+(`DRAIN_N`), which holds peak liveness at exactly what it was. At `BLOCK_N = 128`
+the loop is one iteration and folds away, which is why the control rung's
+codegen is byte-identical.
+
+The occupancy step also **bought 87 registers of headroom**. #91 recorded the
+old kernel as "thin: 167 against 170, with shared memory already capping
+residency at 3, so both resources are at the limit". At two CTAs an SM the step
+is at 255, and `regcount`'s gate now reports 168 against 255. The cliff #100 was
+built to watch is no longer anywhere near.
+
+**What it did cost is generality.** A launch must now have `n % 256 == 0` where
+`n % 128 == 0` used to do, so this kernel computes a strictly narrower set of
+shapes than it did. #92 already named generality as the axis on which a
+like-for-like rate against a general library flatters us, and this moves further
+along it. `GEMM_SIZES`' smallest row moved from `256x128x256` to `256x256x256`
+for the same reason — it is still the one-cluster-one-item shape §7's item 3 is
+about, but its microseconds are not comparable across the change, because the
+item it is one of has twice the columns.
+
+##### and the denominator
+
+cuBLASLt, same device, same container, minutes apart, checked against the same
+`gemm::check_c`:
+
+| shape | cuBLASLt ms | theirs TFLOP/s | #102/theirs | **#87/theirs** |
+| --- | ---: | ---: | ---: | ---: |
+| 8192³ | 0.6233 | 1764.0 | 0.740 | **0.826** |
+| 16384³ | 4.8035 | 1831.2 | 0.728 | **0.886** |
+
+The two `#102` ratios reproduce that section's 0.742 and 0.793 — the second is
+1.5 points off, which is inside what this file's own spread on 16384³ looks
+like, and it is the control saying the container is not the story.
+
+**0.886 of a tuned vendor GEMM is the closest this project has been**, against
+the 0.573–0.694 band it sat in through #92 and 0.742–0.793 through #102.
+
+##### and the whole size sweep, where the small end pays for it
+
+The rungs above are the two sizes every table here is quoted at. The full
+`bench --case gemm` sweep on the shipped kernel says the trade is not uniform,
+and the direction is worth stating before anyone reads 0.886 as the headline:
+
+| shape | ours ms | ours TFLOP/s | theirs TFLOP/s | ours/theirs | was (#91/#92) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 256x256x256 | 0.0222 | 1.5 | 4.3 | 0.354 | — |
+| 512x256x256 | 0.0220 | 3.1 | 8.8 | 0.348 | 0.598 |
+| 1024³ | 0.0269 | 79.9 | 219.3 | 0.364 | 0.581 |
+| 2048³ | 0.0340 | **505.5** | 837.6 | 0.604 | 0.627 |
+| 4096³ | 0.1439 | **954.9** | 1609.2 | 0.593 | 0.573 |
+| 8192³ | 0.7610 | **1444.8** | 1741.4 | **0.830** | 0.689 |
+| 16384³ | 5.4873 | **1603.0** | 1828.8 | **0.877** | 0.694 |
+
+**Above 2048³ every row improves; at and below 1024³ they get worse.** 1024³
+goes 98.0 → 79.9 TFLOP/s against #91's measurement, an 18% regression, and that
+is exactly what the fit predicts: a wider tile costs more per boundary and a
+1024³ launch is 16 tiles over 148 clusters, which is one item each and nothing
+to amortize it over. The wider tile is a trade of small-problem throughput for
+large-problem throughput, and it is a good trade at the sizes this project is
+aimed at and a bad one below 2048³.
+
+The bottom two ratios are also the reproducible ones and the top three are not —
+#92's finding that cuBLASLt's own variance dominates below 4096³ has not changed,
+and 0.354 should be read as "small, unstable, and worse" rather than to three
+digits.
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all
