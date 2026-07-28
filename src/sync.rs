@@ -213,6 +213,18 @@ impl ClusterSemaphore {
     /// transaction bytes, which is the half of the split the module docs are
     /// about.
     ///
+    /// Still nothing in this repo calls it, and #51 is worth recording as the
+    /// case that looked like it would and did not. A persistent cluster
+    /// pipeline needs the CTAs of a pair to agree at each work-item boundary,
+    /// which is a *rendezvous*: every rank arriving at every rank. Built out of
+    /// this it is a barrier per rank and a spin per rank, hand-rolling
+    /// `barrier.cluster.arrive`/`wait` — which is one instruction, is what
+    /// [`cuda_device::cluster::cluster_sync`] issues, and is what
+    /// [`crate::pipeline::run`] takes. What is left for this is the signal a
+    /// cluster barrier is the wrong shape for: one named rank telling another
+    /// that a specific thing has happened, while the rest of the cluster keeps
+    /// going.
+    ///
     /// # Safety
     ///
     /// As [`Semaphore::arrive`], for the barrier at the far end.
