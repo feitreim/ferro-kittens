@@ -296,8 +296,14 @@ scalar_ops! { TernaryOp:
 /// without inventing a column count, and so `scale_rows` can check a vector
 /// and a tile against the *same* `M`.
 pub trait RowLayout<const M: usize> {
-    /// Per-thread storage, one `f32` per owned row (`[f32; SLOTS]`).
-    type Slots: Copy;
+    /// Per-thread storage, one `T` per owned row (`[T; SLOTS]`).
+    ///
+    /// Generic in the element, and that is what opens the shape set: a tile's
+    /// storage is this array of a [`ColLayout::Values`], so
+    /// [`FragmentLayout::Storage`] is a *projection* out of the two extents
+    /// rather than an array whose length is `M / 8` — a length no impl can
+    /// compute from a generic `M` without `generic_const_exprs`.
+    type Slots<T: Copy>: Copy;
 
     /// Rows of the `[M, _]` tile one thread owns.
     const SLOTS: usize;
@@ -306,13 +312,14 @@ pub trait RowLayout<const M: usize> {
     fn row_of(lane: u32, slot: usize) -> u32;
 
     /// Every slot set to `value`.
-    fn splat_slots(value: f32) -> Self::Slots;
+    fn splat_slots<T: Copy>(value: T) -> Self::Slots<T>;
 
-    /// The value in `slot`.
-    fn get_slot(slots: &Self::Slots, slot: usize) -> f32;
+    /// The entry in `slot`. By reference so a tile's row — a whole
+    /// [`ColLayout::Values`] — is reached without copying it.
+    fn get_slot<T: Copy>(slots: &Self::Slots<T>, slot: usize) -> &T;
 
-    /// Write `value` into `slot`.
-    fn set_slot(slots: &mut Self::Slots, slot: usize, value: f32);
+    /// The entry in `slot`, to write through; see [`Self::get_slot`].
+    fn get_slot_mut<T: Copy>(slots: &mut Self::Slots<T>, slot: usize) -> &mut T;
 }
 
 /// The column half of a fragment ownership map, mirroring [`RowLayout`]: the
@@ -350,8 +357,10 @@ pub trait ColLayout<const N: usize> {
 ///
 /// The storage is an associated type rather than `[[f32; VALUES]; SLOTS]`
 /// because an array length must be a const expression of the generic
-/// parameters, which would need `generic_const_exprs`. Each implemented
-/// `(M, N)` shape names its own storage instead — one macro line per shape.
+/// parameters, which would need `generic_const_exprs`. It is nevertheless
+/// *derived*: the blanket impl below projects it as `Slots<Values>`, so no
+/// `(M, N)` needs an impl of its own and the shape set is the product of the
+/// two extent sets rather than a list of pairs (#23).
 pub trait FragmentLayout<const M: usize, const N: usize>: RowLayout<M> + ColLayout<N> {
     /// Per-thread storage, `VALUES` values for each of `SLOTS` rows.
     type Storage: Copy;
@@ -364,6 +373,35 @@ pub trait FragmentLayout<const M: usize, const N: usize>: RowLayout<M> + ColLayo
 
     /// Write `x` at `(slot, value)`.
     fn set(values: &mut Self::Storage, slot: usize, value: usize, x: f32);
+}
+
+/// Every [`RowLayout`] × [`ColLayout`] pair *is* a tile layout: a thread's rows
+/// of values are its row array of its column array, which is the same
+/// `[[f32; VALUES]; SLOTS]` a per-shape impl would have written and needs no
+/// arithmetic on `M` and `N` to name.
+///
+/// Blanket, so a shape costs no line anywhere: adding a row extent and a column
+/// extent adds every tile between them, and a layout defined *outside* this
+/// crate is a tile layout as soon as it has both halves — which is the part
+/// orphan rules put out of reach for [`BaseLdtm`] (#23). The consequence is
+/// that `FragmentLayout` is never implemented directly, here or downstream.
+impl<const M: usize, const N: usize, L: RowLayout<M> + ColLayout<N>> FragmentLayout<M, N> for L {
+    type Storage = L::Slots<L::Values>;
+
+    #[inline(always)]
+    fn splat(value: f32) -> Self::Storage {
+        L::splat_slots(L::splat_values(value))
+    }
+
+    #[inline(always)]
+    fn get(values: &Self::Storage, slot: usize, value: usize) -> f32 {
+        L::get_value(L::get_slot(values, slot), value)
+    }
+
+    #[inline(always)]
+    fn set(values: &mut Self::Storage, slot: usize, value: usize, x: f32) {
+        L::set_value(L::get_slot_mut(values, slot), value, x);
+    }
 }
 
 /// The base-LDTM `16x256b` ownership map — the only drain shape the validated
@@ -417,7 +455,7 @@ macro_rules! base_ldtm_rows {
         const _: () = assert!($m % 16 == 0, "BaseLdtm rows come in 16-row blocks");
 
         impl RowLayout<$m> for BaseLdtm {
-            type Slots = [f32; $m / 8];
+            type Slots<T: Copy> = [T; $m / 8];
             const SLOTS: usize = $m / 8;
 
             #[inline(always)]
@@ -426,18 +464,18 @@ macro_rules! base_ldtm_rows {
             }
 
             #[inline(always)]
-            fn splat_slots(value: f32) -> Self::Slots {
+            fn splat_slots<T: Copy>(value: T) -> Self::Slots<T> {
                 [value; $m / 8]
             }
 
             #[inline(always)]
-            fn get_slot(slots: &Self::Slots, slot: usize) -> f32 {
-                slots[slot]
+            fn get_slot<T: Copy>(slots: &Self::Slots<T>, slot: usize) -> &T {
+                &slots[slot]
             }
 
             #[inline(always)]
-            fn set_slot(slots: &mut Self::Slots, slot: usize, value: f32) {
-                slots[slot] = value;
+            fn get_slot_mut<T: Copy>(slots: &mut Self::Slots<T>, slot: usize) -> &mut T {
+                &mut slots[slot]
             }
         }
     )*};
@@ -476,35 +514,23 @@ macro_rules! base_ldtm_cols {
     )*};
 }
 
-/// One [`FragmentLayout`] impl per logical `(M, N)` shape, joining a
-/// [`RowLayout`] to a [`ColLayout`]. Adding a shape is one line — do it when a
-/// call site needs it.
-macro_rules! base_ldtm_shapes {
-    ($(($m:literal, $n:literal)),* $(,)?) => {$(
-        impl FragmentLayout<$m, $n> for BaseLdtm {
-            type Storage = [[f32; $n / 4]; $m / 8];
-
-            #[inline(always)]
-            fn splat(value: f32) -> Self::Storage {
-                [[value; $n / 4]; $m / 8]
-            }
-
-            #[inline(always)]
-            fn get(values: &Self::Storage, slot: usize, value: usize) -> f32 {
-                values[slot][value]
-            }
-
-            #[inline(always)]
-            fn set(values: &mut Self::Storage, slot: usize, value: usize, x: f32) {
-                values[slot][value] = x;
-            }
-        }
-    )*};
-}
-
-base_ldtm_rows!(16, 32);
-base_ldtm_cols!(16, 32, 128);
-base_ldtm_shapes!((16, 16), (32, 32), (32, 128));
+// Every multiple of 16 up to 512, in both extents — 1024 tile shapes out of 64
+// impls, since `FragmentLayout` is the product of the two.
+//
+// The bound is the register file, not a guess at what kernels want: a thread
+// holds `M * N / 32` fp32 values of an `[M, N]` warp tile, so with the other
+// extent at its 16 minimum, 512 is already 256 registers a thread — one past
+// what the hardware has. No shape outside this grid fits in registers at all,
+// which is the sense in which the set is open rather than merely bigger.
+// Unused extents cost nothing: a trait impl no tile names emits no code.
+base_ldtm_rows!(
+    16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 272, 288, 304, 320,
+    336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512,
+);
+base_ldtm_cols!(
+    16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 272, 288, 304, 320,
+    336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512,
+);
 
 /// The named half of the op set: one line per exposed name, so a new op costs
 /// a [`scalar_ops`] line and one of these. `should_implement_trait` is allowed
@@ -631,7 +657,7 @@ macro_rules! scalar_op_methods {
 /// `mul_assign`/`add_assign` were hand-written copies of exactly that loop
 /// until `modal_app.py::regcount` showed the generic maps assemble to the same
 /// registers and spills at both probe shapes; they are the maps now.
-pub struct RegVec<const M: usize, L: RowLayout<M>>(pub L::Slots);
+pub struct RegVec<const M: usize, L: RowLayout<M>>(pub L::Slots<f32>);
 
 impl<const M: usize, L: RowLayout<M>> Clone for RegVec<M, L> {
     fn clone(&self) -> Self {
@@ -647,7 +673,7 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     /// Wrap this thread's slots. Named rather than the tuple constructor
     /// because a type alias (`Fragment`-style) can't spell one.
     #[inline(always)]
-    pub fn from_slots(slots: L::Slots) -> Self {
+    pub fn from_slots(slots: L::Slots<f32>) -> Self {
         Self(slots)
     }
 
@@ -660,13 +686,13 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     /// The statistic of row-slot `slot`.
     #[inline(always)]
     pub fn get(&self, slot: usize) -> f32 {
-        L::get_slot(&self.0, slot)
+        *L::get_slot(&self.0, slot)
     }
 
     /// Write the statistic of row-slot `slot`.
     #[inline(always)]
     pub fn set(&mut self, slot: usize, value: f32) {
-        L::set_slot(&mut self.0, slot, value);
+        *L::get_slot_mut(&mut self.0, slot) = value;
     }
 
     /// The logical row in `0..M` that `lane`'s `slot` holds.
@@ -1388,17 +1414,27 @@ mod tests {
     /// Its column statistics.
     type Cols = ColVec<32, BaseLdtm>;
 
+    /// The flash score band, and the shape #23 was filed about.
+    type Band = RegTile<32, 64, BaseLdtm>;
+
     /// A tile whose value at `(row, column)` names that coordinate exactly, so
     /// a map that reads the wrong operand shows up as a wrong coordinate.
-    fn coordinate_tile(lane: u32) -> Scores {
-        let mut tile = Scores::zero();
-        for slot in 0..Scores::SLOTS {
-            for value in 0..Scores::VALUES {
-                let (row, column) = Scores::coordinate(lane, slot, value);
+    fn indexed<const M: usize, const N: usize, L: FragmentLayout<M, N>>(
+        lane: u32,
+    ) -> RegTile<M, N, L> {
+        let mut tile = RegTile::<M, N, L>::zero();
+        for slot in 0..L::SLOTS {
+            for value in 0..L::VALUES {
+                let (row, column) = RegTile::<M, N, L>::coordinate(lane, slot, value);
                 tile.set(slot, value, (256 * row + column) as f32);
             }
         }
         tile
+    }
+
+    /// [`indexed`] at the shape most of these tests run on.
+    fn coordinate_tile(lane: u32) -> Scores {
+        indexed(lane)
     }
 
     /// The row vector holding each row's own index.
@@ -1525,9 +1561,27 @@ mod tests {
     }
 
     #[test]
+    fn the_shape_set_is_the_product_of_the_extents() {
+        // #23. `FragmentLayout` is a blanket impl over `RowLayout × ColLayout`
+        // now, so a shape costs no line of its own — and the storage it
+        // projects is still exactly the `[[f32; N/4]; M/8]` the per-shape
+        // impls named, which is what says the change is a spelling and not a
+        // representation.
+        assert_eq!(size_of::<Band>(), 32 * 64 / 32 * 4);
+        assert_eq!(size_of::<RegTile<16, 512, BaseLdtm>>(), 16 * 512 / 32 * 4);
+        assert_eq!(size_of::<RegTile<512, 16, BaseLdtm>>(), 512 * 16 / 32 * 4);
+        assert_eq!(size_of::<RegVec<48, BaseLdtm>>(), 48 / 8 * 4);
+        assert_eq!(size_of::<ColVec<80, BaseLdtm>>(), 80 / 4 * 4);
+        // Shapes nothing in this repo names, and a map is still a map on them.
+        covers_each_coordinate_once::<48, 80, BaseLdtm>();
+        covers_each_coordinate_once::<16, 512, BaseLdtm>();
+    }
+
+    #[test]
     fn base_ldtm_covers_each_coordinate_once() {
         covers_each_coordinate_once::<16, 16, BaseLdtm>();
         covers_each_coordinate_once::<32, 32, BaseLdtm>();
+        covers_each_coordinate_once::<32, 64, BaseLdtm>();
         covers_each_coordinate_once::<32, 128, BaseLdtm>();
         // Slots follow the rows a thread owns: two per 16-row block.
         assert_eq!(Fragment::SLOTS, 2);
@@ -1575,6 +1629,7 @@ mod tests {
         }
         composes::<16, 16, BaseLdtm>();
         composes::<32, 32, BaseLdtm>();
+        composes::<32, 64, BaseLdtm>();
         composes::<32, 128, BaseLdtm>();
     }
 
