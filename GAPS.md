@@ -254,14 +254,23 @@ filed nowhere.
 
 ### 2.4 Cluster ops stop at cg2
 
-`multicast_alias`, `commit_multicast_cg2`, `tma_load_2d_multicast_cg2` and
-`mma_walk_cg2` all hardcode the 2-CTA pair. TK's `tma_cluster.cuh` takes a
-general cluster mask. Larger clusters mostly matter for the GEMM shapes; the
-2-CTA case is the one Blackwell flash kernels use.
+`commit_multicast_cg2`, `tma_load_2d_multicast_cg2` and `mma_walk_cg2` all
+hardcode the 2-CTA pair. TK's `tma_cluster.cuh` takes a general cluster mask.
+Larger clusters mostly matter for the GEMM shapes; the 2-CTA case is the one
+Blackwell flash kernels use. Filed as **#49**, which narrows the remaining ask
+to multicast as *replication* — the only thing a cluster larger than a pair
+buys, and the thing the `_cg2` suffix rules out by name.
+
+The barrier-addressing half is no longer part of it. **#50** replaced
+`multicast_alias` — which reached the peer's barrier by masking the rank bit
+out of a local address, and was therefore correct only for rank 0 of a pair —
+with `Semaphore::at_rank`, a `mapa` that takes any rank.
 
 ### 2.5 No distributed shared memory (DSMEM)
 
-TK has cluster-scope shared→shared. Absent here.
+TK has cluster-scope shared→shared copies. Still absent: #50 brought in the
+*addressing* half, since `Semaphore::at_rank` names a peer's shared offset, but
+nothing here moves data between two CTAs' shared memory.
 
 ---
 
