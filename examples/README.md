@@ -21,8 +21,8 @@ target *of the library*.)
 | --- | --- | --- |
 | [`gemm`](src/gemm.rs) | **runs** — exact against a CPU reference | — (and no gap worked around in-file any more) |
 | [`softmax`](src/softmax.rs) | **runs** — within 2⁻⁸ of a CPU reference | — |
+| [`layernorm`](src/layernorm.rs) | **runs** — `layernorm_rows` within 2⁻⁷ of a CPU reference; `groupnorm_tile` compiles, no launcher | — |
 | [`flash_forward`](src/flash_forward.rs) | **compiles** — no launcher yet | — |
-| [`layernorm`](src/layernorm.rs) | **compiles** — both kernels, no launcher yet | — |
 
 All four are in the default build and this crate has **no cargo features left**.
 That is not tidying: `cargo oxide build kittens-examples --arch sm_100a` — which
@@ -530,6 +530,73 @@ not latency (nothing was put in flight and it went 2.6× faster), and it is not
 issue (the reciprocal control). At 24 of 64 warp slots, shared-memory-capped,
 what is left points at bytes per CTA — which is a launch-geometry change and a
 different issue.
+
+#### the same defect with the opposite sign, and the rung the ladder got wrong — #67
+
+`layernorm_rows` was the other end of it: **255 registers, 16 bytes of spill and
+a 1552-byte frame**, and the occupancy query above reading **2 blocks and 8
+warps an SM** where `softmax` reads 6 and 24 at 33,344 against 32,800 bytes of
+shared memory. Same band shape, opposite failure — softmax's 39 registers were
+too few to hold `[32, 128]`, layernorm's 255 were too many to fit two CTAs on an
+SM, and *neither* kernel had the band in registers.
+
+The diagnosis is the occupancy query and not the 255. Shared memory admits 6
+CTAs at 33,344 bytes; the driver says 2; `255 × 128 = 32,640` against a 65,536
+register file is 2.008. Registers were binding, and the same query says they
+stopped: after the change, **6 blocks and 24 warps at byte-identical shared
+memory**.
+
+It also has a **launcher, a CPU reference and a `bench.rs` row** now, which it
+did not before — that had to come first, because "faster" and "wrong faster"
+are the same number otherwise. The seed is not softmax's and could not be: a
+permutation seed gives every row the same multiset, so the row statistics are
+the tile statistics and `groupnorm_tile` would compute layernorm's answer
+exactly. `layernorm::value` carries that argument and the row-dependent
+distribution shape that closes it.
+
+**The ladder narrowed the search and then got the rung wrong**, which is the
+part worth carrying forward. `[32, 32]` has a zero frame in all five spellings
+of the probe above, and it is what #47 chose for `softmax`. This kernel at
+`CHUNK = 32` gets **40 registers on a 128-byte frame** — the probe carries no
+`ColVec` parameters and no statistics across chunks, and the extra live state
+moves the cliff one rung down:
+
+| `CHUNK` | regs | spill | frame | blocks/SM | GB/s at 8192 blocks |
+| --- | --- | --- | --- | --- | --- |
+| 128 — the whole band | 255 | 16 B | 1552 | 2 | 317 |
+| 64 | 108 | 0 | 272 | 6 | — |
+| 32 — softmax's rung | **40** | 0 | 128 | 6 | 3776 |
+| **16** | 47 | 0 | **0** | 6 | **5539** |
+
+`CHUNK = 32` is seven registers cheaper and **1.46× slower**, at identical
+occupancy. That is the third time the register column has ordered time
+backwards in this file, and the clearest: the two rungs differ only in whether
+`ptxas` kept the band, and the one that did not is the one with fewer
+registers.
+
+| rows × 128 | blocks | before, ms | after, ms | before, GB/s | after, GB/s |
+| --- | --- | --- | --- | --- | --- |
+| 256 | 2 | 0.0324 | 0.0084 | 4.1 | 15.6 |
+| 1024 | 8 | 0.0328 | 0.0083 | 16.0 | 63.3 |
+| 8192 | 64 | 0.0340 | 0.0084 | 123.3 | 496.5 |
+| 65536 | 512 | 0.1206 | 0.0135 | 278.3 | 2490.7 |
+| 524288 | 4096 | 0.8571 | 0.0549 | 313.2 | 4891.3 |
+| 1048576 | 8192 | 1.6926 | 0.0969 | 317.2 | **5538.9** |
+
+**17.5×**, every size checked before it was timed, and the *old* kernel checked
+against the same reference at all six — so the check is not tuned to the
+rewrite. Sizes are twice `softmax`'s rows against one plane rather than two, so
+the two tables share block counts and bytes moved and can be read against each
+other.
+
+Two things this corrects above. The flat floor at the small end is **8.4 µs**
+here, so #47's reading of its own 23 µs as "a fixed cost every launch on this
+harness pays" does not survive — whatever that 23 µs is, it is not the launch.
+And `softmax` is now the slow kernel in the file by 5.8× at equal bytes and
+equal blocks; a one-constant probe puts it at `CHUNK = 16` on a 128-byte frame
+and 1185 against 950 GB/s. That probe is **not** shipped — softmax's header
+argues for 32 at length, and rewriting it wants its own issue and its own
+controls — but it says the mechanism is not peculiar to `layernorm`.
 
 **#6 — reductions. Landed.** `row_reduce`/`col_reduce`/`tile_reduce` over a
 `ReduceOp` (a `BinaryOp` with an identity), with `row_max`/`row_min`/`row_sum`/`row_prod`, the `col_*` mirrors,

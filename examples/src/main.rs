@@ -11,8 +11,8 @@
 //! | --- | --- |
 //! | [`gemm`] | runs — checked against a CPU reference by [`gemm::check`] |
 //! | [`softmax`] | runs — checked against a CPU reference by [`softmax::check`] |
+//! | [`layernorm`] | runs — checked against a CPU reference by [`layernorm::check`] |
 //! | [`flash_forward`] | compiles — no launcher yet |
-//! | [`layernorm`] | compiles — both kernels, no launcher yet |
 //!
 //! **Every kernel here is in the default build**, and there are no cargo
 //! features left. That is what makes `modal run modal_app.py::build` — a real
@@ -22,10 +22,11 @@
 //! library at once was the one nothing checked.
 //!
 //! **Compiles is not runs**, and the distinction is the point of the column.
-//! Two of these have a launcher and a CPU reference and exit non-zero on a
-//! wrong number; two have neither. Giving the other two a launcher is real work
-//! with a real failure mode — see the seed argument in [`softmax::permutation`]
-//! — and not a status to be assigned.
+//! Three of these have a launcher and a CPU reference and exit non-zero on a
+//! wrong number; one has neither. Giving the last one a launcher is real work
+//! with a real failure mode — see the seed arguments in
+//! [`softmax::permutation`] and [`layernorm::value`], which had to answer
+//! different questions — and not a status to be assigned.
 //!
 //! Until #8 there was no launcher here at all, because `global.rs` built one
 //! shape of tensor map (3-D bf16 panels) and the GEMM's operands are 2-D.
@@ -78,7 +79,7 @@ fn examples() -> Vec<Example> {
             name: "layernorm",
             // Kept inside the table's 38-column status field, which a longer
             // string silently pushes the shared-memory column out of.
-            status: "compiles (both kernels)",
+            status: "runs (groupnorm_tile compiles)",
             threads: layernorm::THREADS,
             shared_bytes: layernorm::SHARED_BYTES,
             entry: Some("layernorm_rows"),
@@ -150,6 +151,10 @@ fn checks(
         (
             "softmax",
             softmax::check(context).map_err(|error| error.to_string()),
+        ),
+        (
+            "layernorm",
+            layernorm::check(context).map_err(|error| error.to_string()),
         ),
     ]
 }
