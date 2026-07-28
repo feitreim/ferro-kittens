@@ -1373,11 +1373,13 @@ what would let the two cross, and `tma_store_wait_read` (#9, landed) is the wait
 it needs — it releases the shared buffer as soon as the engine has read it,
 without blocking on global visibility.
 
-##### and the drain is 29% of 8192³, priced — #86
+##### and the drain is roughly a third of 8192³, priced — #86
 
 The paragraph above was written from the shape of the code. It is right, and it
-is the largest single term: **the item boundary costs about 30 µs per output
-tile, and at 8192³ that is 295 µs of a 1024 µs launch.** Deepen `K` so the
+is the largest single term: **the item boundary costs 28–37 µs per output tile,
+which is 27–36% of the 8192³ launch** depending on how the fit is taken — see
+the point-selection table below, which is where all the honest uncertainty in
+this section lives. Deepen `K` so the
 boundaries amortize and the same kernel, unchanged in every constant, does
 **1369.9 TFLOP/s — 60.9% of dense peak** — against 1069.6 at 8192³.
 
@@ -1428,16 +1430,48 @@ moves.
 | 8192 | 128 | 1.0237 | 1074.0 | 47.7% |
 | **32768** | 512 | 3.2105 | **1369.9** | **60.9%** |
 
-Milliseconds against `K` over the two deepest rows give a slope worth
-**1508 TFLOP/s — 67% of dense peak — and an intercept of 0.2948 ms**. The
-intercept is a cost that does not scale with the arithmetic at all, and a
-cluster walks 10 items, so it is **29.5 µs per output tile** and **28.8% of the
-8192³ launch**. The other session gives 1481 TFLOP/s and 27.6 µs on the same
-two rows, so both figures are stable to a few percent. The fit is two points and
-the shallow rows sit above it by 10–30%, so read ~30 µs as the right order
-rather than a fourth digit; the part that needs no fit at all is the measured
-1369.9 sitting 28% above 8192³ and 17% above the 1171 that was offered as where
-the curve would stop.
+Milliseconds against `K` is a line whose intercept is a cost that does not scale
+with the arithmetic. Dividing that intercept by 10 — the items on the critical
+path, since 50 clusters walk 10 and 172 walk 9 — gives a cost per output tile.
+**Which points the fit uses moves the answer, so all of them are shown**, least
+squares on the raw minimum milliseconds rather than on the rounded rates above:
+
+| points | steady state | fixed | per tile | share at K=8192 |
+| --- | ---: | ---: | ---: | ---: |
+| K = 8192, 32768 | 1508 | 0.2948 ms | 29.5 µs | 28.8% |
+| K = 2048, 8192, 32768 | 1534 | 0.3370 ms | 33.7 µs | 32.9% |
+| all four | 1552 | 0.3654 ms | 36.5 µs | 35.7% |
+
+The other session runs 2–4% under all nine of those. So across both sessions and
+every selection: **the boundary is 28–37 µs per output tile and 27–36% of the
+8192³ launch, and the steady state is 1480–1550 TFLOP/s.** Round to that; the
+5.5% cross-run spread on 16384³ is what this benchmark's precision looks like.
+
+**The two deepest points are the preferred fit, and the reason is not the one
+that first suggests itself.** A two-point fit has no residuals, so it checks
+nothing, and the obvious defence — that `K = 512` is 8 blocks against
+`STAGES = 3` and the pipeline barely fills — **is wrong, and the residuals say
+so**. Under the four-point fit they run `+40.0, −2.1, −50.0, +12.0 µs`, and the
+marginal cost of a K block between adjacent rows is **0.378, 0.503,
+0.569 µs** — reproduced as `+34.1, −1.1, −43.3, +10.4` and `0.419, 0.522, 0.580`
+in the other session. A pipeline that fails to fill makes *shallow* loops dear
+per block. These get dearer as they deepen. The curve is convex, and a line
+through convex data has an intercept above the deep-end tangent, which is
+exactly the ordering in the table.
+
+**What is convex about it is a variable this sweep does not hold fixed, and that
+is a limitation of the experiment rather than a subtlety.** `K` sets the operand
+footprint: `A` and `B` are 8 MiB each at `K = 512` and **512 MiB each at
+`K = 32768`**, so the sweep crosses L2 somewhere between the second and third
+rows. The shallow rows are cheap per K block partly because the whole of both
+operands is L2-resident for the entire launch, which the deep rows cannot be. So
+the deepest two points are preferred because `K = 8192` is the regime in
+question and they straddle it in the same cache regime — not because the shallow
+rows fill badly. They also give the *smallest* fixed cost of any selection, so
+the preferred number is the conservative one.
+
+The part that needs no fit at all is the measured **1369.9, sitting 28% above
+8192³ and 17% above the 1171** that was offered as where the curve would stop.
 
 Nothing else in this sweep can be that intercept. It is not launch overhead
 (#67, and `layernorm` reaches 9.2 µs on this harness in this same run), not
@@ -1505,21 +1539,29 @@ looks like against a pipeline `STAGES = 3` deep. Note also that both the
 counters — see below.
 
 **Subtracting the boundary gives the steady-state rate per shape**, which is
-the number a traversal change would move. Taking the 0.2948 ms intercept off
-each row above:
+the number a traversal change would move. Taking the intercept off each row,
+over the range of intercepts the point selections give and both sessions:
 
-| shape | K loop alone | steady TFLOP/s |
-| --- | ---: | ---: |
-| 32768 x 2048 x 8192 | 0.6837 | **1608** (71.5% of peak) |
-| 8192 x 8192 x 8192 | 0.7298 | 1507 |
-| 2048 x 32768 x 8192 | 0.9059 | 1214 |
+| shape | steady TFLOP/s |
+| --- | ---: |
+| 32768 x 2048 x 8192 | **1540 – 1790** |
+| 8192 x 8192 x 8192 | 1500 – 1670 |
+| 2048 x 32768 x 8192 | 1210 – 1320 |
 
 So **this tile shape, with its boundary overlapped and its walk L2-aware, is
-worth about 1600 TFLOP/s — 71% of dense bf16 peak — with no change to the tile,
-the stages or the traversal granularity.** That is derived, not measured: it
-assumes the intercept is shape-independent, which it should be since all three
-rows write the same `C` over the same item count. It is the reason #87's tile
-sweep is the *last* lever here rather than the first.
+worth roughly 1550–1800 TFLOP/s — 69% to 80% of dense bf16 peak — with no change
+to the tile, the stages or the traversal granularity.** The range is wide
+because the two uncertainties compound in the same direction: a larger fixed
+cost implies a larger recovered rate.
+
+**It is a derivation, not a measurement, and it stacks two assumptions** — that
+the line is the right model, which its own residuals say it is only roughly, and
+that the intercept is shape-independent, which it should be since all three rows
+write the same `C` over the same item count. **Nothing has run at any of these
+rates.** The fastest this kernel has been measured at is the 1369.9 TFLOP/s in
+the depth table, and that is the number to hold anyone to. What the derivation
+is for is ordering the levers, and it is the reason #87's tile sweep is the
+*last* one here rather than the first.
 
 **What could not be measured, and it matters which.** The reuse and traffic
 columns above are *arithmetic on the item map*, not counters. Nsight Compute
@@ -1532,12 +1574,13 @@ is worth being plain that the substitute is not strictly weaker: a counter
 attributes, an intervention that holds nine things fixed and moves one
 establishes cause, and the three tables above are all interventions.
 
-**The bind at 8192³, in order.** **28.8% is the item boundary**, and `lcsf`
+**The bind at 8192³, in order.** **27–36% is the item boundary**, and `lcsf`
 (#15) is what would let the epilogue and the next tile's first loads cross.
-**6.2%** more is operand traffic this square shape's row-major walk does not
-leave in L2 — 23% at the worst aspect ratio — and an L2-aware order (#89) is
-what would recover it. Under both sits a steady state of about **1600 TFLOP/s**
-at this tile's fixed 85.3 FLOP/byte, and the only lever on *that* is the tile,
+**6–7%** more is operand traffic this square shape's row-major walk does not
+leave in L2 — **23% at the worst aspect ratio, and that one is measured
+end to end rather than fitted** — and an L2-aware order (#89) is what would
+recover it. Under both sits a steady state of roughly **1550–1800 TFLOP/s** at
+this tile's fixed 85.3 FLOP/byte, and the only lever on *that* is the tile,
 which is #87.
 
 The order is the finding. #86 framed the question as bandwidth versus latency on

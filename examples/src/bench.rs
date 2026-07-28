@@ -333,6 +333,16 @@ const GEMM_FOOTPRINT_SIZES: &[Shape] = &[
 /// boundaries cost. It is also the honest version of the "small size" question
 /// — the smallest rows of [`GEMM_SIZES`] confound a short reduction with a grid
 /// far under one wave, and this separates them by holding the grid full.
+///
+/// **One thing it does not hold fixed, and the fit has to answer for it.** `K`
+/// sets the operand footprint: `A` and `B` are 8 MiB each in the first row and
+/// **512 MiB each in the last**, so the sweep crosses L2 between the second row
+/// and the third. That is visible in the numbers — the marginal cost of a K
+/// block rises 0.378 → 0.503 → 0.569 µs across the three intervals, which is
+/// the *opposite* of what a pipeline failing to fill would do, and it makes the
+/// curve convex. So a straight line through all four rows overstates the
+/// intercept, and `examples/README.md` §7 reports the fixed cost as a range
+/// over point selections rather than as one number off one fit.
 const GEMM_DEPTH_SIZES: &[Shape] = &[
     Shape {
         m: 8192,

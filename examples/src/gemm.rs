@@ -57,11 +57,14 @@
 //! holds the tile count, the wave count, the grid and the `C` traffic fixed
 //! while changing only how much arithmetic sits between two boundaries; the
 //! result is 152.8 / 508.6 / 1074.0 / **1369.9** TFLOP/s at `K` of 512 / 2048 /
-//! 8192 / 32768. The slope is worth ~1508 TFLOP/s and the intercept is 0.2948
-//! ms, which over the ten items a cluster walks is **~30 µs per output tile and
-//! 28.8% of the 8192³ launch**. The same ~30 µs is the flat floor at the small
-//! end of the benchmark: 256x128x256 is one cluster running one item, and it
-//! costs 23.4 µs. See `examples/README.md` §7 for the other two sweeps — the
+//! 8192 / 32768. Milliseconds against `K` is a line whose intercept is the
+//! boundary; over the ten items a cluster walks, and over every reasonable
+//! choice of which points to fit, that is **28–37 µs per output tile and 27–36%
+//! of the 8192³ launch**, on a steady state of 1480–1550 TFLOP/s. The same
+//! ~30 µs is the flat floor at the small end of the benchmark: 256x128x256 is
+//! one cluster running one item, and it costs 23.4 µs. See `examples/README.md`
+//! §7 for the point-selection table, for why the fit's residuals rule *out* the
+//! obvious pipeline-fill explanation, and for the other two sweeps — the
 //! aspect-ratio one is worth 23% and belongs to #89.
 //!
 //! ## What this kernel had to reach past the library for
