@@ -1815,38 +1815,48 @@ anything else.
 The ceiling was stated before it was built, and it is the ragged last wave the
 capped grid idles through. Min ms over 30 timed launches, all three schedulers on
 **one shared plan** — the static path carries the 24 unused bytes of the work
-queue too, so what follows compares schedules and not residencies:
+queue too, so what follows compares schedules and not residencies. `predicted` is
+`1 - tiles/(waves x 222)` and is not fitted to anything:
 
-| shape | tiles | waves | wave eff | predicted | static | clc (prefetched) | clc (serial) |
+| shape | tiles | waves | wave eff | predicted | static | clc | measured |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2048³ | 128 | 1 | 57.7% | 42.3% | 0.0361 | 0.0371 | 0.0362 |
-| 4096³ | 512 | 3 | 76.9% | 23.1% | 0.1517 | 0.1503 | **0.1497** |
-| 8192³ | 2048 | 10 | 92.3% | 7.7% | 0.9075 | 0.9015 | **0.8974** |
-| 16384³ | 8192 | 37 | 99.7% | 0.3% | 6.9275 | 7.3399 | **6.7643** |
+| 2048³ | 128 | 1 | 57.7% | 42.3% | 0.0361 | 0.0362 | −0.3% |
+| 4096³ | 512 | 3 | 76.9% | 23.1% | 0.1517 | **0.1497** | **+1.3%** |
+| 8192³ | 2048 | 10 | 92.3% | 7.7% | 0.9075 | **0.8974** | **+1.1%** |
+| 16384³ | 8192 | 37 | 99.7% | 0.3% | 6.9275 | **6.7643** | **+2.4%** |
 
 **The predicted gain does not arrive.** Where the model says 23% the measurement
-says 1.3%; where it says 7.7% it says 1.1%. The model is not wrong about the
-idle clusters — it is wrong that they are the term that matters. #90 and #94
-priced the *item boundary* at 18–30 µs per output tile and 20–36% of the launch,
-and a dynamic schedule does not remove a single item boundary. It moves which
-cluster pays them. The one number the ragged-wave model does predict correctly is
-16384³'s nothing, and it is right there for the wrong reason.
+says 1.3%; where it says 7.7% it says 1.1%.
+
+The wave-efficiency arithmetic is not wrong, and it is worth being precise about
+what it does say. At 4096³ the ragged last wave really is **23% of the grid
+idling** — 512 tiles over three waves of 222 leaves 154 clusters with nothing to
+do. It is simply not 23% of the *time*, because the clusters that idle are not
+the ones on the critical path: the launch ends when the last busy cluster
+finishes its tile, and an idle neighbour does not make that cluster faster. The
+model is right about a term, and the term is small. #90 and #94 already measured
+the one that is not — the **item boundary**, at 18–30 µs per output tile and
+20–36% of the launch — and a dynamic schedule removes no item boundary at all.
+It only changes which cluster pays them.
 
 **Prefetching the steal is a regression, and #88 predicted the opposite.** The
 response arrives on an mbarrier, so the request can be issued before the current
 item's MMA and harvested after — the latency hides, and "a steal on the critical
-path would be a regression" is what the issue expected. It is backwards at all
-four sizes, by 8.5% at 16384³ (7.3399 against 6.7643), which is far outside the
-0.6% this file's own numbers repeat to. The plausible mechanism is that
-prefetching makes every cluster claim its next tile *before* finishing its
-current one, so the order tiles are handed out in stops tracking the order
-clusters actually become free — which is the tail problem CLC is for,
-reintroduced by the optimization meant to hide its latency. That is a hypothesis
-with one measurement behind it, not a finding.
+path would be a regression" is what the issue expected. Both forms were built and
+timed. The prefetched one was **slower at all four sizes, by 8.5% at 16384³**
+(7.3399 ms against the 6.7643 in the table above), which is far outside the 0.6%
+this file's own numbers repeat to, and it has been **deleted**: the `clc` column
+above is the form that issues its request after the item it will replace.
 
-What is left is real but small: the serial steal is 1.1–2.4% ahead of the static
-stride at the three large sizes, which is at the edge of what this file can
-resolve. **So CLC's case here is portability and not throughput**, and it should
+The plausible mechanism is that prefetching makes every cluster claim its next
+tile *before* finishing its current one, so the order tiles are handed out in
+stops tracking the order clusters actually become free — which is the tail
+problem CLC is for, reintroduced by the optimization meant to hide its latency.
+That is a hypothesis with one measurement behind it, not a finding, and what
+would test it is recording per-cluster item counts and comparing their spread.
+
+What is left is real but small: the steal is 1.1–2.4% ahead of the static stride
+at the three large sizes, which is at the edge of what this file can resolve. **So CLC's case here is portability and not throughput**, and it should
 be adopted on that basis or not at all.
 
 `device-tests`' **`clc work stealing`** is what says the mechanism does what the

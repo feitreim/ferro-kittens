@@ -255,21 +255,17 @@ const CTAS_PER_SM: u32 = 3;
 const MAX_CLUSTERS: u32 = SMS * CTAS_PER_SM / RANKS;
 const _: () = assert!(MAX_CLUSTERS == 222);
 
-/// Which item source a launch runs on. The [`Tile`] job is identical under all
-/// three — that is the point of it being a [`Job`] — and what changes is the
+/// Which item source a launch runs on. The [`Tile`] job is identical under
+/// both — that is the point of it being a [`Job`] — and what changes is the
 /// grid, and where the next item comes from.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Scheduler {
     /// [`pipeline::run`]: a grid capped at [`MAX_CLUSTERS`], each cluster
     /// taking a fixed share decided before the kernel starts. The control.
     Static,
-    /// [`pipeline::run_stealing`] with the request prefetched behind the
-    /// current item's MMA.
+    /// [`pipeline::run_stealing`]: a grid of one cluster per tile, and a
+    /// cluster that finishes cancels one the scheduler has not launched yet.
     Stealing,
-    /// The same, with the request on the critical path: issued and harvested
-    /// together at the item boundary. Here to price the prefetch rather than
-    /// to assert it.
-    StealingSerial,
 }
 
 impl Scheduler {
@@ -278,7 +274,6 @@ impl Scheduler {
         match self {
             Scheduler::Static => "static",
             Scheduler::Stealing => "clc",
-            Scheduler::StealingSerial => "clc-serial",
         }
     }
 }
@@ -470,8 +465,8 @@ impl Job for Tile {
 pub mod kernels {
     use super::*;
 
-    /// The item and the work queue, laid over the one shared plan all three
-    /// entry points launch with. Everything here spans items rather than
+    /// The item and the work queue, laid over the one shared plan both entry
+    /// points launch with. Everything here spans items rather than
     /// belonging to one, which is why it is hoisted out of every scheduler
     /// alike: the rings, the barriers, the operand maps, and the pair's TMEM
     /// allocation, whose `alloc_cluster` is a whole-cluster collective with a
@@ -616,38 +611,7 @@ pub mod kernels {
     ) {
         unsafe {
             let (mut tile, queue) = attach(a_map, b_map, tiles_n, k_blocks, ldc, &mut c);
-            pipeline::run_stealing::<Tile, true>(&mut tile, queue);
-            release(&tile);
-        }
-    }
-
-    /// [`gemm_cg2_clc`] with the steal on the critical path instead of behind
-    /// the MMA. Identical in every other respect — same job, same grid, same
-    /// barrier count — so the difference between the two rows of the comparison
-    /// table is the prefetch and nothing else.
-    ///
-    /// # Safety
-    ///
-    /// As [`gemm_cg2_clc`].
-    #[kernel]
-    #[cluster_launch(2, 1, 1)]
-    #[launch_contract(
-        domain = 1,
-        block = (128, 1, 1),
-        dynamic_shared = 73_816,
-        dynamic_shared_alignment = 128
-    )]
-    pub unsafe fn gemm_cg2_clc_serial(
-        a_map: *const TmaDescriptor,
-        b_map: *const TmaDescriptor,
-        tiles_n: u32,
-        k_blocks: u32,
-        ldc: u32,
-        mut c: DisjointSlice<f32>,
-    ) {
-        unsafe {
-            let (mut tile, queue) = attach(a_map, b_map, tiles_n, k_blocks, ldc, &mut c);
-            pipeline::run_stealing::<Tile, false>(&mut tile, queue);
+            pipeline::run_stealing(&mut tile, queue);
             release(&tile);
         }
     }
@@ -775,7 +739,7 @@ pub fn grid(m: usize, n: usize) -> u32 {
 pub fn grid_for(scheduler: Scheduler, m: usize, n: usize) -> u32 {
     let clusters = match scheduler {
         Scheduler::Static => tiles(m, n).min(MAX_CLUSTERS),
-        Scheduler::Stealing | Scheduler::StealingSerial => tiles(m, n),
+        Scheduler::Stealing => tiles(m, n),
     };
     RANKS * clusters
 }
@@ -868,16 +832,10 @@ fn run<T>(
     // this call will not use costs nothing measurable and keeps the dispatch
     // below a `match` over launches rather than over types the kernel macro
     // named.
-    let config = |scheduler| {
-        LaunchConfig1D::new(
-            grid_for(scheduler, m, n),
-            THREADS,
-            SHARED_BYTES as u32,
-        )
-    };
+    let config =
+        |scheduler| LaunchConfig1D::new(grid_for(scheduler, m, n), THREADS, SHARED_BYTES as u32);
     let static_launch = module.prepare_gemm_cg2(config(Scheduler::Static))?;
     let clc_launch = module.prepare_gemm_cg2_clc(config(Scheduler::Stealing))?;
-    let serial_launch = module.prepare_gemm_cg2_clc_serial(config(Scheduler::StealingSerial))?;
     let tiles_n = (n / BLOCK_N) as u32;
     let k_blocks = (k / BLOCK_K) as u32;
     let launch_once = |c: &mut DeviceBuffer<f32>| -> Result<(), Box<dyn Error>> {
@@ -901,16 +859,6 @@ fn run<T>(
                 Scheduler::Stealing => module.gemm_cg2_clc(
                     &stream,
                     &clc_launch,
-                    a_map.as_ptr(),
-                    b_map.as_ptr(),
-                    tiles_n,
-                    k_blocks,
-                    n as u32,
-                    c,
-                )?,
-                Scheduler::StealingSerial => module.gemm_cg2_clc_serial(
-                    &stream,
-                    &serial_launch,
                     a_map.as_ptr(),
                     b_map.as_ptr(),
                     tiles_n,
@@ -994,11 +942,7 @@ pub(crate) fn check_c(
 ///   separately and land on different output tiles.
 ///
 /// A deadlock is the fourth and reports itself.
-const SCHEDULERS: [Scheduler; 3] = [
-    Scheduler::Static,
-    Scheduler::Stealing,
-    Scheduler::StealingSerial,
-];
+const SCHEDULERS: [Scheduler; 2] = [Scheduler::Static, Scheduler::Stealing];
 
 /// The correctness run: two sizes, checked, nothing timed.
 ///
@@ -1065,8 +1009,8 @@ const COMPARE_SIZES: &[Shape] = &[
     },
 ];
 
-/// The three schedulers on one clock, with the ragged-wave prediction beside
-/// them — `cargo oxide run kittens-examples -- clc`.
+/// Both schedulers on one clock, with the ragged-wave prediction beside them —
+/// `cargo oxide run kittens-examples -- clc`.
 ///
 /// The prediction column is computed from [`wave_efficiency`] and not fitted to
 /// anything, and it is printed *first* so the table is read as a test of a
@@ -1075,21 +1019,13 @@ const COMPARE_SIZES: &[Shape] = &[
 /// timed, by the same entry point the rest of the harness uses.
 pub fn compare(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<(), Box<dyn Error>> {
     println!(
-        "gemm schedulers — min ms over 30 timed launches, all three on one shared plan\n\
+        "gemm schedulers — min ms over 30 timed launches, both on one shared plan\n\
          `predicted` is the ragged last wave the static grid idles through, which is the\n\
          whole of what a dynamic schedule has to win back: 1 - tiles/(waves x {MAX_CLUSTERS})."
     );
     println!(
-        "{:<18}{:>7}{:>7}{:>10}{:>12}{:>11}{:>11}{:>13}{:>11}",
-        "shape",
-        "tiles",
-        "waves",
-        "wave eff",
-        "predicted",
-        "static ms",
-        "clc ms",
-        "clc-serial ms",
-        "measured"
+        "{:<18}{:>7}{:>7}{:>10}{:>12}{:>11}{:>11}{:>11}",
+        "shape", "tiles", "waves", "wave eff", "predicted", "static ms", "clc ms", "measured"
     );
     for &shape in COMPARE_SIZES {
         let Shape { m, n, k } = shape;
@@ -1100,9 +1036,9 @@ pub fn compare(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<(), B
             let (_, timings) = run(context, m, n, k, scheduler, time)?;
             milliseconds.push(timings.min());
         }
-        let (static_ms, clc_ms, serial_ms) = (milliseconds[0], milliseconds[1], milliseconds[2]);
+        let (static_ms, clc_ms) = (milliseconds[0], milliseconds[1]);
         println!(
-            "{:<18}{:>7}{:>7}{:>9.1}%{:>11.1}%{:>11.4}{:>11.4}{:>13.4}{:>10.1}%",
+            "{:<18}{:>7}{:>7}{:>9.1}%{:>11.1}%{:>11.4}{:>11.4}{:>10.1}%",
             shape,
             tiles(m, n),
             waves,
@@ -1110,7 +1046,6 @@ pub fn compare(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<(), B
             100.0 * (1.0 - efficiency),
             static_ms,
             clc_ms,
-            serial_ms,
             100.0 * (1.0 - clc_ms / static_ms)
         );
     }

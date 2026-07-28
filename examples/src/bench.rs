@@ -119,7 +119,7 @@ pub struct Timings(Vec<f64>);
 
 impl Timings {
     /// The headline. `pub` because [`gemm::compare`](crate::gemm::compare)
-    /// puts three schedulers' headlines in one row of its own table.
+    /// puts both schedulers' headlines in one row of its own table.
     pub fn min(&self) -> f64 {
         self.0[0]
     }

@@ -1415,12 +1415,7 @@ pub mod kernels {
     /// under a 2-CTA cluster), and whether both ranks of a cluster are told the
     /// *same* thing — which is what stops #51's split pair coming back.
     #[inline(always)]
-    unsafe fn clc_record(
-        completed: u64,
-        canceled: u64,
-        first: u64,
-        out: &mut DisjointSlice<u64>,
-    ) {
+    unsafe fn clc_record(completed: u64, canceled: u64, first: u64, out: &mut DisjointSlice<u64>) {
         unsafe {
             if thread::threadIdx_x() == 0 {
                 let base = CLC_FIELDS * thread::blockIdx_x() as usize;

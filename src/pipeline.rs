@@ -86,11 +86,18 @@
 //! **What it is worth, and what it turned out to be worth.** The static
 //! stride's only loss is the ragged last wave, and at `MAX_CLUSTERS = 222` with
 //! the GEMM's `[256, 128]` tiles that is 23% at 4096³, 8% at 8192³ and 0.3% at
-//! 16384³. Measured, it is **1.3%, 1.1% and 2.4%** — the model is not wrong
-//! about the idle clusters, it is wrong that they are the term that matters.
-//! #90 and #94 priced the *item boundary* at a fifth to a third of the launch,
-//! and a dynamic schedule removes no item boundaries at all; it only moves
-//! which cluster pays them. `examples/README.md` §7 carries the table.
+//! 16384³. Measured, it is **1.3%, 1.1% and 2.4%**.
+//!
+//! The wave arithmetic is not wrong, and the distinction matters. At 4096³ the
+//! ragged last wave really is 23% of the *grid* idling — 512 tiles over three
+//! waves of 222 leaves 154 clusters with nothing to do. It is not 23% of the
+//! *time*, because the clusters that idle are not the ones on the critical
+//! path: the launch ends when the last busy cluster finishes its tile, and an
+//! idle neighbour does not make that cluster faster. The model is right about a
+//! term, and the term is small. #90 and #94 already measured the one that is
+//! not — the *item boundary*, a fifth to a third of the launch — and a dynamic
+//! schedule removes no item boundary at all; it only moves which cluster pays
+//! them. `examples/README.md` §7 carries the table.
 //!
 //! **The reason to want it anyway is that it deletes the constants.** Picking a
 //! persistent grid needs `SMS` and `CTAS_PER_SM`, and #84 established that the
@@ -111,28 +118,28 @@
 //! item is a fact the cluster agrees on by construction rather than by a
 //! rendezvous someone has to remember to write.
 //!
-//! ## The steal can be prefetched, and should not be
+//! ## The steal could be prefetched, and prefetching it was slower
 //!
-//! The response arrives on an mbarrier, so the request does not have to be
-//! anywhere near the point the answer is needed. `PREFETCH = true` issues the
-//! request for the *next* item before the current item's `work` runs and
-//! harvests it after, putting a whole tile's K pipeline between the
-//! `try_cancel` and the wait so that no steal is ever on the critical path.
-//! #88 expected that to be the fast form and the critical-path form to be a
-//! regression.
+//! The response arrives on an mbarrier, so the request need not sit anywhere
+//! near the point the answer is needed. The obvious form issues the *next*
+//! item's request before the current item's `work` and harvests it after,
+//! putting a whole tile's K pipeline between the `try_cancel` and the wait so
+//! that no steal is ever on the critical path. #88 expected that to be the fast
+//! form and expected the critical-path form to be a regression.
 //!
-//! **It is the other way round, at every size measured.** `examples/README.md`
-//! §7 has the table; the gap is 8.5% at 16384³, against numbers that repeat to
-//! 0.6%. The mechanism is not the latency — it is that prefetching makes every
-//! cluster claim its next tile *before* finishing its current one, so the order
-//! tiles are handed out in stops tracking the order clusters become free. That
-//! is the ragged tail this whole mechanism exists to fix, reintroduced by the
-//! optimization meant to hide its latency.
+//! **It was the other way round at every size measured, by 8.5% at 16384³
+//! against numbers that repeat to 0.6%.** Both forms were built and timed;
+//! `examples/README.md` §7 has the table. The prefetched one is **deleted**,
+//! and [`run_stealing`] is the form that issues the request after the item it
+//! will replace.
 //!
-//! `PREFETCH` stays a const parameter for now so the surprising row can be
-//! reproduced rather than taken on trust. It is one measurement, and the honest
-//! end state is to delete `true` and keep the serial form — not to carry a knob
-//! whose answer is known.
+//! The mechanism is not latency. Prefetching makes every cluster claim its next
+//! tile *before* finishing its current one, so the order tiles are handed out
+//! in stops tracking the order clusters actually become free — which is the
+//! ragged tail this whole mechanism exists to fix, reintroduced by the
+//! optimization meant to hide its latency. That is a hypothesis with one
+//! measurement behind it; what would test it is recording per-cluster item
+//! counts and comparing their spread.
 //!
 //! ## What orders a read of the response against the next request
 //!
@@ -386,11 +393,8 @@ impl ClcQueue {
 /// needs to know how many clusters the device holds, because the ones it does
 /// not hold are the ones that get stolen.
 ///
-/// `PREFETCH` says where the request sits. `true` issues the next item's
-/// request before the current item's `work` and harvests it after, so the
-/// steal's latency hides behind a whole tile of pipeline; `false` issues and
-/// harvests together at the item boundary, which is the same schedule with the
-/// steal on the critical path and exists to be measured against.
+/// The request goes out after the item it will replace, not before it. The
+/// module docs carry why, and it is the opposite of what #88 expected.
 ///
 /// # Safety
 ///
@@ -409,7 +413,7 @@ impl ClcQueue {
 /// - **The device is sm_100a and the launch is a cluster launch**, which
 ///   `clusterlaunchcontrol` requires and nothing here can check.
 #[inline(always)]
-pub unsafe fn run_stealing<J: Job, const PREFETCH: bool>(job: &mut J, queue: ClcQueue) {
+pub unsafe fn run_stealing<J: Job>(job: &mut J, queue: ClcQueue) {
     unsafe {
         let leader = thread::threadIdx_x() == 0;
         let issuer = leader && cluster::block_rank() == 0;
@@ -422,14 +426,6 @@ pub unsafe fn run_stealing<J: Job, const PREFETCH: bool>(job: &mut J, queue: Clc
         // Every rank's barrier has to be armed before any rank asks the
         // hardware to complete transactions on it.
         boundary::<J>();
-        if PREFETCH {
-            if leader {
-                queue.charge();
-            }
-            if issuer {
-                queue.issue();
-            }
-        }
 
         loop {
             if leader {
@@ -439,13 +435,14 @@ pub unsafe fn run_stealing<J: Job, const PREFETCH: bool>(job: &mut J, queue: Clc
             boundary::<J>();
             job.work(item);
             tcgen05_fence_before_thread_sync();
-            if !PREFETCH {
-                if leader {
-                    queue.charge();
-                }
-                if issuer {
-                    queue.issue();
-                }
+            // The request goes out here, once the item it will replace is done,
+            // rather than ahead of it. See the module docs: issuing it early
+            // hides the latency and loses more than the latency is worth.
+            if leader {
+                queue.charge();
+            }
+            if issuer {
+                queue.issue();
             }
             // Harvested before the boundary, so the boundary that retires the
             // item is also what says every reader is done with the response.
@@ -457,14 +454,6 @@ pub unsafe fn run_stealing<J: Job, const PREFETCH: bool>(job: &mut J, queue: Clc
             }
             let Some(next) = stolen else { break };
             item = next;
-            if PREFETCH {
-                if leader {
-                    queue.charge();
-                }
-                if issuer {
-                    queue.issue();
-                }
-            }
         }
 
         if leader {
