@@ -92,7 +92,7 @@ mod host {
 
     /// A vector is one unswizzled box `N` elements wide and one row tall. The
     /// row count is what lets a rank-1 layout describe it at all
-    /// ([`GlobalLayout::descriptor_shape`] asserts exactly that), and the
+    /// (`GlobalLayout::descriptor_shape` asserts exactly that), and the
     /// width is `N` itself rather than a constant of a swizzle mode — the
     /// difference from the tile impl, and the reason `Swizzle` is not in the
     /// picture.

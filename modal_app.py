@@ -138,6 +138,13 @@ image = (
         str(Path(__file__).parent / "device-tests/Cargo.toml"),
         f"{PROJECT_DIR}/device-tests/Cargo.toml",
     )
+    # Its lockfile too. Without it cargo re-resolves against crates.io on every
+    # run, so this build tests a dependency set nothing in the repo pins and an
+    # upstream release can break it with no change of ours.
+    .add_local_file(
+        str(Path(__file__).parent / "device-tests/Cargo.lock"),
+        f"{PROJECT_DIR}/device-tests/Cargo.lock",
+    )
     # The examples crate: also standalone, also path-depends on the library.
     .add_local_dir(
         str(Path(__file__).parent / "examples/src"),
@@ -146,6 +153,10 @@ image = (
     .add_local_file(
         str(Path(__file__).parent / "examples/Cargo.toml"),
         f"{PROJECT_DIR}/examples/Cargo.toml",
+    )
+    .add_local_file(
+        str(Path(__file__).parent / "examples/Cargo.lock"),
+        f"{PROJECT_DIR}/examples/Cargo.lock",
     )
     .add_local_file(
         str(Path(__file__).parent / "rust-toolchain.toml"),
