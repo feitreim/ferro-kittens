@@ -305,6 +305,22 @@ Missing from `prototype/`:
   correct.
 - **No CI.** Nothing runs `cargo check` on the device surface automatically, let
   alone `--features host` on a CUDA box or the device tests on a GPU.
+- **Register cost is swept now, not sampled** (#60). Every claim in this file
+  and in `examples/README.md` used to be measured at 32 and 128 columns, and
+  the reason was structural rather than budgetary: `ptxas` is a host compiler
+  and a width costs milliseconds, but each width was a *hand-written* probe.
+  `device-tests`' `ladder!` generates one per (shape, spelling), so `modal run
+  modal_app.py::regcount` now prints a 14-shape × 5-spelling ladder — 16 to 256
+  fp32 a thread, deliberately onto the 255-register ceiling and over it — with
+  the cliff
+  located per spelling instead of left to be eyeballed, and `--determinism`
+  measures the same tree twice and asserts an identical table before any diff
+  is worth reading. What is still sampled: the ladder varies `M` at two widths
+  only, one op (a scale-and-accumulate step), and no shared-memory or MMA path
+  at all. And what it found is that the shape response is not smooth — the
+  in-place spellings drop 200 registers at some shapes by leaving the band in
+  local memory, so a register count on its own no longer settles a comparison.
+  Whether that trade is faster is not a `ptxas` question; nothing here times it.
 
 ---
 

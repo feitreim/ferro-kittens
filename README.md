@@ -22,6 +22,14 @@ no GPU. Run it either side of a change and diff. Only kernels that are actually
 monomorphized appear, so a library function with no caller gets a codegen probe
 in `device-tests` to put it on the table.
 
+It also prints a **register ladder**: the same step in five spellings across
+fourteen tile shapes, from 16 fp32 a thread to 256 — one past the file — with
+the spill cliff located per spelling. A rung is one line of `ladder!` in
+`device-tests`, which is the point: the number that decides a design here is a
+function of tile *shape*, and it is not a smooth one. `--determinism` measures
+the same tree twice and asserts an identical table, which is what makes a diff
+of two runs evidence.
+
 ## Modules
 
 | Module | What it holds |

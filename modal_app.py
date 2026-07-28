@@ -9,7 +9,8 @@ codegen backend from scratch.
 
 Local usage:
     modal run modal_app.py::build     # host tests + a CPU-only device build
-    modal run modal_app.py::regcount  # ptxas -v register/spill table, no GPU
+    modal run modal_app.py::regcount  # ptxas -v register/spill table + the
+                                      # shape ladder and its cliff, no GPU
     modal run modal_app.py            # the device tests, on a B200
     modal run modal_app.py::examples  # the examples crate's kernels, on a B200
     modal run modal_app.py::bench     # those kernels timed at several sizes
@@ -18,6 +19,7 @@ Local usage:
 
 import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import modal
@@ -324,8 +326,162 @@ def _parse_ptxas(log: str) -> dict[str, dict[str, int]]:
     return kernels
 
 
+def _measure(arch: str) -> dict[tuple[str, str], dict[str, int]]:
+    """Build the harness and price every emitted entry function, keyed by
+    `(ptx file, kernel)`. Building is idempotent, so a caller that wants a
+    *fresh* measurement has to invalidate the artifacts first."""
+    _run([*STUB_ENV, "cargo", "oxide", "build", "device-tests", "--arch", arch], cwd=HARNESS_DIR)
+
+    ptx_files = sorted(Path(HARNESS_DIR).rglob("*.ptx"))
+    if not ptx_files:
+        listing = sorted(p for p in Path(HARNESS_DIR, "target").rglob("*") if p.is_file())
+        raise RuntimeError(
+            "no PTX under the harness target dir; cargo-oxide's artifact layout "
+            f"must have moved. Files found:\n" + "\n".join(map(str, listing[:200]))
+        )
+
+    measured: dict[tuple[str, str], dict[str, int]] = {}
+    for ptx in ptx_files:
+        compiled = subprocess.run(
+            ["ptxas", "-v", f"-arch={arch}", "-o", "/dev/null", str(ptx)],
+            capture_output=True,
+            text=True,
+        )
+        if compiled.returncode != 0:
+            raise RuntimeError(f"ptxas failed on {ptx}:\n{compiled.stderr}")
+        for name, counts in _parse_ptxas(compiled.stderr).items():
+            measured[(str(ptx.relative_to(HARNESS_DIR)), name)] = counts
+    return measured
+
+
+def _print_kernels(measured: dict[tuple[str, str], dict[str, int]]) -> None:
+    for ptx in sorted({source for source, _ in measured}):
+        kernels = {name: counts for (source, name), counts in measured.items() if source == ptx}
+        print(f"\n{ptx}  ({len(kernels)} kernels)")
+        print(f"  {'kernel':<44}{'regs':>6}{'spill st':>10}{'spill ld':>10}{'stack':>8}{'smem':>8}")
+        for name, counts in sorted(kernels.items()):
+            print(
+                f"  {name:<44}{counts['registers']:>6}{counts['spill_stores']:>10}"
+                f"{counts['spill_loads']:>10}{counts['stack']:>8}{counts['smem']:>8}"
+            )
+
+
+# The register ladder `device-tests` compiles, written out a second time here.
+# It has to be: `ptxas` prices the PTX that exists, so a rung that was dropped
+# from `ladder!(..)` — or removed because it would not build — is invisible to
+# a table derived from the PTX alone, and a sweep that quietly omits what it
+# could not compile is worse than no sweep. These two lists are the intent; a
+# rung in them with no PTX prints as `not built`.
+#
+# Mirrors `ladder!(..)` and the `LADDER_*` constants in device-tests/src/main.rs.
+LADDER_SHAPES = (
+    (32, 16), (32, 32), (32, 48), (32, 64), (32, 96), (32, 128), (32, 192), (32, 256),
+    (16, 64), (48, 64), (64, 64), (16, 128), (48, 128), (64, 128),
+)  # fmt: skip
+LADDER_SPELLINGS = ("fused", "assign", "open_coded", "rebound", "all_in_place")
+
+
+def _ladder_pressure(shape: tuple[int, int]) -> int:
+    """fp32 values one thread of an `[M, N]` warp tile holds — `SLOTS * VALUES`.
+
+    The ladder's first-order variable, and deliberately not its only one: two
+    shapes with the same value here can compile very differently, which is what
+    the row sweep is in the ladder to show."""
+    rows, columns = shape
+    return rows * columns // 32
+
+
+def _print_ladder(measured: dict[tuple[str, str], dict[str, int]]) -> None:
+    """The sweep as one table, then where the cliff is.
+
+    "At which width does spill first go non-zero, per spelling" is the number
+    every register issue actually wants, and reading it off fifty-odd rows by
+    eye is how it stays unanswered."""
+    by_kernel = {name: counts for (_, name), counts in measured.items()}
+    rungs = {
+        (shape, spelling): by_kernel.get(f"ladder_probe_{shape[0]}x{shape[1]}_{spelling}")
+        for shape in LADDER_SHAPES
+        for spelling in LADDER_SPELLINGS
+    }
+    if all(counts is None for counts in rungs.values()):
+        return
+
+    def sweep(heading: str, cell: Callable[[dict[str, int]], str], width: int) -> None:
+        print(f"\n{heading}")
+        print(f"  {'shape':<12}{'per thread':>11}" + "".join(f"{s:>{width}}" for s in LADDER_SPELLINGS))
+        for shape in LADDER_SHAPES:
+            counts = (rungs[(shape, spelling)] for spelling in LADDER_SPELLINGS)
+            cells = ("not built" if count is None else cell(count) for count in counts)
+            shape_text = f"[{shape[0]:>2}, {shape[1]:>3}]"
+            row = "".join(f"{text:>{width}}" for text in cells)
+            print(f"  {shape_text:<12}{_ladder_pressure(shape):>11}{row}")
+
+    sweep(
+        "register ladder — regs / spill store bytes, per thread of an [M, N] warp tile",
+        lambda counts: f"{counts['registers']}/{counts['spill_stores']}",
+        14,
+    )
+    # A rung can be cheap in registers because the band fits, or because ptxas
+    # never promoted it and is addressing it in local memory instead. Those are
+    # opposite outcomes and the register column cannot tell them apart, so the
+    # frame goes beside it rather than in a footnote.
+    sweep("  the same rungs, stack frame bytes", lambda counts: str(counts["stack"]), 14)
+
+    missing = [(shape, spelling) for (shape, spelling), counts in rungs.items() if counts is None]
+    if missing:
+        print(f"\n  not built — {len(missing)} of {len(rungs)} rungs emitted no PTX, so nothing")
+        print("  above measures them. Dropped from `ladder!(..)`, or the shape does not compile:")
+        for shape, spelling in missing:
+            print(f"    ladder_probe_{shape[0]}x{shape[1]}_{spelling}")
+
+    # Ordered by the pressure a rung actually puts on the file, so "first" means
+    # the cheapest shape that hits it rather than the earliest line above.
+    ordered = sorted(LADDER_SHAPES, key=lambda shape: (_ladder_pressure(shape), shape))
+    print("\n  the cliff, per spelling — the cheapest rung that spills, and that")
+    print("  reaches the 255-register ceiling (ladder ordered by values/thread):")
+    print(f"    {'spelling':<14}{'first spill':<28}first 255 regs")
+    for spelling in LADDER_SPELLINGS:
+        edges = []
+        for hit in (
+            lambda counts: counts["spill_stores"] > 0,
+            lambda counts: counts["registers"] >= 255,
+        ):
+            found = next(
+                (
+                    shape
+                    for shape in ordered
+                    if (counts := rungs[(shape, spelling)]) is not None and hit(counts)
+                ),
+                None,
+            )
+            edges.append(
+                "never on this ladder"
+                if found is None
+                else f"[{found[0]}, {found[1]}] at {_ladder_pressure(found)}/thread"
+            )
+        print(f"    {spelling:<14}{edges[0]:<28}{edges[1]}")
+
+    # The column sweep on its own: one row extent, so "where does it break" has
+    # a width for an answer, which is the form every earlier issue asked in.
+    widths = [shape for shape in LADDER_SHAPES if shape[0] == 32]
+    if widths:
+        print("\n  the same, as a width — the 32-row column sweep alone:")
+        for spelling in LADDER_SPELLINGS:
+            spilled = next(
+                (
+                    shape[1]
+                    for shape in sorted(widths, key=lambda shape: shape[1])
+                    if (counts := rungs[(shape, spelling)]) is not None
+                    and counts["spill_stores"] > 0
+                ),
+                None,
+            )
+            answer = "no width on this ladder" if spilled is None else f"{spilled} columns"
+            print(f"    {spelling:<14}first spills at {answer}")
+
+
 @app.function(cpu=8, timeout=1800)
-def regcount(arch: str = "sm_100a", label: str = "") -> None:
+def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) -> None:
     """Register pressure of every kernel the harness emits, from `ptxas -v`.
 
     Register count is *the* performance number for this library — a tile
@@ -338,35 +494,50 @@ def regcount(arch: str = "sm_100a", label: str = "") -> None:
     Only kernels that are actually monomorphized appear — an op no kernel calls
     emits no PTX and measures nothing, so a codegen probe in `device-tests` is
     how a bare library function gets onto this table at all.
+
+    `device-tests`' `ladder!(..)` generates a probe per (shape, spelling), and
+    the second table below is that sweep with the cliff located — the widths
+    and *row extents* at which each spelling of the same step starts to spill.
+
+    `--determinism` measures the same tree twice, with the harness' artifacts
+    thrown away in between, and asserts the two tables are identical. It is not
+    ceremony: a diff of this table is only evidence if the table is a function
+    of the tree, and #31 attributed a surprise 71 -> 32 register swing to its own
+    refactor rather than to noise on exactly this control. It costs a second
+    build of the harness crate (its dependencies stay compiled).
     """
-    _run([*STUB_ENV, "cargo", "oxide", "build", "device-tests", "--arch", arch], cwd=HARNESS_DIR)
-
-    ptx_files = sorted(Path(HARNESS_DIR).rglob("*.ptx"))
-    if not ptx_files:
-        listing = sorted(p for p in Path(HARNESS_DIR, "target").rglob("*") if p.is_file())
-        raise RuntimeError(
-            "no PTX under the harness target dir; cargo-oxide's artifact layout "
-            f"must have moved. Files found:\n" + "\n".join(map(str, listing[:200]))
-        )
-
     subprocess.run(["ptxas", "--version"], check=True)
+    measured = _measure(arch)
     print(f"\nregisters per thread, {arch}" + (f" — {label}" if label else ""))
-    for ptx in ptx_files:
-        compiled = subprocess.run(
-            ["ptxas", "-v", f"-arch={arch}", "-o", "/dev/null", str(ptx)],
-            capture_output=True,
-            text=True,
+    _print_kernels(measured)
+    _print_ladder(measured)
+
+    if not determinism:
+        return
+
+    print("\n=== determinism control: the same tree, measured again ===", flush=True)
+    # Throwing the PTX away is what makes the second pass a measurement rather
+    # than a re-read: a build that skipped codegen would hand back the same
+    # file and pass this control without having tested anything. `_measure`
+    # raises if the artifacts do not come back.
+    for ptx in Path(HARNESS_DIR).rglob("*.ptx"):
+        ptx.unlink()
+    _run(["cargo", "clean", "-p", "device-tests"], cwd=HARNESS_DIR)
+    again = _measure(arch)
+
+    differences = [
+        f"  {name} ({source}): {measured.get((source, name))} -> {again.get((source, name))}"
+        for source, name in sorted(measured.keys() | again.keys())
+        if measured.get((source, name)) != again.get((source, name))
+    ]
+    if differences:
+        raise RuntimeError(
+            f"regcount is not deterministic on this tree: {len(differences)} of "
+            f"{len(measured.keys() | again.keys())} kernels changed across two "
+            "builds of the same source. No diff against another tree means "
+            "anything until this passes.\n" + "\n".join(differences)
         )
-        if compiled.returncode != 0:
-            raise RuntimeError(f"ptxas failed on {ptx}:\n{compiled.stderr}")
-        kernels = _parse_ptxas(compiled.stderr)
-        print(f"\n{ptx.relative_to(HARNESS_DIR)}  ({len(kernels)} kernels)")
-        print(f"  {'kernel':<44}{'regs':>6}{'spill st':>10}{'spill ld':>10}{'stack':>8}{'smem':>8}")
-        for name, counts in sorted(kernels.items()):
-            print(
-                f"  {name:<44}{counts['registers']:>6}{counts['spill_stores']:>10}"
-                f"{counts['spill_loads']:>10}{counts['stack']:>8}{counts['smem']:>8}"
-            )
+    print(f"identical: {len(measured)} kernels, every counter, across two builds.")
 
 
 @app.local_entrypoint()
