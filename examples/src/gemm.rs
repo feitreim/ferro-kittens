@@ -1038,9 +1038,8 @@ pub mod kernels {
         mut c: DisjointSlice<f32>,
     ) {
         unsafe {
-            let (mut tile, _) = attach::<128, 64, 2>(
-                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
-            );
+            let (mut tile, _) =
+                attach::<128, 64, 2>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }
@@ -1078,9 +1077,8 @@ pub mod kernels {
         mut c: DisjointSlice<f32>,
     ) {
         unsafe {
-            let (mut tile, _) = attach::<128, 64, 4>(
-                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
-            );
+            let (mut tile, _) =
+                attach::<128, 64, 4>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }
@@ -1120,9 +1118,8 @@ pub mod kernels {
         mut c: DisjointSlice<f32>,
     ) {
         unsafe {
-            let (mut tile, _) = attach::<256, 128, 2>(
-                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
-            );
+            let (mut tile, _) =
+                attach::<256, 128, 2>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }
@@ -1166,9 +1163,8 @@ pub mod kernels {
         mut c: DisjointSlice<f32>,
     ) {
         unsafe {
-            let (mut tile, _) = attach::<128, 64, 3>(
-                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
-            );
+            let (mut tile, _) =
+                attach::<128, 64, 3>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }
@@ -1518,16 +1514,8 @@ fn run<T>(
             let launch = move |c: &mut DeviceBuffer<f32>| -> Result<(), Box<dyn Error>> {
                 unsafe {
                     module_ref.$launch(
-                        stream_ref,
-                        &prepared,
-                        a_ptr,
-                        b_ptr,
-                        tiles_m,
-                        tiles_n,
-                        plan.group,
-                        k_blocks,
-                        n as u32,
-                        c,
+                        stream_ref, &prepared, a_ptr, b_ptr, tiles_m, tiles_n, plan.group,
+                        k_blocks, n as u32, c,
                     )?
                 };
                 Ok(())
@@ -1566,7 +1554,9 @@ fn run<T>(
 /// on a B200, and a rung's residency is a floor division by it, so a figure
 /// that is only nearly right moves a rung across an occupancy step and changes
 /// the answer rather than the third digit.
-fn shared_per_sm(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<usize, Box<dyn Error>> {
+fn shared_per_sm(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+) -> Result<usize, Box<dyn Error>> {
     let mut bytes = 0i32;
     // SAFETY: the attribute is an `int` and `context` names a live device.
     let status = unsafe {
@@ -1577,9 +1567,10 @@ fn shared_per_sm(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<usi
         )
     };
     if status != cuda_core::sys::cudaError_enum_CUDA_SUCCESS {
-        return Err(
-            format!("cuDeviceGetAttribute(MAX_SHARED_MEMORY_PER_MULTIPROCESSOR) = {status}").into(),
-        );
+        return Err(format!(
+            "cuDeviceGetAttribute(MAX_SHARED_MEMORY_PER_MULTIPROCESSOR) = {status}"
+        )
+        .into());
     }
     Ok(bytes as usize)
 }
@@ -1980,10 +1971,7 @@ pub fn tile_sweep(
                 group: GROUP,
                 rung,
             };
-            eprintln!(
-                "{shape} on {}: staging and checking",
-                rung.name()
-            );
+            eprintln!("{shape} on {}: staging and checking", rung.name());
             let (_, timings) = run(context, shape.m, shape.n, shape.k, plan, time)?;
             let milliseconds = timings.min();
             measured.push((rung, shape, milliseconds));
