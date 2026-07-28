@@ -15,6 +15,16 @@
 //!    large-looking number that describes nothing.
 //! 3. **The clock is the device's.** CUDA events either side of the launch, not
 //!    wall clock around the driver call.
+//! 4. **A rate wants a denominator.** `1069 TFLOP/s` is a number nobody can
+//!    act on without first re-deriving what it should have been; `0.52 of
+//!    cuBLASLt at the same shape on the same device` is one they can. Where a
+//!    tuned library implements the same problem, [`Baseline`] puts it in the
+//!    table — **through this same [`time`], on the same stream, after the same
+//!    warm-up, and having passed the same CPU reference** — so the difference
+//!    between the two figures is the two kernels and not the two harnesses.
+//!    Rule 1 has no exception for it: the baseline is checked before it is
+//!    timed, exactly as ours is, because the way a baseline goes wrong is by
+//!    computing a *different* GEMM quickly.
 //!
 //! Every example that is *not* in [`cases`] is in [`SKIPPED`] with the reason,
 //! so a missing row never leaves a reader guessing whether a kernel is slow or
@@ -158,6 +168,18 @@ pub fn time(
     Ok(Timings(milliseconds))
 }
 
+/// An example's verify-then-time entry point: check at a size against that
+/// kernel's own CPU reference, and only then return the clock.
+///
+/// Named rather than spelled out at each use because it is the harness'
+/// central contract — the signature *is* rule 1 at the top of this file, and
+/// the two places that hold one should visibly hold the same thing.
+type Bench = fn(&Arc<CudaContext>, Shape) -> Result<Timings, Box<dyn Error>>;
+
+/// The same contract, plus the identity of the algorithm the library chose —
+/// which ours has no analogue of, since ours only has the one.
+type BaselineBench = fn(&Arc<CudaContext>, Shape) -> Result<(Timings, String), Box<dyn Error>>;
+
 /// One example this harness can run. Adding the next kernel is a `Case` and
 /// nothing else: the sizes, the work each size does, the grid it launches, and
 /// the verify-then-time entry point in the kernel's own module.
@@ -170,8 +192,46 @@ struct Case {
     /// Blocks the launch asks for — the column that explains the small end of
     /// the sweep, where there are fewer of them than the device has SMs.
     blocks: fn(Shape) -> u32,
-    bench: fn(&Arc<CudaContext>, Shape) -> Result<Timings, Box<dyn Error>>,
+    bench: Bench,
+    /// A tuned library measured at the same sizes, where the build has one —
+    /// the denominator, per [`CUBLASLT`].
+    baseline: Option<Baseline>,
 }
+
+/// A vendor implementation of the same problem, timed through this same
+/// harness so the comparison is between two kernels rather than two harnesses.
+///
+/// The point of a baseline as a *column* rather than a one-off measurement is
+/// that it does not decay. An absolute like "1069 TFLOP/s" has to be
+/// re-contextualized by every reader who meets it later; a ratio against the
+/// library on the same device, the same shape and the same day carries its own
+/// context, and every future change to the kernel gets one for free.
+#[derive(Clone, Copy)]
+struct Baseline {
+    name: &'static str,
+    /// The library's version, printed above the table. A baseline whose
+    /// version is not stated cannot be reproduced later.
+    about: fn() -> String,
+    /// The same contract [`Case::bench`] has — checked, then timed — plus the
+    /// identity of the algorithm the library chose.
+    bench: BaselineBench,
+}
+
+/// The GEMM's denominator, behind the off-by-default `cublas` feature (#92).
+///
+/// Off by default so tier 1 CI, which has no CUDA toolkit and therefore no
+/// `libcublasLt.so`, is unaffected and this crate still builds for anyone
+/// without one. `modal run modal_app.py::bench` turns it on; see
+/// [`crate::cublaslt`] for the configuration and for what is and is not fair
+/// about the comparison.
+#[cfg(feature = "cublas")]
+const CUBLASLT: Option<Baseline> = Some(Baseline {
+    name: "cuBLASLt",
+    about: crate::cublaslt::about,
+    bench: crate::cublaslt::bench,
+});
+#[cfg(not(feature = "cublas"))]
+const CUBLASLT: Option<Baseline> = None;
 
 /// Sizes for `gemm`, picked to cross a regime rather than to be large.
 ///
@@ -454,6 +514,7 @@ fn cases() -> Vec<Case> {
             work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
             blocks: |shape| gemm::grid(shape.m, shape.n),
             bench: gemm::bench,
+            baseline: CUBLASLT,
         },
         Case {
             name: "gemm-footprint",
@@ -462,6 +523,13 @@ fn cases() -> Vec<Case> {
             work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
             blocks: |shape| gemm::grid(shape.m, shape.n),
             bench: gemm::bench,
+            // These two exist to compare the kernel against *itself* with one
+            // variable moved, and a baseline is neither needed nor free: each
+            // extra row re-stages its operands on the host, which at these
+            // sizes is the long pole. `CUBLASLT` here is a one-word change for
+            // whoever wants to know whether the library loses 23% to aspect
+            // ratio too — an interesting question, and not this issue's.
+            baseline: None,
         },
         Case {
             name: "gemm-depth",
@@ -470,6 +538,7 @@ fn cases() -> Vec<Case> {
             work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
             blocks: |shape| gemm::grid(shape.m, shape.n),
             bench: gemm::bench,
+            baseline: None,
         },
         Case {
             name: "softmax",
@@ -484,6 +553,7 @@ fn cases() -> Vec<Case> {
             sizes: SOFTMAX_SIZES,
             blocks: |shape| softmax::grid(shape.m, shape.k),
             bench: softmax::bench,
+            baseline: None,
         },
         Case {
             name: "layernorm",
@@ -496,6 +566,7 @@ fn cases() -> Vec<Case> {
             sizes: LAYERNORM_SIZES,
             blocks: |shape| layernorm::grid(shape.m),
             bench: layernorm::bench,
+            baseline: None,
         },
     ]
 }
@@ -504,6 +575,92 @@ fn cases() -> Vec<Case> {
 /// that times a launch it did not first check — so a missing reference is what
 /// keeps one out, not its speed.
 const SKIPPED: &[(&str, &str)] = &[("flash_forward", "no launcher yet — would report TFLOP/s")];
+
+/// The ratio table, and the caveats that make it readable.
+///
+/// Both minimum *and* median are printed for both sides, and each gets its own
+/// ratio column, because #86 measured 16384³ at 1117 and 1179 TFLOP/s in two
+/// runs of the same tree — 5.5% apart, with a median-to-minimum gap of 11%
+/// where every other size repeats to about 1%. A single minimum at that size
+/// could flatter either party, and two ratios that disagree say so out loud.
+///
+/// The caveats are printed under the table rather than left to the module docs
+/// on purpose: this output gets pasted into issues, and a ratio travelling
+/// without them is a ratio that will be over-read.
+fn compare(case: &Case, baseline: Baseline, rows: &[(Shape, Timings, Timings, String)]) {
+    if rows.is_empty() {
+        return;
+    }
+    let rate =
+        |shape: Shape, milliseconds: f64| case.bound.rate((case.work)(shape), milliseconds / 1e3);
+
+    println!(
+        "\n{} against {} ({}) — same process, same stream, same clock, same \
+         {WARMUP} warm-up and min of {ITERATIONS}, both checked first",
+        case.name,
+        baseline.name,
+        (baseline.about)()
+    );
+    println!(
+        "{:<16}{:>12}{:>12}{:>12}{:>12}{:>12}{:>13}{:>14}{:>12}",
+        "shape",
+        "ours min",
+        "ours med",
+        "theirs min",
+        "theirs med",
+        "ours TF/s",
+        "theirs TF/s",
+        "ours/theirs",
+        "at median"
+    );
+    for (shape, ours, theirs, _) in rows {
+        println!(
+            "{:<16}{:>12.4}{:>12.4}{:>12.4}{:>12.4}{:>12.1}{:>13.1}{:>14.3}{:>12.3}",
+            shape,
+            ours.min(),
+            ours.median(),
+            theirs.min(),
+            theirs.median(),
+            rate(*shape, ours.min()),
+            rate(*shape, theirs.min()),
+            theirs.min() / ours.min(),
+            theirs.median() / ours.median(),
+        );
+    }
+
+    println!(
+        "\nthe last two columns are our throughput divided by theirs — equivalently their\n\
+         milliseconds divided by ours — so above 1.00 is us ahead and 0.50 is half their\n\
+         rate. milliseconds are the kernel's own span between CUDA events on the same\n\
+         stream, not wall clock around the driver call."
+    );
+    println!(
+        "both sides read byte-identical operands — plain packed bf16 [m, k] and [n, k],\n\
+         K contiguous. ours reads them through a TMA tensor map and {0} through its own\n\
+         matrix layouts; both descriptors are built once, outside the clock, as is every\n\
+         allocation on both sides. no operand is rearranged for either party.",
+        baseline.name
+    );
+    println!(
+        "{0} is handed a 32 MiB workspace, allocated before the warm-up; ours uses none.",
+        baseline.name
+    );
+    println!(
+        "ours computes only this form: both operands K-major, alpha 1, beta 0, no epilogue,\n\
+         and m % 256 == n % 128 == k % 64 == 0. {0} takes any of that, so a like-for-like\n\
+         rate against a library that is also general reads in our favour.",
+        baseline.name
+    );
+    println!(
+        "the algorithm {0}'s heuristic chose, so the baseline can be reproduced:",
+        baseline.name
+    );
+    for (shape, _, _, algorithm) in rows {
+        // 18 rather than 16: `16384x16384x16384` is seventeen characters, and
+        // in the table the next column is right-aligned and absorbs it.
+        println!("  {shape:<18}{algorithm}");
+    }
+}
 
 fn report(context: &Arc<CudaContext>, case: &Case, sizes: &[Shape]) -> usize {
     let bound = case.bound;
@@ -531,6 +688,7 @@ fn report(context: &Arc<CudaContext>, case: &Case, sizes: &[Shape]) -> usize {
     );
 
     let mut failures = 0;
+    let mut compared = Vec::new();
     for &shape in sizes {
         eprintln!("{shape}: staging and checking");
         let timings = match (case.bench)(context, shape) {
@@ -555,6 +713,25 @@ fn report(context: &Arc<CudaContext>, case: &Case, sizes: &[Shape]) -> usize {
                 None => String::new(),
             }
         );
+
+        // The baseline runs here rather than in a sweep of its own so that the
+        // two measurements of a size are adjacent in time. A device that
+        // throttles or gets shared halfway through a sweep would otherwise
+        // move one side of the ratio and not the other.
+        let Some(baseline) = case.baseline else {
+            continue;
+        };
+        eprintln!("{shape}: staging and checking {}", baseline.name);
+        match (baseline.bench)(context, shape) {
+            Ok((against, algorithm)) => compared.push((shape, timings, against, algorithm)),
+            Err(error) => {
+                println!("{:<16}{} FAIL  {error}", shape, baseline.name);
+                failures += 1;
+            }
+        }
+    }
+    if let Some(baseline) = case.baseline {
+        compare(case, baseline, &compared);
     }
     failures
 }

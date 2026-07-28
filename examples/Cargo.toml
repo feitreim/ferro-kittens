@@ -11,7 +11,18 @@ edition = "2024"
 # cannot break the library's build or its CI.
 [workspace]
 
-# No features. Each aspirational kernel used to sit behind one and be off by
+[features]
+# The cuBLASLt baseline `bench` divides by (#92). Off by default, and it is the
+# link step rather than the code that makes that necessary: turning it on makes
+# the binary need `libcublasLt.so` from a *devel* CUDA toolkit, which tier 1 CI
+# does not have and which nobody should need in order to build this crate.
+#
+# It is not a gated *kernel* — see the note below for why those are all gone.
+# Nothing device-side is behind it. What it gates is host code that calls a
+# vendor library, which is the one thing a feature is genuinely for here.
+cublas = []
+
+# No kernel features. Each aspirational kernel used to sit behind one and be off by
 # default, so that everything in the default build genuinely compiled and
 # turning a feature on printed that kernel's gap list as compiler errors. Every
 # gap list is empty now (#3 closed the last one), so the features held nothing

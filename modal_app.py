@@ -168,6 +168,18 @@ image = (
         str(Path(__file__).parent / "examples/Cargo.lock"),
         f"{PROJECT_DIR}/examples/Cargo.lock",
     )
+    # The `cublas` feature's link step, and the C translation unit that asserts
+    # the hand-written cuBLASLt ABI against the real headers. Both sit outside
+    # `examples/src`, so neither arrives with the directory mount above and a
+    # missing one fails as a confusing build error rather than as an absence.
+    .add_local_file(
+        str(Path(__file__).parent / "examples/build.rs"),
+        f"{PROJECT_DIR}/examples/build.rs",
+    )
+    .add_local_file(
+        str(Path(__file__).parent / "examples/cublaslt_abi.c"),
+        f"{PROJECT_DIR}/examples/cublaslt_abi.c",
+    )
     .add_local_file(
         str(Path(__file__).parent / "rust-toolchain.toml"),
         f"{PROJECT_DIR}/rust-toolchain.toml",
@@ -218,6 +230,25 @@ def build() -> None:
     # lints.
     _run(["cargo", "clippy", "--all-targets"], cwd=EXAMPLES_DIR)
     _run([*STUB_ENV, "cargo", "oxide", "build", "kittens-examples", "--arch", "sm_100a"],
+         cwd=EXAMPLES_DIR)
+
+    # The `cublas` feature (#92), which the two lines above deliberately did
+    # NOT have on: the default build has to keep working for anyone without a
+    # CUDA toolkit, so "it still builds with the feature off" is the claim
+    # those lines make and this one must not weaken.
+    #
+    # Everything static about the baseline is checkable here, with no GPU. The
+    # C file asserts the enum values and struct offsets `cublaslt.rs`
+    # transcribes by hand against the real headers -- `-fsyntax-only`, so no
+    # linker and no binary -- and the device build then links the real
+    # libcublasLt, which is the step that proves FFI through cargo-oxide works
+    # at all. Finding that out here costs a CPU container; finding it out in
+    # `bench` costs a B200 one.
+    _run(["gcc", "-fsyntax-only", "-I/usr/local/cuda/include", "cublaslt_abi.c"],
+         cwd=EXAMPLES_DIR)
+    _run(["cargo", "clippy", "--all-targets", "--features", "cublas"], cwd=EXAMPLES_DIR)
+    _run([*STUB_ENV, "cargo", "oxide", "build", "kittens-examples", "--arch", "sm_100a",
+          "--features", "cublas"],
          cwd=EXAMPLES_DIR)
 
 
@@ -291,8 +322,14 @@ def bench(case: str = "", m: int = 0, n: int = 0, k: int = 0) -> None:
     narrowed = [case] if case else []
     if case and (m or n or k):
         narrowed += [str(m), str(n), str(k)]
+    # `--features cublas` (#92) puts a cuBLASLt column and a ratio beside the
+    # `gemm` table. It is off in the crate's default feature set so that tier 1
+    # CI and anyone without a devel CUDA toolkit are unaffected, and on here
+    # because this image always has one: a GEMM number with no denominator is
+    # the thing the feature exists to stop shipping.
     _run(
-        ["cargo", "oxide", "run", "kittens-examples", "--", "bench", *narrowed],
+        ["cargo", "oxide", "run", "kittens-examples", "--features", "cublas",
+         "--", "bench", *narrowed],
         cwd=EXAMPLES_DIR,
     )
 

@@ -1675,6 +1675,130 @@ change. It also needs plumbing that does not exist: `TensorMapElement` is
 `Bf16`-only, there is no fp32 `SharedTile` swizzle, and `stmatrix` is b16, so
 getting fp32 registers into a swizzled shared tile is plain indexed stores plus
 a proxy fence. Its own issue, queued behind #15 and #89 — not this one.
+##### and the denominator says ~69% of cuBLASLt where the ratio is stable — #92
+
+Everything above divides by a spec sheet. `bench` now divides by a **tuned
+library on the same device, at the same shape, in the same process**, and at the
+two largest sizes this kernel runs at **0.69 of cuBLASLt**, reproducing to about
+one part in a hundred. Below 4096³ the comparison is not stable enough to quote,
+for a reason that is itself the second finding here.
+
+The baseline is `extern "C"` from the examples crate, not upstream's separate C
+binary, and that choice is measurement rather than tidiness: it goes through the
+same `bench::time`, the same stream, the same five discarded warm-ups and the
+same minimum of thirty, so what is left different is the code between the two
+CUDA events. Every row was compared element by element against the **same CPU
+reference** — `gemm::check_c`, the function and not a copy of it — before it was
+timed, because the way a baseline goes wrong is by computing a *different* GEMM
+quickly.
+
+Two complete sweeps of this tree, in separate sessions on one B200 (driver
+580.95.05), both after #94:
+
+| shape | ours min ms | theirs min ms | ours TFLOP/s | theirs TFLOP/s | ours/theirs | at median | run 2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256x128x256 | 0.0169 | 0.0127 | 1.0 | 1.3 | 0.751 | 0.669 | 0.454 |
+| 512x256x256 | 0.0184 | 0.0110 | 3.7 | 6.1 | 0.598 | 0.653 | 0.484 |
+| 1024³ | 0.0230 | 0.0134 | 93.3 | 160.5 | 0.581 | 0.590 | 0.480 |
+| 2048³ | 0.0376 | 0.0236 | 457.3 | 729.4 | 0.627 | 0.623 | 0.564 |
+| 4096³ | 0.1532 | 0.0878 | 896.8 | 1565.8 | 0.573 | 0.585 | 0.574 |
+| 8192³ | 0.9032 | 0.6220 | 1217.4 | **1767.8** | **0.689** | 0.687 | 0.686 |
+| 16384³ | 6.8477 | 4.7511 | 1284.5 | **1851.4** | **0.694** | 0.696 | 0.685 |
+
+bf16 operands, fp32 `C`, `CUBLAS_COMPUTE_32F`, cuBLASLt 130000. `bench` prints
+the heuristic's pick per row so the baseline is reproducible: algorithm `id=66`
+at every size in both sessions, no split-K, and **no workspace used at all**
+despite being offered 32 MiB.
+
+**A ratio is *less* reproducible than either number in it, which is the opposite
+of the intuition.** The instinct — and it was the stated reason for running
+twice — is that run-to-run drift moves both sides together and cancels. It does
+not, because here the variance is almost entirely on the *baseline* side, so the
+ratio inherits all of it and adds our own on top. The split is sharp and it is
+by size:
+
+| shape | ours, run to run | theirs, run to run | ratio, run to run |
+| --- | ---: | ---: | ---: |
+| 256x128x256 | 3% | **77%** | 0.751 → 0.454 |
+| 512x256x256 | 11% | **41%** | 0.598 → 0.484 |
+| 1024³ | 10% | **33%** | 0.581 → 0.480 |
+| 2048³ | 5% | **17%** | 0.627 → 0.564 |
+| 4096³ | 0.6% | 0.3% | 0.573 → 0.574 |
+| 8192³ | 1.5% | 2.0% | 0.689 → 0.686 |
+| 16384³ | 0.9% | 2.2% | 0.694 → 0.685 |
+
+So **only the bottom three rows carry a quotable ratio**: 0.57 at 4096³ and 0.69
+at both sizes above it, each stable to about 1%. The top four are dominated by
+cuBLASLt's own variance — its 256x128x256 figure nearly doubles between sessions
+— and `0.751` in the table above is noise, not this kernel's best row. Anyone
+reading a ratio here to three digits should stop at two, and below 4096³ should
+not read one at all. This is why the min *and* the median are both printed, and
+it is the entire justification for the second sweep.
+
+**cuBLASLt reaches 1767.8–1892.4 TFLOP/s — 79% to 84% of dense bf16 peak — and
+that is the calibration this project did not have.** It is an independent,
+measured check on the derivation two sections up, which subtracted the fitted
+item-boundary cost and claimed this tile "boundary overlapped and walk L2-aware"
+would be worth roughly **1550–1800 TFLOP/s**, with the honest caveat that it
+stacked two assumptions and that nothing had ever run at those rates. Something
+has now, on this part: the band was **not optimistic — if anything conservative**.
+
+**It also prices the target, and the target deserves re-reading.** #86 states
+the goal as **1.7–1.9 PFLOP/s at bf16 before precision changes**. cuBLASLt
+measures **1.77–1.89 PFLOP/s** — *inside that band*. So the written target is
+not "most of the way to the library"; it is **level with the library**, and
+reaching it means matching a vendor GEMM rather than approaching one. That is a
+materially harder goal than "48% of peak → 80% of peak" sounds, and it is worth
+knowing before anyone plans around it. A target above ~1.9 PFLOP/s — 2.0 and up
+has been mentioned — is **above everything cuBLASLt achieved here**, so it is
+not a matter of closing a known gap; it would require beating the vendor on its
+own part, and nothing measured so far suggests where that would come from.
+
+**The ratio improves with size, and the terms already named predict it.** 0.573
+at 4096³ against 0.689 and 0.694 above it, reproduced in run 2 (0.574 / 0.686 /
+0.685). Ragged waves go 76.9% → 92.3% → 99.7% across those rows and the per-tile
+item boundary — a fixed cost, so a `1/K` share of the run — falls by 4×.
+cuBLASLt pays neither. The deficit is largest where the two known fixed costs
+are largest, which is #86's finding seen from outside.
+
+It does not follow that #15 and #89 close it: at 8192³ they would have to be
+worth the whole 1217 → 1768, and the steady state #90 derived for *this tile at
+this shape* was 1500–1670, under what the library actually achieves. So there is
+plausibly a residue that is the tile itself (#87). **This does not reorder the
+levers** — a term worth 27–36% is still the one to take first — and no kernel
+constant moved for this comparison; it is a denominator, not a change.
+
+**Where this flatters us, stated plainly.** Both sides read **byte-identical
+operands** — a plain packed bf16 `[m, k]` and `[n, k]`, K contiguous. Contrary
+to what #92 anticipated, there is *no* rearranged input on our side to discount:
+`gemm.rs` does not use `encode_bf16_panels`, and the TMA tensor map it does need
+is a descriptor built once outside the clock, exactly as cuBLASLt's layouts and
+heuristic are. What is genuinely uneven is **generality**: ours computes this
+one form — both operands K-major, `α = 1`, `β = 0`, no epilogue,
+`m % 256 == n % 128 == k % 64 == 0` — while cuBLASLt takes any of it and picks
+per shape. A like-for-like rate against a library that is also general reads in
+our favour, so 0.69 is an **upper bound** on how well this kernel would stand in
+for one. cuBLASLt is also handed a 32 MiB workspace (allocated before the
+warm-up, outside the clock) that ours does not have and, per the algorithm
+lines, does not spend.
+
+The baseline is attached to `gemm` only, not to `gemm-footprint` or
+`gemm-depth`: those exist to compare the kernel against *itself* with one
+variable moved, and each extra row re-stages its operands on the host, which at
+these sizes is the long pole. Whether cuBLASLt also loses 23% to aspect ratio is
+a good question and **a one-word change** — `baseline: CUBLASLT` on that case —
+for whoever wants it.
+
+**Linking worked**, which #92 asked to have recorded either way. `cargo oxide`
+shells out to plain `cargo` and only injects a codegen backend through
+`RUSTFLAGS`, so an ordinary `build.rs` emitting
+`cargo:rustc-link-lib=dylib=cublasLt` is honoured with nothing special — the
+same mechanism `cuda-bindings` upstream uses for the driver. No fallback to a
+separate binary was needed. The feature is off by default so that a crate anyone
+can build does not require a devel CUDA toolkit to link, and
+`examples/cublaslt_abi.c` asserts the hand-transcribed enum values and struct
+offsets against the real headers under `-fsyntax-only` in the CPU gate, so a
+wrong constant fails there rather than on a B200.
 
 #### 8. Multicast has no geometry to live in
 
