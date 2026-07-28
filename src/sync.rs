@@ -11,6 +11,59 @@
 //! [`SemaphoreRing`] owns the `index → (stage, parity)` arithmetic for the
 //! `N`-deep producer/consumer rings that today thread parity bits by hand.
 //!
+//! # Cluster scope, and who charges the bytes
+//!
+//! A [`Semaphore`] is *one CTA's* barrier. A cta_group::2 MMA consumes an
+//! operand stage of four tiles staged by two CTAs, so its issuer needs one
+//! barrier saying the whole stage is present — which means a CTA has to be
+//! able to name its peer's copy. [`Semaphore::at_rank`] does that, and it
+//! hands back a [`ClusterSemaphore`] rather than another [`Semaphore`],
+//! because a barrier that is not yours is not a barrier you may do everything
+//! to.
+//!
+//! That restriction is the ISA's and not ours.
+//! `mbarrier.arrive.expect_tx` takes `.shared::cta` only, and
+//! `mbarrier.arrive … .shared::cluster` carries no transaction count: remote
+//! addressing and byte accounting sit in different instructions and do not
+//! compose. So a CTA may charge exactly one barrier — its own — and may
+//! arrive at any rank's. [`ClusterSemaphore`] offers exactly that pair:
+//! arrive, or hand the address to an engine that will complete transactions
+//! on it. It has no `wait` and no `expect_tx` because there is no instruction
+//! for either, and a type that admitted them would be promising something the
+//! hardware does not do.
+//!
+//! What is left to decide is which CTA's barrier a cluster stage completes on,
+//! and there are only two shapes:
+//!
+//! 1. **The waiter charges the whole stage.** One barrier, in the CTA that
+//!    waits on it. Every rank's TMA completes there — the peers name it
+//!    through [`Semaphore::at_rank`] — and that CTA charges every byte the
+//!    stage will bring in, including the bytes it does not issue itself.
+//! 2. **Every rank charges its own.** Each producer charges the bytes it
+//!    issues against its own barrier, and forwards a
+//!    [`ClusterSemaphore::arrive`] to the waiter once that barrier flips.
+//!
+//! This library takes (1). What (2) has going for it is that the sum stays
+//! local — a CTA charges exactly what it issued, which is the property #29
+//! wants — and that is all it has. It costs a barrier per rank per stage, a
+//! thread per rank spinning on that barrier, and a second hop on the critical
+//! path carrying no information: when a producer's own barrier flips it knows
+//! nothing the TMA engine could not have told the waiter directly.
+//!
+//! The locality is recoverable under (1) anyway, which is what settles it. A
+//! cluster stage is symmetric by construction — every rank stages the same
+//! tile types at the same shared offsets, which is exactly what lets one MMA
+//! descriptor read across the pair — so the whole-stage charge is the local
+//! charge times the number of ranks staging into it, and the rank count is a
+//! launch constant. A charge derived from the loads a producer issued is
+//! still derivable; it is derived once and multiplied.
+//!
+//! One thing (1) looks like it should need and does not: ordering between the
+//! charge and the peers' loads. An mbarrier's transaction count is a signed
+//! accumulator, so completions may land before the `expect_tx` that expects
+//! them — only the totals have to agree. No sync sits between them in the
+//! GEMM and none is owed.
+//!
 //! [`block_reduce`] is the other thing a kernel needs the block to agree on,
 //! and it is not a barrier idiom but a *collective*: warps cannot shuffle to
 //! each other, so a statistic spanning them is staged through shared memory
@@ -21,9 +74,10 @@
 //! warp scope and stops at 32 lanes.
 
 use cuda_device::barrier::{
-    Barrier, mbarrier_arrive, mbarrier_arrive_expect_tx, mbarrier_init, mbarrier_inval,
-    mbarrier_try_wait_parity,
+    Barrier, mbarrier_arrive, mbarrier_arrive_cluster, mbarrier_arrive_expect_tx, mbarrier_init,
+    mbarrier_inval, mbarrier_try_wait_parity,
 };
+use cuda_device::cluster::map_shared_rank_mut;
 use cuda_device::{thread, warp};
 
 use crate::reg::{Add, ReduceOp};
@@ -87,9 +141,11 @@ impl Semaphore {
     }
 
     /// Count one arrival and register `bytes` of expected TMA transactions —
-    /// the producer side of a `load → wait` handoff. The issuing thread
-    /// charges every byte its `cp.async.bulk.tensor` calls will complete
-    /// against this barrier.
+    /// the producer side of a `load → wait` handoff. `bytes` is every byte
+    /// that will complete *against this barrier*, which under a cluster is not
+    /// the same set as the bytes the calling CTA issues: a peer's loads
+    /// aimed here through [`Semaphore::at_rank`] are counted here, and the
+    /// module docs say why the charge cannot travel with them.
     ///
     /// # Safety
     ///
@@ -120,16 +176,56 @@ impl Semaphore {
         self.bar
     }
 
-    /// The barrier's cluster-multicast alias: a multicast TMA load completes
-    /// on *each* receiving CTA's copy of the barrier, addressed by masking
-    /// the issuing CTA's rank bit (and sub-word bits) out of the local
-    /// address — the validated gemm cta_group::2 idiom. Pass the result to
-    /// [`crate::shared::SharedTile::tma_load_2d_multicast_cg2`].
+    /// This barrier as the CTA at `rank` holds it: the same shared offset, in
+    /// another member of the cluster, addressed through `mapa`. The only thing
+    /// one CTA of a cluster may hand another, and see the module docs for why
+    /// what comes back can be arrived at but neither waited on nor charged.
+    ///
+    /// # Safety
+    ///
+    /// `rank` must name a CTA of the calling block's live cluster, holding an
+    /// initialized barrier at this handle's offset. A symmetric shared plan
+    /// gives that by construction — every rank lays its barriers out the same
+    /// way — which is the same assumption the stage itself rests on.
     #[inline(always)]
-    pub fn multicast_alias(self) -> Semaphore {
-        Semaphore {
-            bar: ((self.bar as u32) & 0xFEFF_FFF8) as *mut Barrier,
+    pub unsafe fn at_rank(self, rank: u32) -> ClusterSemaphore {
+        ClusterSemaphore {
+            bar: unsafe { map_shared_rank_mut(self.bar, rank) },
         }
+    }
+}
+
+/// One rank's copy of a [`Semaphore`], named from another CTA of the same
+/// cluster. It carries everything a CTA may do to a barrier that is not its
+/// own and nothing else: arrive at it, or hand its address to an engine —
+/// [`crate::shared::SharedTile::tma_load_2d_arriving_at`], an MMA commit —
+/// that will complete transactions on it. `wait` and `expect_tx` are missing
+/// because the ISA has no remote form of either, not because they were
+/// overlooked.
+#[derive(Clone, Copy)]
+pub struct ClusterSemaphore {
+    bar: *mut Barrier,
+}
+
+impl ClusterSemaphore {
+    /// Count one arrival on the remote barrier — the peer-progress signal
+    /// [`Semaphore::arrive`] cannot send, being `.shared::cta`. It carries no
+    /// transaction bytes, which is the half of the split the module docs are
+    /// about.
+    ///
+    /// # Safety
+    ///
+    /// As [`Semaphore::arrive`], for the barrier at the far end.
+    #[inline(always)]
+    pub unsafe fn arrive(self) {
+        unsafe { mbarrier_arrive_cluster(self.bar as u64) }
+    }
+
+    /// The raw cluster address, for intrinsics that consume a barrier operand
+    /// directly.
+    #[inline(always)]
+    pub const fn raw(self) -> *mut Barrier {
+        self.bar
     }
 }
 

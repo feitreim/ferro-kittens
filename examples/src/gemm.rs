@@ -41,15 +41,15 @@
 //! The third is gone too, and how it went is worth recording. The pair's four
 //! TMA loads have to complete on *one* barrier for the leader to know the
 //! whole stage is present, and this file used to map the leader's barrier by
-//! hand and call it a missing `Semaphore::at_rank`. That deadlocks: a plain
-//! `cp.async.bulk.tensor` completes on a barrier in the *issuing* CTA's own
-//! shared memory, so the peer's bytes never reached the leader's count. The
-//! fix is [`SharedTile::tma_load_2d_multicast_cg2`] with the CTA's own bit as
-//! the whole mask, onto [`Semaphore::multicast_alias`] — the primitive was
-//! already here, filed under the opposite problem (`examples/README.md` §8
-//! said this kernel "cannot use" the multicast load). What the pair needs
-//! from multicast is not replication; it is the right address space for the
-//! barrier operand.
+//! hand. That deadlocks: a plain `cp.async.bulk.tensor` completes on a barrier
+//! in the *issuing* CTA's own shared memory, so the peer's bytes never reached
+//! the leader's count. It then said so through a multicast load with a
+//! degenerate mask, which worked and did not read as what it was. Both halves
+//! are now named: [`Semaphore::at_rank`] is the leader's copy of the stage
+//! barrier, and [`SharedTile::tma_load_2d_arriving_at`] is a load that
+//! completes there (#50). The charge stays the leader's, and is its own charge
+//! `RANKS` times over — `sync.rs`'s module docs carry the argument for why the
+//! byte accounting can only sit at the barrier and not travel with the loads.
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::cluster;
@@ -88,8 +88,14 @@ const CHUNKS: usize = BLOCK_K / 16;
 const STAGES: usize = 3;
 /// One warp per 32 accumulator rows, which is what a `[32, N]` drain wants.
 pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32;
-/// The CTA mask naming both halves of the pair.
-const PAIR: u16 = 0b11;
+/// CTAs in the cluster. Also the multiplier on a stage's transaction charge:
+/// both ranks stage the same two tile types at the same shared offsets, so the
+/// whole stage is one rank's charge twice over.
+const RANKS: u32 = 2;
+/// The CTA mask naming every half of the pair.
+const PAIR: u16 = ((1u32 << RANKS) - 1) as u16;
+/// The rank that owns the pair's MMA, its accumulator and its stage barriers.
+const LEADER: u32 = 0;
 
 /// This CTA's `A` rows, K-major.
 type ATile = SharedTile<Bf16, BLOCK_M, BLOCK_K, Swizzle128B>;
@@ -188,40 +194,37 @@ pub mod kernels {
             let shape = MmaShape::M256_N128;
 
             if warp_id == 0 && lane == 0 {
-                // Producer. The pair's four tiles all complete on the leader's
-                // copy of the stage barrier, which the leader charges in full
-                // before either CTA issues, so the count is never short.
-                //
-                // The loads are the *multicast* form with each CTA's own bit
-                // and nothing else, which looks pointless and is not: a plain
-                // `cp.async.bulk.tensor` completes on a barrier in the issuing
-                // CTA's own shared memory, so rank 1 cannot name the leader's.
-                // The multicast form takes a `.shared::cluster` barrier, which
-                // is the only way to say "my bytes, the leader's barrier".
-                // Nothing is replicated — `1 << rank` delivers to one CTA.
+                // Producer. Both CTAs load their own halves, and all four
+                // tiles complete on the leader's copy of the stage barrier —
+                // one barrier is what the MMA issuer needs to know the whole
+                // stage is present. Only the leader charges, and it charges
+                // the whole stage: `expect_tx` is `.shared::cta`, so a peer
+                // could not charge this barrier even holding its address.
+                // Nothing orders the two, and nothing has to — the transaction
+                // count is a signed accumulator and only the totals must
+                // agree.
                 let a_row = (2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * rank) as i32;
                 let b_row = (BLOCK_N as u32 * tile_n + HALF_N as u32 * rank) as i32;
                 let mut k = 0u32;
                 while k < k_blocks {
                     free.wait_recycled(k);
-                    if rank == 0 {
+                    if rank == LEADER {
                         load.sem(k)
-                            .expect_tx(2 * (ATile::BYTES + BTile::BYTES) as u32);
+                            .expect_tx(RANKS * (ATile::BYTES + BTile::BYTES) as u32);
                     }
-                    let arrival = load.sem(k).multicast_alias();
+                    let stage = load.sem(k).at_rank(LEADER);
                     let column = (BLOCK_K as u32 * k) as i32;
-                    let mine = 1u16 << rank;
                     a_ring
                         .tile(k)
-                        .tma_load_2d_multicast_cg2(a_map, column, a_row, arrival, mine);
+                        .tma_load_2d_arriving_at(a_map, column, a_row, stage);
                     b_ring
                         .tile(k)
-                        .tma_load_2d_multicast_cg2(b_map, column, b_row, arrival, mine);
+                        .tma_load_2d_arriving_at(b_map, column, b_row, stage);
                     k += 1;
                 }
             }
 
-            if rank == 0 && warp_id == 1 && lane == 0 {
+            if rank == LEADER && warp_id == 1 && lane == 0 {
                 // The pair's single MMA issuer. Every chunk of every stage
                 // chains into the one accumulator, so only the very first
                 // instruction of the very first stage starts it fresh.
