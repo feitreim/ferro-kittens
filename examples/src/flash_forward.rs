@@ -42,6 +42,43 @@
 //! precision loss it never asked for, and the allocation was one this
 //! kernel's shared plan could not spare either.
 //!
+//! ## The shared plan, and the 0 it used to report
+//!
+//! [`SHARED_BYTES`] is 147536 B — 144 KiB, and 4.5x what `softmax` asks for.
+//! It is worth seeing by component rather than as one number:
+//!
+//! | component | shape | bytes | share |
+//! | --- | --- | ---: | ---: |
+//! | `Q` tile | `[128, 128]` bf16 | 32768 | 22% |
+//! | `K` ring | 3 x `[64, 128]` bf16 | 49152 | 33% |
+//! | `V` ring | 3 x `[64, 128]` bf16 | 49152 | 33% |
+//! | `P` staging | `[128, 64]` bf16 | 16384 | 11% |
+//! | barriers + TMEM word | 9 x 8 B + 8 B | 80 | — |
+//! | **total** | | **147536** | |
+//!
+//! Two thirds of it is the pipeline: [`STAGES`] deep over both `K` and `V`,
+//! at 16384 B a stage a side. Dropping to two stages would save 32768 B.
+//!
+//! **It buys nothing, and #70 is what measured that.** The occupancy table
+//! used to print `0` blocks/SM for this kernel, which reads like a plan that
+//! does not fit and was not one. A block gets 48 KiB of dynamic shared memory
+//! without asking; past that the *function* must be opted in, and
+//! `cuOccupancyMaxActiveBlocksPerMultiprocessor` answers 0 for a function
+//! nobody opted in for in exactly the same way it answers 0 for tiles too big
+//! to fit. On a B200 the same function at the same 147536 B goes **0 -> 1**
+//! across a single [`kittens::launch::admit_shared_plan`] call, with the
+//! device's own ceiling at 232448 B — 84912 B of headroom under a plan that
+//! was never too large.
+//!
+//! And 1 is not the shared plan's doing either: swept on a freshly loaded
+//! function per probe, this kernel answers 1 block/SM at 147536 B, at 73792,
+//! at 32800, and at **0** — flat, and flat across block widths of 32, 64, 128
+//! and 256 where `softmax` goes 28/14/7/3 and `layernorm` 8/4/2/1. A ceiling
+//! that ignores both shared memory and warp count is a *per-CTA* resource, and
+//! the one this kernel holds that neither control does is TMEM: it and the
+//! GEMM are the only `tcgen05` entries here. So shrinking the rings is not the
+//! lever, and what the lever is wants its own issue rather than a guess.
+//!
 //! ## What already works
 //!
 //! Everything structural. [`mm_abt`] and [`mm_ab`] are exactly the two MMAs

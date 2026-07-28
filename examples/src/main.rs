@@ -107,6 +107,13 @@ fn examples() -> Vec<Example> {
 /// *with*, and those want opposite fixes. The driver is asked rather than the
 /// arithmetic reproduced here, because the shared-memory carveout it picks is
 /// its own business and not a number this file can derive.
+///
+/// The envelope includes the *opt-in* (#70), which is why
+/// [`kittens::launch::admit_shared_plan`] is called before the query and not
+/// only before a launch. A plan over 48 KiB is inadmissible on a function
+/// nobody opted in for, and the driver answers 0 for that exactly as it
+/// answers 0 for a plan too big to fit — so without this line the column
+/// reports the omission and reads like the tiles.
 fn occupancy(context: &std::sync::Arc<cuda_core::CudaContext>) {
     let Ok(module) = cuda_host::load_embedded_module(context, env!("CARGO_PKG_NAME")) else {
         return;
@@ -119,6 +126,7 @@ fn occupancy(context: &std::sync::Arc<cuda_core::CudaContext>) {
     for example in examples() {
         let blocks = example.entry.and_then(|entry| {
             let function = module.load_function(entry).ok()?;
+            kittens::launch::admit_shared_plan(&function, example.shared_bytes as u32).ok()?;
             function
                 .max_active_blocks_per_multiprocessor(example.threads, example.shared_bytes as u32)
                 .ok()
