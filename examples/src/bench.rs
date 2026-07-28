@@ -180,7 +180,7 @@ type Bench = fn(&Arc<CudaContext>, Shape) -> Result<Timings, Box<dyn Error>>;
 
 /// The same contract, plus the identity of the algorithm the library chose —
 /// which ours has no analogue of, since ours only has the one.
-type BaselineBench = fn(&Arc<CudaContext>, Shape) -> Result<(Timings, String), Box<dyn Error>>;
+pub type BaselineBench = fn(&Arc<CudaContext>, Shape) -> Result<(Timings, String), Box<dyn Error>>;
 
 /// One example this harness can run. Adding the next kernel is a `Case` and
 /// nothing else: the sizes, the work each size does, the grid it launches, and
@@ -209,14 +209,14 @@ struct Case {
 /// library on the same device, the same shape and the same day carries its own
 /// context, and every future change to the kernel gets one for free.
 #[derive(Clone, Copy)]
-struct Baseline {
-    name: &'static str,
+pub struct Baseline {
+    pub name: &'static str,
     /// The library's version, printed above the table. A baseline whose
     /// version is not stated cannot be reproduced later.
-    about: fn() -> String,
+    pub about: fn() -> String,
     /// The same contract [`Case::bench`] has — checked, then timed — plus the
     /// identity of the algorithm the library chose.
-    bench: BaselineBench,
+    pub bench: BaselineBench,
 }
 
 /// The GEMM's denominator, behind the off-by-default `cublas` feature (#92).
@@ -227,13 +227,13 @@ struct Baseline {
 /// [`crate::cublaslt`] for the configuration and for what is and is not fair
 /// about the comparison.
 #[cfg(feature = "cublas")]
-const CUBLASLT: Option<Baseline> = Some(Baseline {
+pub const CUBLASLT: Option<Baseline> = Some(Baseline {
     name: "cuBLASLt",
     about: crate::cublaslt::about,
     bench: crate::cublaslt::bench,
 });
 #[cfg(not(feature = "cublas"))]
-const CUBLASLT: Option<Baseline> = None;
+pub const CUBLASLT: Option<Baseline> = None;
 
 /// Sizes for `gemm`, picked to cross a regime rather than to be large.
 ///
@@ -344,7 +344,7 @@ const GEMM_SIZES: &[Shape] = &[
 /// same working set 16384³ has, at 8192³'s wave structure. If the flattening
 /// above is a footprint effect, this row shows it with the quantization held
 /// still.
-const GEMM_FOOTPRINT_SIZES: &[Shape] = &[
+pub const GEMM_FOOTPRINT_SIZES: &[Shape] = &[
     Shape {
         m: 32768,
         n: 2048,
@@ -405,7 +405,7 @@ const GEMM_FOOTPRINT_SIZES: &[Shape] = &[
 /// curve convex. So a straight line through all four rows overstates the
 /// intercept, and `examples/README.md` §7 reports the fixed cost as a range
 /// over point selections rather than as one number off one fit.
-const GEMM_DEPTH_SIZES: &[Shape] = &[
+pub const GEMM_DEPTH_SIZES: &[Shape] = &[
     Shape {
         m: 8192,
         n: 8192,
@@ -789,6 +789,26 @@ pub fn main() -> ExitCode {
             println!("{name}, sm_{major}{minor}, {sms} SMs")
         }
         _ => println!("device 0 (attributes unavailable)"),
+    }
+
+    // `bench swizzle` is not a [`Case`] and does not pretend to be one: a
+    // `Case` sweeps *sizes* with the kernel held fixed, and this sweeps the
+    // kernel's item traversal with the size held fixed (#89). It rides this
+    // argument rather than `main`'s — where `clc` sits, which is the closer
+    // sibling — for one reason worth stating plainly: `modal_app.py::bench`
+    // already passes its `--case` through and already turns on `--features
+    // cublas`, so the sweep reaches a B200 with a cuBLASLt column and no new
+    // Modal entry point. Two changes to that file were in flight.
+    if let Some((name, _)) = &selected
+        && name == "swizzle"
+    {
+        return match gemm::swizzle(&context, CUBLASLT) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     if let Some((name, _)) = &selected

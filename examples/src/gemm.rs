@@ -67,6 +67,23 @@
 //! obvious pipeline-fill explanation, and for the other two sweeps — the
 //! aspect-ratio one is worth 23% and belongs to #89.
 //!
+//! ## The item map is grouped, not row-major
+//!
+//! That aspect-ratio sweep is what #89 was started from, and it is worth
+//! restating why it is evidence rather than a suggestion. Five shapes, every one
+//! of them identical in flops, tiles, waves, grid, `C` bytes, operand bytes and
+//! arithmetic intensity, differing only in `M : N` — and throughput moved
+//! **1123.7 → 915.7 TFLOP/s**, with the best and worst rows exact transposes of
+//! each other. Nothing but the order the output is walked in can explain a 23%
+//! swing across rows that request the same bytes from the same memory system.
+//!
+//! So the item map is [`pipeline::grouped`] at [`GROUP`] tile-rows rather than
+//! `(item / tiles_n, item % tiles_n)`. What that changes is the *working set of
+//! a wave*: 222 clusters walked row-major sit on `ceil(222 / tiles_n)` rows of
+//! tiles and span as much of `N` as the shape allows, where grouped they sit on
+//! a block whose shape the aspect ratio no longer controls. [`swizzle`] sweeps
+//! the width and keeps the losers, and `examples/README.md` §7 has both.
+//!
 //! ## What this kernel had to reach past the library for
 //!
 //! **Nothing.** There is no `GAP` block left in this file, and the last one to
@@ -255,6 +272,25 @@ const CTAS_PER_SM: u32 = 3;
 const MAX_CLUSTERS: u32 = SMS * CTAS_PER_SM / RANKS;
 const _: () = assert!(MAX_CLUSTERS == 222);
 
+/// Tile-rows the item map walks before moving right — [`pipeline::grouped`]'s
+/// width, and this kernel's answer to #89.
+///
+/// **A measurement, at one tile shape, and not a preference.** [`swizzle`]
+/// sweeps `1, 2, 4, 8, 16, 32` and `examples/README.md` §7 keeps every row
+/// including the ones that lost. `1` is the row-major map this kernel had
+/// through #97; the value here is what won at the `[256, 128]` pair tile the
+/// rest of this file is written around, and #87 moves that tile — so a tile
+/// change is a reason to re-run the sweep and not a reason to trust this line.
+///
+/// What it changes is the *working set of a wave*, which is the quantity #90
+/// measured without a counter. 222 clusters walked row-major sit on
+/// `ceil(222 / tiles_n)` rows of tiles and span the whole of `N` if `N` is
+/// narrow enough; walked in groups they sit on `GROUP` rows and
+/// `ceil(222 / GROUP)` columns, which is a shape the aspect ratio no longer
+/// controls. [`wave_reuse`] is that arithmetic, printed beside every row of the
+/// sweep.
+const GROUP: u32 = 8;
+
 /// Which item source a launch runs on. The [`Tile`] job is identical under
 /// both — that is the point of it being a [`Job`] — and what changes is the
 /// grid, and where the next item comes from.
@@ -282,10 +318,12 @@ impl Scheduler {
 ///
 /// Every field is what the item needs and does not depend on *which* item it
 /// is: the pair's rings and barriers, the two operand maps, this CTA's half of
-/// the accumulator, and the thread's own coordinates. The item index is the
-/// only thing [`Job::work`] takes, and `(item / tiles_n, item % tiles_n)` is
-/// the whole of what it does with it — the same map `blockIdx.x / 2` used to
-/// carry, now asked of a number that means one tile per *cluster*.
+/// the accumulator, the shape of the tile grid, and the thread's own
+/// coordinates. The item index is the only thing [`Job::work`] takes, and
+/// [`pipeline::grouped`] is the whole of what it does with it — the same map
+/// `blockIdx.x / 2` used to carry, now asked of a number that means one tile
+/// per *cluster* and answered in groups of [`GROUP`] tile-rows rather than
+/// row-major.
 #[derive(Clone, Copy)]
 struct Tile {
     a_ring: ARing,
@@ -304,7 +342,15 @@ struct Tile {
     /// `C` with `ldc` in it — built once, since a persistent CTA writes bands
     /// of the same output through every item it runs.
     c: GlobalRows,
+    /// The tile grid, both axes. `tiles_m` is here only so the item map can
+    /// short the last group of tile-rows when [`GROUP`] does not divide it —
+    /// row-major never needed it, and a map that aliases the tail is a wrong
+    /// `C` rather than a slow one.
+    tiles_m: u32,
     tiles_n: u32,
+    /// [`pipeline::grouped`]'s width. A launch parameter and not a constant, so
+    /// [`swizzle`] can sweep it against one staged pair of operands.
+    group: u32,
     k_blocks: u32,
     rank: u32,
     warp_id: u32,
@@ -367,13 +413,19 @@ impl Job for Tile {
                 b_map,
                 accumulator,
                 c,
+                tiles_m,
                 tiles_n,
+                group,
                 k_blocks,
                 rank,
                 warp_id,
                 lane,
             } = *self;
-            let (tile_m, tile_n) = (item / tiles_n, item % tiles_n);
+            // The item map, and the only line in this kernel #89 changes. It is
+            // a bijection under both schedulers alike — `run` hands out a
+            // strided share and `run_stealing` hands out whatever the hardware
+            // cancelled, and a bijection of either is still every tile once.
+            let (tile_m, tile_n) = pipeline::grouped(item, tiles_m, tiles_n, group);
 
             // `M` is the pair's 256 rows and `N` its 128 columns. The rest of
             // the descriptor is the walk's: both operands are K-major, so the
@@ -478,10 +530,13 @@ pub mod kernels {
     /// buffers covering `k_blocks * BLOCK_K` along K and the full extent the
     /// item loop walks, and `c` must hold `ldc` columns for every row of it.
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn attach(
         a_map: *const TmaDescriptor,
         b_map: *const TmaDescriptor,
+        tiles_m: u32,
         tiles_n: u32,
+        group: u32,
         k_blocks: u32,
         ldc: u32,
         c: &mut DisjointSlice<f32>,
@@ -501,7 +556,9 @@ pub mod kernels {
                 b_map,
                 accumulator: Accumulator::from_raw(alloc_cluster(tmem_slot, BLOCK_N as u32)),
                 c: GlobalRows::from_slice(c, ldc as usize),
+                tiles_m,
                 tiles_n,
+                group,
                 k_blocks,
                 rank: cluster::block_rank(),
                 warp_id: warp::warp_id(),
@@ -539,12 +596,18 @@ pub mod kernels {
     ///
     /// The grid is persistent and the item map is [`pipeline::run`]'s: a
     /// *cluster* takes item `%clusterid` and steps by `%nclusterid` until the
-    /// `tiles` are gone, and `cluster::block_rank()` says which half of the
+    /// tiles are gone, and `cluster::block_rank()` says which half of the
     /// pair this CTA owns. `a_map` describes `A` as `[rows, K]` bf16, `b_map`
     /// describes `B` as `[columns, K]`. Both come from a rank-2
     /// [`kittens::global::GlobalLayout`] paired with the tile it feeds, so
     /// their `[R, 64]` boxes are `ATile`'s and `BTile`'s own constants and not
     /// numbers [`check`] wrote down.
+    ///
+    /// **The separate `tiles` argument is gone**, and #89 is why. A grouped
+    /// item map has to know how many tile-*rows* there are, to short the last
+    /// group when the width does not divide them — so `tiles_m` is now a
+    /// parameter, `tiles_m * tiles_n` is the item count, and the launcher no
+    /// longer passes a total it had already told the kernel twice over.
     ///
     /// Everything outside the item loop is `attach` and `release`; what is
     /// left here is the schedule.
@@ -552,8 +615,8 @@ pub mod kernels {
     /// # Safety
     ///
     /// `attach`'s, plus: the grid must be a whole number of clusters and
-    /// `tiles` the item count they are to cover — see [`grid`], which is what
-    /// the launcher below sizes both from.
+    /// `tiles_m * tiles_n` the item count they are to cover — see [`grid`],
+    /// which is what the launcher below sizes both from.
     #[kernel]
     #[cluster_launch(2, 1, 1)]
     #[launch_contract(
@@ -562,18 +625,21 @@ pub mod kernels {
         dynamic_shared = 73_816,
         dynamic_shared_alignment = 128
     )]
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemm_cg2(
         a_map: *const TmaDescriptor,
         b_map: *const TmaDescriptor,
-        tiles: u32,
+        tiles_m: u32,
         tiles_n: u32,
+        group: u32,
         k_blocks: u32,
         ldc: u32,
         mut c: DisjointSlice<f32>,
     ) {
         unsafe {
-            let (mut tile, _) = attach(a_map, b_map, tiles_n, k_blocks, ldc, &mut c);
-            pipeline::run(&mut tile, tiles);
+            let (mut tile, _) =
+                attach(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }
     }
@@ -583,11 +649,17 @@ pub mod kernels {
     /// rest are cancelled out from under the scheduler by clusters that have
     /// finished — [`pipeline::run_stealing`].
     ///
-    /// **There is no `tiles` argument, and that absence is the feature.** The
-    /// static entry point above needs the item count because its grid is capped
-    /// at a constant that had to be measured on one device (#84). Here the grid
-    /// *is* the item count, and neither [`SMS`] nor [`CTAS_PER_SM`] appears
-    /// anywhere on the path.
+    /// **Neither [`SMS`] nor [`CTAS_PER_SM`] appears anywhere on this path, and
+    /// that absence is the feature.** The static entry point above sizes its
+    /// grid from a constant that had to be measured on one device (#84); here
+    /// the grid *is* the tile count and the residency is the scheduler's
+    /// business.
+    ///
+    /// Through #97 the visible marker of that was this entry point taking no
+    /// `tiles`. It is not any more — #89 made `tiles_m` a parameter of the item
+    /// map, so *both* entry points now take the tile grid and derive the count.
+    /// The difference was never the argument list; it is [`grid_for`], where
+    /// one branch reads a measured constant and the other reads the problem.
     ///
     /// # Safety
     ///
@@ -601,16 +673,20 @@ pub mod kernels {
         dynamic_shared = 73_816,
         dynamic_shared_alignment = 128
     )]
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemm_cg2_clc(
         a_map: *const TmaDescriptor,
         b_map: *const TmaDescriptor,
+        tiles_m: u32,
         tiles_n: u32,
+        group: u32,
         k_blocks: u32,
         ldc: u32,
         mut c: DisjointSlice<f32>,
     ) {
         unsafe {
-            let (mut tile, queue) = attach(a_map, b_map, tiles_n, k_blocks, ldc, &mut c);
+            let (mut tile, queue) =
+                attach(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             pipeline::run_stealing(&mut tile, queue);
             release(&tile);
         }
@@ -709,10 +785,79 @@ pub(crate) fn stage(rows: usize, k: usize, value: impl Fn(usize, usize) -> f32) 
     staged
 }
 
+/// Tiles of `C` a `[m, n]` output has along each axis — the grid
+/// [`pipeline::grouped`] walks, and the pair of numbers the kernel needs
+/// because a grouped walk has to know where the tile-rows run out.
+fn tile_grid(m: usize, n: usize) -> (u32, u32) {
+    ((m / (2 * BLOCK_M)) as u32, (n / BLOCK_N) as u32)
+}
+
 /// Tiles of `C` a `[m, n]` output has, which is the item count the persistent
 /// grid walks: one per `2·BLOCK_M` by `BLOCK_N` tile.
 fn tiles(m: usize, n: usize) -> u32 {
-    (m / (2 * BLOCK_M) * (n / BLOCK_N)) as u32
+    let (rows, columns) = tile_grid(m, n);
+    rows * columns
+}
+
+/// Operand bytes the clusters resident at one time collectively touch at a
+/// single K block, and the reuse that implies — **the quantity #89 is about,
+/// and the closest this harness can get to an L2 hit rate.**
+///
+/// It is arithmetic on the item map and not a counter, and that limitation is
+/// not a choice: `modal_app.py::profile` is checked in *not working*, because
+/// the container's injected driver set carries no `libnvidia-pcc.so` and Nsight
+/// Compute cannot start without it. So there is no measured hit rate on this
+/// harness, for this change or for #90's, and the substitute is stated rather
+/// than quietly dropped.
+///
+/// What it computes: [`MAX_CLUSTERS`] consecutive items are resident together
+/// and march through K in step, so at one K block they read the tile-rows of
+/// `A` and the tile-columns of `B` those items span. It walks the map rather
+/// than closing a form over it, because a grouped walk straddles group
+/// boundaries and the closed form would be four cases and a place to be wrong.
+///
+/// Returns the tile-rows and tile-columns a wave spans, the distinct bytes that
+/// comes to, and the reuse — bytes requested over bytes distinct, so 1.0 would
+/// be a wave that shares nothing.
+fn wave_reuse(m: usize, n: usize, group: u32) -> (usize, usize, f64, f64) {
+    let (rows, columns) = tile_grid(m, n);
+    let wave = MAX_CLUSTERS.min(rows * columns);
+    let (mut spans_row, mut spans_column) =
+        (vec![false; rows as usize], vec![false; columns as usize]);
+    for item in 0..wave {
+        let (row, column) = pipeline::grouped(item, rows, columns, group);
+        spans_row[row as usize] = true;
+        spans_column[column as usize] = true;
+    }
+    let spanned = |flags: &[bool]| flags.iter().filter(|&&hit| hit).count();
+    let (walked_rows, walked_columns) = (spanned(&spans_row), spanned(&spans_column));
+    let depth = (BLOCK_K * 2) as f64;
+    let distinct = (walked_rows * 2 * BLOCK_M + walked_columns * BLOCK_N) as f64 * depth;
+    let requested = wave as f64 * (2 * BLOCK_M + BLOCK_N) as f64 * depth;
+    (walked_rows, walked_columns, distinct, requested / distinct)
+}
+
+/// How a launch takes its work: where the next item comes from, and which tile
+/// an item names. The two are orthogonal by construction — [`pipeline::grouped`]
+/// is a bijection and both item sources hand out permutations — which is what
+/// makes sweeping one against the other a two-column table rather than a
+/// combinatorial argument.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Plan {
+    pub scheduler: Scheduler,
+    /// [`pipeline::grouped`]'s width in tile-rows. `1` is row-major.
+    pub group: u32,
+}
+
+impl Plan {
+    /// The kernel as it ships: whichever schedule `scheduler` names, walked at
+    /// the measured [`GROUP`].
+    fn new(scheduler: Scheduler) -> Self {
+        Plan {
+            scheduler,
+            group: GROUP,
+        }
+    }
 }
 
 /// Blocks the launch asks for — [`MAX_CLUSTERS`] pairs, or fewer where the
@@ -788,7 +933,7 @@ fn run<T>(
     m: usize,
     n: usize,
     k: usize,
-    scheduler: Scheduler,
+    plan: Plan,
     then: impl FnOnce(
         &cuda_core::CudaStream,
         &mut dyn FnMut() -> Result<(), Box<dyn Error>>,
@@ -807,6 +952,11 @@ fn run<T>(
             2 * BLOCK_M
         )
         .into());
+    }
+    // `grouped` divides by `group * columns` and the device checks nothing, so
+    // a zero here is a launch that faults rather than a launch that is wrong.
+    if plan.group == 0 {
+        return Err("a traversal group width of 0 has no tiles in it".into());
     }
 
     let stream = context.default_stream();
@@ -836,7 +986,7 @@ fn run<T>(
         |scheduler| LaunchConfig1D::new(grid_for(scheduler, m, n), THREADS, SHARED_BYTES as u32);
     let static_launch = module.prepare_gemm_cg2(config(Scheduler::Static))?;
     let clc_launch = module.prepare_gemm_cg2_clc(config(Scheduler::Stealing))?;
-    let tiles_n = (n / BLOCK_N) as u32;
+    let (tiles_m, tiles_n) = tile_grid(m, n);
     let k_blocks = (k / BLOCK_K) as u32;
     let launch_once = |c: &mut DeviceBuffer<f32>| -> Result<(), Box<dyn Error>> {
         // SAFETY: both maps describe live buffers covering the walk the grid
@@ -844,14 +994,15 @@ fn run<T>(
         // stealing entries additionally take a grid of exactly one cluster per
         // tile, which is what `grid_for` gives them.
         unsafe {
-            match scheduler {
+            match plan.scheduler {
                 Scheduler::Static => module.gemm_cg2(
                     &stream,
                     &static_launch,
                     a_map.as_ptr(),
                     b_map.as_ptr(),
-                    tiles(m, n),
+                    tiles_m,
                     tiles_n,
+                    plan.group,
                     k_blocks,
                     n as u32,
                     c,
@@ -861,7 +1012,9 @@ fn run<T>(
                     &clc_launch,
                     a_map.as_ptr(),
                     b_map.as_ptr(),
+                    tiles_m,
                     tiles_n,
+                    plan.group,
                     k_blocks,
                     n as u32,
                     c,
@@ -944,21 +1097,46 @@ pub(crate) fn check_c(
 /// A deadlock is the fourth and reports itself.
 const SCHEDULERS: [Scheduler; 2] = [Scheduler::Static, Scheduler::Stealing];
 
-/// The correctness run: two sizes, checked, nothing timed.
+/// Traversal widths the correctness run walks every size at, chosen to break
+/// [`pipeline::grouped`] rather than to be fast.
 ///
-/// The second one is [`ITEMS_M`]`x`[`ITEMS_N`], and it is here because the
+/// `1` is row-major, the map this kernel had through #97, so a regression in
+/// the rest of the file still fails against the traversal it always used. The
+/// other two are **not powers of two, and that is the point**: every `M` this
+/// project runs is, so `tiles_m` is too, so a swept width of 8 or 16 always
+/// divides it and the short last group — the one branch in the map, and the one
+/// that turns a wrong width into a tile computed twice — would never execute.
+/// At [`ITEMS_M`]'s 16 tile-rows, `3` leaves a final group of one row and `6`
+/// leaves one of four; at [`M`]'s two tile-rows both are taller than the grid
+/// and take the saturating path instead. Three widths against two shapes covers
+/// full groups, short groups and over-tall widths, under both schedulers.
+const CHECK_GROUPS: [u32; 3] = [1, 3, 6];
+
+/// The correctness run: two sizes, three traversals, two schedulers, checked,
+/// nothing timed.
+///
+/// The second size is [`ITEMS_M`]`x`[`ITEMS_N`], and it is here because the
 /// first cannot fail the way the persistent grid can. Both report the items
 /// their clusters walked, so a size that quietly stopped exercising the loop —
 /// because [`MAX_CLUSTERS`] moved, or because the tiling did — says so in the
 /// pass line instead of in nobody's memory.
+///
+/// The traversal is under the same gate for the same reason the scheduler is:
+/// a wrong item map is a tile computed twice and one computed by nobody, both
+/// silent on the device, and the element-by-element `==` against the CPU
+/// reference is the only thing that sees either.
 pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String, Box<dyn Error>> {
     let mut notes = Vec::new();
     for (m, n, k) in [(M, N, K), (ITEMS_M, ITEMS_N, ITEMS_K)] {
+        let (rows, _) = tile_grid(m, n);
         for scheduler in SCHEDULERS {
-            let (note, ()) = run(context, m, n, k, scheduler, nothing_after)?;
+            for group in CHECK_GROUPS {
+                run(context, m, n, k, Plan { scheduler, group }, nothing_after)?;
+            }
             let clusters = grid_for(scheduler, m, n) / RANKS;
             notes.push(format!(
-                "{note} on {} ({} tiles over {clusters} clusters)",
+                "{m}x{n}x{k} exact on {} at groups {CHECK_GROUPS:?} of {rows} tile-rows \
+                 ({} tiles over {clusters} clusters)",
                 scheduler.name(),
                 tiles(m, n)
             ));
@@ -978,7 +1156,15 @@ pub fn bench(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     shape: Shape,
 ) -> Result<Timings, Box<dyn Error>> {
-    run(context, shape.m, shape.n, shape.k, Scheduler::Static, time).map(|(_, timings)| timings)
+    run(
+        context,
+        shape.m,
+        shape.n,
+        shape.k,
+        Plan::new(Scheduler::Static),
+        time,
+    )
+    .map(|(_, timings)| timings)
 }
 
 /// Sizes the scheduler comparison runs at, which are the sizes the prediction
@@ -1017,9 +1203,15 @@ const COMPARE_SIZES: &[Shape] = &[
 /// stated number rather than as a result looking for an explanation. Every size
 /// is checked against the CPU reference under every scheduler before it is
 /// timed, by the same entry point the rest of the harness uses.
+///
+/// **Both columns now walk at [`GROUP`], where #97's ran row-major**, so the
+/// absolute milliseconds here are not comparable to that table and the
+/// *difference* between the columns still is — which is what this table is for.
+/// [`swizzle`] is where the traversal is the variable.
 pub fn compare(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<(), Box<dyn Error>> {
     println!(
-        "gemm schedulers — min ms over 30 timed launches, both on one shared plan\n\
+        "gemm schedulers — min ms over 30 timed launches, both on one shared plan,\n\
+         both walking pipeline::grouped at width {GROUP} (#89) rather than row-major.\n\
          `predicted` is the ragged last wave the static grid idles through, which is the\n\
          whole of what a dynamic schedule has to win back: 1 - tiles/(waves x {MAX_CLUSTERS})."
     );
@@ -1033,7 +1225,7 @@ pub fn compare(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<(), B
         let mut milliseconds = Vec::new();
         for scheduler in SCHEDULERS {
             eprintln!("{shape} on {}: staging and checking", scheduler.name());
-            let (_, timings) = run(context, m, n, k, scheduler, time)?;
+            let (_, timings) = run(context, m, n, k, Plan::new(scheduler), time)?;
             milliseconds.push(timings.min());
         }
         let (static_ms, clc_ms) = (milliseconds[0], milliseconds[1]);
@@ -1047,6 +1239,303 @@ pub fn compare(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<(), B
             static_ms,
             clc_ms,
             100.0 * (1.0 - clc_ms / static_ms)
+        );
+    }
+    Ok(())
+}
+
+/// Traversal widths [`swizzle`] sweeps, in tile-rows. `1` is the row-major map
+/// this kernel had through #97 and is the control; the rest are kept in the
+/// table whatever they measure.
+const GROUPS: [u32; 6] = [1, 2, 4, 8, 16, 32];
+
+/// The shape the width is chosen at, and the one [`GROUP`] should be read as
+/// belonging to. 8192³ because it is the size every other table in this repo
+/// is quoted at, and because its 32 x 64 tile grid is tall enough for the
+/// widths above to be distinguishable and short enough that 32 saturates —
+/// which puts both ends of the parameter's range inside the sweep.
+const SWEEP: Shape = Shape {
+    m: 8192,
+    n: 8192,
+    k: 8192,
+};
+
+/// The two sizes #89's acceptance names, measured either side of the change.
+const HEADLINE: [Shape; 2] = [
+    SWEEP,
+    Shape {
+        m: 16384,
+        n: 16384,
+        k: 16384,
+    },
+];
+
+/// One checked, timed launch. The only way a number reaches any table below,
+/// which is what keeps [`crate::bench`]'s rule 1 in force here: `run` compares
+/// every element of `C` against the CPU reference before `time` is reachable,
+/// so a traversal that dropped or doubled a tile reports a failure rather than
+/// a throughput.
+fn timed(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    shape: Shape,
+    plan: Plan,
+) -> Result<f64, Box<dyn Error>> {
+    eprintln!(
+        "{shape} on {} at group {}: staging and checking",
+        plan.scheduler.name(),
+        plan.group
+    );
+    let (_, timings) = run(context, shape.m, shape.n, shape.k, plan, time)?;
+    Ok(timings.min())
+}
+
+fn tflops(shape: Shape, milliseconds: f64) -> f64 {
+    2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64 / (milliseconds / 1e3) / 1e12
+}
+
+fn same(left: Shape, right: Shape) -> bool {
+    (left.m, left.n, left.k) == (right.m, right.n, right.k)
+}
+
+/// The traversal sweep — `cargo oxide run kittens-examples -- bench swizzle`,
+/// which is `modal run modal_app.py::bench --case swizzle`.
+///
+/// Four tables, and each one exists to test a claim that was written down
+/// before it ran. In order:
+///
+/// 1. **The width sweep**, at [`SWEEP`], under both schedulers. The losers stay
+///    in the table. The width the rest of the run uses is picked from the
+///    static column here rather than from [`GROUP`], so this function measures
+///    the parameter instead of confirming the constant.
+/// 2. **The mechanism**, which is the table worth reading first. If the width
+///    works by leaving operands in L2, then at a `K` whose operands fit L2
+///    *whole* it can do nothing at all — there is no miss left to avoid — and
+///    at a `K` far past L2 it must do the most. So the same sweep runs over
+///    [`crate::bench::GEMM_DEPTH_SIZES`], where `A` and `B` are 8 MiB each at
+///    `K = 512` against 512 MiB each at `K = 32768`. **A width that helps at
+///    both ends is not doing what this issue claims**, and that is a result
+///    this table can produce.
+/// 3. **The aspect ratio**, over #90's five shapes — identical in flops, tiles,
+///    waves, grid, `C` bytes and arithmetic intensity, differing only in
+///    `M : N`. Row-major throughput across them moved 1123.7 → 915.7 TFLOP/s,
+///    monotone in the reuse the map leaves L2. A grouped walk makes the wave's
+///    footprint nearly independent of the shape, so the prediction is that the
+///    **spread collapses**: the worst rows gain most and the best row, which is
+///    already walking a near-square wave, barely moves.
+/// 4. **Before and after** at the two sizes #89 asks for, under both
+///    schedulers, with cuBLASLt beside them where the feature is on.
+///
+/// The `reuse` column throughout is [`wave_reuse`] — arithmetic on the item
+/// map, not a counter, because this harness has none. See [`wave_reuse`].
+pub fn swizzle(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    baseline: Option<crate::bench::Baseline>,
+) -> Result<(), Box<dyn Error>> {
+    println!(
+        "gemm traversal — min ms over 30 timed launches, every row checked against the CPU\n\
+         reference first. `group` is pipeline::grouped's width in tile-rows: 1 is the\n\
+         row-major map through #97, and is the control rather than a separate code path.\n\
+         `reuse` is operand bytes a wave requests over the distinct bytes it touches at one\n\
+         K block — arithmetic on the item map, not a counter. There is no L2 hit rate in\n\
+         this table because there is none on this harness: Nsight Compute cannot start in\n\
+         the Modal image for want of libnvidia-pcc.so (modal_app.py::profile)."
+    );
+
+    println!("\n1. width, at {SWEEP} — {} clusters a wave", MAX_CLUSTERS);
+    println!(
+        "{:<8}{:>11}{:>11}{:>12}{:>9}{:>12}{:>12}{:>12}{:>12}",
+        "group",
+        "wave rows",
+        "wave cols",
+        "distinct MB",
+        "reuse",
+        "static ms",
+        "static TF/s",
+        "clc ms",
+        "clc TF/s"
+    );
+    let mut swept = Vec::new();
+    for group in GROUPS {
+        let static_ms = timed(
+            context,
+            SWEEP,
+            Plan {
+                scheduler: Scheduler::Static,
+                group,
+            },
+        )?;
+        let clc_ms = timed(
+            context,
+            SWEEP,
+            Plan {
+                scheduler: Scheduler::Stealing,
+                group,
+            },
+        )?;
+        let (rows, columns, distinct, reuse) = wave_reuse(SWEEP.m, SWEEP.n, group);
+        println!(
+            "{:<8}{:>11}{:>11}{:>12.2}{:>8.1}x{:>12.4}{:>12.1}{:>12.4}{:>12.1}",
+            group,
+            rows,
+            columns,
+            distinct / 1e6,
+            reuse,
+            static_ms,
+            tflops(SWEEP, static_ms),
+            clc_ms,
+            tflops(SWEEP, clc_ms)
+        );
+        swept.push((group, static_ms, clc_ms));
+    }
+
+    let &(best, _, _) = swept
+        .iter()
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+        .expect("GROUPS is not empty");
+    let &(clc_best, _, _) = swept
+        .iter()
+        .min_by(|left, right| left.2.total_cmp(&right.2))
+        .expect("GROUPS is not empty");
+    println!(
+        "\nfastest static width at {SWEEP}: group {best}. fastest under clc: group {clc_best}.\n\
+         the rest of this run uses {best}, and GROUP in this file is set from it — at this\n\
+         tile shape only. #87 moves the tile, which moves this."
+    );
+
+    // Every table below asks for 8192³ rows the sweep already paid for, and
+    // re-staging a shape to re-time a plan that has already been timed would
+    // add half an hour of host time for numbers that would only disagree by
+    // the benchmark's own spread. Anything else is measured.
+    let measured =
+        |shape: Shape, group: u32, scheduler: Scheduler| -> Result<f64, Box<dyn Error>> {
+            if same(shape, SWEEP)
+                && let Some(&(_, static_ms, clc_ms)) = swept.iter().find(|row| row.0 == group)
+            {
+                return Ok(match scheduler {
+                    Scheduler::Static => static_ms,
+                    Scheduler::Stealing => clc_ms,
+                });
+            }
+            timed(context, shape, Plan { scheduler, group })
+        };
+
+    println!(
+        "\n2. the mechanism — the same two widths against the operand footprint, static.\n\
+         M and N are 8192 throughout, so tiles, waves, grid, C bytes and the wave's own\n\
+         working set are identical in every row and only K moves. A and B are 8 MiB each\n\
+         at K=512 and 512 MiB each at K=32768, so the first row's operands are L2-resident\n\
+         whole and the last row's cannot be. **Prediction: no gain at K=512, the largest\n\
+         gain at K=32768.** A width that gains at both ends is not working through L2."
+    );
+    println!(
+        "{:<18}{:>13}{:>12}{:>12}{:>12}{:>12}{:>11}",
+        "shape", "operand MiB", "group 1 ms", "group 1 TF/s", "best ms", "best TF/s", "gain"
+    );
+    for &shape in crate::bench::GEMM_DEPTH_SIZES {
+        let row_major = measured(shape, 1, Scheduler::Static)?;
+        let grouped = measured(shape, best, Scheduler::Static)?;
+        let operand = 2.0 * (shape.m * shape.k) as f64 * 2.0 / (1 << 20) as f64;
+        println!(
+            "{:<18}{:>13.0}{:>12.4}{:>12.1}{:>12.4}{:>12.1}{:>10.1}%",
+            shape,
+            operand,
+            row_major,
+            tflops(shape, row_major),
+            grouped,
+            tflops(shape, grouped),
+            100.0 * (row_major / grouped - 1.0)
+        );
+    }
+
+    println!(
+        "\n3. the aspect ratio — #90's five shapes, identical but for M : N, static.\n\
+         row-major moved 1123.7 -> 915.7 TFLOP/s across these, monotone in `reuse`.\n\
+         **Prediction: the spread collapses.** a grouped wave's footprint barely depends\n\
+         on the shape, so the bottom rows gain most and the top row, already walking a\n\
+         near-square wave, barely moves."
+    );
+    println!(
+        "{:<18}{:>9}{:>9}{:>12}{:>12}{:>9}{:>12}{:>12}{:>10}",
+        "shape",
+        "tiles_n",
+        "reuse 1",
+        "group 1 ms",
+        "group 1 TF/s",
+        "reuse",
+        "best ms",
+        "best TF/s",
+        "gain"
+    );
+    for &shape in crate::bench::GEMM_FOOTPRINT_SIZES {
+        let row_major = measured(shape, 1, Scheduler::Static)?;
+        let grouped = measured(shape, best, Scheduler::Static)?;
+        let (_, columns) = tile_grid(shape.m, shape.n);
+        let (_, _, _, was) = wave_reuse(shape.m, shape.n, 1);
+        let (_, _, _, now) = wave_reuse(shape.m, shape.n, best);
+        println!(
+            "{:<18}{:>9}{:>8.1}x{:>12.4}{:>12.1}{:>8.1}x{:>12.4}{:>12.1}{:>9.1}%",
+            shape,
+            columns,
+            was,
+            row_major,
+            tflops(shape, row_major),
+            now,
+            grouped,
+            tflops(shape, grouped),
+            100.0 * (row_major / grouped - 1.0)
+        );
+    }
+
+    println!(
+        "\n4. before and after at the sizes #89 names, under both schedulers.\n\
+         the swizzle applies to the item, not to the item source, so it composes with CLC\n\
+         rather than replacing it — these two columns are the check on that claim."
+    );
+    println!(
+        "{:<18}{:>7}{:>12}{:>12}{:>12}{:>12}{:>14}{:>14}",
+        "shape",
+        "group",
+        "static ms",
+        "static TF/s",
+        "clc ms",
+        "clc TF/s",
+        "cuBLASLt ms",
+        "static/theirs"
+    );
+    for shape in HEADLINE {
+        let against = match baseline {
+            Some(baseline) => {
+                eprintln!("{shape}: staging and checking {}", baseline.name);
+                Some((baseline.bench)(context, shape)?.0.min())
+            }
+            None => None,
+        };
+        for group in [1, best] {
+            let static_ms = measured(shape, group, Scheduler::Static)?;
+            let clc_ms = measured(shape, group, Scheduler::Stealing)?;
+            println!(
+                "{:<18}{:>7}{:>12.4}{:>12.1}{:>12.4}{:>12.1}{:>14}{:>14}",
+                shape,
+                group,
+                static_ms,
+                tflops(shape, static_ms),
+                clc_ms,
+                tflops(shape, clc_ms),
+                match against {
+                    Some(milliseconds) => format!("{milliseconds:.4}"),
+                    None => "—".to_string(),
+                },
+                match against {
+                    Some(milliseconds) => format!("{:.3}", milliseconds / static_ms),
+                    None => "—".to_string(),
+                }
+            );
+        }
+    }
+    if baseline.is_none() {
+        println!(
+            "\nno cuBLASLt column: built without --features cublas. modal_app.py::bench\n\
+             turns it on, and a ratio is the point of the last column."
         );
     }
     Ok(())

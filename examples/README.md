@@ -1583,11 +1583,23 @@ recover it. Under both sits a steady state of roughly **1550–1800 TFLOP/s** at
 this tile's fixed 85.3 FLOP/byte, and the only lever on *that* is the tile,
 which is #87.
 
+> **The second of those has since been recovered, and the estimate here was
+> conservative.** #89 replaced the row-major item map with a grouped one and
+> measured **8.4%** at the square shape against the 6–7% predicted, and **27.6%**
+> at the worst aspect ratio against 23%. See "and the walk was the 23%,
+> recovered" below.
+
 The order is the finding. #86 framed the question as bandwidth versus latency on
 the operand stream and asked which of HBM and L2 to attack; the answer is that
 **the largest term is neither** — it is an epilogue that the pipeline stops for,
 on a kernel whose steady state is already at 67% of dense peak. The tile sweep
 that was queued behind this answer should stay queued behind #15 and #89 too.
+
+> #89 has since landed, and it moved the kernel this sweep was fitted on. **The
+> fit below should be read as describing the pre-#89 kernel**, and `gemm-depth`
+> re-run on the post-#89 tree is what re-establishes the boundary's share and the
+> steady state. The ordering of #15 and #87 depends on that re-fit and not on the
+> numbers as they stand here.
 
 ##### and a third of that boundary was one instruction — #91
 
@@ -2006,6 +2018,255 @@ more answerable question than "what does a CTA cost": it is *how much of the
 boundary does `lcsf` actually hide*, and ~70% is the number it has to beat. That
 is worth measuring on a prototype before the plumbing (`TensorMapElement` is
 `Bf16`-only, no fp32 `SharedTile` swizzle, `stmatrix` is b16) gets built.
+
+##### and the walk was the 23%, recovered — #89
+
+`pipeline::run` and `run_stealing` answer *which item comes next*. Neither says
+what an item **is**, and for a GEMM that second map is the one the memory system
+sees. It was `(item / tiles_n, item % tiles_n)` — row-major over the output —
+and it is now `pipeline::grouped(item, tiles_m, tiles_n, GROUP)`, which walks
+`GROUP` tile-rows down a column before moving right. `GROUP = 1` *is* the
+row-major map, so the control below is a parameter value and not a second code
+path, and the whole change to the kernel is one line of `Job::work`.
+
+**What made this worth doing was the aspect-ratio sweep above and not #86's
+traffic arithmetic.** #86 read 12.7 TB/s of operand traffic as "~48x reuse over
+268 MB of unique input"; that is the aggregate over a whole launch, and what L2
+can capture is the reuse available inside one *wave*, which the table above
+measured at **3x-15x**. The 48x should not be carried anywhere. What should is
+that five shapes identical in flops, tiles, waves, grid, `C` bytes and arithmetic
+intensity differed by 23% on nothing but `M : N`, with the best and worst rows
+exact transposes of each other.
+
+**Predictions, stated before the run.** The best width would be 8 — minimizing a
+wave's operand footprint `256r + 128c` subject to `r * c = 222` gives `r ~ 10.5`.
+The square gain would be 6-7%, per the decomposition above. The aspect spread
+would **collapse**, with `2048 x 32768` gaining most and `32768 x 2048`, already
+walking a near-square wave, slightly *regressing*. The width would cost no
+registers. And, from the L2 story: no gain where the operands are small enough
+not to press on memory, the **largest gain at the largest `K`**.
+
+Four of the five were right. The fifth was wrong in a way worth more than the
+four, and it is table 2.
+
+**1. The width, at 8192³, both schedulers.** Min ms over 30 timed launches, every
+row checked against the CPU reference first. `reuse` is `wave_reuse` — arithmetic
+on the item map, not a counter — and it reproduces the published column above for
+`group 1` at all five aspect ratios to the printed digit.
+
+| group | wave | distinct | reuse | static ms | static TF/s | clc ms | clc TF/s |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4 x 64 | 1.18 MB | 9.2x | 0.9068 | 1212.5 | 0.8942 | 1229.6 |
+| 2 | 4 x 64 | 1.18 MB | 9.2x | 0.8949 | 1228.6 | 0.8858 | 1241.3 |
+| 4 | 4 x 56 | 1.05 MB | 10.4x | 0.8611 | 1276.8 | 0.8630 | 1274.1 |
+| **8** | 8 x 28 | 0.72 MB | 15.1x | **0.8363** | **1314.8** | **0.8301** | **1324.5** |
+| 16 | 16 x 14 | 0.75 MB | 14.5x | 0.8465 | 1298.9 | 0.8453 | 1300.7 |
+| 32 | 32 x 7 | 1.16 MB | 9.4x | 0.8966 | 1226.3 | 0.8932 | 1231.0 |
+
+**8, under both schedulers, as predicted, and the losers are the argument.** The
+curve is not monotone in the width — it turns over at 8, and 32 is back where 1
+was — which is what says the mechanism is the wave's *shape* and not "more
+grouping is better". `group 2` is the sharpest row: it has the same 4 x 64 wave
+and the same 9.2x as row-major, because at `tiles_n = 64` two tile-rows of a
+group still take 128 items and 222 clusters spill into the next group either
+way — and it measures within 1.3% of row-major, which is this benchmark's own
+spread. A width that does not move the reuse does not move the clock.
+
+**2. The mechanism, and the prediction that was wrong.** `M` and `N` are 8192 in
+every row, so tiles, waves, grid, `C` bytes and the wave's own working set are
+identical and only the operand footprint moves. Static, `group 1` against
+`group 8`, as `min ms / TFLOP/s`:
+
+| shape | operand | group 1 | group 8 | gain |
+| --- | ---: | ---: | ---: | ---: |
+| 8192x8192x512 | 16 MiB | 0.2710 / 253.6 | 0.2716 / 253.1 | **−0.2%** |
+| 8192x8192x2048 | 64 MiB | 0.3725 / 738.0 | 0.3710 / 740.8 | **+0.4%** |
+| 8192x8192x8192 | 256 MiB | 0.9068 / 1212.5 | 0.8363 / 1314.8 | **+8.4%** |
+| 8192x8192x32768 | 1024 MiB | 3.0459 / 1443.9 | 3.1135 / 1412.6 | **−2.2%** |
+
+**The gain is a band, not a ramp.** The shallow end was predicted and arrives: at
+`K = 512` the traversal is worth nothing, which is the control the aspect table
+cannot supply — it says the 8.4% is not a fixed cost the change happens to
+remove, because the same change against the same tiles, waves and grid does
+nothing when the operand stream is trivial. **The deep end was predicted
+backwards.** `K = 32768` was supposed to gain most and instead loses 2.2%.
+
+The reason, stated as the hypothesis it is: **the traversal only pays where
+operand delivery is on the critical path, and neither end of this sweep is
+there.** At `K = 512` the launch is the item boundary — 0.271 ms for ten items
+against the 18-30 µs per tile priced above — and the operand stream is 348 GB/s
+on a device where `layernorm` reaches 5497. At `K = 32768` the kernel is at
+1443.9 TFLOP/s, inside the derived steady state of 1480-1550, so it is bound by
+the pipeline and not by memory; the traffic the swizzle removes was not being
+waited on, and what is left is its cost. That cost is real and this table is
+where it shows: a grouped walk makes consecutive items write `C` down a column
+rather than across a row, which is worse locality on the one stream the
+traversal does not help.
+
+**#98's occupancy sweep is independent evidence for that reading**, and it is
+worth more than a better argument for it. The section above measures a lone CTA
+at a flat **~585–640 TFLOP/s across 4096³, 8192³ and 16384³** — so more than half
+of what this kernel achieves at any size is one CTA's stall covered by another's
+work, and *overlap between CTAs is the dominant mechanism everywhere*. A row
+already at 1443.9 TFLOP/s has that resource close to spent: there is little stall
+left uncovered for cheaper operand delivery to remove. Two measurements taken for
+unrelated reasons point the same way at `K = 32768`.
+
+So the L2-residency framing that generated the prediction gets `K = 512` right
+for roughly the wrong reason — it is not that 16 MiB fits L2, it is that 16 MiB
+is not enough traffic to wait on — and gets `K = 32768` wrong outright. **The
+honest generalization is narrower than the one #89 argues for**: a traversal
+change is worth something in the regime where operands are the bottleneck, and
+this kernel is in that regime at its benchmark sizes and out of it at `K` far
+past them.
+
+**3. The aspect ratio, which is the result.** The five shapes above, static, and
+the prediction was that the spread collapses:
+
+| shape | tiles_n | reuse 1 → 8 | group 1 | group 8 | gain |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 32768x2048x8192 | 16 | 15.1x → 13.9x | 0.8416 / 1306.5 | 0.8503 / 1293.0 | **−1.0%** |
+| 16384x4096x8192 | 32 | 14.5x → 15.1x | 0.8643 / 1272.1 | 0.8460 / 1299.7 | **+2.2%** |
+| 8192x8192x8192 | 64 | 9.2x → 15.1x | 0.9068 / 1212.5 | 0.8363 / 1314.8 | **+8.4%** |
+| 4096x16384x8192 | 128 | 5.0x → 15.1x | 0.9607 / 1144.5 | 0.8316 / 1322.1 | **+15.5%** |
+| 2048x32768x8192 | 256 | 3.0x → 15.1x | 1.0561 / 1041.1 | 0.8277 / **1328.4** | **+27.6%** |
+
+**Confirmed, including its sign on the row that was supposed to lose.** Row-major
+spans 1041.1 → 1306.5 TFLOP/s, a 25.5% spread; grouped spans 1293.0 → 1328.4, a
+**2.7%** spread. Every row's gain is ordered by the reuse it recovered, and
+`32768 x 2048` — the one shape whose row-major walk was already near-optimal, and
+whose reuse the swizzle *lowers* from 15.1x to 13.9x — is the one row that gets
+worse. A prediction that only ever says "faster" is not falsifiable; this one
+named the row that would regress, and that row regressed.
+
+The five `group 1` numbers here are all above the ones measured for #86 (1306.5
+against 1123.7, and so on down) because #91's paired fp32 store landed in
+between. The *spread* is the comparable quantity and it is unchanged: 22.7%
+there, 25.5% here.
+
+**4. Before and after, at the sizes #89 names, under both schedulers, against
+cuBLASLt on the same device minutes apart.**
+
+| shape | group | static ms | static TF/s | clc ms | clc TF/s | cuBLASLt ms | ours/theirs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8192³ | 1 | 0.9068 | 1212.5 | 0.8942 | 1229.6 | 0.6201 | 0.684 |
+| 8192³ | **8** | **0.8363** | **1314.8** | **0.8301** | **1324.5** | 0.6201 | **0.742** |
+| 16384³ | 1 | 6.9461 | 1266.3 | 6.6635 | 1320.0 | 4.7560 | 0.685 |
+| 16384³ | **8** | **5.9990** | **1466.3** | **5.9933** | **1467.7** | 4.7560 | **0.793** |
+
+**0.684 → 0.742 of cuBLASLt at 8192³, and 0.685 → 0.793 at 16384³.** The two
+`group 1` ratios reproduce #92's 0.689 and 0.694 to within this file's spread,
+which is what says the control is the kernel that was there before. 1466.3
+TFLOP/s is the fastest this kernel has been measured at — past the 1369.9 of the
+depth sweep above — and 65% of dense bf16 peak.
+
+**16384³ gains more than 8192³ — 13.6% against 8.4% — and that is not noise.** A
+square `M : N` is not a square *wave*. 16384³ has a 64 x 128 tile grid, so 222
+clusters walked row-major span two tile-rows and all 128 columns: a 2 x 128 wave
+at **5.0x** reuse, which is exactly the `4096 x 16384` row of table 3, and that
+row gained 15.5%. The two agree. It is worth being careful here anyway, because
+16384³ is the least reproducible row in this repo by this file's own statements —
+but a 13.6% gain measured against its own control in the same run, landing where
+a shape with the same reuse independently landed, is outside the 5.5% cross-run
+spread that caveat is about.
+
+**It composes with CLC rather than replacing it**, which was the requirement. The
+swizzle is applied to the *item*, and both item sources hand out a permutation of
+`0..tiles`, so `grouped` being a bijection makes it correct under either by
+construction. Both schedulers pick the same width, both gain, and the gain is the
+same size — 8.4% static and 7.7% under CLC at 8192³. One thing the table says
+that is worth noticing: **most of what CLC was winning, the swizzle was already
+winning.** At 16384³ CLC was 4.2% ahead of the static stride row-major (6.9461 →
+6.6635) and is 0.1% ahead of it grouped (5.9990 → 5.9933). #97 concluded CLC's
+case was portability and not throughput; this narrows it further.
+
+**It costs no registers.** `ptxas -v -arch=sm_100a` reports **168 registers, no
+spills, 528 B stack frame, on both entry points, before and after** — measured on
+this tree and on `c802627` through the same `modal_app.py::regcount`. The shared
+plan is untouched at 73 816 B, so residency is the same 3 CTAs/SM. Two integer
+divisions per output tile against a 20-30 µs item boundary is not a cost this
+harness can see, and the cliff at 170 registers was not approached.
+
+**That is worth more than a null result, because of what the section above
+measured.** #98 priced one CTA an SM at **14–16%**, with a 25–44% cliff behind
+it. This traversal spends no shared memory, no registers and no TMEM, so it pays
+none of that: the 8.4% and 27.6% above are not net of an occupancy step, and
+there is no budget in which they have to be argued for. **It is currently the
+only lever this repo has measured that is free of the resource cliff.** Both of
+the ones still on the table have to buy their gains out of a budget it did not
+touch — #15's `lcsf` has to hide ~70% of the item boundary to clear one step, and
+#87's tile change can afford the first step and must not take the second. A free
+lever and a lever with a 14–16% entry fee are not comparable at equal nominal
+size, and should not be ranked as though they were.
+
+**Exactness, and where the map can be silently wrong.** A wrong item map is a
+tile computed twice and a tile computed by nobody — the same failure seen from
+either end, both silent on the device, both reaching the host only as a wrong
+`C`. So `pipeline::grouped` is held two ways. In `src/pipeline.rs` a host test
+asserts it is a **bijection** over every tile grid up to 17 x 17 at every width up
+to 19, which is what covers the short last group a width that does not divide
+`tiles_m` leaves; and `modal_app.py::examples` runs the GEMM at widths `[1, 3, 6]`
+under both schedulers at both correctness sizes — **not powers of two,
+deliberately**, because every `M` this project runs is one, so a swept width of 8
+or 16 always divides `tiles_m` and the short-group branch would never execute.
+All twelve are exact.
+
+**What could not be measured: the L2 hit rate.** #89's acceptance asks for it
+either side, and it is the right demand — a throughput win with an unchanged hit
+rate would mean the cause was something else. **There is no hit rate on this
+harness.** Nsight Compute is in the image and cannot start: the injected driver
+set has no `libnvidia-pcc.so`, which is not in the 580.95.05 package either, and
+`modal_app.py::profile` is checked in saying so. That is the same wall #86 and
+#90 hit, and nothing here moved it. The substitute is stated rather than dropped:
+the `reuse` column is arithmetic on the item map, calibrated by reproducing the
+published column above exactly, and the causal claim rests on two *interventions*
+instead of a counter — table 2, where the effect vanishes when the operand stream
+is not the bottleneck, and table 3, where the effect tracks predicted reuse
+across five shapes that hold nine other things fixed. A counter attributes; an
+intervention that moves one variable establishes cause. It remains true that a
+hit rate would have been worth having.
+
+**What this leaves.** The decomposition above put 6-7% on traversal at the square
+shape and 23% at the worst aspect ratio; the measurements are 8.4% and 27.6%, so
+the estimate was conservative in both places. `GROUP` is a measurement at the
+`[256, 128]` pair tile that **#87 will move**, which is why it is a parameter
+with a sweep behind it rather than a swizzle written into the map.
+
+**And this section invalidates the fit that ranks everything queued behind it.**
+The item boundary's 20–22% and the 1521 TFLOP/s steady state both come from the
+K-depth sweep, which was measured on the row-major kernel. This section moved
+that kernel — 16384³ grouped is **1466.3**, close enough to the old *slope* that
+the fit now describes a kernel which no longer exists. So "there is 20–22% of
+item boundary left to win" is **what was true pre-#89 and is not currently a
+supported claim**; `gemm-depth` has to be re-run on this tree before #15 or #87
+is ranked off it. That is stated here rather than left for someone to trip over,
+because the whole apparatus for choosing the next lever is downstream of it.
+
+What does survive is the *shape* of #98's constraint: whatever the boundary
+re-fits to, `lcsf` has to clear an occupancy step worth 14–16% to be worth
+building, and this traversal had no such threshold to clear — which is most of
+why it went first and landed.
+
+**One coincidence worth being suspicious of, and it is not a finding.** The
+`K = 32768` row regressed under grouping at **1443.9 TFLOP/s**, and 16384³
+grouped lands at **1466.3**. Two shapes with almost nothing in common — a deep
+reduction over a small output against a large square — sitting within 2% of each
+other is *consistent with* a ceiling that is not operand traffic, which would be
+a much larger finding than this section's, since it would mean neither a bigger
+tile (#87) nor a store stage (#15) touches what is actually binding. **Two points
+measured once each is not a ceiling and this does not claim one.** What would
+test it is the re-fit above plus a third shape reaching the same number by a
+third route; if `gemm-depth` re-fits to a steady state near 1470 rather than
+1521, that is the same suspicion arriving from a fourth. A reader coming to that
+re-fit should arrive already suspicious rather than surprised.
+
+One cross-check worth recording, since the two sections were measured for
+unrelated reasons in different containers: **#98's 3-CTA control and this
+section's `group 1` control are the same kernel, and they agree.** 0.8965 ms /
+1226.5 TFLOP/s / 0.685 of cuBLASLt there, against 0.9068 / 1212.5 / 0.684 here —
+1.1% apart on raw time and identical on the ratio. Two independently staged
+baselines landing on the same number is what makes both sets of deltas readable
+against each other.
 
 #### 8. Multicast has no geometry to live in
 
