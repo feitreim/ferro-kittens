@@ -1405,8 +1405,8 @@ pub fn swizzle(
          gain at K=32768.** A width that gains at both ends is not working through L2."
     );
     println!(
-        "{:<18}{:>13}{:>12}{:>12}{:>12}{:>12}",
-        "shape", "operand MiB", "group 1 ms", "group 1 TF/s", "best ms", "best TF/s"
+        "{:<18}{:>13}{:>12}{:>12}{:>12}{:>12}{:>11}",
+        "shape", "operand MiB", "group 1 ms", "group 1 TF/s", "best ms", "best TF/s", "gain"
     );
     for &shape in crate::bench::GEMM_DEPTH_SIZES {
         let row_major = measured(shape, 1, Scheduler::Static)?;
