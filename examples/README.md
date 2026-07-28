@@ -127,6 +127,16 @@ the closest pair 9% apart, against a 2⁻⁸ tolerance. Exactness is not the onl
 way to make a failure unambiguous — separating the right answer from every
 wrong one by forty times the noise floor also works.
 
+Which permutation a row gets is the part worth reading the code for (#56). The
+seed's row term is taken mod 128, so on its own it repeats every 128 rows —
+exactly one CTA band — and the check could not see a kernel that loaded one
+band and stored another. No choice of row multiplier fixes that: the affine
+maps mod 128 are a 2-group of exponent 128, so every row-affine seed repeats
+inside a band. The band therefore picks the *column stride* instead, from a
+cycle of 63, and 63 divides no power of two — so no band displacement this
+grid's arithmetic can produce is invisible. [`softmax::permutation`](src/softmax.rs)
+argues it and states what is left over.
+
 `gemm` **runs**, and is the first numerical result this library has produced.
 `gemm::check` launches it over `[512, 256] x [256, 256]ᵀ` on a B200 and compares
 every element against a CPU reference. The operands are integers in `[-3, 3]`
