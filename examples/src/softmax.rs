@@ -22,45 +22,153 @@
 //! surface was shallow and wide, not deep, and this is the example that said so
 //! first.
 //!
-//! ## Why it walks the row in chunks (#47)
+//! ## Why it walks the row in chunks (#47, #76)
 //!
 //! The body used to hold a whole `[32, 128]` band — 128 fp32 a thread — and
 //! say the algorithm in three lines over it. It computed the right answer at
-//! 367 GB/s, and the reason was not the memory protocol the issue blamed:
-//! `ptxas` never put that band in registers. It priced the kernel at **39
-//! registers and a 1024-byte stack frame**, which is the same table's way of
-//! saying the band is in *local* memory, and every pass over it was a
-//! round trip to the same hierarchy the TMA was already saturating.
+//! 367 GB/s, and the reason was not the memory protocol #47 blamed: `ptxas`
+//! never put that band in registers, and every pass over it was a round trip
+//! to the same hierarchy the TMA was already saturating. [`CHUNK`] is the fix
+//! and it is one number — the row is walked a chunk at a time and the
+//! reductions carry across chunks — which took the kernel to 952 GB/s.
 //!
-//! [`CHUNK`] is the fix and it is one number: the row is walked 32 columns at
-//! a time, which the register ladder says is the widest `[32, N]` rung `ptxas`
-//! gives a zero stack frame. The reductions carry across chunks instead of
-//! being taken over one wide band, and the launch geometry — one `[128, 128]`
-//! tile per CTA, one TMA in, one TMA out, both waited on — is untouched, so
-//! what changed between the two numbers is only where the band lives. It is
-//! 66 registers on a 256-byte frame now, and 367 → 952 GB/s.
+//! That is where #47 stopped, and it stopped one rung short and for the wrong
+//! reason. #76 built this kernel at **every** `[32, N]` rung rather than
+//! taking the ladder's answer, exactly as #67 had to for `layernorm_rows`.
+//! The row extent is not free — a warp owns 32 rows of a 128-row tile and
+//! changing that is a launch-geometry change — so the column sweep is the only
+//! ladder that applies, and it is the shipped arithmetic at each rung:
 //!
-//! Three things the issue proposed are ruled out by that, and they are worth
-//! naming because each would have been a much larger change:
+//! | `CHUNK` | regs | spill | frame | blocks/SM | GB/s at 8192 blocks |
+//! | --- | --- | --- | --- | --- | --- |
+//! | 128 | 197 | 0 | 1024 | 6 | 278 |
+//! | 64 | 40 | 0 | 512 | 6 | 554 |
+//! | 32 — #47's answer | 39 | 0 | 256 | 6 | 1004 |
+//! | **16 — shipped** | **32** | 0 | **0** | 6 | **4414** |
 //!
-//! - **Occupancy did not move.** `cuOccupancyMaxActiveBlocksPerMultiprocessor`
-//!   (printed by `main`) says 6 blocks and 24 warps an SM, and it said the
-//!   same before: shared memory caps this kernel at 6 either way, and neither
-//!   39 nor 66 registers a thread is what binds it. The 2.6× arrived with
-//!   occupancy held constant.
-//! - **Nothing was put in flight.** There is still exactly one TMA load and
-//!   one TMA store per CTA, and both still block — the same `tma_store_wait`
-//!   rather than `tma_store_wait_read`, the same one-deep barrier. The six
-//!   resident CTAs were always six loads in flight per SM.
-//! - **The floor was not the launch.** It is 23.0 µs at two blocks now, and
-//!   the GEMM's floor at two blocks is 22.3 µs. What is left is a cost every
-//!   launch on this harness pays, and it is not this kernel's to fix.
+//! `[32, 32]` has a **zero** frame in all five spellings of #60's probe and
+//! this kernel gets 256 bytes there, for #67's reason: the probe carries no
+//! statistics across chunks and a real kernel's extra live state moves its
+//! cliff a rung down. **The ladder narrows the search; it does not answer.**
 //!
-//! What is left over is stated rather than hoped for: 952 GB/s is still well
-//! under HBM, and it is not instruction issue either — see the note on
-//! `div_row` below, which is the control for that. At 24 of 64 warp slots,
-//! shared-memory-capped, the next lever is bytes per CTA, and that is a launch
-//! geometry change and a different issue.
+//! ## The rung was a quarter of it, and `exp2` was the rest (#76)
+//!
+//! After #67, `layernorm_rows` ran 5483 GB/s where this kernel ran 950 — a
+//! factor of **5.8** at equal bytes, equal blocks and the same 6 CTAs an SM,
+//! against a kernel doing *more* arithmetic per element. So the ordering was
+//! backwards, and the rung is not what explains it: at the shipped `exp2` the
+//! rung is worth only 950 → 1178.
+//!
+//! The rest was found by ablation rather than by argument — the same kernel,
+//! the same geometry, one thing removed at a time, all at `CHUNK = 16` and all
+//! at 8192 blocks. The two bottom rows do not compute a softmax and exist only
+//! to be timed:
+//!
+//! | at `CHUNK = 16` | GB/s | what it removes |
+//! | --- | --- | --- |
+//! | `exp2` polynomial, `div_row` | 1178 | — (the shipped arithmetic) |
+//! | `exp2_hw`, `div_row` | 3153 | the FMA polynomial |
+//! | **`exp2_hw`, `recip` + `mul_row`** | **4414** | 124 of every 128 divides |
+//! | no transcendental, no divide | 6042 | *both* `exp2` calls |
+//! | one pass, `load_tile` → `store_tile` | 6324 | the two extra passes |
+//!
+//! Read downwards that is the whole 5.8×, and it is three things and not one:
+//!
+//! - **The FMA `exp2` polynomial is the largest single term, at 2.7×.**
+//!   [`kittens::reg::exp2_approx`] is a clamp, a shift-trick split and a
+//!   degree-3 minimax polynomial — around a dozen instructions, evaluated
+//!   twice per element, 128 elements a thread. `exp2_hw` is one
+//!   `ex2.approx.f32`. This is **not** an accuracy trade in the direction it
+//!   looks: the SFU instruction is good to about 2⁻²², the polynomial to
+//!   7.5e-5 = 2⁻¹³·⁷, so the swap is *more* accurate and the check's worst
+//!   relative error does not move at all (1.97e-3 either way) because bf16
+//!   output rounding dominates both.
+//! - **The 128 `div.rn.f32` cost 1.4×, and #47 measured them at nothing.**
+//!   That measurement was not wrong; it was taken under a different binding
+//!   constraint. With the polynomial in the loop the kernel was so far from
+//!   memory that removing 124 divides moved it 952.5 → 952.1 GB/s. With the
+//!   SFU in the loop the same change is 3153 → 4414. **A control is only valid
+//!   under the bind it was taken in**, and this is the cleanest instance of
+//!   that in the repository.
+//! - **The three passes over shared memory cost 4.5%**, which is the one thing
+//!   #47 proposed to fix and the one thing that was never worth fixing:
+//!   6324 → 6042 GB/s for two extra full reads of the tile plus every row
+//!   reduction in the kernel.
+//!
+//! What the two changes come to, at all six benchmark sizes, every one checked
+//! before it was timed and `layernorm_rows` untouched beside it at 5483 → 5497
+//! GB/s as the control:
+//!
+//! | rows × 128 × 2 planes | blocks | before, GB/s | after, GB/s |
+//! | --- | --- | --- | --- |
+//! | 128 | 2 | 5.2 | 12.0 |
+//! | 512 | 8 | 20.4 | 48.9 |
+//! | 4096 | 64 | 157.9 | 354.2 |
+//! | 32768 | 512 | 632.4 | 2004.9 |
+//! | 262144 | 4096 | 917.5 | 3880.0 |
+//! | 524288 | 8192 | 950.3 | **4389.6** |
+//!
+//! **4.6×**, on **66 registers and a 256-byte frame → 32 and zero**. The 5.8×
+//! is now 1.25×, and that residual is not a defect: it is the two
+//! `ex2.approx.f32` this kernel owes its own definition and a layernorm does
+//! not, priced at exactly that by the fourth row of the ablation.
+//!
+//! Two things that are *not* in that list, and were checked rather than
+//! assumed:
+//!
+//! - **Occupancy never moved.** `cuOccupancyMaxActiveBlocksPerMultiprocessor`
+//!   says 6 blocks and 24 warps an SM at every rung but 128 and for every
+//!   ablation above — shared memory binds this kernel and 32 registers a
+//!   thread is nowhere near what would.
+//! - **Nothing was put in flight, and nothing needed to be.** There is still
+//!   one TMA load and one TMA store per CTA and both still block. The kernel
+//!   now runs at 70% of the rate a pure `load_tile` → `store_tile` over the
+//!   same tiles achieves, so the memory protocol is not what is left.
+//!
+//! ### The floor was never the launch
+//!
+//! #47 read this kernel's 23 µs at two blocks as "a fixed cost every launch on
+//! this harness pays". It is not, and the ablation says so directly — one
+//! session, one two-block launch, the arithmetic put back a piece at a time:
+//! **7.0 µs** for the copy, 8.9 µs with both extra passes and every reduction,
+//! **11.6 µs** as shipped, and 23.7 µs at the old rung and the old `exp2`. So
+//! twelve of those twenty-three microseconds were this kernel's own arithmetic
+//! standing at the head of a dependent chain with two blocks on a 148-SM
+//! device, and none of them were the launch. `layernorm_rows` reaching 8.4 µs
+//! (#67) was the first evidence the reading was wrong; this is the mechanism.
+//! The checked benchmark, a different session, puts the shipped floor at
+//! 10.9 µs against the 25.4 µs it measured before this change.
+//!
+//! ### What was measured and deliberately not shipped
+//!
+//! - **Folding the normalizer into the exponent.** `exp2(x - peak)/total` is
+//!   `exp2(x - peak - log2(total))`, which is four `log2` a thread and no
+//!   divide at all. It measured 4390, 4415 and 4462 GB/s across three sweep
+//!   rounds against `recip`'s 4363 and 4414 — the two forms are inside each
+//!   other's run-to-run spread. It is not here because a 1% that a rerun
+//!   erases does not buy putting [`kittens::reg::log2_approx`]'s error inside
+//!   the exponent, where the tolerance argument would then have to carry it.
+//! - **Parking the numerator in the tile.** The third pass recomputes `exp2`
+//!   rather than keeping the second pass's result; storing it and only scaling
+//!   in the third pass is one `exp2` per element instead of two and measured
+//!   **4670 GB/s**, the fastest correct form here. It is not shipped, and the
+//!   reason is now a number rather than a worry: the tile is bf16, so the
+//!   numerator rounds on the way in and the quotient rounds again, and the
+//!   check's worst relative error goes **1.97e-3 → 3.44e-3 against a 3.91e-3
+//!   tolerance**. 5.8% more throughput for a check with 12% of its headroom
+//!   left is the wrong trade, and a tolerance sitting on its own rounding
+//!   floor is not a check (#75).
+//!
+//! ### One claim upstream that this contradicts
+//!
+//! `reg.rs`'s module header says of the two `exp2`s that "the measurement does
+//! not favour" the SFU, on the evidence that pointing `exp2` at it takes
+//! `softmax_probe_128` from 168 registers to 255 with 112 bytes of spill. That
+//! is true, and it is a statement about *registers*. At this kernel's shape it
+//! is 32 registers and a zero frame either way, and the SFU is **2.7× faster**.
+//! That is the fourth time in this repository the register column has ordered
+//! time backwards (#47, #63, #67, now this), and the note upstream should be
+//! read as the register claim it is rather than as advice about speed.
 //!
 //! ## What the numbers can prove
 //!
@@ -77,12 +185,40 @@
 //! catch (#56); [`permutation`] carries that argument and states what is left
 //! over.
 //!
-//! The column walk [`CHUNK`] introduced is under that check and not merely
-//! beside it, and the control says so rather than the argument: pinning the
-//! third pass's `column` to 0 — every chunk of a row written from the first
-//! 32 columns — fails 65,408 of the check's 65,536 cells, by up to a relative
-//! 1.0 against a 3.9e-3 tolerance. The check the seed was strengthened for
-//! (#56, #61) sees a misplaced *column* exactly as loudly as a misplaced row.
+//! ## The column walk is under that check, and two kernels say so
+//!
+//! Halving [`CHUNK`] doubles the number of chunks a row is walked in, so the
+//! errors the walk can commit are the ones this check has to see. A table
+//! computed by the reference's own functions is an argument and not a control
+//! — it cannot fail in a way the reference does not also fail — so both were
+//! **built as kernels and launched** over the check's 65,536 cells:
+//!
+//! | deliberate error | predicted | device |
+//! | --- | --- | --- |
+//! | third pass reads the first chunk for every chunk | 56,960 | **56,960** |
+//! | second pass sums the first chunk twice | 65,536 | **65,536** |
+//!
+//! The first is the misindexing this change is the one that can commit, and
+//! predicting it to the cell took two corrections that are the reason it was
+//! worth launching rather than tabulating. The obvious model — "column `c` is
+//! written from column `c % CHUNK`" — predicts 57,344 and is wrong by 384,
+//! because the third pass reads and writes *the same tile*: chunk 0 is
+//! overwritten before chunks 1..7 re-read it, so what they exponentiate is a
+//! softmax output and not an input. Modelling that leaves 64, and the last 64
+//! are cells the device's bf16 intermediate moves across the tolerance where
+//! an `f64` host model keeps them inside it. With both, the model is exact.
+//!
+//! The second was chosen as the *weakest* error a chunk walk can commit — one
+//! too many trips round a loop, changing only the denominator — and it turns
+//! out not to be weak: it fails every cell. That is a property of the seed and
+//! worth naming, because it is the row argument paying off somewhere it was
+//! not designed for. [`permutation`] spreads a row's chunk across the whole
+//! ladder at an odd stride rather than giving it 16 adjacent values, so the
+//! first chunk always carries a real share of the mass — the smallest shift
+//! over all 512 rows of the check is **4.3%, eleven times the tolerance**.
+//!
+//! The check the seed was strengthened for (#56, #61) therefore sees a
+//! misplaced *column* exactly as loudly as a misplaced row.
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
@@ -102,16 +238,15 @@ use kittens::sync::Semaphore;
 const ROWS: usize = 128;
 /// Columns the softmax runs over. One row of the tile is one distribution.
 const COLUMNS: usize = 128;
-/// Columns a warp holds in registers at once, and the whole of #47.
+/// Columns a warp holds in registers at once — #47's fix, at #76's rung.
 ///
-/// A `[32, N]` band is `N` fp32 a thread, and `ptxas` stops promoting one to
-/// registers long before it stops compiling: on the register ladder
-/// (`modal run modal_app.py::regcount`) `[32, 32]` is the widest rung with a
-/// **zero** stack frame, and every wider one keeps the band addressable in
-/// local memory instead — `[32, 128]`, which this kernel used to hold whole,
-/// at 1024 bytes a thread. So the row is walked four chunks at a time and the
-/// reductions carry across them.
-const CHUNK: usize = 32;
+/// The widest `[32, N]` band **this kernel** gets a zero stack frame at,
+/// measured at 16, 32, 64 and 128 rather than read off #60's ladder: the
+/// ladder says `[32, 32]` is frame-free in all five spellings and this kernel
+/// carries 256 bytes there, because the probe holds no statistics across
+/// chunks. 32 is one rung too wide and **4.4× slower**; the module header has
+/// the table.
+const CHUNK: usize = 16;
 /// Chunks a row is walked in.
 const CHUNKS: usize = COLUMNS / CHUNK;
 
@@ -178,34 +313,37 @@ pub mod kernels {
                 chunk += 1;
             }
 
+            // `exp2_hw` and not `exp2`: one `ex2.approx.f32` rather than the
+            // dozen-instruction FMA polynomial, twice per element over 128
+            // elements a thread, and it is 2.7× (#76). It is also the more
+            // accurate of the two — the SFU is good to ~2⁻²² and the
+            // polynomial to 7.5e-5 — so the check's worst error does not move.
             let mut total = Rows::splat(0.0);
             chunk = 0;
             while chunk < CHUNKS {
                 let x: Band = load_tile(chunks, row_base, (CHUNK * chunk) as u32, lane);
-                total.add_assign(x.sub_row(peak).exp2().row_sum());
+                total.add_assign(x.sub_row(peak).exp2_hw().row_sum());
                 chunk += 1;
             }
+            // Four `div.rn.f32` a thread and 128 multiplies, rather than
+            // `div_row`'s 128 divides. #47 measured that swap at nothing —
+            // 952.5 against 952.1 GB/s — and it was measuring a kernel the
+            // `exp2` polynomial had already made compute-bound. With the SFU
+            // in the loop the same swap is 3153 → 4414 GB/s.
+            let scale = total.recip();
 
             // The third pass re-reads the input and recomputes `exp2` rather
-            // than keeping the second pass's result: the tile is bf16, so
-            // parking the numerator there and dividing it afterwards would
-            // round twice and spend the whole 2⁻⁸ tolerance on doing so. The
-            // exponential is arithmetic and the round trip is memory.
-            //
-            // `div_row` is one `div.rn.f32` for each of a thread's 128 values,
-            // and there is no fast-math flag on this build to make it anything
-            // cheaper. Reciprocating per *row* instead — `total.recip()` then
-            // `mul_row`, four divides a thread rather than 128 — was measured
-            // and is not here because it did not pay: 952.5 against 952.1 GB/s
-            // at the largest size, and 622 against 647 in the middle of the
-            // sweep. That is the control on what binds this kernel now.
-            // Removing 124 of every 128 divides is worth nothing, so the
-            // remaining distance to HBM is not instruction issue.
+            // than keeping the second pass's result. Parking the numerator in
+            // the tile instead is one `exp2` per element and 4670 GB/s, and it
+            // is not here because the tile is bf16: rounding the numerator and
+            // then the quotient takes the check's worst relative error from
+            // 1.97e-3 to 3.44e-3 against a 3.91e-3 tolerance. The exponential
+            // is arithmetic; the precision is not recoverable.
             chunk = 0;
             while chunk < CHUNKS {
                 let column = (CHUNK * chunk) as u32;
                 let x: Band = load_tile(chunks, row_base, column, lane);
-                let x = x.sub_row(peak).exp2().div_row(total);
+                let x = x.sub_row(peak).exp2_hw().mul_row(scale);
                 store_tile(chunks, row_base, column, lane, x);
                 chunk += 1;
             }
@@ -375,20 +513,20 @@ fn nothing_after(
 /// That order is the whole design of [`crate::bench`]: the timing hook cannot
 /// be reached from a launch whose output was wrong.
 ///
-/// The tolerance is relative and it is the honest one: the result is bf16, so
-/// half an ulp is already 2⁻⁹, and the kernel's `exp2` is the FMA polynomial
-/// [`kittens::reg::exp2_approx`] (7.5e-5 relative) folded by a shuffle
-/// butterfly in an order no host loop reproduces. 2⁻⁸ covers all of that with
-/// room to spare and is still forty times tighter than the gap between two
-/// neighbouring outputs of a row, which is what a misplaced element would have
-/// to hide inside.
+/// The tolerance is relative and it is the honest one. The result is bf16, and
+/// half an ulp *relative* is `2⁻⁸/m` for a significand `m` — 2⁻⁹ only when `m`
+/// is near 2 and a full 2⁻⁸ when it is near 1 (#75 established that, correcting
+/// an earlier reading of this file's own comment as a constant). This seed's
+/// outputs sit at the forgiving end of that range, which is why 2⁻⁸ has room
+/// here where `layernorm` needed 2⁻⁷.
 ///
 /// Measured rather than argued: the worst relative error over the checked run
-/// is 1.97e-3, a hair past the 2⁻⁹ = 1.95e-3 that rounding the output to bf16
-/// costs on its own. So the tolerance is 2.0× what a correct kernel actually
-/// needs, and 46× below the 2^(1/8) − 1 = 9.05% gap between neighbouring
-/// outputs — the band the check has to separate a right answer from a wrong
-/// one in.
+/// is **1.97e-3**, a hair past the 1.95e-3 that rounding to bf16 costs on its
+/// own, and it is unchanged by #76 swapping the `exp2` polynomial for the SFU
+/// — because at 2⁻²² the instruction is nowhere near what dominates. So the
+/// tolerance is 2.0× what a correct kernel needs, and 23× below the
+/// 2^(1/8) − 1 = 9.05% gap between two neighbouring outputs of a row, which is
+/// the band the check has to separate a right answer from a wrong one in.
 fn run<T>(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     rows: usize,

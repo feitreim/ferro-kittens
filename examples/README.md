@@ -592,7 +592,9 @@ untouched, so it is a controlled swap of where the band lives:
 Every size checked before it was timed, on the same B200 in the same session.
 The flat floor went with it: 52.3 µs → 23.0 µs at two blocks, against the
 GEMM's own 22.3 µs at two blocks. What is left there is a fixed cost every
-launch on this harness pays, not something `softmax` does.
+launch on this harness pays, not something `softmax` does. **(Wrong — see
+#76 below. Twelve of those 23 µs were this kernel's own `exp2`, and the same
+launch reaches 10.9 µs.)**
 
 Three controls, because a number that moves is not yet an explanation.
 **Occupancy did not change**: `main` now prints
@@ -604,16 +606,21 @@ registers, so the query is demonstrably register-sensitive and the 6 is not a
 constant.) **It is not instruction issue either**: replacing `div_row`'s 128
 `div.rn.f32` a thread with one `recip` per row and a `mul_row` — four divides
 instead of 128 — measured 952.5 against 952.1 GB/s, and slightly *worse* in the
-middle of the sweep, so it is not in the tree. And **the check sees the column
-walk the change introduced**: pinning the third pass to column 0 fails 65,408
-of the check's 65,536 cells by up to a relative 1.0.
+middle of the sweep, so it is not in the tree. **(This control is the one #76
+overturns, and it is worth understanding rather than deleting: it is a correct
+measurement of a kernel that the `exp2` polynomial had already made
+compute-bound. The same swap, once the polynomial is gone, is 3153 → 4414 GB/s.
+A control is only valid under the bind it was taken in.)** And **the check sees
+the column walk the change introduced**: pinning the third pass to column 0
+fails 65,408 of the check's 65,536 cells by up to a relative 1.0.
 
 So the issue named the right symptom and the wrong cause, and the residual is
 worth stating rather than rounding off. 952 GB/s is still well under HBM, it is
 not latency (nothing was put in flight and it went 2.6× faster), and it is not
 issue (the reciprocal control). At 24 of 64 warp slots, shared-memory-capped,
 what is left points at bytes per CTA — which is a launch-geometry change and a
-different issue.
+different issue. **(It was not bytes per CTA either. It was instruction issue
+after all, in the one place the reciprocal control could not see: #76.)**
 
 #### the same defect with the opposite sign, and the rung the ladder got wrong — #67
 
@@ -681,6 +688,91 @@ equal blocks; a one-constant probe puts it at `CHUNK = 16` on a 128-byte frame
 and 1185 against 950 GB/s. That probe is **not** shipped — softmax's header
 argues for 32 at length, and rewriting it wants its own issue and its own
 controls — but it says the mechanism is not peculiar to `layernorm`.
+
+#### the rung was a quarter of it, and the polynomial was the rest — #76
+
+That issue got filed, and the probe was the smaller half. `softmax_rows` at
+`CHUNK = 16` is worth 950 → 1178 GB/s and the gap to `layernorm` was 5.8×, so
+**the rung had to be measured and then set aside**, which is the part of #76
+worth carrying forward: a one-constant fix that closes a fifth of a gap is a
+fix and not an explanation.
+
+The rest was found by ablation — the same kernel, the same launch geometry, one
+thing removed at a time, every row at `CHUNK = 16` and 8192 blocks in one
+session. The last two rows do not compute a softmax and exist to be timed:
+
+| at `CHUNK = 16` | regs | frame | GB/s | what it removes |
+| --- | --- | --- | --- | --- |
+| `exp2` polynomial, `div_row` | 50 | 128 | 1178 | — |
+| `exp2_hw`, `div_row` | 48 | 0 | 3153 | the FMA polynomial |
+| **`exp2_hw`, `recip` + `mul_row`** | **32** | **0** | **4414** | 124 of 128 divides |
+| no transcendental, no divide | 32 | 0 | 6042 | *both* `exp2` calls |
+| one pass, `load_tile` → `store_tile` | 31 | 0 | 6324 | the two extra passes |
+
+Three findings, and the register column orders none of them:
+
+- **[`exp2_approx`] is 2.7× on this kernel.** A clamp, a shift-trick split and
+  a degree-3 minimax polynomial, evaluated twice per element over 128 elements
+  a thread, against one `ex2.approx.f32`. `reg.rs` says "the measurement does
+  not favour" the SFU on the evidence that it takes `softmax_probe_128` from
+  168 registers to 255 with spill. That is true **of registers**; here it is
+  32 registers and a zero frame either way. Fourth time in this repository the
+  register column has ordered time backwards (#47, #63, #67, #76).
+- **The divide is 1.4×, and #47 measured it at nothing.** See the annotation
+  in that section: the control was valid, under a bind that no longer holds.
+- **The three passes over shared memory cost 4.5%** — the thing #47 proposed
+  to fix, and the one thing that was never worth fixing.
+
+| rows × 128 × 2 planes | blocks | before, GB/s | after, GB/s |
+| --- | --- | --- | --- |
+| 128 | 2 | 5.2 | 12.0 |
+| 512 | 8 | 20.4 | 48.9 |
+| 4096 | 64 | 157.9 | 354.2 |
+| 32768 | 512 | 632.4 | 2004.9 |
+| 262144 | 4096 | 917.5 | 3880.0 |
+| 524288 | 8192 | 950.3 | **4389.6** |
+
+**4.6×**, 66 registers on a 256-byte frame → **32 on a zero frame**, occupancy
+unmoved at 6 blocks and 24 warps, every size checked before it was timed and
+`layernorm_rows` untouched beside it at 5483 → 5497 GB/s as the control. The
+5.8× is now 1.25×, and that residual is not a defect: it is the two
+`ex2.approx` this kernel owes its definition and `layernorm` does not, priced
+at exactly that in the ablation's fourth row.
+
+The floor, finally: 25.4 µs → **10.9 µs** at two blocks, against the copy's
+7.0 µs. #47 read its 23 µs as the launch and #67 disproved that with
+`layernorm`'s 8.4 µs; the ablation says what it actually was.
+
+Two forms measured and **not** shipped, both faster:
+`exp2(x - peak - log2(total))` folds the normalizer into the exponent and needs
+no divide at all — 4390/4415/4462 GB/s over three rounds against `recip`'s
+4363/4414, inside each other's spread, and it would put `log2_approx`'s error
+inside the exponent for nothing. Parking the numerator in the tile is one
+`exp2` per element and **4670 GB/s**, the fastest correct form here, and it
+takes the check's worst relative error from 1.97e-3 to **3.44e-3 against a
+3.91e-3 tolerance**. 5.8% for 12% of the headroom is the wrong trade, and it
+turns #47's prose worry about double rounding into a number.
+
+The positive controls, both built as kernels and launched over the check's
+65,536 cells — halving `CHUNK` doubles the chunks a row is walked in, so the
+walk's errors are what the check has to see:
+
+| deliberate error | predicted | device |
+| --- | --- | --- |
+| third pass reads the first chunk for every chunk | 56,960 | **56,960** |
+| second pass sums the first chunk twice | 65,536 | **65,536** |
+
+The first is exact only because the model accounts for two things a table
+would have missed: the third pass reads and writes the *same* tile, so chunk 0
+is overwritten before chunks 1..7 re-read it (worth 384 cells), and the
+device's bf16 intermediate moves cells across a tolerance an `f64` host model
+keeps inside it (the last 64). The second was picked as the *weakest* error a
+chunk walk can commit and is not weak: [`softmax::permutation`](src/softmax.rs)
+spreads a chunk across the whole ladder at an odd stride rather than giving it
+16 adjacent values, so the smallest denominator shift over the check's 512 rows
+is 4.3% — eleven times the tolerance.
+
+[`exp2_approx`]: ../src/reg.rs
 
 **#6 — reductions. Landed.** `row_reduce`/`col_reduce`/`tile_reduce` over a
 `ReduceOp` (a `BinaryOp` with an identity), with `row_max`/`row_min`/`row_sum`/`row_prod`, the `col_*` mirrors,
