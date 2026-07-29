@@ -87,8 +87,9 @@
 use cuda_device::cusimd::{CuSimd, TmemRegs4};
 use cuda_device::tcgen05::{
     tcgen05_alloc, tcgen05_alloc_cg2, tcgen05_dealloc, tcgen05_dealloc_cg2,
-    tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_relinquish_alloc_permit,
-    tcgen05_relinquish_alloc_permit_cg2, tcgen05_st_16x256b_x1_raw, tcgen05_store_wait,
+    tcgen05_ld_16x256b_pure, tcgen05_ld_16x256b_x8_pure, tcgen05_load_wait,
+    tcgen05_relinquish_alloc_permit, tcgen05_relinquish_alloc_permit_cg2,
+    tcgen05_st_16x256b_x1_raw, tcgen05_store_wait,
 };
 use cuda_device::{cluster, thread, warp};
 
@@ -241,6 +242,45 @@ fn interleave(low: TmemRegs4, high: TmemRegs4) -> Fragment {
         reg += 1;
     }
     tile
+}
+
+/// Resolve one `16x256b.x8` load's 32 registers into the four `[16, 16]`
+/// blocks they cover.
+///
+/// `.x8` is eight base accesses laid end to end along the *column* axis — the
+/// shape fixes the 16 lanes, so the repeat count is the only thing that can
+/// widen — and the register list is ordered by repeat, then by the base
+/// access's own `2*slot + pair`. So repeat `r` is exactly what
+/// [`tcgen05_ld_16x256b_pure`] would have returned at `column + 8r`, and
+/// [`interleave`]'s low/high pair for block `j` is repeats `2j` and `2j + 1`:
+/// register `8j + 4*(value/2) + 2*slot + value%2`.
+///
+/// That ordering is a claim about silicon, not an inference from the ISA text.
+/// `device-tests`' `ldtm x8 map` case is what holds it: it drains one
+/// accumulator both ways and requires the tiles to be equal, so an x8 whose
+/// registers arrive in another order fails there rather than in a GEMM's
+/// tolerance.
+#[inline(always)]
+fn interleave_x8(regs: CuSimd<f32, 32>) -> [Fragment; 4] {
+    let mut blocks = [Fragment::zero(); 4];
+    let mut block = 0usize;
+    while block < 4 {
+        let mut slot = 0usize;
+        while slot < Fragment::SLOTS {
+            let mut value = 0usize;
+            while value < Fragment::VALUES {
+                blocks[block].set(
+                    slot,
+                    value,
+                    regs[8 * block + 4 * (value / 2) + 2 * slot + value % 2],
+                );
+                value += 1;
+            }
+            slot += 1;
+        }
+        block += 1;
+    }
+    blocks
 }
 
 /// The inverse of [`interleave`] — a fragment back into the two collective
@@ -519,6 +559,84 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
                         ),
                     );
                     column_block += 1;
+                }
+                row_block += 1;
+            }
+            tile
+        }
+    }
+
+    /// The four `[16, 16]` blocks at `(row, column..column + 64)` in **one**
+    /// LDTM, against the eight [`Self::fragment`] issues and eight waits that
+    /// cover the same 64 columns.
+    ///
+    /// `tcgen05.ld.16x256b.x8` returns 32 f32 a thread where the `.x1` this
+    /// crate has always used returns 4. Same bytes, same map, one eighth the
+    /// issues — and one eighth the waits, which is the larger half of it:
+    /// [`Self::fragment`] waits after *each* of its two loads because the
+    /// registers it waits on are its return value, so the `.x1` drain never
+    /// has more than one load in flight and pays the full TMEM latency per
+    /// four values.
+    ///
+    /// What it costs is liveness. 32 f32 arrive at once and all four blocks
+    /// are live until the caller consumes them, where the `.x1` path lets the
+    /// compiler fuse a single eight-value [`Fragment`] through to the store.
+    /// That is the trade this method exists to let a kernel measure.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::fragment`]: all 32 lanes of a warp owning TMEM rows
+    /// `row..row + 16` must call this together after the MMA writing them has
+    /// committed, and `column + 64` must fit the allocation.
+    #[inline(always)]
+    pub unsafe fn fragments_x8(self, row: u32, column: u32) -> [Fragment; 4] {
+        unsafe {
+            let regs = tcgen05_ld_16x256b_x8_pure(self.at(row, column));
+            tcgen05_load_wait();
+            interleave_x8(regs)
+        }
+    }
+
+    /// [`Self::tile`] over [`Self::fragments_x8`] — the same `[M, N]` band,
+    /// drained 64 columns at a time instead of 16.
+    ///
+    /// `N` must be a multiple of 64, which is what makes the `.x8` land on
+    /// whole blocks; the `[M, N]` shape set is otherwise
+    /// [`Self::tile`]'s. The two must return the same tile for every shape
+    /// both accept, and `device-tests`' `ldtm x8 map` is that assertion.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::fragments_x8`], for every 64-column group of the band.
+    #[inline(always)]
+    pub unsafe fn tile_x8<const M: usize, const N: usize>(
+        self,
+        row: u32,
+        column: u32,
+    ) -> RegTile<M, N, BaseLdtm>
+    where
+        BaseLdtm: FragmentLayout<M, N>,
+    {
+        const {
+            assert!(
+                N % 64 == 0,
+                "tcgen05.ld.16x256b.x8 covers 64 columns; a band it drains has to be a multiple of that"
+            )
+        };
+        unsafe {
+            let mut tile = RegTile::<M, N, BaseLdtm>::zero();
+            let mut row_block = 0usize;
+            while row_block < M / 16 {
+                let mut group = 0usize;
+                while group < N / 64 {
+                    let blocks =
+                        self.fragments_x8(row + 16 * row_block as u32, column + 64 * group as u32);
+                    let mut block = 0usize;
+                    while block < 4 {
+                        place_block(&mut tile, row_block, 4 * group + block, blocks[block]);
+                        block += 1;
+                    }
+                    group += 1;
                 }
                 row_block += 1;
             }
