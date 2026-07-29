@@ -765,8 +765,13 @@ Three things every kernel writes for itself, ordered by size:
   library knows, and it is the source of three of §7.2's four intrinsic leaks
   (`DynamicSharedArray::get_raw`, the `*mut Barrier` cast, `alloc_cluster`'s
   staging word). **#125**, and the largest single thing in this audit.
-- **The epilogue.** `drain_staged` is verbatim identical in `gemm.rs:1371-1403`
-  and `gemm_ws.rs:780-813`, it is what `SHIPPED_EPILOGUE` selects, and every
+- **The epilogue.** `drain_staged`'s *loop* is the same program in
+  `gemm.rs:1371-1403` and `gemm_ws.rs:780-813` — same band selection on
+  `WIDE`/`X4`, same `store_tile{,_x4}` into the same `store_shared_rows`, same
+  warp-scope write-after-read, same `STAGE_N` stride — while the preambles
+  differ, because `gemm_ws` has two accumulator stages to select between and
+  resolves the tile origin inline where `gemm` has an `origin()`. The loop is
+  the part that would move. It is what `SHIPPED_EPILOGUE` selects, and every
   instruction in it is a library call — what is missing is the loop and the
   inter-band convergence. `epilogue::StoreRing` is the library's only epilogue
   type and it covers the TMA route, which #123 measured *losing* to this one.
