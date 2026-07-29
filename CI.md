@@ -172,6 +172,12 @@ a live app.
 only command in its step, so the wrapper's code is the step's code and the job
 is red on every one of 2, 3 and 4. Nothing catches, remaps, or `|| true`s them.
 
+CI is also where the sentinel earns the most. `pip install modal` is unpinned,
+so the runner takes whatever version shipped that morning — 1.5.3 on the first
+run of this, against the 1.5.1 the three exit-code behaviours in #103 were
+measured on. A gate built on the client's exit code would be a gate that can
+change under you between two pushes; a line the container prints cannot.
+
 2, 3 and 4 also arrive as **`::error::` annotations**, so the diagnosis is on
 the check rather than three hundred lines into a log. That is worth most for 2:
 the spend limit fails every entry point at once, in seconds, and a `build` check
@@ -179,16 +185,33 @@ that goes red in fifteen seconds reads exactly like a broken diff — it has cos
 diagnosis time before. There is deliberately no retry on any of them; 2 in
 particular would spend the rest of the workspace's day retrying nothing.
 
-**The graces keep their defaults in CI (300 / 1200).** They are budgets for
-*silence*, not deadlines on the run: every line the client prints — `Created
-objects`, image-build progress, the NVIDIA banner — resets the clock, so a cold
-start costs wall time without consuming the grace, which is what makes one value
-work on a laptop and on a runner. The measurement they have to clear is #99's:
-`build` is 155–221 s warm end to end and ~7.5 min cold, and that whole cold
-build happens *after* Python is alive, where the 1200 s silence budget governs
-and cargo is printing `Compiling` throughout. What 300 s of startup silence is
-sized against is the failure itself — a container that said nothing at all for
-twenty-six minutes.
+**The graces keep their defaults in CI (300 / 1200), and the runner's own
+timestamps say why.** They are budgets for *silence*, not deadlines on the run:
+every line the client prints — `Created objects`, the mount tree, the NVIDIA
+banner — resets the clock, so a cold start costs wall time without consuming a
+grace. That is what lets one pair of values work on a laptop and on a runner.
+
+Measured on the first run of the branch that wired this up, from the per-line
+timestamps in the GitHub log:
+
+| | `build` | `regcount` | budget |
+| --- | ---: | ---: | ---: |
+| first line the watchdog reads as alive | 6.5 s | 7.3 s | — |
+| longest silence before it | 3.1 s | 2.9 s | **300 s** |
+| longest silence anywhere in the run | 58.9 s | 55.7 s | **1200 s** |
+| sentinel, and the run's length | 219 / 221 s | 183 / 184 s | `timeout=900` |
+
+Two orders of magnitude of headroom on the startup budget, and the longest
+quiet stretch in either run — the `sm_100a` codegen, which prints nothing while
+it works — is a twentieth of the silence budget. Note also that in tier 2 the
+silence budget cannot bind: the entry point's own `timeout=900` (#99) is
+shorter, so a run that starts and then hangs dies on Modal's clock first, which
+is the right owner for it.
+
+Tier 3 is where a tighter silence budget would buy something real, and tier 3
+is the one there is no measurement for here. It keeps the value #99 chose
+against `bench`'s genuinely quiet sweeps rather than a number extrapolated from
+a CPU job.
 
 ## Pull requests from forks
 
