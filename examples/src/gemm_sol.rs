@@ -12,8 +12,8 @@
 //! loop, and L2-aware output ordering, and [`select_variant`] picks between them
 //! on wave arithmetic alone.
 //!
-//! On B200 that is `[256, 128]` at and below 36 output tiles, `[256, 256]`
-//! through 4K, and `[512, 256]` from 8K. The two narrow-tile branches are what
+//! On B200 that is `[256, 128]` at and below 37 wide output tiles — half a wave
+//! of them — `[256, 256]` through 4K, and `[512, 256]` from 8K. The two narrow-tile branches are what
 //! `bench sol` and `bench sol-small` added; the doc on [`select_variant`] is the
 //! rule and the measurements that bound it.
 //!
