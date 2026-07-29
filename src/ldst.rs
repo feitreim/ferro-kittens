@@ -75,10 +75,13 @@ pub const fn fragment_address(row: u32, column: u32, lane: u32, slot: usize) -> 
 ///
 /// # Safety
 ///
-/// All 32 lanes of the warp owning TMEM rows `row..row+16` must call this
-/// together, `chunks` must belong to a tile at least `row + 16` rows tall into
-/// which `column + 16` fits, and the caller owes a
-/// `fence.proxy.async.shared::cta` before any MMA reads the tile.
+/// All 32 lanes of the warp holding the fragment must call this together —
+/// `stmatrix` takes its addresses from lanes 0..15 and its data from all 32, so
+/// a lane that skips it makes the instruction ill-formed rather than leaving
+/// its own values unwritten. `row` and `column` are the *shared tile's*
+/// coordinates and nothing here reads tensor memory: `chunks` must belong to a
+/// tile at least `row + 16` rows tall into which `column + 16` fits. The caller
+/// owes a `fence.proxy.async.shared::cta` before any MMA or TMA reads the tile.
 #[inline(always)]
 pub unsafe fn store_fragment<E: Element<Unpacked = [f32; 2]>>(
     chunks: SwizzledChunks<E>,
@@ -121,10 +124,11 @@ pub unsafe fn store_fragment<E: Element<Unpacked = [f32; 2]>>(
 ///
 /// # Safety
 ///
-/// As [`store_fragment`]: all 32 lanes of the warp owning TMEM rows
-/// `row..row+16` must call this together, `chunks` must belong to a tile at
-/// least `row + 16` rows tall into which `column + 16` fits, and the caller
-/// owes a `fence.proxy.async.shared::cta` before any MMA reads the tile.
+/// As [`store_fragment`]: all 32 lanes of the warp holding the fragment must
+/// call this together — all 32 of them supply addresses here, not just the
+/// first 16 — `chunks` must belong to a tile at least `row + 16` rows tall into
+/// which `column + 16` fits, and the caller owes a
+/// `fence.proxy.async.shared::cta` before any MMA or TMA reads the tile.
 #[inline(always)]
 pub unsafe fn store_fragment_x4<E: Element<Unpacked = [f32; 2]>>(
     chunks: SwizzledChunks<E>,

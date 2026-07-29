@@ -9,15 +9,28 @@
 //! kernels use — is the crate's only layout, and its doc carries the ownership
 //! contract every op here assumes.
 //!
-//! `exp2` exists twice —
-//! [`exp2_approx`] (the FMA polynomial, bit-identical to what the flash
-//! kernels shipped with) and [`exp2_hw`] (one `ex2.approx` SFU instruction,
-//! also pure-PTX-safe post-#56). Ports that must hold "same SASS" keep the
-//! polynomial; swapping to the SFU is a separate, measured change — and the
-//! measurement does not favour it: pointing `exp2` at the SFU takes
-//! `softmax_probe_128` from 168 registers and no spill to 255 and 112 bytes
-//! of spill stores (`modal_app.py::regcount`). One instruction, but the FMA
-//! chain schedules where `ex2.approx` serializes.
+//! `exp2` exists twice — [`exp2_approx`] (the FMA polynomial, bit-identical
+//! to what the flash kernels shipped with) and [`exp2_hw`] (one `ex2.approx`
+//! SFU instruction, `cuda_device::float::ex2_approx_f32`, which is a generated
+//! intrinsic at the pinned revision and so needs no libdevice call, exactly as
+//! [`Sqrt`] does not).
+//!
+//! **On a clock the SFU wins by 2.7×**: #76 timed both on `softmax` at
+//! `CHUNK = 16` over 8192 blocks, and the polynomial is 50 registers on a
+//! 128 B frame at 1178 GB/s against the SFU's 48 on a zero frame at
+//! **3153 GB/s**. Accuracy does not separate them either — `softmax`'s
+//! exactness check measures a worst relative error of 1.97e-3 either way,
+//! because the bf16 round trip dominates and not the transcendental. This
+//! header used to say the measurement did not favour the SFU, on a *register
+//! count* taken on a probe shape no kernel has; #81 is that correction.
+//!
+//! **The default has not moved.** `exp2` still resolves to [`Exp2Approx`]
+//! (`exp2_stays_the_polynomial_everywhere` is what says so): which one a
+//! *name* means is a numerics change, and `flash_forward` — the other caller,
+//! twice per element in its inner loop — has no CPU reference to check one
+//! against. #81 carries the decision and the sweep it needs. `softmax` calls
+//! [`exp2_hw`] explicitly today; ports that must hold "same SASS" keep the
+//! polynomial.
 //!
 //! Elementwise work goes through [`UnaryOp`] / [`BinaryOp`] / [`TernaryOp`]
 //! and the `*_map` methods, so a scalar function is written once and reaches
@@ -256,7 +269,8 @@ scalar_ops! { UnaryOp:
     /// `ln(x)` on [`log2_approx`]; see [`Exp`].
     Log(x) = log2_approx(x) * core::f32::consts::LN_2;
     /// Sign-bit clear rather than a libdevice `fabsf` — one `abs.f32`, and it
-    /// keeps the op usable in a pure-PTX artifact regardless of #56's fate.
+    /// keeps the op usable in a pure-PTX artifact whatever becomes of the
+    /// crate-level claim that libdevice math is legal beside tcgen05 in one.
     Abs(x) = f32::from_bits(x.to_bits() & 0x7fff_ffff);
     Neg(x) = -x;
     Relu(x) = fmax(x, 0.0);

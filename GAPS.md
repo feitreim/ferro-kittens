@@ -2,7 +2,7 @@
 
 Measured against HazyResearch/ThunderKittens `main` (~21.3k lines of headers under
 `include/`, plus `prototype/`). `wc -l src/*.rs` answers for this side, so that
-number is not maintained here: it was 1851 when this file was written and 7353
+number is not maintained here: it was 1851 when this file was written and 10 156
 on the date below.
 
 The size difference overstates the functional gap and understates the structural
@@ -21,7 +21,19 @@ layer in a Rust world, and left unmarked where it is a genuine hole.
 
 ## How to read this file, and when it was last true
 
-**Audited against the source on 2026-07-28** (#65). Every entry was checked by
+**Audited against the source on 2026-07-29.** That pass read all of `src/`
+whole for the first time since the library grew, and it widened what this file
+is for: sections 1–6 are still the ThunderKittens diff, and **§7 is new** — the
+coherence of the surface itself, which no comparison against another library
+would have found. Two of the three worst finds were the failure mode below
+rather than a missing feature: §2.2 still said `GlobalRows` was fp32-only after
+#108 had given it an element, and §4 still said the pipeline scaffold had no
+caller after `gemm` had been running on it since #83. Neither is a slow rot —
+both landed on 2026-07-28, the same day #65 re-read the entries they falsified.
+The lesson is the one #65 drew and not a new one: the entries went stale inside
+a day, and no commit message contradicted either.
+
+**Previously audited 2026-07-28** (#65). Every entry was checked by
 reading the module it names, not the log — the failure this file keeps having is
 an entry that still says *missing* for something that shipped, and no commit
 message contradicts one of those. §3.2 read "Missing: … generic `row_reduce`"
@@ -67,8 +79,32 @@ roughly tripled the surface — and, more to the point, a `Scope` of
 wanted block scope. Warps cannot shuffle to each other, so a fold across them
 needs *storage* between two barriers, which no such trait has. What shipped is
 `sync::block_reduce::<Op, WARPS>` over a `SharedVec<F32, WARPS>` — the specific
-collective, not the parameterization. The scope of every other op is still
-baked into its index math, and naming it in the types is unfiled.
+collective, not the parameterization.
+
+**#123 then did it once, for one type, and the argument it settled is not the
+one #3 lost.** `epilogue::StoreRing` takes a `Scope` — `Cta` or `Warp`, a trait
+of `{ issuing(), converge() }` — because a staging tile need not be CTA-wide and
+a ring hard-wired to `bar.sync` could not express `gemm`'s per-warp tile at all.
+That is exactly the trait #3 argued against, and it works here for the reason
+#3's version did not work for a block reduction: a store ring has *its own*
+storage already, so the scope only has to name a barrier and an issuing thread,
+which is all `{ WARPS, rank(), sync() }` was ever able to say.
+
+So the crate now spells scope **four ways**, and they do not compose:
+
+| where | spelling | rungs it covers |
+| --- | --- | --- |
+| `epilogue::StoreRing` | `SC: Scope` | warp, CTA |
+| `pipeline::Job` | `const RANKS: u32`, branched in `boundary` | CTA, cluster |
+| `sync::block_reduce` | `const WARPS: usize` | CTA, of a named width |
+| `global::store_shared_rows` | `const THREADS: u32` + a `thread` argument | any cooperative set |
+
+`Scope` and `RANKS` are the same decision at adjacent rungs of one ladder —
+warp < CTA < cluster — implemented twice with no rung in common, and neither can
+express the other's. Everything else is still baked into its index math:
+`tmem::alloc_block` *is* `warp_id() == 0` plus `sync_threads`, `alloc_cluster`
+*is* that plus `cluster_sync`, and neither says so in its type. Filed as
+**#124**.
 
 ### 1.2 Single element type
 
@@ -114,6 +150,16 @@ those separated first — which is why `SharedVec` routes around `Swizzle` rathe
 than borrowing it (1.4). A second `FragmentLayout` is **filed nowhere**, and
 3.4's `transpose`/`swap_layout` wait on it.
 
+`ATOM_BYTES` turns out to be doing a *third* job, and it is the one with a cost
+already on the clock: it is also the **walk step**. `SharedTile::k_walk` asserts
+`C * E::BYTES == S::ATOM_BYTES`, so at bf16 a K-major walk is 64 wide and
+nothing else, and `gemm` reaches a `BLOCK_K = 128` stage by re-wrapping each
+subtile as a narrower tile type to get a walk out of it
+(`examples/src/gemm.rs:1199-1209`, and `gemm.rs:5846-5852` says why). The
+arithmetic to cross a stacked subtile already exists — `mma::k_major_offset`
+does it for the typed walks — so a multi-atom `OperandWalk` is separable from
+the swizzle work. Both halves are recorded on #14.
+
 ### 1.4 Shared vectors — the type landed (#13), the ops did not
 
 TK has `sv` as a first-class type with its own maps, reductions, conversions and
@@ -144,7 +190,11 @@ descriptor is `sync::block_reduce`'s scratch — a two-warp block's partials are
 
 What #13 asked for and did not get is the other half: the map and reduction
 instantiations, on shared vectors **and** shared tiles. The issue closed on the
-type. See 3.1 — nothing tracks the ops.
+type. **#130** now carries the vector half — with two smaller holes beside it
+that the audit found in the same corner: a `SharedVec` cannot be sliced, so
+`layernorm` reaches a chunk of its parameter vector by laundering `at()` through
+`from_raw`, and `RegVec` has no bridge to memory at all. The shared-*tile* half
+is still tracked nowhere (3.1).
 
 ### 1.5 Global layout — a type since #8, and still bf16-only
 
@@ -200,6 +250,14 @@ Same `[16, 16]` granularity as 2.1, composed into a band by `ldst::load_tile`
 and `ldst::store_tile` (#22) out of the same helpers the TMEM side uses, at any
 width the cursor can describe (#25).
 
+The two directions are no longer the same width. #116 gave the store side a
+`.x4` form — `store_fragment_x4`/`store_tile_x4`, one `stmatrix` per `[16, 16]`
+block instead of two — and it is what `gemm`'s shipped epilogue uses. The load
+side is still two `ldmatrix_x2` a block, though `ldmatrix_x4` is right there at
+the pin. Filed as **#131**, which asks for the measurement as much as the code:
+`.x8` on the TMEM side (#117) bought its 23.6% by removing *waits*, and a
+shared-memory load has none to remove.
+
 ### 2.2 Global ↔ register — done (#11)
 
 TK's `global_to_register.cuh` (`load`/`store`): `global::load_rows` and
@@ -217,23 +275,37 @@ The two are also the only movers here generic over `FragmentLayout` rather
 than pinned to `BaseLdtm`: `ldmatrix`, `stmatrix` and LDTM each fix a lane map
 in hardware, and a plain global store fixes nothing.
 
-Two things this deliberately is not. It is **fp32 only**: `GlobalRows` names a
-`*mut f32` outright rather than carrying an `Element`, and fp32 out of registers
-without a rounding step is the whole point of the entry. The reason first given
-here — that `Element` was bf16-only — expired with #2 and #3, which made it a
-real trait with `F32` under it; the parameter is available now and nothing has
-asked for it. And it **bounds-checks nothing**: the extents a TMA descriptor
-carries are absent rather than forgotten, since predicating every value would be
-paid by the epilogues that do divide. TK's ragged-tail loads want them back, and
-that is what is left of this entry, along with the vector shapes
-(`RegVec`/`ColVec` straight out of global memory — the shared-memory bridge
-exists, `ldst::load_vec`, but not the global one) and group scope (1.1).
+**This entry said "It is fp32 only" until 2026-07-29, and that is the worst
+thing this file did in the audit's window.** `GlobalRows<E: Element>` has
+carried an element since #108, which is what makes a bf16 `C` round once in the
+store instruction instead of in a round trip through a shared tile — and the
+paragraph asserting otherwise was written as the *reason* a bf16 `C` was out of
+reach, so it read as an argument rather than as a fact and nothing prompted a
+re-read. `ColLayout::CONTIGUOUS_VALUES` (#91) rides with it: a layout that hands
+a thread adjacent columns gets `Element::write_pair`, one access for two values,
+chosen once per call by `GlobalRows::runs_aligned` rather than promised in a
+contract an odd leading dimension would break. Named in `tests/gaps.rs` as
+`global_movers_carry_an_element`, which is what stops it going back to fp32 in
+prose.
+
+What is genuinely left. It **bounds-checks nothing**: the extents a TMA
+descriptor carries are absent rather than forgotten, since predicating every
+value would be paid by the epilogues that do divide. TK's ragged-tail loads want
+them back. Then the vector shapes, and they are less symmetric than this entry
+used to imply: `ColVec` has a shared-memory bridge (`ldst::load_vec`/`store_vec`)
+and no global one, and **`RegVec` has neither** — a per-row statistic, which is
+what every attention and normalization kernel actually computes, cannot leave
+the warp except by being folded to a scalar through `sync::block_reduce`. That
+is **#130**, with the reason the two vectors need different code: a `ColVec`'s
+entries depend only on `lane % 4` and shared memory broadcasts them, where a
+`RegVec`'s slots are spread across `lane / 4` and staging one is a scatter.
+Group scope is 1.1.
 
 ### 2.3 TMA store side — plain stores landed (#9), reductions absent
 
 | TK | ferro-kittens |
 | --- | --- |
-| `load_async` | `tma_load`, `tma_load_at`, `tma_load_2d`, `tma_load_2d_multicast_cg2` ✅ |
+| `load_async` | `tma_load`, `tma_load_at`, `tma_load_2d`, `tma_load_2d_multicast_cg2`, `tma_load_2d_arriving_at` ✅ |
 | `store_async` | `tma_store`, `tma_store_2d` ✅ |
 | `store_async_wait`, `store_commit_group`, `store_async_read_wait` | `tma_store_wait::<N>`, `tma_store_commit`, `tma_store_wait_read::<N>` ✅ |
 | `store_add_async`, `store_min_async`, `store_max_async` | — |
@@ -245,12 +317,20 @@ beside these (1.4), at rank 1 and 2 and one instruction each.
 
 What is left of this entry is the *reduction* stores, and they are a different
 kind of missing: `cp.reduce.async.bulk.tensor` is absent from cuda-oxide at the
-pinned revision in every form, so unlike the plain stores they are not a
+pinned revision in every form — not in the generated crate and not in
+`intrinsics/imported.json` either — so unlike the plain stores they are not a
 transcription. `store_add_async` is what makes split-K and multi-CTA reduction
 epilogues cheap, and getting it means a local `ptx_asm!` intrinsic (`ldst.rs`
 sets the precedent) or an upstream contribution — filed as **#42**, which argues
-for the upstream half. Prefetch is absent upstream for the same reason and is
-filed nowhere.
+for the upstream half.
+
+**Prefetch is not absent for the same reason, and this file said it was.**
+`int_nvvm_cp_async_bulk_prefetch_L2` and the tensor prefetch forms *are* in
+`intrinsics/imported.json` at the pin, with their PTX spelled out; what is
+missing is only the generated Rust wrapper. So it is a generation-list change
+upstream, or a `ptx_asm!` locally with none of #42's argument against one.
+Recorded on #42 rather than filed separately, since the two share a section and
+nothing has asked for prefetch.
 
 ### 2.4 Cluster ops stop at cg2
 
@@ -271,6 +351,26 @@ with `Semaphore::at_rank`, a `mapa` that takes any rank.
 TK has cluster-scope shared→shared copies. Still absent: #50 brought in the
 *addressing* half, since `Semaphore::at_rank` names a peer's shared offset, but
 nothing here moves data between two CTAs' shared memory.
+
+### 2.6 Shared → global without an engine — done (#113), and the inverse absent
+
+Not a TK entry, which is why it had none here: TK's shared→global path is the
+TMA and nothing else. `global::store_shared_rows` is the other one — a whole
+`[R, C]` swizzled tile copied out to a row-major rectangle by ordinary
+`ld.shared.v4` / `st.global.v4` pairs, `THREADS` threads splitting the tile's
+16-byte chunks between them, no descriptor and no fence. It exists because a
+fragment layout is a bad shape to store *from*: under `BaseLdtm` the widest
+thing `store_rows` can issue is a pair and a warp's addresses are scattered
+across the row, where a hop through shared memory widens the access to 16 bytes
+and makes a warp's addresses one contiguous run. `access_width` walks 16/8/4
+down to the element and takes the first the cursor admits, so an odd `ldc` gets
+narrower stores rather than a fault.
+
+It is the shipped GEMM epilogue's second half, and #123 measured it **beating**
+the TMA route on that kernel. Absent: the load direction. Nothing reads a global
+rectangle into a shared tile without a descriptor, which is what an irregular
+operand not worth a host-built map would want — the mirror of the argument 2.2
+makes for `load_rows`.
 
 ---
 
@@ -295,8 +395,9 @@ equivalent to be.
 Missing: the shared-tile and shared-vector instantiations. Shared memory is
 still a movement target only — nothing in `shared.rs` maps or folds in place, so
 data comes back to registers before anything is done to it. #13 asked for these
-beside the `SharedVec` type and closed on the type alone (1.4); **no open issue
-carries the rest**. The per-column operand of `col_map` is no longer the hole
+beside the `SharedVec` type and closed on the type alone (1.4). **#130 carries
+the vector half; the tile half is still filed nowhere.** The per-column operand
+of `col_map` is no longer the hole
 this entry described: `col_reduce` produces one (3.2), and `ldst::load_vec`
 reads one out of shared memory.
 
@@ -332,7 +433,8 @@ derives the lane groups from the maps rather than restating the constants, and
 *logical* tile. On silicon they are the `reduction shuffles` device case.
 
 Still missing: **every shared-tile and shared-vector reduction**, which is 3.1's
-other half and is tracked nowhere. Note also that everything above is warp
+other half — the vector half is #130's third item, the tile half is filed
+nowhere. Note also that everything above is warp
 scope. The fold four warps need is `sync::block_reduce` (1.1) — storage between
 two barriers, not a wider `Op`, because warps cannot shuffle to each other.
 
@@ -385,6 +487,18 @@ work, not shape work. `tcgen05_mma_sp_*` (sparse), `tcgen05_mma_ws_*`
 (weight-stationary) and `tcgen05_shift_down` remain available upstream and
 unused.
 
+Two shape observations from the 2026-07-29 audit, neither filed, both weak on
+evidence and recorded so the next reader does not re-derive them. The
+square is closed at **cta_group::1 for the typed walks and cta_group::2 for the
+value walk**, and the other two quadrants do not exist: there is no `mma_abt_cg2`
+and no single-CTA `mma_walk`. No kernel has wanted either — `flash_forward`
+takes `mm_abt`/`mm_ab` and both GEMMs take `mma_walk_cg2` — so the hole is
+symmetrical on paper and unmotivated in practice. And the accumulator is a bare
+`u32` in all nine entry points, where `TmemTile<R, C>` exists and knows the
+shape the caller is passing separately as an `MmaShape`; that one *is* filed, as
+**#128**, because it is what `examples/src/gemm.rs`'s hand-written
+`pair_shape(block_n) -> MmaShape` lookup is standing in for.
+
 ### 3.4 Tile-shape utilities
 
 Landed with #7: `tril`/`triu`, `make_causal`/`make_causal_t`,
@@ -410,29 +524,50 @@ only, no arch dispatch.
 
 ## 4. Missing kernel scaffolding
 
-`pipeline::run` + `trait Job` is TK's `prototype::lcf` (load-compute-finish), and
-it's a faithful port of that shape — still the only one, and still uncalled by
-anything in `examples/`, which is worth knowing before porting a second: the
-GEMM declines it deliberately, because `run` strides work items by `blockIdx.x`
-and a cluster launch needs the whole cluster on the same item (**#51**).
+`pipeline::run` + `trait Job` is TK's `prototype::lcf` (load-compute-finish),
+and it's a faithful port of that shape. **This entry read "still uncalled by
+anything in `examples/`" until 2026-07-29**, on the argument that `run` strides
+items by `blockIdx.x` and a cluster launch needs the whole cluster on one item.
+#51 fixed that — the map is `%clusterid` stepping by `%nclusterid`, which at a
+one-CTA cluster *is* the old loop — and `gemm` has run on the scaffold since
+#83, exact on a B200 and a dead heat with the launch-per-tile grid it replaced.
 
-Missing from `prototype/` (**#15**):
+The module has grown two things since, both of which this entry predates:
 
-- **`lcsf`** — load-compute-**store**-finish. The store stage is what a training
-  kernel with a producer-consumer epilogue needs; without it the store is folded
-  into `finish` and can't overlap the next work item's load.
+- **`run_stealing`** (#88/#97) — the same loop over the hardware's own work
+  queue, `clusterlaunchcontrol.try_cancel` multicast to the cluster and
+  harvested off an mbarrier. It takes no item count, because the grid *is* the
+  item count. What it buys is not speed — the ragged last wave is 1.1–2.4%,
+  against a wave model that predicted up to 23% — but the deletion of `SMS` and
+  `CTAS_PER_SM`, the two constants that make the scaffold B200-shaped.
+- **`grouped`** (#89/#102) — item → `(row, column)` in blocks of `group`
+  tile-rows, a bijection for every width including one that does not divide the
+  grid. It composes with either item source rather than replacing one, which is
+  what lets the swizzle and the scheduler be swept independently.
 
-  **Built, measured and not adopted for the GEMM — and the scaffold needed no
-  change to carry it.** An undrained accumulator survives the item boundary in
-  tensor memory, so deferring the epilogue by one item is a reordering of
-  phases inside `Job::work` and `pipeline::run` is untouched: `lcf`'s scaffold
-  already admits an `lcsf` job. Measured over two sessions it is **−5.4% to
-  +1.2%** and never reliably positive, and a probe holding the epilogue's
-  instructions fixed while removing its HBM traffic puts the write-bound part
-  of the epilogue at **0–1.2%**. So the term `lcsf` exists to overlap is not
-  costing this kernel anything to begin with. `examples/README.md` §7 has both
-  tables and what they leave open. A kernel whose epilogue is genuinely
-  latency-exposed may still want this; a `Job` whose accumulator is
+**#15 closed without `lcsf`**, and the finding is worth keeping: an undrained
+accumulator survives the item boundary in tensor memory, so deferring the
+epilogue by one item is a reordering *inside* `Job::work` and the scaffold needs
+no store stage at all. Measured over two sessions it is −5.4% to +1.2% on the
+GEMM and never reliably positive.
+
+What the trait still cannot do, both named by the kernels rather than by this
+file: a **warp-asynchronous item stream** — every thread enters `work` with one
+`item`, so warps cannot be on different items, which is the shape a reference
+warp-specialized GEMM uses — and a **teardown hook**, so the drain a deferred
+job owes after `run` returns is remembered by hand at nine entry points in
+`gemm_ws.rs` alone. Filed as **#132**.
+
+Still missing from `prototype/`:
+
+- **`lcsf`** — load-compute-**store**-finish, as a *stage the scaffold
+  sequences*. That is what remains unbuilt and it is deliberate: the paragraph
+  above is why the shape needed no scaffold at all here. A probe holding the
+  epilogue's instructions fixed while removing its HBM traffic puts the
+  write-bound part of the GEMM's epilogue at **0–1.2%**, so the term `lcsf`
+  exists to overlap is not costing this kernel anything to begin with.
+  `examples/README.md` §7 has both tables. A kernel whose epilogue is genuinely
+  latency-exposed may still want it; a `Job` whose accumulator is
   single-buffered in TMEM cannot overlap more than one pipeline fill's worth of
   it, which is the constraint that decided this one.
 - **`lcsc`** — the store-compute variant.
@@ -495,6 +630,18 @@ Missing from `prototype/` (**#15**):
   the row, column and whole-tile reduction shuffles; the TMA store paths
   including `tma_store_wait_read`'s early recycle; and a repeated-launch probe
   under a watchdog that would catch a TMEM leak across waves.
+
+  Four families have landed since that list was written and are worth naming
+  because each covers a mechanism nothing else does. `ldtm x8 map` drains one
+  accumulator through both `.x1` and `.x8` and requires equality, which is what
+  holds #117's claim about the wide load's *register order* — an ISA-text
+  inference otherwise. The `store ring` cases cover depths 1, 2 and 4, the wide
+  tile, and both scopes (#123), with `store ring warp phased` the store side of
+  `swizzle roundtrip short`: a staging tile that begins mid-swizzle-period, read
+  correctly by the engine off its absolute address. `shared drain` covers
+  §2.6's mover. And `tmem occupancy ladder` / `tmem residency census` count CTAs
+  an SM by `%smid` and `%globaltimer` rather than asking the occupancy query,
+  which is what refuted #70's and #74's readings (see `src/tmem.rs`).
 
   The matching global *store* is checked by `examples/gemm.rs` instead, whose
   register-drain rung is one `store_rows` compared elementwise against an exact
@@ -563,6 +710,93 @@ Missing from `prototype/` (**#15**):
 
 ---
 
+## 7. Coherence of the surface itself (new on 2026-07-29)
+
+Sections 1–6 ask what ThunderKittens has that this does not. This one asks what
+the crate says about *itself*, which no comparison against another library
+finds, and it is where the 2026-07-29 audit spent most of its time. Nothing here
+is a bug. All of it is what a new user meets first.
+
+### 7.1 Scope is in the type once, and spelled three other ways
+
+`epilogue::StoreRing` takes a `Scope` — `Cta` or `Warp`, a trait of
+`{ issuing(), converge() }` — because #123 needed a staging tile that was not
+CTA-wide and a ring hard-wired to `bar.sync` could not express one. That is the
+right shape, and it is the only place in the crate a collective's scope is
+named. Beside it: `pipeline::Job::RANKS` is a `const u32` branched into
+`cluster_sync` or `sync_threads`, `sync::block_reduce` takes a `const WARPS`,
+and `global::store_shared_rows` takes a `const THREADS` plus a thread index.
+`Scope` and `RANKS` are adjacent rungs of one ladder — warp < CTA < cluster —
+built twice with no rung in common. Everything else keeps its scope in its index
+math: `tmem::alloc_block` *is* `warp_id() == 0` plus `sync_threads`, and does
+not say so. **#124**, and 1.1 for why #3's argument does not reach it.
+
+### 7.2 A kernel cannot call one register-side function without `cuda_device`
+
+Every warp-scope entry point takes `lane: u32` and the crate exposes no way to
+get one — it uses `warp::lane_id()` internally in two modules and re-exports
+neither it nor `warp_id()`. So all five kernels import `cuda_device::warp` in
+their first three lines. Worse in kind: `ldst::store_fragment`'s contract says
+the caller *owes a `fence.proxy.async.shared::cta`*, and the only thing in the
+crate that issues that fence is `StoreRing::publish`, which is private. The
+library creates an obligation and does not export the instruction that
+discharges it, at seven sites in the three small kernels. **#127.**
+
+### 7.3 The handles pick two conventions each
+
+`from_raw` for `SharedTile`/`SharedVec`/`GlobalRows`/`TmemTile`, `attach` for
+`SharedTileRing`/`StoreRing`/`Semaphore`/`PhasedSemaphore`/`SemaphoreRing`/`ClcQueue`
+— and "rings use `attach`" is the obvious rule and is false. `SharedTile::from_raw`
+is `unsafe` and `TmemTile::from_raw` is safe, though neither dereferences
+anything, so the crate has no stated rule for where the `unsafe` boundary is.
+The TMEM read direction has no verb (`TmemTile::tile` against
+`ldst::load_tile`) while its write direction shares one. `lib.rs` re-exports
+`ReduceOp` but none of the four types that implement it, and no free function at
+all, so `use kittens::*` yields types with no verbs. **#129.**
+
+### 7.4 What a kernel still open-codes, which is the coverage question restated
+
+Three things every kernel writes for itself, ordered by size:
+
+- **The shared plan.** Five kernels, each computing it twice — a
+  host-visible `SHARED_BYTES` and an in-kernel pointer walk — related only by a
+  hand-written `const { assert!(..) }`. The two GEMM walks are the same program.
+  Almost everything in them is arithmetic over library objects whose sizes the
+  library knows, and it is the source of three of §7.2's four intrinsic leaks
+  (`DynamicSharedArray::get_raw`, the `*mut Barrier` cast, `alloc_cluster`'s
+  staging word). **#125**, and the largest single thing in this audit.
+- **The epilogue.** `drain_staged`'s *loop* is the same program in
+  `gemm.rs:1371-1403` and `gemm_ws.rs:780-813` — same band selection on
+  `WIDE`/`X4`, same `store_tile{,_x4}` into the same `store_shared_rows`, same
+  warp-scope write-after-read, same `STAGE_N` stride — while the preambles
+  differ, because `gemm_ws` has two accumulator stages to select between and
+  resolves the tile origin inline where `gemm` has an `origin()`. The loop is
+  the part that would move. It is what `SHIPPED_EPILOGUE` selects, and every
+  instruction in it is a library call — what is missing is the loop and the
+  inter-band convergence. `epilogue::StoreRing` is the library's only epilogue
+  type and it covers the TMA route, which #123 measured *losing* to this one.
+  `softmax` and `layernorm` then open-code a third shape, the single-shot
+  `tma_store` + commit + `wait::<0>`. **#126.**
+- **The band origin.** `32 * warp_id` appears in every kernel in the repo, five
+  times inline in `flash_forward.rs`. The `32` is `BaseLdtm`'s rows per warp,
+  which the library never names, and `DRAIN_N = 128` — the widest band a thread
+  can drain before 256 fp32 crosses the 255-register ceiling — is derived
+  independently in both GEMMs' docs. Both are library facts living in
+  `examples/`. Named in #126.
+
+### 7.5 Types that exist and are not used by the operation that needs them
+
+`TmemTile<R, C>` knows an accumulator's shape; all nine MMA entry points take a
+bare `u32` and a separately-passed `MmaShape`, which is what `gemm`'s
+hand-written `pair_shape(block_n) -> MmaShape` lookup stands in for.
+`tmem::alloc_block` takes a runtime `columns: u32` and checks nothing, so
+`flash_forward` asked for an illegal 192 columns from the day it was written and
+nothing in the type system was in a position to notice — the kernel now carries
+the ISA rule itself. Both are **#128**, and both are const-parameter work rather
+than design work.
+
+---
+
 ## Work order
 
 The original order was issues #1–#16, structural items first, since they change
@@ -571,29 +805,50 @@ sixteen have closed** — #1 through #13 — and the sections above name the wor
 beside each. Listing them again here only creates a second place for the status
 to go stale, which is how this file earned #65.
 
-What was open on 2026-07-28, and where it lives. `gh issue list` is the live
-version; this is a snapshot with a date on it.
+What was open on 2026-07-29, and where it lives. `gh issue list` is the live
+version; this is a snapshot with a date on it. The 2026-07-28 snapshot listed
+#15, #50 and #51 as open and all three had closed by the next day, which is the
+argument for keeping this table dated and short rather than complete.
 
 | # | Issue | Section |
 | --- | --- | --- |
-| 14 | Swizzle modes: 32B, 64B, unswizzled | 1.3 |
-| 15 | `lcsf` and the rest of the prototype layer | 4 |
+| 14 | Swizzle modes: 32B, 64B, unswizzled — and the walk step | 1.3 |
 | 16 | FP8 element support | 1.2 |
 | 42 | Reduction TMA stores — upstream rather than a local `ptx_asm!` | 2.3 |
 | 49 | Cluster geometry beyond the 2-CTA pair | 2.4 |
-| 50 | Cluster-scope semaphore arrival | 2.4 |
-| 51 | `pipeline::run` cannot schedule a cluster | 4 |
+| 124 | Scope is in the type once and spelled three other ways | 1.1, 7.1 |
+| 125 | The shared plan is open-coded, in bytes, twice per kernel | 7.4 |
+| 126 | The shipped epilogue is open-coded in both GEMMs | 7.4 |
+| 127 | No way to obtain a `lane`, and the proxy fence is private | 7.2 |
+| 128 | TMEM columns unchecked; the MMA takes an address, not a tile | 3.3, 7.5 |
+| 129 | Two conventions each for constructors, `unsafe`, verbs, re-exports | 7.3 |
+| 130 | `RegVec` cannot reach memory; `SharedVec` cannot be sliced | 1.4, 2.2 |
+| 131 | The load side is stuck at `ldmatrix.x2` | 2.1a |
+| 132 | `Job` has no teardown hook | 4 |
+
+Kernel-side issues not in this table because they are not library gaps: #81
+(the `exp2` default — this PR corrects the doc it names and does not move the
+default), #85 (`flash_forward`'s shared plan), #105 (tile selection).
 
 **Wanted and filed nowhere**, each named in its section above: a second
 `FragmentLayout` (1.3, and 3.4 waits on it), the map and reduction
-instantiations on shared tiles and shared vectors (3.1, 3.2 — the half of #13
-that closed without them), an fp32 `TensorMapElement` (1.5), TMA prefetch (2.3),
-DSMEM (2.5), and naming each op's scope in its type rather than in its index
-math (1.1).
+instantiations on shared **tiles** (3.1, 3.2 — the vector half is #130), an fp32
+`TensorMapElement` (1.5), DSMEM (2.5), and the global→shared mover with no
+descriptor (2.6). TMA prefetch is no longer on this list in the form it was:
+see 2.3 and the note on #42.
 
 ## cuda-oxide support at the pinned rev (`b099f64`)
 
-Checked against the vendored source, since several gaps turn on it:
+Checked against the source, since several gaps turn on it. **Re-checked on
+2026-07-29 against a checkout whose `HEAD` was confirmed to be
+`b099f64c1a32869b74be99f4f88242fb68655b51` before anything was read from it** —
+which is #106's rule, written after a `~/.cargo` checkout at `4514af2` was cited
+for a `clc` doc that our pin does not have. There are six cuda-oxide checkouts
+on this machine; five of them are not our pin.
+
+"Absent" below means absent from the generated `cuda-device` crate. That is the
+line that matters for a caller and it is *not* the same as absent upstream — see
+the prefetch row.
 
 | Need | Status |
 | --- | --- |
@@ -602,12 +857,12 @@ Checked against the vendored source, since several gaps turn on it:
 | Sparse MMA | ✅ `tcgen05_mma_sp_*` (unused) |
 | Register → TMEM (STTM) | ✅ full `tcgen05_st_*` family + `tcgen05_store_wait` |
 | TMA store | ✅ `cp_async_bulk_tensor_{1..5}d_s2g` + commit/wait groups |
-| TMA reduction store (add/min/max) | ❌ absent — needs `ptx_asm!` or an upstream PR (#42) |
-| TMA prefetch | ❌ absent |
+| TMA reduction store (add/min/max) | ❌ absent from the crate **and** from `intrinsics/imported.json` — needs a new record and a lowering, or `ptx_asm!` (#42) |
+| TMA prefetch | ❌ absent from the crate, ✅ **present in `intrinsics/imported.json`** (`int_nvvm_cp_async_bulk_prefetch_L2`, plain and `.L2::cache_hint`, plus the tensor forms) — a generation-list change, not a lowering (#42's thread) |
 | f32 → fp8 | ✅ `cvt_rn_satfinite_{e4m3,e5m2}x2_f32` (+ `relu`) |
 | f32 → fp4/fp6/e8m0 | ❌ absent — hand bit-packing |
 | MXFP block-scale smem→tmem | ✅ `tcgen05_cp_*_b4x16_p64`, `_b6x16_p32` |
-| `stmatrix` | ✅ `x2`/`x4`, plain and `trans` (we use `x2` only) |
-| `ldmatrix` | ✅ `cuda_device::wmma::ldmatrix_{x1,x2,x4}` (+ `trans`); filed under `wmma`, but lowers for `sm_100a` — we use `x2` |
+| `stmatrix` | ✅ `x2`/`x4`, plain and `trans` — we use **both** widths since #116, through local `ptx_asm!` either way (the generated declarations do not resolve for `sm_100a`) |
+| `ldmatrix` | ✅ `cuda_device::wmma::ldmatrix_{x1,x2,x4}` (+ `trans`); filed under `wmma`, but lowers for `sm_100a` — we use `x2` only, which is #131 |
 
 **FP8 is not blocked upstream.** FP4/FP6 and MXFP block scaling are.
