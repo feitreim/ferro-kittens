@@ -823,13 +823,17 @@ def _census(directory: str) -> dict[str, dict[str, int]]:
 
 
 def _print_census() -> None:
-    # Both kernel crates, because the rungs a census is *for* are the ones in
-    # `experiments/` and the kernel it is read against ships from `examples/`.
-    # The two crates share one kernel name and it is one kernel, so a later
-    # entry overwriting an earlier one loses nothing -- and if it ever did, the
-    # register table above would have said so first.
-    counted = {**_census(EXAMPLES_DIR), **_census(EXPERIMENTS_DIR)}
-    if not counted:
+    # Per crate, and both of them. The rungs a census is *for* are in
+    # `experiments/`; the kernel they are read against is the one `examples/`
+    # ships, and the two crates emit it under one name because it is one
+    # kernel. Two sections rather than one merged table is what lets that be
+    # checked instead of assumed -- the two rows must agree opcode for opcode,
+    # and a difference between them is the extraction having moved something.
+    sections = [
+        ("kittens-examples", _census(EXAMPLES_DIR)),
+        ("kittens-experiments", _census(EXPERIMENTS_DIR)),
+    ]
+    if not any(counted for _, counted in sections):
         print(f"\nno `{CENSUS_PREFIX}*` entry functions in the crates' PTX to census.")
         return
     print(
@@ -840,10 +844,25 @@ def _print_census() -> None:
         "function, so a loop the compiler did not unroll shows as one."
     )
     columns = [column for column, _ in CENSUS_OPCODES]
-    print("  " + f"{'kernel':<30}" + "".join(f"{column:>12}" for column in columns))
-    for name in sorted(counted):
-        row = "".join(f"{counted[name][column]:>12}" for column in columns)
-        print(f"  {name:<30}{row}")
+    for package, counted in sections:
+        if not counted:
+            continue
+        print(f"\n  {package}")
+        print("  " + f"{'kernel':<30}" + "".join(f"{column:>12}" for column in columns))
+        for name in sorted(counted):
+            row = "".join(f"{counted[name][column]:>12}" for column in columns)
+            print(f"  {name:<30}{row}")
+    shared = set(sections[0][1]) & set(sections[1][1])
+    disagreed = [name for name in sorted(shared) if sections[0][1][name] != sections[1][1][name]]
+    if shared:
+        print(
+            f"\n  {len(shared)} kernel(s) in both crates: "
+            + (
+                "identical opcode counts."
+                if not disagreed
+                else "DIFFER — " + ", ".join(disagreed)
+            )
+        )
 
 
 def _print_kernels(measured: dict[tuple[str, str], dict[str, int]]) -> None:
@@ -1148,6 +1167,14 @@ GATED_KERNELS = (
     # visits last. That is only sound while the two are the same kernel, which
     # is exactly what the two identical rows in the register table assert.
     ("gemm_cg2_staged_x8x4", "examples/src/gemm.rs"),
+    # And `experiments/`' copy of it, which is the same source-level kernel in a
+    # crate with forty-one others. It is here because the two do *not* have to
+    # come out the same and did not: the extraction reads 80 registers against
+    # 96, and `groupnorm_tile` — a file neither crate edited — moves 168 -> 236
+    # the other way, so crate composition alone moves a register count here.
+    # Both copies being gated is what keeps that from turning into an occupancy
+    # step nobody watched.
+    ("gemm_cg2_staged_x8x4", "experiments/src/gemm.rs"),
 )
 
 _CONTRACT_BLOCK = re.compile(r"block\s*=\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)")
@@ -1246,7 +1273,16 @@ def _check_occupancy_model(threads: int) -> int:
 
 def _check_occupancy_step(measured: dict[tuple[str, str], dict[str, int]]) -> None:
     """Registers against the occupancy step, per gated kernel — issue #95."""
-    by_kernel = {name: counts for (_, name), counts in measured.items()}
+    # Keyed by (crate, kernel) and not by kernel alone. `examples/` and
+    # `experiments/` both emit `gemm_cg2_staged_x8x4`, and a flat map would hand
+    # this gate whichever crate `PTX_CRATES` happened to visit last -- a gate
+    # reading a kernel other than the one it names is exactly the silent failure
+    # #95 exists to prevent. The crate is the first path component of both a
+    # `GATED_KERNELS` source and a `_measure` key, so it joins them directly.
+    def crate(path: str) -> str:
+        return path.split("/", 1)[0]
+
+    by_kernel = {(crate(ptx), name): counts for (ptx, name), counts in measured.items()}
     print("\n  the occupancy model, against the toolkit's own (`cuda_occupancy.h`,")
     print("  compiled here — it needs no driver, and neither does this whole run):")
     for threads in sorted({_launch_geometry(source, kernel)[0] for kernel, source in GATED_KERNELS}):
@@ -1255,31 +1291,35 @@ def _check_occupancy_step(measured: dict[tuple[str, str], dict[str, int]]) -> No
 
     rows, crossed = [], []
     for kernel, source in GATED_KERNELS:
-        counts = by_kernel.get(kernel)
+        counts = by_kernel.get((crate(source), kernel))
         if counts is None:
             raise RuntimeError(
-                f"{kernel} is gated on its occupancy step but emitted no PTX, so this run "
-                "measured nothing about it. Either it stopped being monomorphized or it was "
-                "renamed; a gate that silently watches an absent kernel is worse than none."
+                f"{kernel} is gated on its occupancy step but {crate(source)} emitted no PTX "
+                "for it, so this run measured nothing about it. Either it stopped being "
+                "monomorphized, or it was renamed, or it moved crate; a gate that silently "
+                "watches an absent kernel is worse than none."
             )
         threads, ctas = _launch_geometry(source, kernel)
         ceiling = _register_ceiling(ctas, threads)
         registers = counts["registers"]
         allowed = _ctas_by_registers(registers, threads)
-        rows.append((kernel, threads, ctas, registers, ceiling, ceiling - registers, allowed))
+        rows.append(
+            (f"{crate(source)}/{kernel}", threads, ctas, registers, ceiling, ceiling - registers, allowed)
+        )
         if allowed < ctas:
             crossed.append(
-                f"  {kernel}: {registers} registers at {threads} threads leaves {allowed} "
+                f"  {crate(source)}/{kernel}: {registers} registers at {threads} threads "
+                f"leaves {allowed} "
                 f"CTAs/SM where the kernel is built for {ctas}. {ceiling} is the most a "
                 f"thread may use and keep {ctas} — it is {registers - ceiling} over."
             )
 
     print("\n  the occupancy step (#95) — registers against the residency each kernel's")
     print("  own grid is sized for. `ceiling` is derived, not written down anywhere:")
-    print(f"    {'kernel':<24}{'threads':>8}{'wants':>7}{'regs':>6}{'ceiling':>9}{'headroom':>10}{'allows':>8}")
+    print(f"    {'kernel':<36}{'threads':>8}{'wants':>7}{'regs':>6}{'ceiling':>9}{'headroom':>10}{'allows':>8}")
     for kernel, threads, ctas, registers, ceiling, headroom, allowed in rows:
         print(
-            f"    {kernel:<24}{threads:>8}{ctas:>7}{registers:>6}"
+            f"    {kernel:<36}{threads:>8}{ctas:>7}{registers:>6}"
             f"{ceiling:>9}{headroom:>10}{allowed:>8}"
         )
     if crossed:
