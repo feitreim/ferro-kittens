@@ -15,32 +15,22 @@
 //! intrinsic at the pinned revision and so needs no libdevice call, exactly as
 //! [`Sqrt`] does not).
 //!
-//! **On a clock the SFU wins by 2.7×, and this header said the opposite for
-//! months.** What it said was that "the measurement does not favour it",
-//! on the evidence that pointing `exp2` at the SFU takes `softmax_probe_128`
-//! from 168 registers to 255 and 112 bytes of spill stores
-//! (`modal_app.py::regcount`) — a *register count*, and one taken on a probe
-//! shape the shipped kernel does not have. #76 timed the two on `softmax`
-//! itself: at `CHUNK = 16` over 8192 blocks, the polynomial is 50 registers on
-//! a 128 B frame at 1178 GB/s and the SFU is 48 registers on a zero frame at
-//! **3153 GB/s**. At that kernel's shipped shape the register column does not
-//! separate them at all, and where it did it pointed the wrong way — the
-//! fourth time in this repo that has happened (#47, #63, #67, #76). The
-//! accuracy argument does not rescue the polynomial either: `softmax`'s
-//! exactness check measures a worst relative error of 1.97e-3 *either way*,
-//! because what dominates is the bf16 round trip and not the transcendental.
+//! **On a clock the SFU wins by 2.7×**: #76 timed both on `softmax` at
+//! `CHUNK = 16` over 8192 blocks, and the polynomial is 50 registers on a
+//! 128 B frame at 1178 GB/s against the SFU's 48 on a zero frame at
+//! **3153 GB/s**. Accuracy does not separate them either — `softmax`'s
+//! exactness check measures a worst relative error of 1.97e-3 either way,
+//! because the bf16 round trip dominates and not the transcendental. This
+//! header used to say the measurement did not favour the SFU, on a *register
+//! count* taken on a probe shape no kernel has; #81 is that correction.
 //!
-//! A claim that `ex2.approx` serializes where the FMA chain schedules used to
-//! sit here. It had no probe behind it and is removed rather than restated.
-//!
-//! **The default has not moved**, and that is a decision this correction does
-//! not take: `exp2` still resolves to [`Exp2Approx`] everywhere
-//! (`exp2_stays_the_polynomial_everywhere` is what says so), because which one
-//! a *name* means is a numerics change and `flash_forward` — the other caller,
-//! twice per element in its inner loop — has no launcher and no CPU reference
-//! to check one against. #81 carries that decision and the sweep it needs.
-//! `softmax` calls [`exp2_hw`] explicitly today. Ports that must hold "same
-//! SASS" keep the polynomial.
+//! **The default has not moved.** `exp2` still resolves to [`Exp2Approx`]
+//! (`exp2_stays_the_polynomial_everywhere` is what says so): which one a
+//! *name* means is a numerics change, and `flash_forward` — the other caller,
+//! twice per element in its inner loop — has no CPU reference to check one
+//! against. #81 carries the decision and the sweep it needs. `softmax` calls
+//! [`exp2_hw`] explicitly today; ports that must hold "same SASS" keep the
+//! polynomial.
 //!
 //! Elementwise work goes through [`UnaryOp`] / [`BinaryOp`] / [`TernaryOp`]
 //! and the `*_map` methods, so a scalar function is written once and reaches
