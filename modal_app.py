@@ -33,8 +33,11 @@ Local usage:
     modal run modal_app.py::profile   # one launch under Nsight Compute (see
                                       # the note there: no counters on Modal)
     modal run modal_app.py::doctor    # env / GPU sanity check
+    modal run modal_app.py::stall     # does nothing, out loud -- the control
+                                      # for scripts/modal-run (#103)
 """
 
+import functools
 import re
 import subprocess
 import time
@@ -221,6 +224,34 @@ SWEEPING = 2700  # 16384^3 launched dozens of times: `bench` and the profiles
 ASKING = 300  # one driver query, nothing built: `doctor`
 
 
+# Positive evidence that an entry point reached its last line. `scripts/modal-run`
+# imports this name and refuses to return 0 without having seen it.
+#
+# Why not just trust the client's exit code: `modal run` exits **0** when its app
+# is stopped out from under it (#103, measured -- the PR quotes the transcript).
+# So "the client came back without an error" cannot distinguish a gate that
+# passed from a gate that a concurrent agent, a Modal-side eviction, a spend
+# limit or the dashboard's stop button killed halfway. Absence of failure is not
+# evidence of completion. This line is, and it costs one print.
+COMPLETED = "== modal_app: entry point completed =="
+
+
+def completes(fn: Callable) -> Callable:
+    """Print `COMPLETED` once `fn` has returned normally.
+
+    Applied *under* `@app.function`, so it runs in the container and the
+    sentinel arrives on the same stream as everything else the run said -- the
+    stream the client is already reading. A raised exception skips it, which is
+    the point: only the last line of a finished body prints this."""
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        fn(*args, **kwargs)
+        print(COMPLETED, flush=True)
+
+    return wrapped
+
+
 def _run(cmd: list[str], cwd: str) -> None:
     print(f"$ {' '.join(cmd)}  (cwd={cwd})", flush=True)
     start = time.monotonic()
@@ -234,6 +265,7 @@ def _run(cmd: list[str], cwd: str) -> None:
 
 
 @app.function(cpu=8, timeout=CHECKING)
+@completes
 def build() -> None:
     """Everything that does not need a GPU: the library's host surface (which
     cannot be checked off a CUDA box, `global.rs` needs cuda.h) and a full
@@ -305,6 +337,7 @@ def build() -> None:
 # change runs. `bench`, `ladder_bench` and `profile` already say it; these two
 # were simply missed.
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=RUNNING)
+@completes
 def device_tests() -> None:
     """The harness itself. One binary, every case, non-zero exit on failure."""
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
@@ -312,6 +345,7 @@ def device_tests() -> None:
 
 
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=RUNNING)
+@completes
 def examples() -> None:
     """The examples crate's own launchers. Prints the status table, then runs
     every kernel that has one against its CPU reference; non-zero on a wrong
@@ -325,6 +359,7 @@ def examples() -> None:
 # eight milliseconds a launch, but staging it is 268 million host-side operand
 # values per matrix and the exact check compares 268 million elements of `C`.
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
+@completes
 def bench(case: str = "", m: int = 0, n: int = 0, k: int = 0) -> None:
     """The same kernels, timed at several sizes, reporting achieved throughput.
 
@@ -369,6 +404,7 @@ def bench(case: str = "", m: int = 0, n: int = 0, k: int = 0) -> None:
 
 
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
+@completes
 def clc_bench() -> None:
     """The GEMM's three item sources on one clock -- issue #88.
 
@@ -389,6 +425,7 @@ def clc_bench() -> None:
 
 
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
+@completes
 def ws_bench() -> None:
     """The warp-specialized GEMM against the one it is a variant of.
 
@@ -426,6 +463,7 @@ def ws_bench() -> None:
 # run that dies between the third shape and the fourth has spent the GPU and
 # answered three quarters of the question.
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
+@completes
 def ladder_bench() -> None:
     """Four rungs of #60's register ladder, with a clock on them — issue #63.
 
@@ -488,6 +526,7 @@ NCU_SKIP, NCU_COUNT = "6", "1"
 
 
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
+@completes
 def profile(kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192) -> None:
     """One launch of one kernel at one size, under Nsight Compute — issue #86.
 
@@ -545,9 +584,29 @@ def profile(kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192) -
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=ASKING)
+@completes
 def doctor() -> None:
     _run(["nvidia-smi"], cwd="/")
     _run(["cargo", "oxide", "doctor"], cwd="/opt/warmup")
+
+
+@app.function(timeout=ASKING)
+@completes
+def stall(seconds: int = 120) -> None:
+    """Do nothing, out loud, for `seconds`. This is `scripts/modal-run`'s
+    control, and it is here rather than in a scratch file because a check nobody
+    has watched fail is not a check (#67, #76, #95, #99).
+
+    From the wrapper's side it is indistinguishable from a real run: one `$ `
+    line proving Python is alive, then a long quiet stretch of work. So
+
+        scripts/modal-run stall &        # in one shell
+        modal app stop -y <app id>       # in another, from `modal app list`
+
+    reproduces #103 exactly -- a run killed out from under the client -- for a
+    fractional CPU and a minute. No GPU, no build, and nothing else in the repo
+    refers to it."""
+    _run(["sleep", str(seconds)], cwd="/")
 
 
 # `ptxas -v` writes one block per entry function on stderr:
@@ -1058,6 +1117,7 @@ def _check_occupancy_step(measured: dict[tuple[str, str], dict[str, int]]) -> No
 
 
 @app.function(cpu=8, timeout=CHECKING)
+@completes
 def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) -> None:
     """Register pressure of every kernel the harness and the examples emit,
     from `ptxas -v`.
