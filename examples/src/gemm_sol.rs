@@ -33,8 +33,37 @@ use kittens::shared::{Bf16, Element, F16, SharedCell, SharedTile, SharedTileRing
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
 
+/// The whole kernel. Both shipped entries pass this and nothing else does.
+pub const WHOLE: u8 = 0;
+/// TMA and every barrier, with the MMA and the drain removed: what the memory
+/// pipeline alone can sustain.
+pub const FEED_ONLY: u8 = 1;
+/// The MMA and every barrier, with the loads removed — the producer arrives on
+/// `load` instead of filling it, so the ring recycles on tensor-core issue and
+/// no global traffic occurs at all.
+pub const ISSUE_ONLY: u8 = 2;
+/// The whole kernel except the drain: the accumulator fills and is released
+/// without being read, so the difference against [`WHOLE`] is the epilogue's
+/// cost *including* whatever of it fails to overlap.
+pub const NO_DRAIN: u8 = 3;
+
+const fn loads(ablate: u8) -> bool {
+    ablate != ISSUE_ONLY
+}
+const fn multiplies(ablate: u8) -> bool {
+    ablate != FEED_ONLY
+}
+const fn drains(ablate: u8) -> bool {
+    ablate == WHOLE
+}
+
 const BLOCK_M: usize = 128;
 const BLOCK_N: usize = 256;
+/// Columns of `C` one cluster owns — the same for both variants, and `pub`
+/// because the ablation arms size their own grids from it.
+pub const N_TILE: usize = BLOCK_N;
+/// Depth one stage carries, so `k / K_TILE` is the K loop's trip count.
+pub const K_TILE: usize = BLOCK_K;
 const HALF_N: usize = BLOCK_N / 2;
 const BLOCK_K: usize = 64;
 const CHUNKS: usize = BLOCK_K / 16;
@@ -57,9 +86,12 @@ const _: () = {
     assert!(2 * BLOCK_N as u32 == ACCUM_COLUMNS);
 };
 
-type ATile = SharedTile<F16, BLOCK_M, BLOCK_K, Swizzle128B>;
+/// The `A` tile a tensor map is built for — `pub` because `experiments/`'
+/// ablation arms build the same two maps this file's own runner does.
+pub type ATile = SharedTile<F16, BLOCK_M, BLOCK_K, Swizzle128B>;
 
-type BPanel = SharedTile<F16, 64, BLOCK_K, Swizzle128B>;
+/// The `B` panel a tensor map is built for, per [`ATile`].
+pub type BPanel = SharedTile<F16, 64, BLOCK_K, Swizzle128B>;
 type ARing = SharedTileRing<F16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>;
 type BRing = SharedTileRing<F16, HALF_N, BLOCK_K, Swizzle128B, STAGES>;
 type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
@@ -314,7 +346,7 @@ struct Small {
 
 impl Small {
     #[inline(always)]
-    unsafe fn producer(self) {
+    unsafe fn producer<const ABLATE: u8>(self) {
         unsafe {
             let common = self.common;
             let mut cursor: ClcCursor = common.queue.cursor();
@@ -340,28 +372,32 @@ impl Small {
                     while k < common.k_blocks {
                         let global_k = sequence * common.k_blocks + k;
                         common.free.wait_recycled(global_k);
-                        let load = common.load.sem(global_k).at_rank(LEADER);
-                        let k_base = (k * BLOCK_K as u32) as i32;
-                        let b = common.b.tile(global_k);
-                        let bytes = self
-                            .a
-                            .tile(global_k)
-                            .tma_load_2d_arriving_at(self.a_map, k_base, a_row, load)
-                            + b.tma_load_2d_at_arriving_at::<64>(
-                                self.b_map, 0, k_base, b_row, load,
-                            )
-                            + b.tma_load_2d_at_arriving_at::<64>(
-                                self.b_map,
-                                64,
-                                k_base,
-                                b_row + 64,
-                                load,
-                            );
-                        if common.rank == LEADER {
-                            common
-                                .load
-                                .sem(global_k)
-                                .expect_tx(bytes.across_ranks(RANKS));
+                        if loads(ABLATE) {
+                            let load = common.load.sem(global_k).at_rank(LEADER);
+                            let k_base = (k * BLOCK_K as u32) as i32;
+                            let b = common.b.tile(global_k);
+                            let bytes = self
+                                .a
+                                .tile(global_k)
+                                .tma_load_2d_arriving_at(self.a_map, k_base, a_row, load)
+                                + b.tma_load_2d_at_arriving_at::<64>(
+                                    self.b_map, 0, k_base, b_row, load,
+                                )
+                                + b.tma_load_2d_at_arriving_at::<64>(
+                                    self.b_map,
+                                    64,
+                                    k_base,
+                                    b_row + 64,
+                                    load,
+                                );
+                            if common.rank == LEADER {
+                                common
+                                    .load
+                                    .sem(global_k)
+                                    .expect_tx(bytes.across_ranks(RANKS));
+                            }
+                        } else if common.rank == LEADER {
+                            common.load.sem(global_k).arrive();
                         }
                         k += 1;
                     }
@@ -378,26 +414,33 @@ impl Small {
     }
 
     #[inline(always)]
-    unsafe fn multiply_stage(self, accumulator: Accumulator, sequence: u32, k: u32) {
+    unsafe fn multiply_stage<const ABLATE: u8>(
+        self,
+        accumulator: Accumulator,
+        sequence: u32,
+        k: u32,
+    ) {
         unsafe {
             let common = self.common;
             let global_k = sequence * common.k_blocks + k;
             if common.rank == LEADER {
                 common.load.wait(global_k);
-                mma_walk_cg2::<F16, CHUNKS>(
-                    accumulator.raw(),
-                    self.a.tile(global_k).k_walk(),
-                    common.b.tile(global_k).k_walk(),
-                    MmaShape::M256_N256,
-                    k > 0,
-                );
+                if multiplies(ABLATE) {
+                    mma_walk_cg2::<F16, CHUNKS>(
+                        accumulator.raw(),
+                        self.a.tile(global_k).k_walk(),
+                        common.b.tile(global_k).k_walk(),
+                        MmaShape::M256_N256,
+                        k > 0,
+                    );
+                }
                 commit_multicast_cg2(common.free.sem(global_k), PAIR);
             }
         }
     }
 
     #[inline(always)]
-    unsafe fn multiply(self) {
+    unsafe fn multiply<const ABLATE: u8>(self) {
         unsafe {
             let common = self.common;
             let mut sequence = 0u32;
@@ -412,10 +455,10 @@ impl Small {
 
                 let mut k = 0u32;
                 while k < common.k_blocks {
-                    self.multiply_stage(accumulator, sequence, k);
-                    self.multiply_stage(accumulator, sequence, k + 1);
-                    self.multiply_stage(accumulator, sequence, k + 2);
-                    self.multiply_stage(accumulator, sequence, k + 3);
+                    self.multiply_stage::<ABLATE>(accumulator, sequence, k);
+                    self.multiply_stage::<ABLATE>(accumulator, sequence, k + 1);
+                    self.multiply_stage::<ABLATE>(accumulator, sequence, k + 2);
+                    self.multiply_stage::<ABLATE>(accumulator, sequence, k + 3);
                     k += 4;
                 }
                 if common.rank == LEADER {
@@ -427,7 +470,7 @@ impl Small {
     }
 
     #[inline(always)]
-    unsafe fn epilogue(self) {
+    unsafe fn epilogue<const ABLATE: u8>(self) {
         unsafe {
             let common = self.common;
             let mut sequence = 0u32;
@@ -437,11 +480,13 @@ impl Small {
                     break;
                 }
                 common.full.wait(sequence);
-                common.drain::<SMALL_STAGE_N>(
-                    Common::accumulator(self.accumulator, sequence),
-                    info.row * (2 * BLOCK_M) as u32,
-                    info.column * BLOCK_N as u32,
-                );
+                if drains(ABLATE) {
+                    common.drain::<SMALL_STAGE_N>(
+                        Common::accumulator(self.accumulator, sequence),
+                        info.row * (2 * BLOCK_M) as u32,
+                        info.column * BLOCK_N as u32,
+                    );
+                }
                 common.release_accumulator(sequence);
                 sequence += 1;
             }
@@ -461,7 +506,7 @@ struct Large {
 
 impl Large {
     #[inline(always)]
-    unsafe fn producer(self) {
+    unsafe fn producer<const ABLATE: u8>(self) {
         unsafe {
             let common = self.common;
             let mut cursor = common.queue.cursor();
@@ -488,32 +533,36 @@ impl Large {
                     while k < common.k_blocks {
                         let global_k = sequence * common.k_blocks + k;
                         common.free.wait_recycled(global_k);
-                        let load = common.load.sem(global_k).at_rank(LEADER);
-                        let k_base = (k * BLOCK_K as u32) as i32;
-                        let b = common.b.tile(global_k);
-                        let bytes = self
-                            .a0
-                            .tile(global_k)
-                            .tma_load_2d_arriving_at(self.a_map, k_base, a_row0, load)
-                            + self
-                                .a1
+                        if loads(ABLATE) {
+                            let load = common.load.sem(global_k).at_rank(LEADER);
+                            let k_base = (k * BLOCK_K as u32) as i32;
+                            let b = common.b.tile(global_k);
+                            let bytes = self
+                                .a0
                                 .tile(global_k)
-                                .tma_load_2d_arriving_at(self.a_map, k_base, a_row1, load)
-                            + b.tma_load_2d_at_arriving_at::<64>(
-                                self.b_map, 0, k_base, b_row, load,
-                            )
-                            + b.tma_load_2d_at_arriving_at::<64>(
-                                self.b_map,
-                                64,
-                                k_base,
-                                b_row + 64,
-                                load,
-                            );
-                        if common.rank == LEADER {
-                            common
-                                .load
-                                .sem(global_k)
-                                .expect_tx(bytes.across_ranks(RANKS));
+                                .tma_load_2d_arriving_at(self.a_map, k_base, a_row0, load)
+                                + self
+                                    .a1
+                                    .tile(global_k)
+                                    .tma_load_2d_arriving_at(self.a_map, k_base, a_row1, load)
+                                + b.tma_load_2d_at_arriving_at::<64>(
+                                    self.b_map, 0, k_base, b_row, load,
+                                )
+                                + b.tma_load_2d_at_arriving_at::<64>(
+                                    self.b_map,
+                                    64,
+                                    k_base,
+                                    b_row + 64,
+                                    load,
+                                );
+                            if common.rank == LEADER {
+                                common
+                                    .load
+                                    .sem(global_k)
+                                    .expect_tx(bytes.across_ranks(RANKS));
+                            }
+                        } else if common.rank == LEADER {
+                            common.load.sem(global_k).arrive();
                         }
                         k += 1;
                     }
@@ -530,19 +579,21 @@ impl Large {
     }
 
     #[inline(always)]
-    unsafe fn multiply_stage(self, sequence: u32, k: u32) {
+    unsafe fn multiply_stage<const ABLATE: u8>(self, sequence: u32, k: u32) {
         unsafe {
             let common = self.common;
             let global_k = sequence * common.k_blocks + k;
             if common.rank == LEADER {
                 common.load.wait(global_k);
-                mma_walk_cg2::<F16, CHUNKS>(
-                    self.accumulator.raw(),
-                    self.a0.tile(global_k).k_walk(),
-                    common.b.tile(global_k).k_walk(),
-                    MmaShape::M256_N256,
-                    k > 0,
-                );
+                if multiplies(ABLATE) {
+                    mma_walk_cg2::<F16, CHUNKS>(
+                        self.accumulator.raw(),
+                        self.a0.tile(global_k).k_walk(),
+                        common.b.tile(global_k).k_walk(),
+                        MmaShape::M256_N256,
+                        k > 0,
+                    );
+                }
                 commit_multicast_cg2(common.free.sem(global_k), PAIR);
                 if k + 1 == common.k_blocks {
                     commit_multicast_cg2(common.full.sem(0), PAIR);
@@ -551,13 +602,15 @@ impl Large {
                 if sequence > 0 && k == 0 {
                     common.empty.sem(1).wait((sequence - 1) & 1);
                 }
-                mma_walk_cg2::<F16, CHUNKS>(
-                    self.accumulator.columns_right(BLOCK_N as u32).raw(),
-                    self.a1.tile(global_k).k_walk(),
-                    common.b.tile(global_k).k_walk(),
-                    MmaShape::M256_N256,
-                    k > 0,
-                );
+                if multiplies(ABLATE) {
+                    mma_walk_cg2::<F16, CHUNKS>(
+                        self.accumulator.columns_right(BLOCK_N as u32).raw(),
+                        self.a1.tile(global_k).k_walk(),
+                        common.b.tile(global_k).k_walk(),
+                        MmaShape::M256_N256,
+                        k > 0,
+                    );
+                }
                 commit_multicast_cg2(common.free.sem(global_k), PAIR);
                 if k + 1 == common.k_blocks {
                     commit_multicast_cg2(common.full.sem(1), PAIR);
@@ -567,7 +620,7 @@ impl Large {
     }
 
     #[inline(always)]
-    unsafe fn multiply(self) {
+    unsafe fn multiply<const ABLATE: u8>(self) {
         unsafe {
             let common = self.common;
             let mut sequence = 0u32;
@@ -581,10 +634,10 @@ impl Large {
 
                 let mut k = 0u32;
                 while k < common.k_blocks {
-                    self.multiply_stage(sequence, k);
-                    self.multiply_stage(sequence, k + 1);
-                    self.multiply_stage(sequence, k + 2);
-                    self.multiply_stage(sequence, k + 3);
+                    self.multiply_stage::<ABLATE>(sequence, k);
+                    self.multiply_stage::<ABLATE>(sequence, k + 1);
+                    self.multiply_stage::<ABLATE>(sequence, k + 2);
+                    self.multiply_stage::<ABLATE>(sequence, k + 3);
                     k += 4;
                 }
                 sequence += 1;
@@ -593,7 +646,7 @@ impl Large {
     }
 
     #[inline(always)]
-    unsafe fn epilogue(self) {
+    unsafe fn epilogue<const ABLATE: u8>(self) {
         unsafe {
             let common = self.common;
             let mut sequence = 0u32;
@@ -605,11 +658,13 @@ impl Large {
                 let mut half = 0u32;
                 while half < 2 {
                     common.full.sem(half).wait(sequence & 1);
-                    common.drain::<LARGE_STAGE_N>(
-                        self.accumulator.columns_right(half * BLOCK_N as u32),
-                        info.row * 512 + half * 256,
-                        info.column * BLOCK_N as u32,
-                    );
+                    if drains(ABLATE) {
+                        common.drain::<LARGE_STAGE_N>(
+                            self.accumulator.columns_right(half * BLOCK_N as u32),
+                            info.row * 512 + half * 256,
+                            info.column * BLOCK_N as u32,
+                        );
+                    }
                     let empty = common.empty.sem(half);
                     if common.rank == LEADER {
                         empty.arrive();
@@ -621,6 +676,115 @@ impl Large {
                 sequence += 1;
             }
         }
+    }
+}
+
+/// The M256xN256 device body, with one dial on it.
+///
+/// The kernel below is this at [`WHOLE`] and nothing else; `experiments/`'
+/// ablation arms are the same text at [`FEED_ONLY`], [`ISSUE_ONLY`] and
+/// [`NO_DRAIN`], so no arm can drift from the kernel it decomposes.
+///
+/// # Safety
+///
+/// As [`kernels::gemm_sol_m256`].
+#[inline(always)]
+pub unsafe fn m256_body<const ABLATE: u8>(
+    a_map: *const TmaDescriptor,
+    b_map: *const TmaDescriptor,
+    tiles_m: u32,
+    tiles_n: u32,
+    k_blocks: u32,
+    ldc: u32,
+    c: &mut DisjointSlice<u16>,
+) {
+    unsafe {
+        let smem = DynamicSharedArray::<u8, 128>::get_raw();
+        let common = Common::attach(
+            smem,
+            SMALL_RINGS_END,
+            SMALL_B_OFFSET,
+            tiles_m,
+            tiles_n,
+            k_blocks,
+            ldc,
+            c,
+        );
+        common.initialize(1);
+        let state = Small {
+            common,
+            a: ARing::attach(smem.add(A0_OFFSET)),
+            accumulator: Accumulator::from_raw(alloc_cluster(
+                smem.add(tmem_offset(SMALL_RINGS_END)).cast(),
+                ACCUM_COLUMNS,
+            )),
+            a_map,
+            b_map,
+        };
+
+        if common.warp_id == TMA_WARP && common.lane == 0 {
+            state.producer::<ABLATE>();
+        } else if common.warp_id == MMA_WARP && common.lane == 0 {
+            state.multiply::<ABLATE>();
+        } else if common.warp_id < EPILOGUE_WARPS {
+            state.epilogue::<ABLATE>();
+        }
+
+        common.retire();
+        dealloc_cluster(state.accumulator.raw(), ACCUM_COLUMNS);
+    }
+}
+
+/// The M512xN256 device body, per [`m256_body`].
+///
+/// # Safety
+///
+/// As [`kernels::gemm_sol_m512`].
+#[inline(always)]
+pub unsafe fn m512_body<const ABLATE: u8>(
+    a_map: *const TmaDescriptor,
+    b_map: *const TmaDescriptor,
+    tiles_m: u32,
+    tiles_n: u32,
+    k_blocks: u32,
+    ldc: u32,
+    c: &mut DisjointSlice<u16>,
+) {
+    unsafe {
+        let smem = DynamicSharedArray::<u8, 128>::get_raw();
+        let common = Common::attach(
+            smem,
+            LARGE_RINGS_END,
+            LARGE_B_OFFSET,
+            tiles_m,
+            tiles_n,
+            k_blocks,
+            ldc,
+            c,
+        );
+        common.initialize(2);
+        let state = Large {
+            common,
+            a0: ARing::attach(smem.add(A0_OFFSET)),
+            a1: ARing::attach(smem.add(LARGE_A1_OFFSET)),
+            accumulator: Accumulator::from_raw(alloc_cluster(
+                smem.add(tmem_offset(LARGE_RINGS_END)).cast(),
+                ACCUM_COLUMNS,
+            )),
+            a_map,
+            b_map,
+        };
+
+        if common.warp_id == TMA_WARP && common.lane == 0 {
+            state.producer::<ABLATE>();
+        } else if common.warp_id == MMA_WARP && common.lane == 0 {
+            state.multiply::<ABLATE>();
+        } else if common.warp_id < EPILOGUE_WARPS {
+            state.epilogue::<ABLATE>();
+        }
+
+        common.retire();
+        dealloc_cluster(state.accumulator.raw(), ACCUM_COLUMNS);
     }
 }
 
@@ -651,39 +815,7 @@ pub mod kernels {
     ) {
         unsafe {
             const { assert!(SMALL_SHARED_BYTES == 196_864) };
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let common = Common::attach(
-                smem,
-                SMALL_RINGS_END,
-                SMALL_B_OFFSET,
-                tiles_m,
-                tiles_n,
-                k_blocks,
-                ldc,
-                &mut c,
-            );
-            common.initialize(1);
-            let state = Small {
-                common,
-                a: ARing::attach(smem.add(A0_OFFSET)),
-                accumulator: Accumulator::from_raw(alloc_cluster(
-                    smem.add(tmem_offset(SMALL_RINGS_END)).cast(),
-                    ACCUM_COLUMNS,
-                )),
-                a_map,
-                b_map,
-            };
-
-            if common.warp_id == TMA_WARP && common.lane == 0 {
-                state.producer();
-            } else if common.warp_id == MMA_WARP && common.lane == 0 {
-                state.multiply();
-            } else if common.warp_id < EPILOGUE_WARPS {
-                state.epilogue();
-            }
-
-            common.retire();
-            dealloc_cluster(state.accumulator.raw(), ACCUM_COLUMNS);
+            m256_body::<WHOLE>(a_map, b_map, tiles_m, tiles_n, k_blocks, ldc, &mut c);
         }
     }
 
@@ -709,40 +841,7 @@ pub mod kernels {
     ) {
         unsafe {
             const { assert!(LARGE_SHARED_BYTES == 229_632) };
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let common = Common::attach(
-                smem,
-                LARGE_RINGS_END,
-                LARGE_B_OFFSET,
-                tiles_m,
-                tiles_n,
-                k_blocks,
-                ldc,
-                &mut c,
-            );
-            common.initialize(2);
-            let state = Large {
-                common,
-                a0: ARing::attach(smem.add(A0_OFFSET)),
-                a1: ARing::attach(smem.add(LARGE_A1_OFFSET)),
-                accumulator: Accumulator::from_raw(alloc_cluster(
-                    smem.add(tmem_offset(LARGE_RINGS_END)).cast(),
-                    ACCUM_COLUMNS,
-                )),
-                a_map,
-                b_map,
-            };
-
-            if common.warp_id == TMA_WARP && common.lane == 0 {
-                state.producer();
-            } else if common.warp_id == MMA_WARP && common.lane == 0 {
-                state.multiply();
-            } else if common.warp_id < EPILOGUE_WARPS {
-                state.epilogue();
-            }
-
-            common.retire();
-            dealloc_cluster(state.accumulator.raw(), ACCUM_COLUMNS);
+            m512_body::<WHOLE>(a_map, b_map, tiles_m, tiles_n, k_blocks, ldc, &mut c);
         }
     }
 }
@@ -761,14 +860,16 @@ impl Variant {
         }
     }
 
-    const fn m_tile(self) -> usize {
+    /// Rows of `C` one cluster owns.
+    pub const fn m_tile(self) -> usize {
         match self {
             Self::M256xN256 => 256,
             Self::M512xN256 => 512,
         }
     }
 
-    const fn shared_bytes(self) -> usize {
+    /// The dynamic shared plan this variant's kernel is launched with.
+    pub const fn shared_bytes(self) -> usize {
         match self {
             Self::M256xN256 => SMALL_SHARED_BYTES,
             Self::M512xN256 => LARGE_SHARED_BYTES,
@@ -984,7 +1085,9 @@ pub fn bench(
     Ok(run(context, m, n, k, variant, false, crate::bench::time)?.1)
 }
 
-fn grid_for(shape: crate::bench::Shape, variant: Variant) -> u32 {
+/// One two-CTA cluster per output tile, in CTAs — `pub` for the ablation arms,
+/// which must launch the geometry they are decomposing and not another.
+pub fn grid_for(shape: crate::bench::Shape, variant: Variant) -> u32 {
     RANKS * (shape.m / variant.m_tile() * (shape.n / BLOCK_N)) as u32
 }
 

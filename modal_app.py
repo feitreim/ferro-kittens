@@ -626,6 +626,20 @@ def profile(kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192) -
     each holding everything constant but one thing — rather than by counters.
     That is a weaker instrument for attribution and a stronger one for cause.
 
+    **#138 re-derived this and closed the two obvious escapes.** On a fresh
+    B200 container at driver 580.95.05, `ncu` 2025.3.0 fails identically on a
+    four-line `nvcc` kernel that has nothing to do with this repo, so it is not
+    the codegen. `NVIDIA_DRIVER_CAPABILITIES=all` is *already in the container's
+    environment* and the injected set already includes the graphics libraries,
+    so the capability set is not the lever it looks like. And NVIDIA's own
+    component list for the 580 branch names exactly one `pcc` file — `nvidia-pcc`,
+    the VulkanSC pipeline cache compiler — and no performance-counter library at
+    all, so this is not something the runtime withheld from a package that has
+    it. `libnvperf_host.so` and `libnvperf_target.so` are both present and both
+    useless without it; `nsys` is not in the image, and it would trace rather
+    than count. The conclusion is the same and now has a floor under it: there
+    is no counter here, and an ablation is the instrument.
+
     Whenever the library does appear, this is one command. `--clock-control
     none` is deliberate: the default locks the clocks to base so that two runs
     compare, which also means the duration it reports is not the duration

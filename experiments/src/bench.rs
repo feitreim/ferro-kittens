@@ -1190,6 +1190,24 @@ pub fn main() -> ExitCode {
         };
     }
 
+    // `bench sol` is the ninth, and it is `ablation` asked of the other GEMM:
+    // #138's port is 0.795 of cuBLASLt at 4096³ and the PR names three suspects
+    // for it. It leads with the one that is arithmetic — one cluster per output
+    // tile over 74 resident clusters is a 0.865 ceiling at that shape before any
+    // cadence is measured — and then removes one phase at a time from the
+    // kernel's own device body to price the other three.
+    if let Some((name, _)) = &selected
+        && name == "sol"
+    {
+        return match crate::gemm_sol_ablate::decompose(&context) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     if let Some((name, _)) = &selected
         && !cases().iter().any(|case| case.name == name)
     {
