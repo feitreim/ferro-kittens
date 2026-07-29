@@ -3141,6 +3141,340 @@ around fails to buy. (`lcsf` also stops being reliably negative here where #107
 had it at zero — +1.0/+1.7 at 8192³ against that section's −0.2/−0.0 — which is
 inside both sections' spread and is not a reason to ship it.)
 
+##### and the item boundary was the epilogue, all of it — the ablation
+
+Every section above prices a *part* of this kernel with one of two instruments,
+and since #108 they have disagreed. The `gemm-depth` fit takes the intercept of
+ms against `K` and puts the item boundary at 8.6–18.3 µs a tile (#104); that
+intercept is everything not scaling with `K`, so it sees only what the pipeline
+is **exposed** to. `2x` and `2s` run a second epilogue inside an item and price
+it at 21.4 µs, split 13.1 stores and 8.3 LDTM — *more than the whole fitted
+boundary*, and it can only be, because a second epilogue has nothing in flight
+to hide behind and so measures the epilogue's **serial** cost.
+
+#109 read that gap as "most of the epilogue is already overlapped with
+something, and which part is exposed is the question this turns on". This asks
+it a third way — take a phase **out** of the shipped kernel and measure what the
+launch stops costing — and the answer is that **none of it is overlapped**.
+
+**The instrument is a cube, not a ladder.** An item has three phases — the
+operand traffic, the multiply, the epilogue — and a rung is any subset, so the
+corners of `{loads} × {mma} × {drain}` are the entry points and every edge is
+one phase's cost *in one context*. That matters because a ladder that peels
+phases off the end prices the epilogue in a kernel that still has its multiply,
+and the multiply in a kernel that has already lost its epilogue, and cannot say
+which of those attributions is the overlap. Pricing a phase at more than one
+corner separates **serial** from **exposed** without assuming either: if the
+epilogue costs the same with the multiply beside it and without, it is
+overlapped with nothing, whatever a fit says.
+
+Every rung launches on the shipped geometry — `[256, 256] @ STAGES = 3`, static
+schedule, `GROUP = 8`, 98 392 B, 2 CTAs an SM, the same grid and item count —
+and `M = N = 8192` throughout, so tiles, waves, `C` bytes and the wave's working
+set are identical everywhere and only the arithmetic between two boundaries
+moves. **Only `whole` computes a GEMM**; it is checked element-by-element before
+it is timed and the rest are `UNCHECKED` in their own labels, the same exception
+`hot`, `2x` and `2s` carry.
+
+**What says each rung measures what it names**, which is #101's standard, and
+the named hazard is that a deleted drain lets a compiler delete the MMA that fed
+it. An opcode census over `kittens_examples.ptx`, per entry function, is the
+direct check:
+
+| entry point | `tcgen05.mma` | `tcgen05.ld` | `cp.async.bulk.tensor` | `mbarrier.arrive` | `st.global` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `gemm_cg2` | 4 | 4 | 2 | 0 | 5 |
+| `gemm_cg2_no_drain` | **4** | **0** | 2 | 0 | **0** |
+| `gemm_cg2_no_mma` | **0** | 4 | 2 | 0 | 5 |
+| `gemm_cg2_loads` | 0 | 0 | 2 | 0 | 0 |
+| `gemm_cg2_dry` | 0 | 0 | **0** | **1** | 0 |
+| `gemm_cg2_idle` | 0 | 0 | 0 | 0 | 0 |
+
+`no drain` keeps all four chained MMA chunks and loses every LDTM, store and
+`cvt`; `no mma` is its mirror; `dry` is the only rung with a bare
+`mbarrier.arrive` and the only one with no TMA. Each removes exactly what it
+names. Three things corroborate without the PTX: the MMA's commit is what
+`done.wait` waits for, so deleting it gives a kernel that hangs rather than a
+fast one; `no drain` and `loads` differ only in the MMA and differ by 26 µs a
+tile; and `regcount` prices every entry point in the same run. The same table
+also reproduces #108's probes from a direction that section did not have — `2x`
+carries 8 LDTM and 10 stores, `2s` carries 4 and 10 — which is what those two
+claim to be.
+
+**1. The ladder.** Min ms over 30 timed launches, one B200, `M = N = 8192`:
+
+| rung | what it runs | K=512 | K=2048 | K=8192 | K=32768 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `whole` | loads + mma + drain | 0.2320 | 0.3308 | 0.7374 | 2.5725 |
+| `no drain` | loads + mma | 0.0699 | 0.1494 | **0.5944** | 2.3895 |
+| `no mma` | loads + drain | 0.2832 | 0.2743 | 0.5564 | 1.8228 |
+| `loads` | loads | 0.0429 | 0.1079 | 0.4122 | 1.7011 |
+| `dry` | barriers only | 0.0232 | 0.0523 | 0.1680 | 0.6306 |
+| `idle` | an empty item | 0.0123 | 0.0122 | 0.0122 | 0.0122 |
+
+A second session, run in its own container on the four rungs it reached before
+it was stopped, reproduces every one of them: 0.7417 / 0.6001 / 0.5596 / 0.4169
+at `K = 8192` against 0.7374 / 0.5944 / 0.5564 / 0.4122 — **within 1% on all
+four**, which is what makes the ratio below a measurement rather than a session.
+
+**2. Every phase, in microseconds per output tile on the critical path**, as
+what the launch stops paying when the phase goes:
+
+| edge | K=512 | K=2048 | K=8192 | K=32768 |
+| --- | ---: | ---: | ---: | ---: |
+| the epilogue, with the mma | 23.15 | 25.91 | **20.43** | 26.14 |
+| the epilogue, without it | 34.33 | 23.78 | **20.59** | 17.39 |
+| the mma, with the epilogue | −7.32 | 8.06 | 25.87 | 107.09 |
+| the mma, without it | 3.86 | 5.93 | 26.03 | 98.35 |
+| the operand traffic, no mma | 2.81 | 7.94 | 34.88 | 152.93 |
+| the barrier protocol | 1.57 | 5.74 | 22.27 | 88.34 |
+| the floor — an empty item | 1.75 | 1.74 | 1.74 | 1.74 |
+
+As a share of the launch each was taken out of, at `K = 8192`: the epilogue is
+**19.4%**, the multiply 24.6%, the traffic 33.1%.
+
+**3. The epilogue, with the multiply beside it and without it** — the pair the
+whole design exists to produce, since if the epilogue were serial in the shipped
+kernel the two would differ by whatever the multiply was covering:
+
+| shape | with the mma, µs | without it, µs | ratio | hidden |
+| --- | ---: | ---: | ---: | ---: |
+| 8192x8192x512 | 23.15 | 34.33 | 1.48× | 33% |
+| 8192x8192x2048 | 25.91 | 23.78 | 0.92× | −9% |
+| **8192x8192x8192** | **20.43** | **20.59** | **1.01×** | **1%** |
+| 8192x8192x32768 | 26.14 | 17.39 | 0.67× | −50% |
+
+**At the benchmark's own shape the epilogue costs the same whether the multiply
+is there or not, to 1%** — and the same as #108's `2x` measured *serially*
+(21.4 µs), by a route sharing none of this one's arithmetic. Three numbers for
+one quantity, two of them designed to differ, and they agree.
+
+The two ends of that table are not noise and are worth reading. At `K = 512` the
+epilogue is 70% of the launch and removing the multiply makes it *dearer*: with
+no arithmetic to space them, 148 clusters run their epilogues at once and
+contend. At `K = 32768` it goes the other way, and the honest reading is that
+`whole − no drain` at a deep reduction is picking up an L2 term the two rungs do
+not share rather than a hiding term — the operand footprint is 1 GiB there and
+`no drain` streams it with nothing else in the kernel. **The 8192³ row is the
+one to hold, and it is the row every other table in this file is quoted at.**
+
+**4. A fit per rung, which is the decomposition of the fixed cost itself.**
+Least squares on raw minimum ms against `K`, all three point selections, the
+intercept over the 7 items a critical-path cluster walks:
+
+| rung | 2-point | 3-point | all four | steady TFLOP/s |
+| --- | ---: | ---: | ---: | ---: |
+| `whole` | 18.0 µs | 22.9 | 25.0 | 1798 – 1840 |
+| **`no drain`** | **−0.6 µs** | **−0.2** | **1.8** | 1838 – 1853 |
+| `no mma` | 19.2 µs | 22.5 | 28.4 | — |
+| `loads` | −2.5 µs | −0.8 | 0.5 | — |
+| `dry` | 2.0 µs | 2.0 | 2.0 | — |
+| `idle` | 1.7 µs | 1.7 | 1.7 | — |
+
+**The `whole` row is `gemm-depth` re-fitted on the bf16 kernel, and it is
+18.0–25.0 µs a tile** against #104's 21.5–27.2 on the fp32 one — the re-measure
+#109 asked for, and it moves the boundary down by about 2 µs and not more.
+
+**The `no drain` row is the finding.** A kernel with no epilogue has **no fixed
+per-tile cost at all**, at every point selection, and its steady state is the
+whole kernel's. Differencing the fits along the cube's edges says the same thing
+from the other side: the epilogue carries 18.5–23.1 µs a tile of *fixed* cost —
+all of it — while the multiply carries −1.2 to +0.5 and the traffic −4.5 to
+−1.4, which are zeros with the fit's own noise on them.
+
+**Three findings, and the first retires a decomposition this file has carried
+since #86.**
+
+**1. The item boundary is the epilogue, and the rest of it is free.** #90
+described the boundary structurally — *"`done.wait`, then `sync_threads`, then
+LDTM … then `store_rows`. Only then does `pipeline::run` re-arm the barriers and
+the next item issue its first TMA loads, and only then, a full memory latency
+later, can the MMA start. Nothing in that chain overlaps with anything."* That
+names the right members and gets the weights wrong. Delete the LDTM and the
+stores, leave every barrier, boundary and refill exactly where it was, and the
+intercept goes to zero. **The barrier re-arm, the two cluster boundaries and the
+pipeline refill are all inside the `K`-proportional term** — which is another
+way of saying the neighbouring CTA covers them, #98's mechanism seen from a
+third direction. The boundary is not a chain of five things to shave one at a
+time. It is one thing.
+
+**2. It is exposed, not hidden, and that reconciles #108 against #104 by
+making #104 the broken instrument.** #109's reading — the epilogue is *partly*
+overlapped and the fit sees its residue — is refuted. Nothing overlaps it, and
+the fitted intercept was never a residue: it was the epilogue, attributed to a
+"boundary" whose four other members cost nothing.
+
+**3. Which makes `stmatrix`'s ceiling real rather than an overestimate, and
+that was the question #109 left open.** That section bounds the route at half
+the `stores` column and none of the `LDTM` one — 6.6 µs a tile at 8192³, 6.2% of
+the launch — and adds *"if the store half is mostly hidden rather than exposed,
+6.2% is an overestimate, and saying so is worth more than the ladder's
+headline"*. **It is not hidden.** The epilogue is exposed at 1.01×, so its store
+half is exposed too and 6.2% stands. That does not make it a good trade — it is
+still an upper bound with four serialized TMA round trips to buy it out of — it
+removes the one way it could have been a bad one for free.
+
+**And what it says about the target, which is why this was run.** The framing
+this work was set against: the fitted steady state is 1826–1862 TFLOP/s,
+cuBLASLt at 16384³ measures 1851, and those being the same number means the
+asymptotic rate already matches, so parity is a matter of driving the fixed
+per-tile cost to zero. **The asymptote is not an artifact of point selection,
+and there is now a version of it that needs no fit at all.** `no drain` *is* the
+kernel with its fixed cost driven to zero, and it does not need a line drawn
+through it:
+
+| | ours, `whole` | ours, `no drain` | cuBLASLt |
+| --- | ---: | ---: | ---: |
+| 8192³, min ms | 0.7374 | **0.5944** | 0.6082 |
+| 8192³, TFLOP/s | 1491 | **1850** | 1808 |
+| `K = 32768`, TFLOP/s | 1710 | **1841** | — |
+| % of dense bf16 peak | 66% | **82%** | 80% |
+
+**The kernel with its epilogue removed is 2.3% faster than cuBLASLt's whole
+kernel**, measured in the same container minutes apart, flat across a 4× change
+in reduction depth, with no extrapolation. The fitted asymptote (1798–1840) and
+the measured rung (1841–1850) agree, which is what says the fit was reading a
+real ceiling and not a point selection.
+
+**So the gap to cuBLASLt at 8192³ is the epilogue, quantitatively.** Ours is
+0.7374 ms, theirs 0.6082, and the epilogue is 0.1430 — **111% of the entire
+distance between us**. That is not a proposal to delete it: cuBLASLt writes its
+`C` too, so the honest statement is that **the whole of the remaining distance
+is the difference between our epilogue and theirs**, and ours costs at least as
+much as the gap. Every other term this file has ranked — the traversal (#102,
+spent), the tile (#87, spent), the scheduler (#97, ~1%), the store placement
+(#107, zero), the epilogue's bytes (#107, ≤1.2%) — lives inside the part of the
+kernel that already runs faster than the library does.
+
+**What this cannot show, and one of them is a hole rather than a caveat.**
+Three corners of the cube are not built: **every rung that runs the epilogue
+with the operand loads switched off fails to return.** Two were launched at
+8192x8192x512, produced nothing, and were stopped by hand; their neighbours run
+(`dry` is loads-off drain-off and finishes in 23 µs, `no mma` is loads-on
+drain-on and finishes at every depth), so the property is `loads = 0` and
+`drain = 1` in both MMA states. The first explanation offered for it — an MMA
+against never-written shared memory — is refuted by the second hang, which
+issues no MMA. **What hangs is not established**, and `Ablation::at` in
+`examples/src/gemm.rs` carries the observation rather than a mechanism. What it
+costs: the epilogue keeps both contexts the question turns on, so nothing above
+depends on the missing corners, but **the operand traffic's exposed cost is not
+measured here** — its 33.1% is taken in a kernel with no arithmetic to hide it
+and is a serial number. That is the one row of table 2 that should not be
+ranked against the others.
+
+The decomposition is also **context-dependent** by construction: an edge
+attributes to its phase everything the launch stops paying, including whatever
+that phase made other work wait for. That is why each phase is priced at more
+than one corner and the numbers are printed rather than averaged. And no rung
+separates the epilogue's LDTM from its stores — #108's `2s` is what does that,
+and this sweep deliberately does not duplicate it.
+
+**Registers and residency.** `ptxas -v` through `modal_app.py::regcount`:
+`gemm_cg2` is **166 registers, 0 spill, 528 B frame — byte-identical to
+#109's**, across two structural refactors (the phases became const parameters,
+and so did `BLOCK_K`), which is the check that the shipped kernel did not move.
+The rungs without an epilogue are **20–28 registers on a zero frame**, so the
+epilogue is the whole of both — the eighth time in this file the register column
+has been unable to order the times, since residency is tensor-memory-bound at
+two CTAs an SM whatever the count. Residency is unchanged and uncounted for the
+same reason #108 gives: no accumulator column and no byte of the shared plan
+moved, so #87's census row carries by identity.
+
+##### and `BLOCK_K`, which is not a free axis and was already right
+
+`BLOCK_K` was 64 from this file's first commit and no issue had moved it. Two
+facts about it turned up before a single rung was built, and both are worth more
+than the sweep:
+
+**It cannot be swept as a walk width.** `SharedTile::k_walk` carries
+`const { assert!(C * E::BYTES == S::ATOM_BYTES) }` — *"a linear K-major walk
+needs K to span exactly one swizzle atom"* — and `Swizzle128B` is the only mode
+in tree, so **64 is what a walk *is*** at bf16. A stage that wants more K holds
+several atoms and walks each in turn, which is what `Tile::multiply` does now
+(`SharedTile::subtile` and `from_raw` were both already public, so this needed
+nothing from `src/`), and the descriptor never sees it: a tensor map's box is
+`[R, SUBTILE_COLS]` whatever the tile's `C`, so `BLOCK_K` does not reach it.
+Going *down* is closed outright — a 32-wide stage needs a `Swizzle64B` that does
+not exist.
+
+**And it does not move arithmetic intensity.** A tile reads `(M + N) · K` bytes
+to do `2 · M · N · K` flops however K is blocked, so the mechanism #87 found —
+the whole of what the pair tile was worth — is not on this axis at all. What
+`BLOCK_K` moves is the number of stage barriers, `expect_tx` charges and loop
+iterations an item pays, and how coarsely the ring recycles.
+
+**Which makes the sweep a factorization of a fixed budget rather than an axis.**
+A stage is `512 · BLOCK_K` bytes at this pair tile, so two CTAs an SM cap
+`BLOCK_K · STAGES` at 228 and **every extra atom in a stage is a stage given
+back**. `[256, 256] @ k128 s2` — the shipped kernel's 192 K in flight arriving as
+two barriers instead of three — is 131 144 B, one CTA an SM, and #98's cliff:
+computed, not built.
+
+So the rungs that matter are the ones holding the bytes fixed. Min ms over 30
+timed launches, static schedule, `GROUP = 8`, every row checked against the CPU
+reference first, `vs #102` against `[256, 128] k64 s3`:
+
+| rung | K in flight | shared B | CTA/SM | 8192³ TFLOP/s | 16384³ TFLOP/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `[256,256] k64 s1` | 64 | 32 824 | 2 | 821.3 | 894.1 |
+| **`[256,256] k128 s1`** | **128** | **65 592** | 2 | **1135.1** | **1273.0** |
+| **`[256,256] k64 s2`** | **128** | **65 608** | 2 | **1326.4** | **1527.0** |
+| `[256,256] k64 s3` — shipped | 192 | 98 392 | 2 | **1479.5** | **1642.7** |
+| `[256,256] k128 s2` | 256 | 131 144 | 1 | *not built* | *not built* |
+
+**The predictions, written into the source before the rungs ran, and two of the
+four are wrong.**
+
+1. `k64 s1` is a catastrophe — predicted −35% to −55% against the shipped
+   kernel. **Confirmed: −44.5% and −45.6%.** One stage is no pipeline.
+2. `k128 s1` loses to `k64 s2` at equal bytes, by most of what the load/MMA
+   overlap is worth — predicted −20% to −45%. **Refuted in magnitude: −14.4%
+   and −16.6%**, the right sign and half the size.
+3. `k128 s1` beats `k64 s1` — *this is the `BLOCK_K` measurement*, at fixed
+   depth — predicted +5% to +20% from a halved per-K-block fixed cost.
+   **Refuted upward, and it is the informative one: +38.2% and +42.4%.**
+4. Nothing beats the shipped kernel. **Confirmed**, and by a lot.
+
+**The prediction that was wrong is wrong about the mechanism, and that is the
+finding.** +38% is far too large to be barrier issue cost — the `dry` rung of the
+ablation above prices the *entire* barrier protocol, walked once per K block, at
+22 µs a tile against a 105 µs launch, and halving the count of those cannot buy
+38%. What doubling `BLOCK_K` at one stage actually halves is **the number of
+times the pipeline is exposed to a load latency**: at `STAGES = 1` the producer
+cannot refill until the MMA has released the one buffer, so every K block pays a
+full round trip, and a block twice as wide amortizes that same round trip over
+twice the arithmetic. `BLOCK_K` is not a fixed-cost lever at all. It is a
+latency-amortization lever, and it competes for the same bytes as the pipeline
+depth that is a better one.
+
+**Which is the design rule the sweep bought, and it is the pair at 65 KiB that
+states it.** `k128 s1` and `k64 s2` are 16 bytes apart in shared memory, at
+identical residency, identical tiles, waves, wave reuse and K in flight, and
+differ in exactly one thing: one barrier over two atoms against two barriers
+over one atom each. **Two shallow stages beat one deep one by 14–17%.** At a
+fixed shared budget, spend it on stages and not on stage width — which is why
+`BLOCK_K = 64`, the narrowest a walk admits, is the right value here rather than
+merely the inherited one. **`BLOCK_K` is swept and the answer is that it was
+already right**, for a reason nobody in this file had stated.
+
+**It costs 78 registers and they decide nothing.** `ptxas -v` reads **246 for
+`gemm_256x256_k128_s1` against 168 for `gemm_256x256_k64_s1`**, zero spill
+either way, and the wider one is 38% *faster*; residency is tensor-memory-bound
+at two CTAs an SM at both, so the count cannot cost a CTA. Eighth time in this
+file (#47, #63, #67, #76, #94, #100, #109).
+
+**The traversal, re-swept because a new rung is a new item map**, and `GROUP` is
+unmoved: at the shipped rung 1450.3 / 1454.2 / **1484.3** / 1482.4 TFLOP/s at
+widths 1 / 4 / 8 / 16. Eight and sixteen are 0.1% apart, exactly as #87 found.
+
+**And the denominator, same device, same container, minutes apart:** cuBLASLt
+1786.9 TFLOP/s at 8192³ and 1864.0 at 16384³, putting the shipped kernel at
+**0.828 and 0.881** — reproducing #108's 0.812–0.825 and 0.851–0.872 at the top
+of their bands, which is the control saying the container is not the story.
+Nothing in this section moves the shipped kernel: it is the same 166 registers,
+the same 98 392 B plan and the same two CTAs an SM, and the two new entry points
+are rungs beside it.
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all
