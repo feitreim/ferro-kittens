@@ -34,6 +34,10 @@ Local usage:
                                       # gemm's epilogue SHAPE: a register drain
                                       # against one staged through shared
                                       # memory by stmatrix (#15)
+    modal run modal_app.py::bench --case widths
+                                      # gemm's epilogue INSTRUCTION WIDTHS:
+                                      # .x8 LDTM and stmatrix .x4 on the staged
+                                      # epilogue, ablated and composed (#117)
     modal run modal_app.py::profile   # one launch under Nsight Compute (see
                                       # the note there: no counters on Modal)
     modal run modal_app.py::doctor    # env / GPU sanity check

@@ -101,6 +101,87 @@ pub unsafe fn store_fragment<E: Element<Unpacked = [f32; 2]>>(
     }
 }
 
+/// [`store_fragment`]'s four matrices in one instruction, rather than two
+/// `.x2`s a slot apart.
+///
+/// A fragment is exactly four `8x8` b16 matrices — two slots by the two
+/// 8-column halves — which is the shape `stmatrix.m8n8.x4` takes. The `.x2`
+/// form has to be issued per slot because it names two matrices and a
+/// fragment's are four; that is the only reason [`store_fragment`] loops at
+/// all, so naming all four at once removes the loop rather than unrolling it.
+///
+/// **The addressing is [`fragment_address`] with one substitution and no new
+/// derivation.** `.x2` takes its 16 addresses from lanes 0..15 and is issued
+/// twice, once per slot; `.x4` takes 32 from all lanes, eight per matrix, and
+/// its four matrices are the two slots' two halves in that order. So lane `l`
+/// supplies what lane `l % 16` supplied for slot `l / 16` — the identity
+/// `stmatrix_x4_addresses_are_the_x2_addresses_restacked` pins. A second
+/// address derivation for the wider instruction is exactly the thing that
+/// could drift from the load side, and there isn't one.
+///
+/// # Safety
+///
+/// As [`store_fragment`]: all 32 lanes of the warp owning TMEM rows
+/// `row..row+16` must call this together, `chunks` must belong to a tile at
+/// least `row + 16` rows tall into which `column + 16` fits, and the caller
+/// owes a `fence.proxy.async.shared::cta` before any MMA reads the tile.
+#[inline(always)]
+pub unsafe fn store_fragment_x4<E: Element<Unpacked = [f32; 2]>>(
+    chunks: SwizzledChunks<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+    fragment: Fragment,
+) {
+    unsafe {
+        let (address_row, chunk) = fragment_address(row, column, lane % 16, (lane / 16) as usize);
+        stmatrix_m8n8_x4(
+            chunks.at(address_row, chunk),
+            E::pack([fragment.get(0, 0), fragment.get(0, 1)]),
+            E::pack([fragment.get(0, 2), fragment.get(0, 3)]),
+            E::pack([fragment.get(1, 0), fragment.get(1, 1)]),
+            E::pack([fragment.get(1, 2), fragment.get(1, 3)]),
+        );
+    }
+}
+
+/// [`store_tile`] over [`store_fragment_x4`] — the same band, at one
+/// `stmatrix` per `[16, 16]` block instead of two.
+///
+/// # Safety
+///
+/// As [`store_fragment_x4`], for every block of the band — including the
+/// `fence.proxy.async.shared::cta` the caller owes before any MMA or TMA reads
+/// the tile.
+#[inline(always)]
+pub unsafe fn store_tile_x4<E: Element<Unpacked = [f32; 2]>, const M: usize, const N: usize>(
+    chunks: SwizzledChunks<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+    tile: RegTile<M, N, BaseLdtm>,
+) where
+    BaseLdtm: FragmentLayout<M, N>,
+{
+    unsafe {
+        let mut row_block = 0usize;
+        while row_block < M / 16 {
+            let mut column_block = 0usize;
+            while column_block < N / 16 {
+                store_fragment_x4(
+                    chunks,
+                    row + 16 * row_block as u32,
+                    column + 16 * column_block as u32,
+                    lane,
+                    take_block(&tile, row_block, column_block),
+                );
+                column_block += 1;
+            }
+            row_block += 1;
+        }
+    }
+}
+
 /// Read a `[16, 16]` block at `(row, column)` of a swizzled tile into one
 /// thread's [`Fragment`] — the inverse of [`store_fragment`], and the
 /// way a kernel whose input is not an MMA operand gets its data into registers
@@ -320,6 +401,31 @@ pub unsafe fn stmatrix_m8n8_x2(smem_ptr: *mut u8, r0: u32, r1: u32) {
     }
 }
 
+/// [`stmatrix_m8n8_x2`]'s four-matrix form, through the same `ptx_asm!`
+/// workaround and for the same reason: cuda-oxide `b099f64` ships
+/// `stmatrix_m8n8_x4` in `generated/stmatrix.rs`, and its LLVM declaration
+/// does not resolve for `sm_100a` any more than the `.x2` one does.
+///
+/// # Safety
+///
+/// `smem_ptr` must be a 16-byte-aligned shared-memory address with 16 bytes
+/// writable at each of the 32 lanes' addresses, and all 32 lanes of the warp
+/// must call this together.
+#[inline(always)]
+pub unsafe fn stmatrix_m8n8_x4(smem_ptr: *mut u8, r0: u32, r1: u32, r2: u32, r3: u32) {
+    unsafe {
+        ptx_asm!(
+            "{ .reg .u64 smem; cvta.to.shared.u64 smem, %0; stmatrix.sync.aligned.m8n8.x4.shared.b16 [smem], {%1, %2, %3, %4}; }",
+            in("l") smem_ptr as u64,
+            in("r") r0,
+            in("r") r1,
+            in("r") r2,
+            in("r") r3,
+            clobber("memory"),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +483,55 @@ mod tests {
                 assert_eq!(owned(1) as usize / 8, low);
                 assert_eq!(owned(2) as usize / 8, high);
                 assert_eq!(owned(3) as usize / 8, high);
+            }
+        }
+    }
+
+    /// The `.x4`'s 32 addresses are the `.x2`'s two sets of 16, stacked in
+    /// slot order — which is the whole of why [`store_fragment_x4`] needs no
+    /// address derivation of its own, and the thing that would have to break
+    /// for the wide store to disagree with the narrow one.
+    #[test]
+    fn stmatrix_x4_addresses_are_the_x2_addresses_restacked() {
+        for row in [0u32, 16, 48] {
+            for column in [0u32, 16, 32, 48] {
+                for lane in 0..32u32 {
+                    // Eight lanes per matrix, four matrices: the lane's group
+                    // picks the slot and the half, its position in the group
+                    // the row.
+                    let (address_row, chunk) =
+                        fragment_address(row, column, lane % 16, (lane / 16) as usize);
+                    assert_eq!(
+                        address_row,
+                        row as usize + 8 * (lane / 16) as usize + (lane % 8) as usize,
+                        "lane {lane}"
+                    );
+                    assert_eq!(
+                        chunk,
+                        (column / 8) as usize + ((lane % 16) / 8) as usize,
+                        "lane {lane}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The four matrices of one `.x4` are exactly the four the two `.x2`s
+    /// wrote, one lane group each: nothing is dropped and nothing is written
+    /// twice.
+    #[test]
+    fn the_x4_covers_both_slots_of_both_halves() {
+        for row in [0u32, 32] {
+            for column in [0u32, 16] {
+                let wide: Vec<_> = (0..32)
+                    .map(|lane| fragment_address(row, column, lane % 16, (lane / 16) as usize))
+                    .collect();
+                let narrow: Vec<_> = (0..Fragment::SLOTS)
+                    .flat_map(|slot| {
+                        (0..16).map(move |lane| fragment_address(row, column, lane, slot))
+                    })
+                    .collect();
+                assert_eq!(wide, narrow, "row {row} column {column}");
             }
         }
     }

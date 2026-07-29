@@ -870,6 +870,24 @@ pub fn main() -> ExitCode {
         };
     }
 
+    // `bench widths` is the sixth, and the only one whose four arms declare
+    // the *same* shared plan: #117's instruction widths on the staged
+    // epilogue's two halves — `.x8` LDTM and `stmatrix.x4` — separately and
+    // composed, against `staged` as the control. It is its own sweep rather
+    // than more columns of `staged` because the control is different: that
+    // one's baseline is the register drain, this one's is #116's result.
+    if let Some((name, _)) = &selected
+        && name == "widths"
+    {
+        return match gemm::widths_sweep(&context, CUBLASLT) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // `bench ablation` is the fourth, and the one that decomposes rather than
     // sweeps: the same size sweep `gemm-depth` runs, with one phase of the
     // item removed per rung and everything else held at the shipped kernel's.

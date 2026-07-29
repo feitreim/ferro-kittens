@@ -1438,6 +1438,70 @@ pub mod kernels {
         }
     }
 
+    /// [`sttm_roundtrip`] draining through `tcgen05.ld.16x256b.x8` instead of
+    /// `.x1` — the case that pins **the order the wide load's 32 registers
+    /// arrive in** (#117).
+    ///
+    /// `TmemTile::tile_x8` gets four `[16, 16]` blocks out of one instruction
+    /// by asserting the register list is *repeat-major*: repeat `r` of the
+    /// `.x8` is what a `.x1` at `column + 8r` would have returned, so block `j`
+    /// is repeats `2j` and `2j + 1`. **No document at this pin says that.**
+    /// `intrinsics/generated-reference.md` validates the encoding and the
+    /// register *count*; the mapping from those 32 registers to `(row, column)`
+    /// is silicon's, and upstream's own evidence table marks the intrinsic
+    /// `runtime: unexecuted`.
+    ///
+    /// So this is the assertion. The seed and the dump are byte-for-byte
+    /// [`sttm_roundtrip`]'s — the same `dump_index` in, the same
+    /// `observed[i] == i` out — and the *only* thing that differs is which
+    /// drain reads it back. A wide load whose registers arrive in any other
+    /// order returns a permutation, and the host names both the coordinate that
+    /// should own each value and the one that actually wrote it.
+    ///
+    /// It is a composition, like the case above: `sttm round trip` pins `.x1`
+    /// against the store, and this pins `.x8` against the same store, so the
+    /// two together say the wide and narrow drains agree. Neither faults if it
+    /// is wrong — a `gemm` would simply compute a wrong `C` — which is why the
+    /// claim is worth a case rather than a comment.
+    ///
+    /// Launch with `ROWS` threads, as [`sttm_roundtrip`].
+    #[kernel]
+    pub unsafe fn ldtm_x8_map(mut out: DisjointSlice<f32>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tmem = alloc_block(smem as *mut u32, COLUMNS as u32);
+            let band = Accumulator::from_raw(tmem);
+            let warp_id = warp::warp_id();
+            let lane = warp::lane_id();
+
+            let mut tile = RegTile::<32, COLUMNS, BaseLdtm>::zero();
+            let slots = RegTile::<32, COLUMNS, BaseLdtm>::SLOTS;
+            let values = RegTile::<32, COLUMNS, BaseLdtm>::VALUES;
+            let mut slot = 0usize;
+            while slot < slots {
+                let mut value = 0usize;
+                while value < values {
+                    let index = dump_index(warp_id as usize, lane, slot, value, slots, values);
+                    tile.set(slot, value, index as f32);
+                    value += 1;
+                }
+                slot += 1;
+            }
+
+            band.store_tile(32 * warp_id, 0, tile);
+            store_wait();
+            dump_band(
+                band.tile_x8::<32, COLUMNS>(32 * warp_id, 0),
+                warp_id,
+                lane,
+                &mut out,
+            );
+
+            thread::sync_threads();
+            dealloc_block(tmem, COLUMNS as u32);
+        }
+    }
+
     /// One CTA's whole TMEM lifecycle, over a grid that does not fit in one
     /// wave and a process that launches it more than once.
     ///
@@ -4632,24 +4696,27 @@ fn check_ldmatrix<const R: usize, const C: usize>(
 /// is `observed[i] == i` and a mismatch names both the thread coordinate that
 /// should own the value and the one that actually wrote it.
 ///
-/// This establishes that `TmemTile::store_tile` is the exact inverse of
-/// `TmemTile::tile` — no more. A store and a load agreeing on the *wrong* lane
-/// map would pass identically; it is the `fragment map` cases that fix LDTM's
-/// map against silicon, and `sttm restage` that checks the store's column
-/// arithmetic against a value it did not compute.
+/// This establishes that `TmemTile::store_tile` is the exact inverse of the
+/// drain it is taken through — no more. A store and a load agreeing on the
+/// *wrong* lane map would pass identically; it is the `fragment map` cases
+/// that fix LDTM's map against silicon, and `sttm restage` that checks the
+/// store's column arithmetic against a value it did not compute.
+///
+/// Two cases ride it. `sttm round trip` reads back through `TmemTile::tile`
+/// (`.x1`) and `ldtm x8 map` through `TmemTile::tile_x8` (`.x8`), so the pair
+/// says the wide drain returns what the narrow one does — which is the whole
+/// of #117's register-order claim, and a claim no document at the pinned
+/// cuda-oxide revision makes.
+/// `drain` is which read-back the round trip is being taken through, so the
+/// `.x1` and `.x8` cases are one derivation with the kernel swapped and cannot
+/// drift into checking two different things.
 fn check_sttm_roundtrip(
     stream: &CudaStream,
-    module: &kernels::LoadedModule,
+    drain: impl Fn(LaunchConfig, &mut DeviceBuffer<f32>) -> Result<(), cuda_core::DriverError>,
 ) -> Result<String, Box<dyn Error>> {
     let (slots, values) = (RegTile::<32, COLUMNS, BaseLdtm>::SLOTS, COLUMNS / 4);
     let mut out = DeviceBuffer::<f32>::zeroed(stream, ROWS * slots * values)?;
-    unsafe {
-        module.sttm_roundtrip(
-            stream,
-            launch_config(ROWS as u32, STTM_SHARED as u32),
-            &mut out,
-        )?
-    };
+    drain(launch_config(ROWS as u32, STTM_SHARED as u32), &mut out)?;
     let observed = out.to_host_vec(stream)?;
 
     let coordinate = |index: usize| {
@@ -5600,7 +5667,23 @@ fn run() -> Result<usize, Box<dyn Error>> {
     ));
     cases.push((
         "sttm round trip",
-        Box::new(|| check_sttm_roundtrip(stream, module)),
+        Box::new(|| {
+            check_sttm_roundtrip(stream, |config, out| unsafe {
+                module.sttm_roundtrip(stream, config, out)
+            })
+        }),
+    ));
+    // The same round trip read back through `tcgen05.ld.16x256b.x8` (#117).
+    // It goes here rather than beside the `fragment map` cases because it is
+    // the case above with one line changed, and the pair is what says the wide
+    // drain and the narrow one agree.
+    cases.push((
+        "ldtm x8 map",
+        Box::new(|| {
+            check_sttm_roundtrip(stream, |config, out| unsafe {
+                module.ldtm_x8_map(stream, config, out)
+            })
+        }),
     ));
     cases.push((
         "reduction shuffles",

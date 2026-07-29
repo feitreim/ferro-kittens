@@ -3637,6 +3637,153 @@ the whole of §7 quotable against one shipped kernel. On this evidence it is the
 rung to ship, at both entry points, and that is a change worth making on its own
 rather than folded into the measurement that motivates it.
 
+##### and the LDTM half, which was the wait and not the issue — #117
+
+#116 cut the store half by ~20% and left the load half exactly as it found it,
+which made it the largest identified lever with the epilogue still ~100% of the
+gap to the library. Three levers were scoped. **One of them does not exist, one
+of them is worth nothing, and one of them is worth more than anything measured
+in this file since the port.**
+
+**`.pack::16b` is not a lever, and the pin says so before any device time is
+spent on it.** The scoping read it as folding the fp32→bf16 convert into the
+load — eliminating the `cvt` and halving the registers reaching `stmatrix`. At
+`b099f64c1a32869b74be99f4f88242fb68655b51`, `intrinsics/abi-v1.toml` gives
+`tcgen05_ld_16x256b_x8_pack16` the result type `[u32; 32]`, **the same 32
+registers as `_x8_raw`**, and `intrinsics/generated-reference.md` validates it
+as `tcgen05.ld.sync.aligned.16x256b.x8.pack::16b.b32 <register-list:32>`. The
+count does not fall, so nothing is being packed two-into-one for the same span.
+`.pack::16b` is the load-side twin of `tcgen05.st`'s `.unpack::16b` — it moves
+**16-bit-typed** tensor memory, pairing adjacent columns' half-words. Against an
+fp32 accumulator it is not a rounding mode, it is the wrong instruction. No rung
+was built and no GPU time was spent. (And the rounding question it was flagged
+for is moot twice over: `check_c` compares bf16 words with `==` and **no
+tolerance at all**, so a lever that cost a mantissa bit fails the gate rather
+than passing a loose one.)
+
+**The `.x8` hazard is stale history, not a live warning.**
+`crates/cuda-device/src/tcgen05.rs` says `tcgen05_ld_16x256b_x4/x8/x16/x32` were
+removed as broken — "stored to SMEM instead of returning registers" — while
+`generated/tcgen05.rs` exposes `_x4_raw`, `_x8_raw`, `_x16_raw`, `_x32_raw` at
+every shape. The removed intrinsics took a shared-memory *pointer*; every
+generated variant at this pin is `status = "active"` with an array **result**,
+and `_x8_pure` and `_x8_raw` share one LLVM intrinsic
+(`llvm.nvvm.tcgen05.ld.16x256b.x8`) and one validated encoding. Checked against
+the checkout at `b099f64`, `git rev-parse HEAD` confirmed — not against the
+stale `4514af2` in the same cargo directory.
+
+**What no document settles is the register *order*, and that got a case.**
+`TmemTile::tile_x8` gets four `[16, 16]` blocks out of one instruction by
+asserting the list is repeat-major — repeat `r` is what a `.x1` at `column + 8r`
+would have returned. Upstream's own evidence table marks the intrinsic
+`runtime: unexecuted`. `device-tests`' **`ldtm x8 map`** is the assertion: it is
+`sttm round trip` with one line changed, same seed in, same `observed[i] == i`
+out, so a wide load whose registers arrive in any other order returns a
+permutation and the host names both the coordinate that should own each value
+and the one that wrote it. It passes on a B200 — `16384 registers survived TMEM
+unchanged`, the same line and the same count as the `.x1` case beside it — and
+39 of 39 device cases pass. **Repeat-major is what the silicon does**, and it is
+now a standing check rather than an inference.
+
+**Counted in the PTX, and the two levers land exactly where they were aimed.**
+Every other column is identical across all four rungs — the global half is
+untouched, which is what makes this an ablation of the *other* half rather than
+a second pass at #116's.
+
+| kernel | ldtm | stmatrix | mma | tma | ld.sh.v4 | st.g.v4 | st.g.b32 | cvt.bf16x2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `gemm_cg2_staged` | 8 | 4 | 4 | 2 | 1 | 1 | 4 | 8 |
+| `gemm_cg2_staged_x8` | **2** | 4 | 4 | 2 | 1 | 1 | 4 | 8 |
+| `gemm_cg2_staged_x4` | 8 | **2** | 4 | 2 | 1 | 1 | 4 | 8 |
+| `gemm_cg2_staged_x8x4` | **2** | **2** | 4 | 2 | 1 | 1 | 4 | 8 |
+
+**Min ms over 30 timed launches, static schedule, `GROUP = 8`, one container.
+All four rows declare the same 114 816 B — unlike #116's A/B, which had a 16 424
+byte envelope change to price first — so one `no drain` control serves all four
+and there is no envelope table here. Every row computes the GEMM and was checked
+element-by-element before it was timed.**
+
+| shape | `staged` ms | `staged8` ms | `staged4` ms | `staged84` ms | `8` vs | `4` vs | `84` vs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4096³ | 0.1283 | **0.1038** | 0.1291 | 0.1043 | **+23.6%** | −0.6% | +23.1% |
+| 8192³ | 0.7164 | 0.6599 | 0.7186 | **0.6585** | +8.6% | −0.3% | **+8.8%** |
+| 16384³ | 5.3677 | 5.1804 | 5.4263 | **5.1061** | +3.6% | −1.1% | **+5.1%** |
+
+| shape | `staged` TF/s | `staged8` TF/s | `staged4` TF/s | `staged84` TF/s |
+| --- | ---: | ---: | ---: | ---: |
+| 4096³ | 1071.3 | **1324.4** | 1064.7 | 1318.3 |
+| 8192³ | 1534.8 | 1666.2 | 1530.1 | **1669.8** |
+| 16384³ | 1638.7 | 1697.9 | 1621.0 | **1722.7** |
+
+**And the epilogue itself, by #114's subtraction, which is the measurement this
+is really about.**
+
+| shape | `staged` µs/tile | `staged8` µs/tile | `staged4` µs/tile | `staged84` µs/tile | best |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4096³ | 21.18 | 8.93 | 21.58 | 9.17 | **−57.9%** |
+| 8192³ | 14.96 | 6.89 | 15.27 | 6.68 | **−55.3%** |
+| 16384³ | 15.15 | 8.47 | 17.25 | 5.81 | **−61.7%** |
+
+**#109's split is confirmed by an independent route, four issues later.** #109
+put the epilogue at 13.1 µs of stores against 8.3 µs of LDTM at 8192³. #116 cut
+the store half and said it did not touch the load half; this section removes the
+load half and the arithmetic closes: `staged − staged8` at 8192³ is
+**14.96 − 6.89 = 8.07 µs a tile**, against #109's 8.3. Two different
+instruments, two different containers, four issues apart, 2.8% apart. The
+epilogue after #116 was 14.96 µs and **54% of it was LDTM**.
+
+**The mechanism is the wait, not the issue — which is why `.x4` is worth
+nothing.** `TmemTile::fragment` waits after *each* of its two `.x1` loads,
+because the registers a load waits on are its return value, so the shipped drain
+never has two LDTM in flight and pays the full tensor-memory latency per four
+values: a `[32, 64]` band is 16 loads and 16 fully exposed latencies. `.x8` is 2
+and 2. **`stmatrix.x4` halves an instruction count and buys nothing** —
+−0.6% / −0.3% / −1.1%, a null result with a consistent sign — which is the same
+lesson #116 learned from the other direction: total issue is not what the
+epilogue is paying for. This file has now measured that twice, once per half.
+
+**The two compose only where liveness is the binding term, and the register
+column is why.** `ptxas -v`, zero spill everywhere, frame 256 B throughout:
+
+| kernel | registers | spill |
+| --- | ---: | ---: |
+| `gemm_cg2_staged` | 42 | 0 |
+| `gemm_cg2_staged_x4` | 40 | 0 |
+| `gemm_cg2_staged_x8` | **94** | 0 |
+| `gemm_cg2_staged_x8x4` | **80** | 0 |
+
+`.x8` costs +52 registers, which is exactly the 32 f32 that arrive at once where
+the `.x1` path let the compiler fuse one eight-value `Fragment` through to the
+store. It does **not** spill, and 94 is far inside the 168 occupancy step —
+residency here is tensor-memory-bound at 256 accumulator columns and the count
+was never the binding resource, which is the tenth occasion this file has said
+so. What `.x4` then buys is liveness rather than issue: it consumes all four of
+a fragment's matrices at once, taking the composed rung from 94 back to 80, and
+that is the whole of why `staged84` beats `staged8` at 16384³ (+5.1% against
++3.6%) while being a wash at 8192³ and marginally behind at 4096³. A lever worth
+nothing alone is worth something in composition, and the register column is what
+says which.
+
+**Against the library, same device, same container:** cuBLASLt 1655.7 / 1768.5 /
+1869.1 TFLOP/s.
+
+| shape | `staged`/theirs | `staged8`/theirs | `staged4`/theirs | `staged84`/theirs |
+| --- | ---: | ---: | ---: | ---: |
+| 4096³ | 0.647 | **0.800** | 0.643 | 0.796 |
+| 8192³ | 0.868 | 0.942 | 0.865 | **0.944** |
+| 16384³ | 0.877 | 0.908 | 0.867 | **0.922** |
+
+**0.856 → 0.944 at 8192³ and 0.893 → 0.922 at 16384³**, reading #116's ratios
+across containers and this section's within one. It is the largest single step
+in this table since the kernel was ported.
+
+**Neither kernel's default was changed**, on #116's own precedent: `staged84` is
+a rung beside `staged`, every number above is an A/B, and shipping it is a
+change worth making on its own rather than folded into the measurement that
+motivates it. On this evidence it is the rung to ship, and the same two widths
+are untried on `gemm_ws`, whose staged rung carries twice the LDTM (16 against
+8) for the same reason its bands are twice as wide.
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all
