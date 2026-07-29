@@ -834,6 +834,22 @@ pub fn main() -> ExitCode {
         };
     }
 
+    // `bench epilogue` is the third of these, and the one lever `swizzle` and
+    // `tile` both hold fixed: #15's store placement, with the size sweeping and
+    // everything else — grid, shared plan, tensor memory, tile, traversal,
+    // schedule — identical between the two columns.
+    if let Some((name, _)) = &selected
+        && name == "epilogue"
+    {
+        return match gemm::epilogue_sweep(&context, CUBLASLT) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     if let Some((name, _)) = &selected
         && !cases().iter().any(|case| case.name == name)
     {

@@ -608,6 +608,146 @@ struct Tile<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
     lane: u32,
 }
 
+/// The three phases of an output tile, named so that the two epilogue shapes
+/// below can order them differently without either one owning a second copy of
+/// the K walk.
+///
+/// The split is [`Lcsf`]'s reason for existing and nothing else moves because
+/// of it: [`Job::work`] on [`Tile`] calls all three back to back and is the
+/// kernel that shipped through #87, instruction for instruction.
+impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Tile<BLOCK_N, HALF_N, STAGES> {
+    /// K blocks the producer can issue before any of them has to be recycled.
+    ///
+    /// [`SemaphoreRing::wait_recycled`] is a no-op below `STAGES`, so this
+    /// prefix of the walk is the part that can be issued and then *left* — the
+    /// producer does not block in it, and the loads it starts are in flight
+    /// across whatever runs next. That is the whole of what [`Lcsf`] overlaps
+    /// its store with, and it is why the split is at `STAGES` and not
+    /// somewhere tunable.
+    const FILL: u32 = STAGES as u32;
+
+    /// Issue this rank's half of K blocks `from..to`, charging the leader's
+    /// stage barrier for the whole pair.
+    ///
+    /// # Safety
+    ///
+    /// One thread of the CTA, with `from..to` inside `0..k_blocks` and every
+    /// block issued exactly once across the calls that cover the walk.
+    #[inline(always)]
+    unsafe fn produce(&self, tile_m: u32, tile_n: u32, from: u32, to: u32) {
+        unsafe {
+            // Both CTAs load their own halves, and all four tiles complete on
+            // the leader's copy of the stage barrier — one barrier is what the
+            // MMA issuer needs to know the whole stage is present. Only the
+            // leader charges, and it charges the whole stage: `expect_tx` is
+            // `.shared::cta`, so a peer could not charge this barrier even
+            // holding its address.
+            //
+            // Every rank derives the same half-stage charge from the loads it
+            // just issued, because a cluster stage is symmetric; the leader
+            // scales its own by `RANKS` to cover the peer's, and the peer drops
+            // it. Nothing orders the charge and the loads, and nothing has to —
+            // the transaction count is a signed accumulator and only the totals
+            // must agree, which is what lets the charge follow the calls it is
+            // derived from.
+            let a_row = (2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank) as i32;
+            let b_row = (BLOCK_N as u32 * tile_n + HALF_N as u32 * self.rank) as i32;
+            let mut k = from;
+            while k < to {
+                self.free.wait_recycled(k);
+                let stage = self.load.sem(k).at_rank(LEADER);
+                let column = (BLOCK_K as u32 * k) as i32;
+                let a_bytes = self
+                    .a_ring
+                    .tile(k)
+                    .tma_load_2d_arriving_at(self.a_map, column, a_row, stage);
+                let b_bytes = self
+                    .b_ring
+                    .tile(k)
+                    .tma_load_2d_arriving_at(self.b_map, column, b_row, stage);
+                if self.rank == LEADER {
+                    self.load
+                        .sem(k)
+                        .expect_tx((a_bytes + b_bytes).across_ranks(RANKS));
+                }
+                k += 1;
+            }
+        }
+    }
+
+    /// Chain the whole K walk into the pair's accumulator and publish it.
+    ///
+    /// # Safety
+    ///
+    /// One thread of the leader rank, with the accumulator's previous contents
+    /// already read — every chunk of every stage chains into the one
+    /// accumulator, so only the very first instruction of the very first stage
+    /// starts it fresh, and "first" is per *item*.
+    #[inline(always)]
+    unsafe fn multiply(&self) {
+        unsafe {
+            // `MmaShape` is a re-export of `Tcgen05MmaShape` and `mma_walk_cg2`
+            // takes the shape as a value, so widening the pair tile needs
+            // nothing from `src/mma.rs`. In a `const` block so a rung whose
+            // columns name no shape is a codegen error rather than a `panic!`
+            // lowered into device code.
+            let shape = const { pair_shape(BLOCK_N) };
+            let mut k = 0u32;
+            while k < self.k_blocks {
+                self.load.wait(k);
+                mma_walk_cg2::<Bf16, CHUNKS>(
+                    self.accumulator.raw(),
+                    self.a_ring.tile(k).k_walk(),
+                    self.b_ring.tile(k).k_walk(),
+                    shape,
+                    k > 0,
+                );
+                // The MMA releases its own operands, in both CTAs: a thread
+                // arriving here would only prove the instruction was *issued*.
+                commit_multicast_cg2(self.free.sem(k), PAIR);
+                k += 1;
+            }
+            commit_multicast_cg2(self.done, PAIR);
+        }
+    }
+
+    /// The fp32 epilogue, straight out of registers (#11) — this warp's band of
+    /// the accumulator, LDTM'd and stored to the tile `item` names.
+    ///
+    /// `ldc` is the destination's leading dimension and `C` is wider than this
+    /// tile's columns, so the cursor carries the stride and each band lands at
+    /// its own `(row, column)` origin — no shared staging tile, no descriptor,
+    /// and no rounding to bf16 on the way out.
+    ///
+    /// A band at a time rather than the whole accumulator at once, and
+    /// [`DRAIN_N`] is why: 256 columns in one `RegTile` is 256 fp32 a thread.
+    /// At `BLOCK_N = 128` this is the single band (#22) it has always been, and
+    /// the loop folds away.
+    ///
+    /// # Safety
+    ///
+    /// Every thread of the CTA, with the accumulator complete and fenced, and
+    /// nothing that will overwrite it in flight.
+    #[inline(always)]
+    unsafe fn drain(&self, item: u32) {
+        unsafe {
+            let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, self.group);
+            let row_base =
+                2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank + 32 * self.warp_id;
+            let column_base = BLOCK_N as u32 * tile_n;
+            let mut column = 0u32;
+            while column < BLOCK_N as u32 {
+                // This warp's 32 TMEM lanes by `DRAIN_N` columns of the
+                // accumulator, composed out of the `[16, 16]` blocks LDTM
+                // delivers.
+                let band: Band = self.accumulator.tile(32 * self.warp_id, column);
+                store_rows(self.c, row_base, column_base + column, self.lane, band);
+                column += DRAIN_N as u32;
+            }
+        }
+    }
+}
+
 impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
     for Tile<BLOCK_N, HALF_N, STAGES>
 {
@@ -656,127 +796,235 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
     #[inline(always)]
     unsafe fn work(&mut self, item: u32) {
         unsafe {
-            let Tile {
-                a_ring,
-                b_ring,
-                load,
-                free,
-                done,
-                a_map,
-                b_map,
-                accumulator,
-                c,
-                tiles_m,
-                tiles_n,
-                group,
-                k_blocks,
-                rank,
-                warp_id,
-                lane,
-            } = *self;
             // The item map, and the only line in this kernel #89 changes. It is
             // a bijection under both schedulers alike — `run` hands out a
             // strided share and `run_stealing` hands out whatever the hardware
             // cancelled, and a bijection of either is still every tile once.
-            let (tile_m, tile_n) = pipeline::grouped(item, tiles_m, tiles_n, group);
+            let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, self.group);
 
-            // `M` is the pair's 256 rows and `N` its own columns. The rest of
-            // the descriptor is the walk's: both operands are K-major, so the
-            // MMA takes no transpose bits, and bf16 comes from the tiles.
-            //
-            // `MmaShape` is a re-export of `Tcgen05MmaShape` and
-            // `mma_walk_cg2` takes the shape as a value, so widening the pair
-            // tile needs nothing from `src/mma.rs` — every shape from
-            // `M128_N64` to `M256_N256` is already there.
-            // In a `const` block so a rung whose columns name no shape is a
-            // codegen error rather than a `panic!` lowered into device code.
-            let shape = const { pair_shape(BLOCK_N) };
-
-            if warp_id == 0 && lane == 0 {
-                // Producer. Both CTAs load their own halves, and all four
-                // tiles complete on the leader's copy of the stage barrier —
-                // one barrier is what the MMA issuer needs to know the whole
-                // stage is present. Only the leader charges, and it charges
-                // the whole stage: `expect_tx` is `.shared::cta`, so a peer
-                // could not charge this barrier even holding its address.
-                //
-                // Every rank derives the same half-stage charge from the loads
-                // it just issued, because a cluster stage is symmetric; the
-                // leader scales its own by `RANKS` to cover the peer's, and
-                // the peer drops it. Nothing orders the charge and the loads,
-                // and nothing has to — the transaction count is a signed
-                // accumulator and only the totals must agree, which is what
-                // lets the charge follow the calls it is derived from.
-                let a_row = (2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * rank) as i32;
-                let b_row = (BLOCK_N as u32 * tile_n + HALF_N as u32 * rank) as i32;
-                let mut k = 0u32;
-                while k < k_blocks {
-                    free.wait_recycled(k);
-                    let stage = load.sem(k).at_rank(LEADER);
-                    let column = (BLOCK_K as u32 * k) as i32;
-                    let a_bytes = a_ring
-                        .tile(k)
-                        .tma_load_2d_arriving_at(a_map, column, a_row, stage);
-                    let b_bytes = b_ring
-                        .tile(k)
-                        .tma_load_2d_arriving_at(b_map, column, b_row, stage);
-                    if rank == LEADER {
-                        load.sem(k)
-                            .expect_tx((a_bytes + b_bytes).across_ranks(RANKS));
-                    }
-                    k += 1;
-                }
+            if self.warp_id == 0 && self.lane == 0 {
+                self.produce(tile_m, tile_n, 0, self.k_blocks);
             }
-
-            if rank == LEADER && warp_id == 1 && lane == 0 {
-                // The pair's single MMA issuer. Every chunk of every stage
-                // chains into the one accumulator, so only the very first
-                // instruction of the very first stage starts it fresh — and
-                // "first" is per *item*, because the epilogue below drains the
-                // accumulator before the next item starts filling it.
-                let mut k = 0u32;
-                while k < k_blocks {
-                    load.wait(k);
-                    mma_walk_cg2::<Bf16, CHUNKS>(
-                        accumulator.raw(),
-                        a_ring.tile(k).k_walk(),
-                        b_ring.tile(k).k_walk(),
-                        shape,
-                        k > 0,
-                    );
-                    // The MMA releases its own operands, in both CTAs: a
-                    // thread arriving here would only prove the instruction
-                    // was *issued*.
-                    commit_multicast_cg2(free.sem(k), PAIR);
-                    k += 1;
-                }
-                commit_multicast_cg2(done, PAIR);
+            if self.rank == LEADER && self.warp_id == 1 && self.lane == 0 {
+                self.multiply();
             }
+            self.done.wait(0);
+            thread::sync_threads();
+            self.drain(item);
+        }
+    }
+}
 
-            done.wait(0);
+/// [`Epilogue::HotStore`]'s job: [`Tile`] with every store aimed at the
+/// cluster's own first tile, so the epilogue's bytes stay in L2.
+///
+/// **It computes a wrong `C` and is never checked.** See [`Epilogue::HotStore`]
+/// for what it is for and why an exact version of it does not exist.
+#[derive(Clone, Copy)]
+struct HotStore<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
+    tile: Tile<BLOCK_N, HALF_N, STAGES>,
+    /// The item this cluster was launched for, and the only tile of `C` it ever
+    /// writes. Read once outside the loop: [`pipeline::run`]'s first item *is*
+    /// `cluster_idx`, so this is a tile the cluster would have written anyway
+    /// and the probe stays inside the buffer without a bounds check.
+    home: u32,
+}
+
+impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
+    for HotStore<BLOCK_N, HALF_N, STAGES>
+{
+    const RANKS: u32 = crate::gemm::RANKS;
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn init(&self, item: u32) {
+        unsafe { self.tile.init(item) }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn inval(&self) {
+        unsafe { self.tile.inval() }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s. The store is to a tile of `C` this cluster owns, so it is
+    /// in bounds; it is the *wrong* tile, which is the point and not a hazard.
+    #[inline(always)]
+    unsafe fn work(&mut self, item: u32) {
+        unsafe {
+            let tile = self.tile;
+            let (tile_m, tile_n) = pipeline::grouped(item, tile.tiles_m, tile.tiles_n, tile.group);
+            if tile.warp_id == 0 && tile.lane == 0 {
+                tile.produce(tile_m, tile_n, 0, tile.k_blocks);
+            }
+            if tile.rank == LEADER && tile.warp_id == 1 && tile.lane == 0 {
+                tile.multiply();
+            }
+            tile.done.wait(0);
+            thread::sync_threads();
+            // The one line that differs from `Tile::work`, and the whole probe.
+            tile.drain(self.home);
+        }
+    }
+}
+
+/// The same output tile with its store phase moved into the *next* item —
+/// ThunderKittens' `prototype::lcsf`, and #15.
+///
+/// # The store stage is a phase of the item, not a stage of the scaffold
+///
+/// #15 files `lcsf` as a shape [`pipeline::run`] would have to grow, and #94
+/// priced it as a TMEM → shared → TMA store epilogue needing an fp32
+/// `TensorMapElement`, an fp32 `SharedTile` swizzle and a shared staging buffer
+/// nobody had the bytes for. **None of that is what the overlap needs here.**
+///
+/// The thing `lcf` forbids is the epilogue of item `i` running while item
+/// `i + 1`'s first loads are in flight. What actually stands between them is
+/// not the shape of the scaffold — it is that [`Tile::drain`] is the last thing
+/// `work` does. The pair's accumulator lives in tensor memory allocated once
+/// *outside* the item loop, and the item boundary re-arms mbarriers and touches
+/// no tensor memory at all, so an undrained accumulator survives the boundary
+/// intact. Deferring the drain by one item is therefore a change of phase order
+/// inside `work`, and [`pipeline::run`] is unmodified: the pending item is job
+/// state, and `lcf`'s scaffold already admits an `lcsf` job.
+///
+/// So the whole epilogue — the LDTM *and* the scattered fp32 stores — runs
+/// after [`Tile::FILL`] stages of the next item's loads have been issued and
+/// while they are in flight. It costs **no shared memory, no deferred
+/// registers, no fp32 TMA path and no occupancy step**, which is what makes it
+/// measurable without first building the 250–400 lines #94 scoped.
+///
+/// # It does need a synchronisation the item boundary does not supply
+///
+/// The MMA is `cta_group::2` and is issued by the leader alone, writing *both*
+/// ranks' halves of the accumulator. Under the fused epilogue the pair is
+/// separated by [`pipeline::run`]'s cluster boundary, so a peer is provably
+/// done reading before a leader can issue. Here the peer's drain of item `i`
+/// and the leader's MMA for item `i + 1` are inside the same `work`, and a
+/// `bar.sync` orders only one CTA — the leader would overwrite tensor memory
+/// the peer is still reading, silently and as a wrong `C`. The rendezvous below
+/// is therefore `cluster_sync`, which is the finding: `lcsf` does not want an
+/// extra barrier at the boundary, it wants the boundary's *scope* moved inside
+/// the item.
+#[derive(Clone, Copy)]
+struct Lcsf<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
+    tile: Tile<BLOCK_N, HALF_N, STAGES>,
+    /// The item whose accumulator is still sitting in tensor memory, or
+    /// [`Self::NONE`] before the first one and after the last.
+    pending: u32,
+}
+
+impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Lcsf<BLOCK_N, HALF_N, STAGES> {
+    /// No accumulator owed. `u32::MAX` is not a reachable item: the tile grid
+    /// is `tiles_m * tiles_n` and both are `u32`, so a real item is strictly
+    /// less than their product and cannot be this.
+    const NONE: u32 = u32::MAX;
+
+    #[inline(always)]
+    fn new(tile: Tile<BLOCK_N, HALF_N, STAGES>) -> Self {
+        Self {
+            tile,
+            pending: Self::NONE,
+        }
+    }
+
+    /// Store the last item's accumulator, which no later item is coming to
+    /// overlap. Called once, after the loop and before the pair gives its
+    /// tensor memory back.
+    ///
+    /// A cluster that ran no items at all owes nothing, which is the
+    /// [`Scheduler::Static`] case where `MAX_CLUSTERS` exceeds the tile count.
+    ///
+    /// # Safety
+    ///
+    /// Every thread of the CTA, after [`pipeline::run`] has returned and before
+    /// `release`.
+    #[inline(always)]
+    unsafe fn finish(&self) {
+        unsafe {
+            if self.pending != Self::NONE {
+                self.tile.drain(self.pending);
+            }
+        }
+    }
+}
+
+impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
+    for Lcsf<BLOCK_N, HALF_N, STAGES>
+{
+    const RANKS: u32 = crate::gemm::RANKS;
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn init(&self, item: u32) {
+        unsafe { self.tile.init(item) }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn inval(&self) {
+        unsafe { self.tile.inval() }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s, plus: the accumulator must still hold [`Self::pending`]'s
+    /// result, which is [`pipeline::run`] calling this once per item in order.
+    #[inline(always)]
+    unsafe fn work(&mut self, item: u32) {
+        unsafe {
+            let tile = self.tile;
+            let (tile_m, tile_n) = pipeline::grouped(item, tile.tiles_m, tile.tiles_n, tile.group);
+            let fill = Tile::<BLOCK_N, HALF_N, STAGES>::FILL.min(tile.k_blocks);
+
+            // Fill the pipe first, so the loads are in flight across the store
+            // below. The producer does not block in this prefix — a stage
+            // barrier below `STAGES` has nothing to recycle — so it reaches the
+            // drain rather than sitting in `free.wait_recycled`.
+            if tile.warp_id == 0 && tile.lane == 0 {
+                tile.produce(tile_m, tile_n, 0, fill);
+            }
+            // Reconvergence, and it is load-bearing rather than tidy: `LDTM` is
+            // warp-collective and the producer branch above leaves warp 0's
+            // lane 0 somewhere its other 31 lanes are not. Under the fused
+            // epilogue the `sync_threads` after `done.wait` did this job; here
+            // there is no wait between the branch and the drain, so the barrier
+            // has to be written down. It is the *same* barrier count as `lcf` —
+            // what `lcsf` adds is the cluster-scope one below, not this.
             thread::sync_threads();
 
-            // The fp32 epilogue, straight out of registers (#11). `ldc` is the
-            // destination's leading dimension and `C` is wider than this
-            // tile's columns, so the cursor carries the stride and each band
-            // lands at its own `(row, column)` origin — no shared staging
-            // tile, no descriptor, and no rounding to bf16 on the way out.
-            //
-            // A band at a time rather than the whole accumulator at once, and
-            // [`DRAIN_N`] is why: 256 columns in one `RegTile` is 256 fp32 a
-            // thread. At `BLOCK_N = 128` this is the single band (#22) it has
-            // always been, and the loop folds away.
-            let row_base = 2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * rank + 32 * warp_id;
-            let column_base = BLOCK_N as u32 * tile_n;
-            let mut column = 0u32;
-            while column < BLOCK_N as u32 {
-                // This warp's 32 TMEM lanes by `DRAIN_N` columns of the
-                // accumulator, composed out of the `[16, 16]` blocks LDTM
-                // delivers.
-                let band: Band = accumulator.tile(32 * warp_id, column);
-                store_rows(c, row_base, column_base + column, lane, band);
-                column += DRAIN_N as u32;
+            // The previous item's epilogue, overlapped with those loads. This
+            // is the whole of `lcsf`.
+            if self.pending != Self::NONE {
+                tile.drain(self.pending);
             }
+
+            // Cluster-scope, and the type doc says why: the leader's MMA below
+            // writes the peer's half of the accumulator the peer was just
+            // reading. The fence is the same pairing [`pipeline::run`] takes
+            // around its own boundary — tcgen05 work (here the drain's LDTM)
+            // retired before a thread sync that publishes it.
+            tcgen05_fence_before_thread_sync();
+            cluster::cluster_sync();
+
+            if tile.warp_id == 0 && tile.lane == 0 {
+                tile.produce(tile_m, tile_n, fill, tile.k_blocks);
+            }
+            if tile.rank == LEADER && tile.warp_id == 1 && tile.lane == 0 {
+                tile.multiply();
+            }
+            tile.done.wait(0);
+            self.pending = item;
         }
     }
 }
@@ -946,6 +1194,91 @@ pub mod kernels {
             );
             pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
+        }
+    }
+
+    /// The same GEMM with its store phase deferred one item — #15's `lcsf`.
+    ///
+    /// Identical to [`gemm_cg2`] in grid, shared plan, tensor memory, operand
+    /// maps and item map; the only difference is that [`Lcsf`] drains the
+    /// previous item's accumulator after the next item's first stages are in
+    /// flight rather than before them. The shared plan is *unchanged* — the
+    /// overlap needs no staging buffer — so this is a comparison of epilogue
+    /// placement at a fixed residency, which is what makes the A/B readable.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_cg2`]'s exactly.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 98_392,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_cg2_lcsf(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let (tile, _) = attach::<BLOCK_N, HALF_N, STAGES>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
+            let mut job = Lcsf::new(tile);
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            // The last item has no successor to overlap its store with, so it
+            // pays an un-hidden epilogue — one per cluster over the whole
+            // launch, against one per *item* under the fused shape.
+            job.finish();
+            release(&job.tile);
+        }
+    }
+
+    /// **A deliberately wrong GEMM** — [`Epilogue::HotStore`]'s probe, which
+    /// splits the epilogue's cost into the part that is issue and the part that
+    /// is bandwidth. Never checked, never shipped, and its number is an upper
+    /// bound rather than a throughput.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_cg2`]'s. It writes fewer tiles of `C` than that one, not more.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 98_392,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_cg2_hot(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let (tile, _) = attach::<BLOCK_N, HALF_N, STAGES>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
+            let mut job = HotStore {
+                tile,
+                home: cluster::cluster_idx().min(tiles_m * tiles_n - 1),
+            };
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            release(&job.tile);
         }
     }
 
@@ -1334,17 +1667,80 @@ pub struct Plan {
     /// The pair tile and pipeline depth to launch — #87's variable, and the
     /// one #89's `GROUP` is only measured *at*.
     pub rung: Rung,
+    /// Where the store phase sits — #15's variable.
+    pub epilogue: Epilogue,
 }
 
 impl Plan {
     /// The kernel as it ships: whichever schedule `scheduler` names, walked at
-    /// the measured [`GROUP`], on the [`SHIPPED`] rung.
+    /// the measured [`GROUP`], on the [`SHIPPED`] rung, with the epilogue fused
+    /// into the item.
     fn new(scheduler: Scheduler) -> Self {
         Plan {
             scheduler,
             group: GROUP,
             rung: SHIPPED,
+            epilogue: Epilogue::Fused,
         }
+    }
+
+    /// The same plan with its store phase somewhere else — #15's variable.
+    fn with(self, epilogue: Epilogue) -> Self {
+        Plan { epilogue, ..self }
+    }
+}
+
+/// Where an item's store phase runs — #15, and the axis [`Lcsf`] adds.
+///
+/// It is not a scheduler and not a rung: the grid, the shared plan, the tensor
+/// memory, the item map and the tile are identical across the two, and the only
+/// thing that moves is whether [`Tile::drain`] runs at the end of its own item
+/// or at the start of the next one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Epilogue {
+    /// `lcf`: the store folds into the item and cannot overlap the next item's
+    /// loads. The control, and what this kernel shipped through #87.
+    Fused,
+    /// `lcsf`: the store is deferred one item and runs while the next item's
+    /// first [`Tile::FILL`] stages are in flight.
+    Deferred,
+    /// **Not a GEMM. This computes a wrong `C` on purpose and is never checked.**
+    ///
+    /// The fused epilogue with every item's store aimed at the *cluster's own
+    /// first tile* instead of the item's. Identical in every instruction — same
+    /// LDTM, same count of `st.global.v2.f32`, same addresses within a tile —
+    /// and the only thing that moves is that 148 clusters rewrite 38 MB of `C`
+    /// over and over instead of streaming 268 MB or 1 GB of it, so the writes
+    /// stay in L2 and never press on HBM.
+    ///
+    /// It exists to split the epilogue's cost in two, which no exact
+    /// intervention here can. If this is much faster than [`Epilogue::Fused`]
+    /// the epilogue is **bandwidth-bound**, and staging through shared memory
+    /// so a TMA engine does the global write — #15's original route — has that
+    /// much to win. If it is not, the epilogue is **issue-bound**, the threads
+    /// are paying for the LDTM and the stores themselves rather than for where
+    /// they land, and no amount of decoupling the write recovers it.
+    ///
+    /// The number it produces is an upper bound and not a throughput. It is
+    /// excluded from [`check`] deliberately: a probe that computed the right
+    /// answer would not be measuring what this one is for.
+    HotStore,
+}
+
+impl Epilogue {
+    /// What the benchmark prints, and the only place these names are spelled.
+    pub fn name(self) -> &'static str {
+        match self {
+            Epilogue::Fused => "lcf",
+            Epilogue::Deferred => "lcsf",
+            Epilogue::HotStore => "hot",
+        }
+    }
+
+    /// Whether a launch on this epilogue computes the GEMM. Only
+    /// [`Epilogue::HotStore`] does not, and it says so everywhere it appears.
+    fn exact(self) -> bool {
+        self != Epilogue::HotStore
     }
 }
 
@@ -1523,27 +1919,67 @@ fn run<T>(
             Box::new(launch) as Box<dyn Fn(&mut DeviceBuffer<f32>) -> Result<(), Box<dyn Error>>>
         }};
     }
-    let launch_once = match (rung.entry, plan.scheduler) {
-        (Entry::Shipped, Scheduler::Static) => launcher!(prepare_gemm_cg2, gemm_cg2),
-        (Entry::Shipped, Scheduler::Stealing) => launcher!(prepare_gemm_cg2_clc, gemm_cg2_clc),
-        (Entry::N128S2, Scheduler::Static) => launcher!(prepare_gemm_256x128_s2, gemm_256x128_s2),
-        (Entry::N128S4, Scheduler::Static) => launcher!(prepare_gemm_256x128_s4, gemm_256x128_s4),
-        (Entry::N128S3, Scheduler::Static) => launcher!(prepare_gemm_256x128_s3, gemm_256x128_s3),
-        (Entry::N256S2, Scheduler::Static) => launcher!(prepare_gemm_256x256_s2, gemm_256x256_s2),
-        (Entry::Unbuilt, _) => {
+    let launch_once = match (rung.entry, plan.scheduler, plan.epilogue) {
+        (Entry::Shipped, Scheduler::Static, Epilogue::Fused) => {
+            launcher!(prepare_gemm_cg2, gemm_cg2)
+        }
+        (Entry::Shipped, Scheduler::Static, Epilogue::Deferred) => {
+            launcher!(prepare_gemm_cg2_lcsf, gemm_cg2_lcsf)
+        }
+        (Entry::Shipped, Scheduler::Static, Epilogue::HotStore) => {
+            launcher!(prepare_gemm_cg2_hot, gemm_cg2_hot)
+        }
+        (Entry::Shipped, Scheduler::Stealing, Epilogue::Fused) => {
+            launcher!(prepare_gemm_cg2_clc, gemm_cg2_clc)
+        }
+        (Entry::N128S2, Scheduler::Static, Epilogue::Fused) => {
+            launcher!(prepare_gemm_256x128_s2, gemm_256x128_s2)
+        }
+        (Entry::N128S4, Scheduler::Static, Epilogue::Fused) => {
+            launcher!(prepare_gemm_256x128_s4, gemm_256x128_s4)
+        }
+        (Entry::N128S3, Scheduler::Static, Epilogue::Fused) => {
+            launcher!(prepare_gemm_256x128_s3, gemm_256x128_s3)
+        }
+        (Entry::N256S2, Scheduler::Static, Epilogue::Fused) => {
+            launcher!(prepare_gemm_256x256_s2, gemm_256x256_s2)
+        }
+        (Entry::Unbuilt, _, _) => {
             return Err("[256,256] s4 is one CTA an SM and is computed, not built".into());
         }
         // Only the shipped rung has a stealing twin, and deliberately: a
-        // scheduler comparison at a moving tile would be two variables.
-        (entry, Scheduler::Stealing) => {
-            return Err(format!("{entry:?} has no work-stealing entry point").into());
+        // scheduler comparison at a moving tile would be two variables. The
+        // deferred epilogue is the same rule for the same reason — it is the
+        // one variable #15 moves, so it moves against the shipped kernel on the
+        // static schedule and nothing else.
+        (entry, scheduler, epilogue) => {
+            return Err(format!(
+                "{entry:?} has no {} entry point on the {} schedule",
+                epilogue.name(),
+                scheduler.name()
+            )
+            .into());
         }
     };
     launch_once(&mut c)?;
-    check_c(&c.to_host_vec(&stream)?, m, n, k)?;
+    // Rule 1 of `crate::bench`, and the one exception to it is stated in the
+    // label rather than hidden: `HotStore` writes the wrong tile of `C` on
+    // purpose, so checking it would fail by construction. Every other plan —
+    // every schedule, every rung, every traversal width, and #15's deferred
+    // epilogue — goes through the element-by-element `==` before a clock can
+    // reach it.
+    let label = if plan.epilogue.exact() {
+        check_c(&c.to_host_vec(&stream)?, m, n, k)?;
+        format!("{m}x{n}x{k} exact")
+    } else {
+        format!(
+            "{m}x{n}x{k} UNCHECKED ({} is not a GEMM)",
+            plan.epilogue.name()
+        )
+    };
 
     let after = then(&stream, &mut || launch_once(&mut c))?;
-    Ok((format!("{m}x{n}x{k} exact"), after))
+    Ok((label, after))
 }
 
 /// Bytes of shared memory an SM divides between its resident CTAs — the
@@ -1685,6 +2121,7 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
                     scheduler,
                     group,
                     rung: SHIPPED,
+                    epilogue: Epilogue::Fused,
                 };
                 run(context, m, n, k, plan, nothing_after)?;
             }
@@ -1696,6 +2133,31 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
                 tiles(m, n, BLOCK_N)
             ));
         }
+        // #15's deferred store phase, under the same widths and the same `==`.
+        //
+        // It is on this gate rather than beside a benchmark row because the two
+        // ways it can go wrong are both silent and neither is a fault: a
+        // deferred drain that is not ordered against the next item's MMA reads
+        // an accumulator the leader has begun overwriting, and a cluster that
+        // forgets its last item drops one tile of `C` entirely. The second is
+        // exactly what `ITEMS_M x ITEMS_N` is here to catch — a shape with more
+        // tiles than clusters, so every cluster carries a pending item across
+        // several boundaries and one past the loop.
+        for group in CHECK_GROUPS {
+            let plan = Plan {
+                scheduler: Scheduler::Static,
+                group,
+                rung: SHIPPED,
+                epilogue: Epilogue::Deferred,
+            };
+            run(context, m, n, k, plan, nothing_after)?;
+        }
+        notes.push(format!(
+            "{m}x{n}x{k} exact on {} at groups {CHECK_GROUPS:?} ({} tiles, one deferred \
+             accumulator per cluster in flight)",
+            Epilogue::Deferred.name(),
+            tiles(m, n, BLOCK_N)
+        ));
         // #87's rungs, on the static schedule they are swept on. A wider pair
         // tile is a different item map, a different accumulator and a
         // different epilogue loop, and every way those go wrong is a wrong `C`
@@ -1709,6 +2171,7 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
                     scheduler: Scheduler::Static,
                     group,
                     rung,
+                    epilogue: Epilogue::Fused,
                 };
                 run(context, m, n, k, plan, nothing_after)?;
             }
@@ -1974,6 +2437,7 @@ pub fn tile_sweep(
                 scheduler: Scheduler::Static,
                 group: GROUP,
                 rung,
+                epilogue: Epilogue::Fused,
             };
             eprintln!("{shape} on {}: staging and checking", rung.name());
             let (_, timings) = run(context, shape.m, shape.n, shape.k, plan, time)?;
@@ -2020,6 +2484,7 @@ pub fn tile_sweep(
                 scheduler: Scheduler::Static,
                 group,
                 rung,
+                epilogue: Epilogue::Fused,
             };
             eprintln!(
                 "{SWEEP} on {} at group {group}: staging and checking",
@@ -2078,6 +2543,217 @@ pub fn tile_sweep(
                 Some(ours) => format!("{:.3}", theirs / ours),
                 None => "—".to_string(),
             }
+        );
+    }
+    Ok(())
+}
+
+/// Sizes the epilogue sweep runs, chosen so the answer has to be a *shape* and
+/// not a number.
+///
+/// The item boundary is a fixed cost per output tile, so what [`Epilogue`]
+/// moves is amortized over the arithmetic between one boundary and the next.
+/// That makes the gain a decreasing function of `K` per item and of tiles per
+/// cluster, and these five sizes span both: 1024³ is 16 tiles over 148
+/// clusters — one item each, nothing to amortize and **no successor to overlap
+/// with at all**, so `lcsf` should do nothing there or lose — while 16384³ is
+/// 4096 tiles over 148 clusters at 256 K blocks apiece.
+///
+/// A gain that is flat across this range is not the item boundary and would
+/// refute the mechanism rather than confirm the win.
+const EPILOGUE_SIZES: [Shape; 5] = [
+    Shape {
+        m: 1024,
+        n: 1024,
+        k: 1024,
+    },
+    Shape {
+        m: 2048,
+        n: 2048,
+        k: 2048,
+    },
+    Shape {
+        m: 4096,
+        n: 4096,
+        k: 4096,
+    },
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 8192,
+    },
+    Shape {
+        m: 16384,
+        n: 16384,
+        k: 16384,
+    },
+];
+
+/// #15's sweep — `cargo oxide run kittens-examples -- bench epilogue`, which is
+/// `modal run modal_app.py::bench --case epilogue`.
+///
+/// One variable moves: whether [`Tile::drain`] runs at the end of its own item
+/// or at the start of the next one. The grid, the shared plan, the tensor
+/// memory, the pair tile, the traversal width and the schedule are identical in
+/// both columns, and the shared plan being *unchanged* is what makes this
+/// readable at all — #94 and #101 could not separate a staging buffer's cost
+/// from its benefit precisely because a real one moves the epilogue and the
+/// residency at once. Here the residency cannot move: [`CTAS_PER_SM`] is 2
+/// because 256 accumulator columns are half of tensor memory, and nothing below
+/// touches a column or a byte.
+///
+/// # The prediction, written down before it ran
+///
+/// #104's re-fit puts the item boundary at **8.6–18.3 µs per tile and 20.0–25.3%
+/// of 8192³**, and that fit is a poor instrument — the intercept now carries a
+/// K-dependent locality term, so the spread is point selection and not
+/// precision. What `lcsf` can hide is the part of that which is the *epilogue*
+/// rather than the drain of the last MMAs or the barrier round trip: the LDTM
+/// and the scattered fp32 stores, which #91's evidence puts at roughly half the
+/// boundary.
+///
+/// So: **+4% to +11% at 8192³ and 16384³, nothing at 1024³, and monotone
+/// between.** The 1024³ row is the falsifiable one — one item per cluster means
+/// every epilogue is the *last* epilogue, [`Lcsf::finish`] pays it un-hidden,
+/// and the extra `cluster_sync` inside the item is a pure cost. If 1024³ gains,
+/// the mechanism is not the one this function claims.
+///
+/// The second prediction is about registers and it is the one that would stop
+/// this: the deferred drain reads tensor memory the previous item wrote, and
+/// nothing is held in registers across the boundary, so peak liveness is
+/// unchanged and `regcount` should report **168 and no spill**. A band held
+/// across the boundary would be 128 fp32 a thread and would show up there
+/// instead of here.
+pub fn epilogue_sweep(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    baseline: Option<crate::bench::Baseline>,
+) -> Result<(), Box<dyn Error>> {
+    println!(
+        "gemm epilogue placement (#15) — min ms over 30 timed launches, every row checked\n\
+         element-by-element against the CPU reference before it was timed, static schedule\n\
+         and GROUP = {GROUP} throughout.\n\
+         `lcf` folds the store into the item; `lcsf` defers it one item, so it runs while\n\
+         the next item's first {} stages are in flight. Same grid, same {SHARED_BYTES} B\n\
+         shared plan, same {BLOCK_N} accumulator columns, same {CTAS_PER_SM} CTAs an SM —\n\
+         the store stage needs no staging buffer, so there is no occupancy step in this\n\
+         table and nothing has to be argued for out of a budget.",
+        STAGES
+    );
+    println!("\n1. the two epilogues, over sizes chosen so the gain has to fall with amortization");
+    println!(
+        "{:<18}{:>8}{:>10}{:>12}{:>12}{:>12}{:>12}{:>10}",
+        "shape", "tiles", "items/cl", "lcf ms", "lcf TF/s", "lcsf ms", "lcsf TF/s", "vs lcf"
+    );
+    let mut measured = Vec::new();
+    for shape in EPILOGUE_SIZES {
+        let plan = Plan::new(Scheduler::Static);
+        let fused = timed(context, shape, plan)?;
+        let deferred = timed(context, shape, plan.with(Epilogue::Deferred))?;
+        let hot = timed(context, shape, plan.with(Epilogue::HotStore))?;
+        let items = tiles(shape.m, shape.n, BLOCK_N);
+        let clusters = grid_for(Scheduler::Static, shape.m, shape.n, SHIPPED, MAX_CLUSTERS) / RANKS;
+        println!(
+            "{:<18}{:>8}{:>10.1}{:>12.4}{:>12.1}{:>12.4}{:>12.1}{:>10}",
+            shape,
+            items,
+            items as f64 / clusters as f64,
+            fused,
+            tflops(shape, fused),
+            deferred,
+            tflops(shape, deferred),
+            format!("{:+.1}%", 100.0 * (fused / deferred - 1.0))
+        );
+        measured.push((shape, fused, deferred, hot));
+    }
+
+    println!(
+        "\n2. what the gain implies about the item boundary. #104 fits the boundary at\n\
+         8.6-18.3 us per tile over three point selections; `hidden` divides the measured\n\
+         saving per item by that range, so it is the fraction of the *fitted* boundary\n\
+         this placement removed. Two numbers because the fit's own spread is 2.1x, which\n\
+         is why this column is a range and not a figure."
+    );
+    println!(
+        "{:<18}{:>12}{:>14}{:>16}{:>18}",
+        "shape", "items/cl", "saved ms", "saved us/item", "hidden of boundary"
+    );
+    for &(shape, fused, deferred, _) in &measured {
+        let items = tiles(shape.m, shape.n, BLOCK_N);
+        let clusters = grid_for(Scheduler::Static, shape.m, shape.n, SHIPPED, MAX_CLUSTERS) / RANKS;
+        // Items on the critical path, which is what #90 and #104 divide a
+        // fitted intercept by — the deepest-loaded cluster, not the average.
+        let critical = items.div_ceil(clusters) as f64;
+        let saved = fused - deferred;
+        let per_item = saved * 1e3 / critical;
+        println!(
+            "{:<18}{:>12.1}{:>14.4}{:>16.2}{:>18}",
+            shape,
+            items as f64 / clusters as f64,
+            saved,
+            per_item,
+            format!(
+                "{:.0}%-{:.0}%",
+                100.0 * per_item / 18.3,
+                100.0 * per_item / 8.6
+            )
+        );
+    }
+
+    println!(
+        "\n2b. what the epilogue costs, split into issue and bandwidth. `hot` is the fused\n\
+         kernel with every store aimed at the cluster's own first tile — same LDTM, same\n\
+         store count, same addresses within a tile, 38 MB of C rewritten instead of 268 MB\n\
+         or 1 GB streamed, so the writes stay in L2. IT COMPUTES A WRONG C AND IS NOT\n\
+         CHECKED; the number is an upper bound on what decoupling the global write could\n\
+         ever be worth, and that is exactly what #15's TMEM -> shared -> TMA route buys\n\
+         over the deferred drain above.\n\
+         A `hot` close to `lcf` means the epilogue is issue-bound and no staging buffer\n\
+         recovers it. A `hot` far below means it is bandwidth-bound and the route has\n\
+         that much, and no more, to win."
+    );
+    println!(
+        "{:<18}{:>12}{:>12}{:>14}{:>18}",
+        "shape", "lcf ms", "hot ms", "hot TF/s", "write-bound part"
+    );
+    for &(shape, fused, _, hot) in &measured {
+        println!(
+            "{:<18}{:>12.4}{:>12.4}{:>14.1}{:>18}",
+            shape,
+            fused,
+            hot,
+            tflops(shape, hot),
+            format!("{:.1}%", 100.0 * (fused - hot) / fused)
+        );
+    }
+
+    println!(
+        "\n3. against cuBLASLt on the same device in the same container — the denominator,\n\
+         and the drift control that says how much of the delta above is the session."
+    );
+    println!(
+        "{:<18}{:>14}{:>14}{:>14}{:>16}",
+        "shape", "cuBLASLt ms", "theirs TF/s", "lcf/theirs", "lcsf/theirs"
+    );
+    for &(shape, fused, deferred, _) in &measured {
+        if shape.m < 8192 {
+            continue;
+        }
+        let Some(baseline) = baseline else {
+            println!(
+                "no cuBLASLt column: built without --features cublas. modal_app.py::bench\n\
+                 turns it on, and a ratio is the point of this table."
+            );
+            break;
+        };
+        eprintln!("{shape}: staging and checking {}", baseline.name);
+        let theirs = (baseline.bench)(context, shape)?.0.min();
+        println!(
+            "{:<18}{:>14.4}{:>14.1}{:>14.3}{:>16.3}",
+            shape,
+            theirs,
+            tflops(shape, theirs),
+            theirs / fused,
+            theirs / deferred
         );
     }
     Ok(())
@@ -2149,6 +2825,7 @@ pub fn swizzle(
                 scheduler: Scheduler::Static,
                 group,
                 rung: SHIPPED,
+                epilogue: Epilogue::Fused,
             },
         )?;
         let clc_ms = timed(
@@ -2158,6 +2835,7 @@ pub fn swizzle(
                 scheduler: Scheduler::Stealing,
                 group,
                 rung: SHIPPED,
+                epilogue: Epilogue::Fused,
             },
         )?;
         let (rows, columns, distinct, reuse) =
@@ -2212,6 +2890,7 @@ pub fn swizzle(
                     scheduler,
                     group,
                     rung: SHIPPED,
+                    epilogue: Epilogue::Fused,
                 },
             )
         };
