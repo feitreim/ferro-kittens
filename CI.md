@@ -17,6 +17,13 @@ buys something the one below genuinely cannot see.
 `fmt`, lockfile freshness, `clippy --all-targets -- -D warnings`, `test`, and
 `doc --no-deps` with `RUSTDOCFLAGS=-D warnings`.
 
+**Format with `scripts/fmt`, not `cargo fmt`.** This tier checks three
+manifests; a root `cargo fmt` reaches only the library, because `device-tests/`
+and `examples/` are separate workspaces. That gap has turned this gate red three
+times (#97, #104, #109) on changes that were otherwise correct — the code was
+fine and a signature wanted to be on one line. `scripts/fmt --check` is what CI
+runs; `scripts/fmt` fixes it.
+
 The library's default feature set is device-only and `cuda-device` is ordinary
 Rust, so all of that runs on a stock runner with no toolkit. `device-tests/` and
 `examples/` cannot be compiled here — both pull `cuda-core` -> `cuda-bindings`,
