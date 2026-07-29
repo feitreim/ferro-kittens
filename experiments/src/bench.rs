@@ -1275,6 +1275,25 @@ pub fn main() -> ExitCode {
         };
     }
 
+    // `bench sol-ablate` is `ablation` asked of the other GEMM: #138's port is
+    // 0.795 of cuBLASLt at 4096³ and the PR names three suspects for it. It
+    // leads with the one that is arithmetic — one cluster per output tile over
+    // 74 resident clusters is a 0.865 ceiling at that shape before any cadence
+    // is measured — and then removes one phase at a time from the kernel's own
+    // device body to price the other three. #144 called this `sol`; `sol` is
+    // #146's plan sweep, so the two tables have two names.
+    if let Some((name, _)) = &selected
+        && name == "sol-ablate"
+    {
+        return match crate::sol_ablate::decompose(&context) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // Each name in the list has to name a case. A list where one of three is a
     // typo would otherwise run two tables and say nothing about the third,
     // which is the failure mode worth being loud about: the reader gets a

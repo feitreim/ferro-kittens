@@ -31,6 +31,10 @@ Local usage:
     modal run modal_app.py::bench --case sol-small
                                       # the same two rungs below 4096^3, taken
                                       # twice, where the clock is the limit
+    modal run modal_app.py::sol_ablate
+                                      # gemm_sol's phases priced one at a time,
+                                      # with upstream's own K loop as the
+                                      # reference the port is short of
     modal run modal_app.py::upstream_bench
                                       # the port, the kernel it is a port of
                                       # unported, and cuBLASLt beside both --
@@ -659,6 +663,20 @@ def profile(kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192) -
     each holding everything constant but one thing — rather than by counters.
     That is a weaker instrument for attribution and a stronger one for cause.
 
+    **#138 re-derived this and closed the two obvious escapes.** On a fresh
+    B200 container at driver 580.95.05, `ncu` 2025.3.0 fails identically on a
+    four-line `nvcc` kernel that has nothing to do with this repo, so it is not
+    the codegen. `NVIDIA_DRIVER_CAPABILITIES=all` is *already in the container's
+    environment* and the injected set already includes the graphics libraries,
+    so the capability set is not the lever it looks like. And NVIDIA's own
+    component list for the 580 branch names exactly one `pcc` file — `nvidia-pcc`,
+    the VulkanSC pipeline cache compiler — and no performance-counter library at
+    all, so this is not something the runtime withheld from a package that has
+    it. `libnvperf_host.so` and `libnvperf_target.so` are both present and both
+    useless without it; `nsys` is not in the image, and it would trace rather
+    than count. The conclusion is the same and now has a floor under it: there
+    is no counter here, and an ablation is the instrument.
+
     Whenever the library does appear, this is one command. `--clock-control
     none` is deliberate: the default locks the clocks to base so that two runs
     compare, which also means the duration it reports is not the duration
@@ -798,6 +816,40 @@ def upstream_bench() -> None:
           "cargo", "oxide", "run", "kittens-experiments",
           "--features", "cublas,gemm-sol-upstream",
           "--", "bench", "gemm-sol,gemm-sol-upstream,gemm-sol-upstream-m512"],
+         cwd=EXPERIMENTS_DIR)
+
+
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
+@completes
+def sol_ablate() -> None:
+    """`gemm_sol`'s decomposition with upstream's own kernel as the reference --
+    one container, so one device, one cuBLASLt, one clock.
+
+    `bench sol-ablate` prices each phase of the item, then asks the one question
+    the phases cannot answer on their own: the `[256, 256]` entry's K loop runs
+    at 75.8% of tensor-core peak where `[512, 256]`'s runs at 99.4%, and the two
+    run the same K-loop code. Its last table is the same K-depth ladder on
+    upstream's `gemm_sol_final` at the same tile, which is what splits that
+    deficit into the algorithm's and the port's.
+
+    That table needs `gemm-sol-upstream`, which needs `OPT_NO_LOOKUP_TABLE` to
+    assemble at all, and the flag is global to the compilation -- so this runs
+    the whole sweep *twice*, once without upstream compiled in and once with. The
+    first run is the control: if the port's rows disagree between them, the flag
+    moved the port and the upstream comparison has to be read against the second
+    run's port rows rather than the first's. #145 measured that difference at
+    0.006-0.15%.
+    """
+    _run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
+          "--format=csv"], cwd="/")
+    _run(["cargo", "oxide", "run", "kittens-experiments", "--features", "cublas",
+          "--", "bench", "sol-ablate"],
+         cwd=EXPERIMENTS_DIR)
+    _run(["sh", "-c", WRITE_OPT_WRAPPER], cwd="/")
+    _run(["env", f"CUDA_OXIDE_OPT={OPT_NO_LOOKUP_TABLE}",
+          "cargo", "oxide", "run", "kittens-experiments",
+          "--features", "cublas,gemm-sol-upstream",
+          "--", "bench", "sol-ablate"],
          cwd=EXPERIMENTS_DIR)
 
 

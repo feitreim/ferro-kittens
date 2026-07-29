@@ -18,7 +18,7 @@
 //! scripts/modal-run examples                   # the correctness gate, both crates
 //! scripts/modal-run bench --case gemm-depth    # or tile, staged, widths,
 //! scripts/modal-run clc_bench                  #    residual, swizzle, repro,
-//! scripts/modal-run ws_bench                   #    ablation, epilogue
+//! scripts/modal-run ws_bench                   #    ablation, epilogue, sol
 //! ```
 //!
 //! **Every rung here is on a correctness gate**, which is [`gemm::check`] and
@@ -61,6 +61,7 @@ pub mod gemm_sol;
 pub mod gemm_sol_upstream;
 pub mod gemm_ws;
 pub mod sol;
+pub mod sol_ablate;
 
 /// The teaching crate's kernels, compiled here so [`bench`] can time them
 /// against their own CPU references.
