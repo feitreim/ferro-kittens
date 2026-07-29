@@ -497,8 +497,10 @@ Missing from `prototype/` (**#15**):
   under a watchdog that would catch a TMEM leak across waves.
 
   The matching global *store* is checked by `examples/gemm.rs` instead, whose
-  whole epilogue is one `store_rows` compared elementwise against an exact CPU
-  reference. Still verified only by downstream kernels being numerically
+  register-drain rung is one `store_rows` compared elementwise against an exact
+  CPU reference — and whose shipped rung since #119 is `store_tile_x4` into a
+  per-warp shared tile and `store_shared_rows` out of it, on the same gate and
+  the same `==`. Still verified only by downstream kernels being numerically
   correct: the phase-parity rules, the pipeline scaffold, the masking ops
   (`mask_probe` is a codegen probe and says so in its own doc comment), and
   every cluster/multicast path — those last live in `examples/src/gemm.rs` and

@@ -55,8 +55,9 @@
 //! drained at the same points. So a persistent grid changes only how many
 //! clusters exist, and picking that number wrong costs 2×.
 //!
-//! What the scaffold does *not* buy is overlap between items. `lcf` folds the
-//! epilogue into the item, so this kernel's `store_rows` and the next tile's
+//! What the scaffold does *not* buy is overlap between items. Every epilogue
+//! this file ships folds into the item — `staged84` moved the drain's *shape*
+//! and not its placement — so this kernel's stores and the next tile's
 //! first K loads are still separated by a boundary that drains the pipeline —
 //! #15's `lcsf` is the shape that would let them cross. So the honest claim for
 //! this port is a **dead heat**: 1.0217 ms at 8192³ against the launch-per-tile
@@ -90,6 +91,11 @@
 //! intercept is everything not scaling with `K`, which after #102 is no longer
 //! only the item boundary.
 //!
+//! Both fits are the register drain's, and `bench --case gemm-depth` no longer
+//! runs it: since #119 that sweep launches [`SHIPPED_EPILOGUE`] like every
+//! other `gemm` row, so a re-fit taken today is against `staged84` and belongs
+//! beside these two rather than in place of either.
+//!
 //! ## What the item boundary is, ablated rather than fitted
 //!
 //! Every figure above for a *part* of this kernel is a share of that intercept,
@@ -119,6 +125,14 @@
 //!
 //! `examples/README.md` §7 has the tables, the PTX census that says each rung
 //! removes what it names, and the three corners that do not run.
+//!
+//! **Every figure in the three bullets above is the register drain's, and that
+//! epilogue is no longer the default.** The two sections below are what was
+//! spent against them: the same subtraction reads 20.43 µs a tile for `lcf`,
+//! 14.96 for `staged` and 6.68 for the shipped `staged84` at 8192³, so the
+//! epilogue is now roughly a third of the term these bullets rank everything
+//! by. The ladder itself is unchanged and still runs on `lcf`, which is what
+//! keeps the two comparable.
 //!
 //! ## And the epilogue can be staged, which is worth 2–8%
 //!
@@ -151,7 +165,42 @@
 //! `gemm_ws` carries the same epilogue and gains 2.5–4.1% from it — which is
 //! the control that says the win is the store's *shape* and not its placement,
 //! since that kernel's epilogue was already deferred and already on warps of
-//! its own. §7 has both, and why this file still ships the register drain.
+//! its own. §7 has both.
+//!
+//! ## And the widths on top of it, which is what this file now ships
+//!
+//! [`SHIPPED_EPILOGUE`] is `staged84` — [`Epilogue::StagedWideX4`], the staged
+//! drain with the LDTM half at `tcgen05.ld.16x256b.x8` and the `stmatrix` half
+//! at `.m8n8.x4` (#117). [`bench`] launches it; [`gemm_cg2`](kernels::gemm_cg2)
+//! and its register drain are the control every A/B above is taken against.
+//!
+//! **The mechanism is the wait and not the issue.** [`TmemTile::fragment`]
+//! waits after *each* `.x1` load, because the registers it waits on are the
+//! load's return value — so a `[32, 64]` band is 16 loads and 16 fully exposed
+//! tensor-memory latencies where `.x8` is 2 and 2. That alone is
+//! **+23.6% / +8.6% / +3.6%** over `staged`. `.x4` halves an instruction count
+//! and is worth −0.6% / −0.3% / −1.1% *alone*, a clean null with a consistent
+//! sign; composed the pair is **+23.1% / +8.8% / +5.1%**, which is 1668 and
+//! 1723 TFLOP/s and **0.944 and 0.922 of cuBLASLt** at 8192³ and 16384³.
+//! #119 re-measured that in its own container against its own cuBLASLt and got
+//! 1645.0 and 1754.6 TFLOP/s, **0.939 and 0.958** — the largest ratio this
+//! kernel has reached, and a reminder that the denominator moves too.
+//!
+//! **The composition gain is liveness, and the register column is what says
+//! so.** `ptxas` reads 42 for `staged`, 94 for `staged8` — the 32 f32 that now
+//! arrive at once — and 80 for `staged84`, because `.x4` consumes all four of
+//! a fragment's matrices in one instruction. Those 14 registers are the whole
+//! of why the composed rung beats `.x8` alone at 16384³. Zero spill in every
+//! rung, and 80 is far inside the 255 that two CTAs at 128 threads admit —
+//! `regcount`'s ceiling for this kernel has been 255 rather than 168 since #87
+//! gave up the third CTA. Residency here is tensor-memory-bound at 256
+//! accumulator columns and was never the count.
+//!
+//! **`gemm_ws` ships `staged8` instead, and the same column is why.** There
+//! `.x8` costs the same +50 and `.x4` recovers **2** registers (94 → 92), so
+//! the two do not compose, `staged8` and `staged84` sit within 1.1% and trade
+//! places between sessions, and the rung with less surface wins the tie. The
+//! two files differ here on purpose (#118, #119).
 //!
 //! ## The item map is grouped, not row-major
 //!
@@ -178,7 +227,9 @@
 //! [`BLOCK_N`] fp32 columns of tensor memory, [`Band`] is still 128 fp32 a
 //! thread, and the single `cvt.rn.bf16x2.f32` is inside the store
 //! ([`kittens::global::store_rows`] over a [`kittens::global::GlobalRows`] of
-//! [`Bf16`]).
+//! [`Bf16`]). The shipped drain converts in [`kittens::ldst::store_tile_x4`]
+//! on the way into shared instead, and the count is the same 128 a thread —
+//! see the widths section above.
 //!
 //! **The cuBLASLt baseline moved in the same change and had to.** At 8192³ an
 //! fp32 `C` is 268 MB and a bf16 `C` is 134 MB, so a baseline left at
@@ -220,7 +271,10 @@
 //! [`kittens::global::GlobalRows`] cursor holding `ldc` (#11), and the exact
 //! CPU check below is what says the two address the same elements: every one
 //! of `M * N` is compared, so a coordinate this kernel no longer computes is
-//! still a coordinate the reference would catch.
+//! still a coordinate the reference would catch. The shipped drain reaches the
+//! same cursor a hop later — [`kittens::ldst::store_tile_x4`] into a per-warp
+//! shared tile and [`kittens::global::store_shared_rows`] out of it — and no
+//! index arithmetic came back with it.
 //!
 //! The cluster-scope TMEM allocation that used to sit beside it is now
 //! [`kittens::tmem::alloc_cluster`] / [`kittens::tmem::dealloc_cluster`]
@@ -334,7 +388,10 @@ const BLOCK_K: usize = 64;
 const STAGES: usize = 3;
 /// One warp per 32 accumulator rows, which is what a `[32, N]` drain wants.
 pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32;
-/// Accumulator columns one warp drains in a single band.
+/// Accumulator columns one warp drains in a single band of the
+/// **register-drain** epilogue — [`Epilogue::Fused`] and [`Epilogue::Deferred`],
+/// which since #119 are the control rather than the default. [`STAGE_N`] is
+/// the shipped drain's band.
 ///
 /// A `RegTile<32, N, BaseLdtm>` is `32 * N / 32` fp32 values a thread, so a
 /// warp draining 256 columns at once would want **256 registers** before any
@@ -346,7 +403,8 @@ pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32;
 /// kernel's codegen is unchanged, which `regcount` is what confirms.
 const DRAIN_N: usize = 128;
 /// Accumulator columns one warp drains in a single band of the **staged**
-/// epilogue ([`Epilogue::Staged`]) — and not a swept parameter.
+/// epilogue ([`Epilogue::Staged`] and #117's three widths on it, which is
+/// [`SHIPPED_EPILOGUE`]) — and not a swept parameter.
 ///
 /// The band goes to shared memory through `stmatrix`, so its width is the
 /// staging tile's width, and `SharedTile::WIDTH_OK` wants a whole swizzle
@@ -446,7 +504,14 @@ const fn pair_shape(block_n: usize) -> MmaShape {
     }
 }
 
-/// Dynamic shared memory the shipped kernel's launch must provide.
+/// Dynamic shared memory a **register-drain** launch must provide — `lcf`,
+/// `lcsf`, every [`Ablation`] rung and every rung of #87's tile sweep.
+///
+/// **Not the shipped envelope since #119.** [`SHIPPED_EPILOGUE`] is `staged84`
+/// and declares [`STAGED_SHARED_BYTES`]; this is the plan the staged one is
+/// laid on top of, byte for byte, which is what keeps the two arms of every
+/// epilogue A/B differing in the drain and in 16 424 declared bytes and in
+/// nothing else.
 ///
 /// Every scheduler below launches with the *same* plan, including the static
 /// one that never touches the queue. Twenty-four bytes is not worth a second
@@ -488,17 +553,24 @@ const STAGE_OFFSET: usize = SHARED_BYTES.next_multiple_of(128);
 /// CTAs of a staged launch an SM holds — [`Rung::ctas_per_sm`]'s
 /// `min(512 / columns, shared per SM / plan)` at [`STAGED_SHARED_BYTES`].
 ///
-/// It is 2, the same integer the shipped envelope gets, because the
+/// It is 2, the same integer the register-drain envelope gets, because the
 /// tensor-memory term binds at [`BLOCK_N`] columns and the staging tiles come
 /// out of slack the shared term still had. `device-tests`' `tmem residency
 /// census` counts the same 2 at this envelope, which is what makes the A/B an
-/// epilogue comparison rather than a residency one.
+/// epilogue comparison rather than a residency one — and, since #119, what
+/// says [`CTAS_PER_SM`] still describes the shipped launch after the default
+/// moved onto this plan.
 fn staged_ctas_per_sm(shared_per_sm: usize) -> u32 {
     (512 / BLOCK_N).min(shared_per_sm / STAGED_SHARED_BYTES) as u32
 }
 
-/// The staged epilogue's envelope, and the second literal
-/// `#[launch_contract]` needs.
+/// The staged epilogue's envelope, the second literal `#[launch_contract]`
+/// needs — and since #119 **the envelope the shipped launch declares**, since
+/// [`SHIPPED_EPILOGUE`] is one of the four rungs that carry staging tiles.
+///
+/// All four declare it: #117's two instruction widths change what the epilogue
+/// issues and not what it occupies, so `staged`, `staged8`, `staged4` and
+/// `staged84` share one number and one `no drain` control.
 ///
 /// **It must stay at or under 116 736 B**, which is the 233 472 an SM has
 /// divided by the 2 CTAs [`CTAS_PER_SM`] counts — and the residency itself does
@@ -553,7 +625,10 @@ const SMS: u32 = 148;
 /// before shared memory is consulted at all. So this is the first kernel in
 /// this repo whose residency is set by the *tensor memory* half of
 /// `min(512 / columns, shared per SM / plan)` — every one before it was capped
-/// by the shared half. The census counts 2 at the 98392 B plan, agreeing.
+/// by the shared half. The census counts 2 at the 98392 B plan, agreeing —
+/// **and the same 2 at the 114 816 B plan [`SHIPPED_EPILOGUE`] declares**,
+/// which is why moving the default onto the staged epilogue in #119 left this
+/// constant, [`MAX_CLUSTERS`] and the grid exactly where they were.
 ///
 /// The step down from 3 was paid for and the sweep is what says at what price.
 /// #98 priced a 3 → 2 step at **13.6–16.1%** on bytes no code touched; here the
@@ -745,6 +820,31 @@ pub const SHIPPED: Rung = Rung {
     stages: STAGES,
     entry: Entry::Shipped,
 };
+
+/// The epilogue this file ships — `staged84`, both of #117's instruction
+/// widths on #116's staged drain, and what [`bench`] launches.
+///
+/// **It was [`Epilogue::Fused`] through #119**, on the precedent that a rung
+/// beside the shipped kernel keeps every A/B in `examples/README.md` §7
+/// quotable against one launch. The evidence is three sections deep and points
+/// one way: staging the drain is +8.0% / +4.2% / +1.9% at 4096³ / 8192³ /
+/// 16384³ (#116) and the two widths compose on top of that for
+/// **+23.1% / +8.8% / +5.1%** (#117). Measured default against default in one
+/// container, with cuBLASLt re-measured in it, that is
+/// **+37.2% / +13.5% / +10.0%** and **0.583 → 0.801, 0.827 → 0.939 and
+/// 0.871 → 0.958 of cuBLASLt**. Every rung passed the same element-by-element
+/// `==` on bf16 words at both check sizes and all three traversal widths.
+///
+/// It carries [`STAGED_SHARED_BYTES`] rather than [`SHARED_BYTES`] and the
+/// residency does not move with it — `min(512 / columns, shared per SM /
+/// plan)` binds on the tensor-memory term at [`BLOCK_N`] columns, so
+/// [`CTAS_PER_SM`] is 2 at both envelopes.
+///
+/// **`gemm_ws` ships a different rung on purpose** — `staged8`, without
+/// `.x4`. There `.x4` recovers 2 registers where it recovers 14 here, so the
+/// composition gain that makes this the winner does not exist on that design
+/// point; see [`crate::gemm_ws::SHIPPED_ENTRY`].
+pub const SHIPPED_EPILOGUE: Epilogue = Epilogue::StagedWideX4;
 
 /// #87's sweep, and the losers stay in it.
 ///
@@ -2033,7 +2133,11 @@ pub mod kernels {
     }
 
     /// `C[m, n] = Σₖ A[m, k] · B[n, k]`, one `(2·BLOCK_M, BLOCK_N)` output
-    /// tile per work item, `k_blocks` stages of `BLOCK_K` deep.
+    /// tile per work item, `k_blocks` stages of `BLOCK_K` deep — **with the
+    /// register drain, which since #119 is the control and not the default.**
+    /// [`gemm_cg2_staged_x8x4`] is what [`bench`] launches; this is the arm
+    /// every epilogue A/B in `examples/README.md` §7 is measured against, and
+    /// the only entry point with a [`Scheduler::Stealing`] twin.
     ///
     /// The grid is persistent and the item map is [`pipeline::run`]'s: a
     /// *cluster* takes item `%clusterid` and steps by `%nclusterid` until the
@@ -2254,8 +2358,15 @@ pub mod kernels {
         }
     }
 
-    /// Both of #117's widths at once — the composition rung, and the only one
-    /// that can say whether they add.
+    /// Both of #117's widths at once — the composition rung, and **the kernel
+    /// this file ships since #119** ([`SHIPPED_EPILOGUE`]).
+    ///
+    /// It is the only rung that can say whether the two widths add, and they
+    /// do: `.x8` alone is +23.6% / +8.6% / +3.6% over `staged` and the pair is
+    /// +23.1% / +8.8% / +5.1%, the gain at the largest size coming entirely
+    /// from `.x4` handing back 14 of the 52 registers `.x8` costs (94 → 80).
+    /// That recovery is what makes this the shipped rung here and *not* on
+    /// `gemm_ws`, where the same `.x4` recovers 2.
     ///
     /// # Safety
     ///
@@ -3164,9 +3275,17 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The kernel as it ships: whichever schedule `scheduler` names, walked at
-    /// the measured [`GROUP`], on the [`SHIPPED`] rung, with the epilogue fused
-    /// into the item.
+    /// The [`SHIPPED`] rung on whichever schedule `scheduler` names, walked at
+    /// the measured [`GROUP`], **with the epilogue fused into the item**.
+    ///
+    /// That last clause used to say "the kernel as it ships" and no longer
+    /// does: [`SHIPPED_EPILOGUE`] is `staged84` since #119, and [`bench`] is
+    /// what applies it. What this constructor gives is the register-drain
+    /// base every sweep below takes its control arm from — the only epilogue
+    /// with a [`Scheduler::Stealing`] entry point, and the only one the
+    /// [`Ablation`] cube is built at — so a caller wanting the shipped launch
+    /// says `.with(SHIPPED_EPILOGUE)` and a caller wanting the control says
+    /// nothing.
     fn new(scheduler: Scheduler) -> Self {
         Plan {
             scheduler,
@@ -3430,7 +3549,7 @@ impl Phase {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Epilogue {
     /// `lcf`: the store folds into the item and cannot overlap the next item's
-    /// loads. The control, and what this kernel shipped through #87.
+    /// loads. The control, and what this kernel shipped through #119.
     Fused,
     /// `lcsf`: the store is deferred one item and runs while the next item's
     /// first [`Tile::FILL`] stages are in flight.
@@ -3456,7 +3575,7 @@ pub enum Epilogue {
     ///
     /// The waits are the point. [`TmemTile::fragment`] waits after *each* of
     /// its two `.x1` loads because the registers it waits on are the load's
-    /// return value, so the shipped drain never has more than one LDTM in
+    /// return value, so a `.x1` drain never has more than one LDTM in
     /// flight and pays the full tensor-memory latency per four values.
     ///
     /// **The shared plan does not move**, unlike [`Epilogue::Staged`]'s: this
@@ -3480,8 +3599,13 @@ pub enum Epilogue {
     /// Same plan and same control as [`Epilogue::StagedWide`]. On the
     /// correctness gate.
     StagedX4,
-    /// `staged84`: both of #117's widths — the composition rung, and the only
-    /// one that can say whether the two add or overlap.
+    /// `staged84`: both of #117's widths — the composition rung, and
+    /// [`SHIPPED_EPILOGUE`] since #119.
+    ///
+    /// They do add, and the register column is why: `.x4` hands back 14 of the
+    /// 52 registers `.x8` costs (94 → 80), which is the whole of why this beats
+    /// [`Epilogue::StagedWide`] at 16384³. On `gemm_ws` the same `.x4` recovers
+    /// 2 and that kernel ships `staged8` instead.
     ///
     /// Same plan and same control as [`Epilogue::StagedWide`]. On the
     /// correctness gate.
@@ -4185,10 +4309,12 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
             }
         }
         notes.push(format!(
-            "{m}x{n}x{k} exact on {}, {} and {} at groups {CHECK_GROUPS:?} (same {} B)",
+            "{m}x{n}x{k} exact on {}, {} and {} at groups {CHECK_GROUPS:?} \
+             ({} ships, same {} B)",
             Epilogue::StagedWide.name(),
             Epilogue::StagedX4.name(),
             Epilogue::StagedWideX4.name(),
+            SHIPPED_EPILOGUE.name(),
             STAGED_SHARED_BYTES
         ));
         // #87's rungs, on the static schedule they are swept on. A wider pair
@@ -4232,11 +4358,16 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
 /// against every earlier run of this table, and moving it to a different
 /// scheduler in the same change that introduces one would make the comparison
 /// unreadable. [`compare`] is where the schedulers are put beside each other.
+///
+/// **The epilogue it launches is [`SHIPPED_EPILOGUE`], which since #119 is
+/// `staged84` and not `lcf`.** Every `bench --case gemm*` row published before
+/// that is against the register drain and is not comparable to one taken after
+/// it; `examples/README.md` §7 says which tables moved.
 pub fn bench(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     shape: Shape,
 ) -> Result<Timings, Box<dyn Error>> {
-    bench_with(context, shape, Epilogue::Fused)
+    bench_with(context, shape, SHIPPED_EPILOGUE)
 }
 
 /// [`bench`] on a named epilogue — the shipped rung and schedule, checked
@@ -5097,10 +5228,11 @@ pub fn ablation_ladder(
         return Ok(());
     };
     println!(
-        "\n5. the drift control. Nothing here changes the shipped kernel, so `whole` at\n\
-         8192³ has to reproduce the published 0.812-0.825 of cuBLASLt for the rest of this\n\
-         run to be readable as a decomposition of THAT kernel — which is #109's lesson\n\
-         about a control the change itself moved."
+        "\n5. the drift control. Every rung here is the REGISTER-drain kernel — the ladder\n\
+         is built at `lcf` and #119 moved the default to `staged84` without touching it —\n\
+         so `whole` at 8192³ has to reproduce the published 0.812-0.825 of cuBLASLt for\n\
+         the rest of this run to be readable as a decomposition of THAT kernel, which is\n\
+         #109's lesson about a control the change itself moved."
     );
     println!(
         "{:<18}{:>14}{:>14}{:>16}",
@@ -5626,7 +5758,7 @@ const WIDTH_RUNGS: [Epilogue; 4] = [
 /// `tcgen05.ld.16x256b.x1` twice per `[16, 16]` block and waits after each
 /// one, so a `[32, 64]` staged band costs 16 loads and — the part that
 /// matters — 16 fully exposed tensor-memory latencies, since a load's
-/// registers *are* what the wait waits on and the shipped drain therefore
+/// registers *are* what the wait waits on and a `.x1` drain therefore
 /// never has two in flight. [`TmemTile::tile_x8`] is 2 and 2.
 ///
 /// **`.x4` (`staged4`) is real.** A [`kittens::reg::Fragment`] is four `8x8`

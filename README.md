@@ -35,10 +35,18 @@ each kernel that states an exact block shape and the CTAs per SM its grid is
 sized for, `regcount` derives the most registers a thread may use and still
 hold that many — from the launch and the 64 K register file, checked against the
 toolkit's own `cuda_occupancy.h` on every run — and goes red when `ptxas` went
-over. At 128 threads that number is **168**, not the 170 the naive
-`file / threads / CTAs` gives: registers are allocated per warp in units of 256,
-across four sub-partitions. `gemm_cg2` is at 167. It is a gate on *occupancy*
-and nothing else — see below for why a register count is not a ranking.
+over. At 128 threads and three CTAs an SM that number is **168**, not the 170
+the naive `file / threads / CTAs` gives: registers are allocated per warp in
+units of 256, across four sub-partitions.
+
+The gate watches three kernels and none of them is at that step any more.
+`gemm_cg2` gave up the third CTA in #87 — `[256, 256]` is 256 accumulator
+columns, so `512 / 256` fixes it at two before shared memory is consulted — and
+two CTAs at 128 threads admits the whole 255-register file. Measured:
+`gemm_cg2` 166, `gemm_cg2_staged` 42, and `gemm_cg2_staged_x8x4` — the epilogue
+the crate ships since #119 — **80**, all with zero spill. It is a gate on
+*occupancy* and nothing else — see below for why a register count is not a
+ranking.
 
 **And read that table as allocation, not as a ranking.** `modal run
 modal_app.py::ladder_bench` puts a clock on four of those rungs — the first

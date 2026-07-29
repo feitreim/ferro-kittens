@@ -2594,7 +2594,10 @@ the 0.573–0.694 band it sat in through #92 and 0.742–0.793 through #102.
 
 The rungs above are the two sizes every table here is quoted at. The full
 `bench --case gemm` sweep on the shipped kernel says the trade is not uniform,
-and the direction is worth stating before anyone reads 0.886 as the headline:
+and the direction is worth stating before anyone reads 0.886 as the headline.
+*(#119 moved what `bench --case gemm` launches, from the register drain to
+`staged84`. Every row below is the register drain's; a sweep run today is a
+different kernel and belongs beside this table rather than in it.)*
 
 | shape | ours ms | ours TFLOP/s | theirs TFLOP/s | ours/theirs | was (#91/#92) |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -2786,8 +2789,10 @@ rather than by extrapolation. **No new census rung was run, and that is the
 reason** — a rung at an envelope already counted would have spent a B200 to
 reproduce a number.
 
-**What is kept, and why the losing attempt stays in the tree.** `gemm` still
-ships `lcf`. `Lcsf`, `HotStore`, the `Epilogue` axis and
+**What is kept, and why the losing attempt stays in the tree.** `gemm` shipped
+`lcf` until #119 and ships `staged84` now — which is still `lcf`'s *placement*,
+so nothing in this section's conclusion moved. `Lcsf`, `HotStore`, the
+`Epilogue` axis and
 `bench --case epilogue` stay, and `Lcsf` stays on the correctness gate at both
 shapes and all three traversal widths — including `4096x4096x256`, where 256
 tiles over 148 clusters means every cluster carries a pending accumulator across
@@ -3170,6 +3175,8 @@ overlapped with nothing, whatever a fit says.
 
 Every rung launches on the shipped geometry — `[256, 256] @ STAGES = 3`, static
 schedule, `GROUP = 8`, 98 392 B, 2 CTAs an SM, the same grid and item count —
+and on the **register** drain, which is what this ladder still decomposes after
+#119 moved the default onto `staged84` (same geometry, 114 816 B) —
 and `M = N = 8192` throughout, so tiles, waves, `C` bytes and the wave's working
 set are identical everywhere and only the arithmetic between two boundaries
 moves. **Only `whole` computes a GEMM**; it is checked element-by-element before
@@ -3473,7 +3480,9 @@ widths 1 / 4 / 8 / 16. Eight and sixteen are 0.1% apart, exactly as #87 found.
 of their bands, which is the control saying the container is not the story.
 Nothing in this section moves the shipped kernel: it is the same 166 registers,
 the same 98 392 B plan and the same two CTAs an SM, and the two new entry points
-are rungs beside it.
+are rungs beside it. *(The rung is still shipped. The epilogue on it is not —
+#119 moved that to `staged84`, at 80 registers and 114 816 B on the same two
+CTAs an SM. Every figure in this section is the register drain's.)*
 
 ##### and the epilogue itself, staged through shared memory — #15
 
@@ -3630,12 +3639,14 @@ unmoved and could not move, since 512 accumulator columns fixed `gemm_ws` at one
 CTA an SM before shared memory was consulted and 147 584 B is well inside the
 233 472 an SM has.
 
-**Neither kernel's default was changed.** `gemm_cg2` and `gemm_ws` still ship
-the register epilogue and `staged` is a rung beside them, on the same axis
-`lcf`/`lcsf` sit on — which is what makes every number above an A/B and keeps
-the whole of §7 quotable against one shipped kernel. On this evidence it is the
-rung to ship, at both entry points, and that is a change worth making on its own
-rather than folded into the measurement that motivates it.
+**Neither kernel's default was changed *in this section*.** `gemm_cg2` and
+`gemm_ws` still shipped the register epilogue here and `staged` was a rung
+beside them, on the same axis `lcf`/`lcsf` sit on — which is what makes every
+number above an A/B and keeps the whole of §7 quotable against one shipped
+kernel. On this evidence it is the rung to ship, at both entry points, and that
+is a change worth making on its own rather than folded into the measurement
+that motivates it. **#119 is that change**, taken after #117 and #118 had
+sharpened *which* rung; see "the defaults move" at the end of this section.
 
 ##### and the LDTM half, which was the wait and not the issue — #117
 
@@ -3754,7 +3765,9 @@ column is why.** `ptxas -v`, zero spill everywhere, frame 256 B throughout:
 
 `.x8` costs +52 registers, which is exactly the 32 f32 that arrive at once where
 the `.x1` path let the compiler fuse one eight-value `Fragment` through to the
-store. It does **not** spill, and 94 is far inside the 168 occupancy step —
+store. It does **not** spill, and 94 is far inside the step — which for this
+kernel is 255 and not the 168 quoted elsewhere in this file, since #87 gave up
+the third CTA and two CTAs at 128 threads admit the whole register file —
 residency here is tensor-memory-bound at 256 accumulator columns and the count
 was never the binding resource, which is the tenth occasion this file has said
 so. What `.x4` then buys is liveness rather than issue: it consumes all four of
@@ -3777,10 +3790,11 @@ says which.
 across containers and this section's within one. It is the largest single step
 in this table since the kernel was ported.
 
-**Neither kernel's default was changed**, on #116's own precedent: `staged84` is
-a rung beside `staged`, every number above is an A/B, and shipping it is a
-change worth making on its own rather than folded into the measurement that
-motivates it. On this evidence it is the rung to ship, and the same two widths
+**Neither kernel's default was changed *in this section***, on #116's own
+precedent: `staged84` is a rung beside `staged`, every number above is an A/B,
+and shipping it is a change worth making on its own rather than folded into the
+measurement that motivates it. **#119 made it** — `staged84` is `gemm_cg2`'s
+default now, on exactly the evidence in this table. The same two widths
 are untried on `gemm_ws`, whose staged rung carries twice the LDTM (16 against
 8) for the same reason its bands are twice as wide. *(The second half of that
 sentence is wrong and #118 measured why — the bands are the same width and the
@@ -3801,7 +3815,7 @@ own, and the producer never stops.
 row element-by-element exact against the CPU reference before it was timed
 (`check_c` compares bf16 words with `==` and no tolerance). All four staged rows
 declare the same 147 584 B, so one `no drain` control serves them all; `ws s4`
-is the shipped register epilogue at 131 176 B.**
+is the register epilogue this kernel shipped through #119, at 131 176 B.**
 
 | shape | `ws s4` ms | `staged` ms | `staged8` ms | `staged4` ms | `staged84` ms | `8` vs | `4` vs | `84` vs |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -3904,10 +3918,12 @@ left: at a 32 B plan it counts 1 holding but **2 resident**, with a second CTA
 parked 100.9 µs inside a blocking allocator; at the real plan the second CTA is
 never admitted and the wait falls to 0.9 µs.
 
-**Neither kernel's default was changed**, on #116's and #117's precedent. The
-rung to ship on `gemm_ws` is `staged8` — `.x4` is a null here, alone and in
-composition, and a lever that buys 2 registers is not worth a second entry
-point's worth of surface if one has to be chosen.
+**Neither kernel's default was changed *in this section***, on #116's and
+#117's precedent. The rung to ship on `gemm_ws` is `staged8` — `.x4` is a null
+here, alone and in composition, and a lever that buys 2 registers is not worth
+a second entry point's worth of surface if one has to be chosen. **#119 shipped
+it**, and shipped `staged84` on `gemm_cg2`, which is the one place the two
+files are deliberately different.
 
 **What is left, and it is not the epilogue.** #112 attributed this kernel's loss
 to the peer CTA hiding `gemm_cg2`'s epilogue; #114 refuted that by measuring
@@ -3921,6 +3937,121 @@ has never been measured is what an SM running one CTA of six warps does to the K
 pipeline against two CTAs of four. That is where the next probe belongs, and
 `kittens::epilogue::StoreRing` (#111) no longer has "about 7% to find" on this
 kernel — it has at most 3.0%.
+
+##### the defaults move, and they move to different rungs — #119
+
+The three sections above each end by saying the rung was worth shipping and
+that shipping it belonged in its own change. This is that change, and it is the
+whole of it: **`gemm_cg2`'s default epilogue becomes `staged84` and
+`gemm_ws`'s becomes `staged8`.** No rung was added, none was deleted, nothing
+was retuned; every entry point that existed before still launches and is still
+on the correctness gate.
+
+**They ship different rungs, and that is a measurement rather than an
+oversight.** #117's and #118's register column, reproduced by
+`scripts/modal-run regcount` on the tree that ships — zero spill everywhere,
+frame 256 B in every staged rung:
+
+| kernel | `staged` | `staged8` | `staged4` | `staged84` |
+| --- | ---: | ---: | ---: | ---: |
+| `gemm_cg2_staged*` | 42 | 94 | 40 | **80** |
+| `gemm_ws_staged*` | 44 | 94 | 44 | 92 |
+
+`.x8` costs +52 and +50, identically. What differs is what `.x4` hands back:
+**14 registers on `gemm_cg2` and 2 on `gemm_ws`**, and that recovery *is* the
+composition gain — there the pair is +5.1% at 16384³ against `.x8` alone's
++3.6%, here `staged8` and `staged84` land inside 1.1% and trade places between
+sessions. So the composed rung wins where the recovery is real and the tie goes
+to the rung with less surface where it is not. Tidying the two files onto one
+choice would be discarding exactly what the two sections above measured.
+
+**The confirming run — one container, min of 30 timed launches, every row
+checked element-by-element first, and cuBLASLt re-measured beside them rather
+than quoted** (#109 would have published a false +3.6% had it not noticed its
+own commit moved the baseline). cuBLASLt is 0.0836 / 0.6275 / 4.8020 ms here,
+which is 1645.0 / 1752.2 / 1831.8 TFLOP/s.
+
+| shape | `gemm` was (`lcf`) | `gemm` ships (`staged84`) | gain | of cuBLASLt |
+| --- | ---: | ---: | ---: | ---: |
+| 4096³ | 0.1432 | **0.1044** | **+37.2%** | 0.583 → **0.801** |
+| 8192³ | 0.7584 | **0.6684** | **+13.5%** | 0.827 → **0.939** |
+| 16384³ | 5.5157 | **5.0132** | **+10.0%** | 0.871 → **0.958** |
+
+| shape | `gemm_ws` was (`ws s4`) | `gemm_ws` ships (`staged8`) | gain | of cuBLASLt |
+| --- | ---: | ---: | ---: | ---: |
+| 4096³ | 0.1395 | **0.1166** | **+19.6%** | 0.599 → **0.717** |
+| 8192³ | 0.7947 | **0.7310** | **+8.7%** | 0.790 → **0.858** |
+| 16384³ | 5.9157 | **5.5663** | **+6.3%** | 0.812 → **0.863** |
+
+in milliseconds. The `gemm` column composes #116 and #117 in one step, which is
+why it is larger than either section's headline. Against the published ratios:
+#117's 0.796 / 0.944 / 0.922 for `staged84` reproduces at 0.801 / 0.939 /
+0.958, and #118's 0.726 / 0.856 / 0.852 for `ws staged8` at 0.717 / 0.858 /
+0.863. The 16384³ row is the one that moved, and the re-measured control is
+what says why: the library ran at 1831.8 TFLOP/s here against #117's 1869.1,
+and our own launch was 1.8% quicker. **0.958 of cuBLASLt is the closest this
+project has been.**
+
+`staged8` against `staged84` on `gemm_ws` in this session: 0.1166/0.1154,
+0.7310/0.7299, 5.5663/**5.5850** — `staged84` marginally ahead at the two small
+sizes and behind at the largest, the largest gap being 1.0%. That is the third
+session to land inside the tie and the second to order it differently, which is
+the evidence the shipped rung was chosen on.
+
+**What moved with the default, since a constant describing the shipped launch
+has to.** `gemm`'s launch declares **114 816 B** where it declared 98 392 and
+`gemm_ws`'s declares **147 584 B** where it declared 131 176; `main.rs`'s
+envelope table reports those, and the register plans are still asserted and are
+now what the *control* arms declare. `CTAS_PER_SM` does **not** move on either
+kernel and could not: residency is `min(512 / columns, shared per SM / plan)`
+and the tensor-memory term binds at both envelopes — 2 an SM for `gemm` at 256
+accumulator columns, 1 for `gemm_ws` at 512 — which `device-tests`' census has
+already counted at all four.
+
+The occupancy-step gate gained the shipped kernel as a third watched entry
+point, because that is the row that would go red first: `.x8` is the largest
+single liveness step any epilogue rung in this tree has taken. It is green, and
+the room is not the 168 this repo quoted for years — #87 gave up the third CTA,
+and two CTAs at 128 threads admits the whole register file.
+
+| kernel | threads | wants CTAs | regs | ceiling | headroom |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `gemm_cg2` | 128 | 2 | 166 | 255 | 89 |
+| `gemm_cg2_staged` | 128 | 2 | 42 | 255 | 213 |
+| `gemm_cg2_staged_x8x4` | 128 | 2 | **80** | 255 | 175 |
+
+The opcode census is unchanged rung for rung: `gemm_cg2_staged_x8x4` still
+reads 2 `tcgen05.ld`, 2 `stmatrix`, 4 `tcgen05.mma`, 1 `ld.shared.v4`, 1
+`st.global.v4` and 8 `cvt.rn.bf16x2`, and `gemm_ws_staged_x8` still reads its
+doubled counts from the two call sites `Ws::work` and `Ws::finish`.
+
+**What deliberately did not move.** The ablation cube, `bench --case epilogue`
+and `bench --case staged` are all built at `lcf` and stay there: they decompose
+the *register* drain, #114's 20.43 µs a tile is the figure they reproduce, and
+a ladder that moved with the default would stop being comparable to every
+earlier run of itself. `lcf` is also the only epilogue with a `clc` entry
+point, so the scheduler A/B keeps it. And **table 1 of `ws_bench` now names
+`lcf` on both sides instead of taking `gemm`'s default** — its one variable is
+where the overlap comes from, and a default moving under it would have made it
+two. It still reads −4.6% and −6.8% at the two large sizes, reproducing #112.
+
+**Every `bench --case gemm*` row published before this change is against a
+different kernel.** That includes the `gemm-depth` fit whose intercept ranks
+everything in the ablation section and the whole-size sweep above. Those rows
+are kept and labelled rather than re-run: re-fitting `gemm-depth` on `staged84`
+is a measurement of its own and this change is not it.
+
+**Correctness, before any of the above was quoted.** `scripts/modal-run
+examples` passes every rung of both kernels at both check sizes and all three
+traversal widths, under both schedulers wherever a rung has both — `==` on bf16
+words with no tolerance at all, so a lever costing a mantissa bit fails here
+rather than places. The pass line now names which rung ships, which is the
+cheapest place for that fact to live:
+
+```
+512x256x256 exact on staged8, staged4 and staged84 at groups [1, 3, 6] (staged84 ships, same 114816 B)
+4096x4096x256 exact on ws staged, ws staged8, ws staged4, ws staged84 (147584 B, ws staged8 ships)
+```
 
 #### 8. Multicast has no geometry to live in
 
