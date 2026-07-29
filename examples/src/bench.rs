@@ -16,11 +16,20 @@
 //!    samples tell them apart.
 //!
 //! **The sweeps that use this live in `experiments/`**, and this file is
-//! deliberately the part they do not own: `experiments/src/bench.rs` re-exports
-//! these three items rather than carrying a second copy of them, so the
-//! `softmax` and `layernorm` rows of that harness are timed by exactly the
-//! clock their own [`bench`](crate::softmax::bench) entry points are written
-//! against.
+//! deliberately the part they do not own: `experiments/src/bench.rs` includes
+//! it through `#[path]` and re-exports it rather than carrying a second copy,
+//! so the `softmax` and `layernorm` rows of that harness are timed by exactly
+//! the clock their own [`bench`](crate::softmax::bench) entry points are
+//! written against.
+//!
+//! So this file has two sets of callers and every item here has one, but not
+//! all of them are in this crate: [`time`] is reached from
+//! [`softmax::bench`](crate::softmax::bench) and
+//! [`layernorm::bench`](crate::layernorm::bench) either way, while
+//! [`Timings::median`], [`Timings::spread`] and [`Timings::drift`] are columns
+//! only a sweep prints. Nothing in `examples/` calls those three, and removing
+//! them would take the two diagnoses #122 was about out of the harness the
+//! sweep shares with the example.
 
 use std::error::Error;
 

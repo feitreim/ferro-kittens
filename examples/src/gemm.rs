@@ -222,22 +222,8 @@ type Atom<const R: usize> = SharedTile<Bf16, R, ATOM_K, Swizzle128B>;
 type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
 
 /// Barriers and the TMEM staging word, in the tail of the shared plan: the two
-/// `stages`-deep rings' semaphores, the MMA-complete semaphore, and one `u32`.
-const fn scratch_bytes(stages: usize) -> usize {
-    2 * stages * 8 + 8 + 8
-}
-
-/// Dynamic shared memory the operand rings and the scratch tail ask for.
-///
-/// Stated as arithmetic because `#[launch_contract]` takes a literal and this
-/// is where the two have to agree. It is not trusted either: [`kernels::attach`]
-/// carries a codegen-time assert against the rings' own `BYTES`, which is the
-/// only place the two could ever drift.
-const fn shared_plan(block_n: usize, block_k: usize, stages: usize) -> usize {
-    let a = BLOCK_M * block_k * 2 * stages;
-    let b = (block_n / 2) * block_k * 2 * stages;
-    a + b + scratch_bytes(stages)
-}
+/// [`STAGES`]-deep rings' semaphores, the MMA-complete semaphore, and one `u32`.
+const SCRATCH_BYTES: usize = 2 * STAGES * 8 + 8 + 8;
 
 /// The UMMA shape this pair tile issues.
 ///
@@ -252,8 +238,18 @@ const fn pair_shape(block_n: usize) -> MmaShape {
     }
 }
 
-/// The operand half of the envelope: everything but the staging run.
-const SHARED_BYTES: usize = shared_plan(BLOCK_N, BLOCK_K, STAGES);
+/// The operand half of the envelope: the two rings and the scratch tail, and
+/// everything but the staging run.
+///
+/// Stated as arithmetic because `#[launch_contract]` takes a literal and this
+/// is where the two have to agree. It is not trusted either: [`kernels::attach`]
+/// carries a codegen-time assert against the rings' own `BYTES`, which is the
+/// only place the two could ever drift.
+const SHARED_BYTES: usize = {
+    let a = BLOCK_M * BLOCK_K * 2 * STAGES;
+    let b = HALF_N * BLOCK_K * 2 * STAGES;
+    a + b + SCRATCH_BYTES
+};
 const _: () = assert!(THREADS == 128 && SHARED_BYTES == 98_368);
 
 /// Where the first warp's [`StageTile`] starts, as a byte offset into the
@@ -606,7 +602,7 @@ pub mod kernels {
     /// inside anybody's loop.
     ///
     /// The staging run sits at the *end* of the envelope rather than folded
-    /// into [`shared_plan`], so the operand offsets are the same ones a kernel
+    /// into [`SHARED_BYTES`], so the operand offsets are the same ones a kernel
     /// with no staging tiles would lay out.
     ///
     /// # Safety
@@ -627,19 +623,16 @@ pub mod kernels {
         ldc: u32,
         c: &mut DisjointSlice<u16>,
     ) -> Tile {
-        // The join `shared_plan` cannot make on its own, fired at codegen —
+        // The join [`SHARED_BYTES`]' arithmetic cannot make on its own, fired at
+        // codegen —
         // which is the only place the ring byte counts are known, and the
         // reason `cargo check` cannot stand in for a device build.
         const {
-            assert!(
-                shared_plan(BLOCK_N, BLOCK_K, STAGES)
-                    == ARing::BYTES + BRing::BYTES + scratch_bytes(STAGES)
-            );
+            assert!(SHARED_BYTES == ARing::BYTES + BRing::BYTES + SCRATCH_BYTES);
         };
         unsafe {
-            let rings = ARing::BYTES + BRing::BYTES;
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let scratch = smem.add(rings);
+            let scratch = smem.add(ARing::BYTES + BRing::BYTES);
             let tmem_slot = scratch.add(2 * STAGES * 8 + 8) as *mut u32;
             let warp_id = warp::warp_id();
 
@@ -1040,19 +1033,22 @@ fn check_c(observed: &[u16], m: usize, n: usize, k: usize) -> Result<f64, Box<dy
     Ok(worst)
 }
 
-/// Traversal widths the correctness run walks every size at, chosen to break
-/// [`pipeline::grouped`] rather than to be fast.
+/// Traversal widths the correctness run walks every size at: the one a launch
+/// uses, and three chosen to break [`pipeline::grouped`] rather than to be
+/// fast.
 ///
-/// `1` is row-major, so a regression in the map still fails against the
-/// traversal this kernel had before it was grouped. The other two are **not
-/// powers of two, and that is the point**: every `M` this project runs is, so
-/// `tiles_m` is too, so a swept width of 8 or 16 always divides it and the
-/// short last group — the one branch in the map, and the one that turns a wrong
-/// width into a tile computed twice — would never execute. At [`ITEMS_M`]'s 16
-/// tile-rows, `3` leaves a final group of one row and `6` leaves one of four;
-/// at [`M`]'s two tile-rows both are taller than the grid and take the
-/// saturating path instead.
-const CHECK_GROUPS: [u32; 3] = [1, 3, 6];
+/// [`GROUP`] is first because it is the one that ships, and a gate that never
+/// launches the shipped configuration is not a gate on it. It is also the least
+/// searching of the four, which is why the other three are here: `1` is
+/// row-major, so a regression in the map still fails against the traversal this
+/// kernel had before it was grouped, and `3` and `6` are **not powers of two,
+/// which is the point**. Every `M` this project runs is, so `tiles_m` is too,
+/// so a width of 8 always divides it and the short last group — the one branch
+/// in the map, and the one that turns a wrong width into a tile computed twice
+/// — would never execute. At [`ITEMS_M`]'s 16 tile-rows, `3` leaves a final
+/// group of one row and `6` leaves one of four; at [`M`]'s two tile-rows both
+/// are taller than the grid and take the saturating path instead.
+const CHECK_GROUPS: [u32; 4] = [GROUP, 1, 3, 6];
 
 /// The correctness run: two sizes, three traversals, checked, nothing timed.
 ///

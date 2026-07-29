@@ -111,12 +111,15 @@ the API it shipped, and § "in-place versus by-value" below is rewritten around
 it.
 
 ```sh
-cargo oxide build kittens-examples --arch sm_100a   # all four kernels
-cargo oxide run kittens-examples                    # and run the ones with launchers, on a B200
+cargo oxide build kittens-examples --arch sm_100a      # all four kernels
+cargo oxide run kittens-examples                       # and run the ones with launchers, on a B200
+cargo oxide build kittens-experiments --arch sm_100a   # every rung and probe below
+cargo oxide run kittens-experiments -- check           # and check the ones that compute a GEMM
 ```
 
-From the repo root: `modal run modal_app.py::build` for the first and
-`modal run modal_app.py::examples` for the second.
+From the repo root: `scripts/modal-run build` for the two builds and
+`scripts/modal-run examples` for the two runs — that entry point invokes both
+binaries, so the correctness gate is the one it always was.
 
 ## The gap lists, and why there is no longer a command for them
 
@@ -463,7 +466,7 @@ short — at `[48, 64]` `assign` runs 32 warps an SM against `fused`'s 16 and is
 still 5% *slower* across the device. Twice the warps did not quite cover it.
 
 **So the advice.** Do not read a register count as a speed. Read it with the
-occupancy beside it — `regcount` prices both kernel crates now, and
+occupancy beside it — `regcount` prices all three kernel crates now, and
 `kittens-examples`' own status table prints
 `cuOccupancyMaxActiveBlocksPerMultiprocessor` per kernel (#47) — and ask the one
 question that matters: *does this kernel get more warps if the band leaves the
