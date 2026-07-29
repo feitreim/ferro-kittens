@@ -124,8 +124,6 @@
 //! layernorm's answer exactly. A softmax seed cannot see the difference
 //! between the two kernels in this file.
 
-use cuda_device::barrier::Barrier;
-use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, launch_bounds, thread};
 
@@ -134,6 +132,7 @@ use crate::bench::{Shape, Timings, time};
 use std::error::Error;
 
 use kittens::ldst::{load_tile, load_vec, store_tile};
+use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, ColVec, RegTile, RegVec, rsqrt};
 use kittens::shared::{
     Bf16, F32, SharedTile, SharedVec, Swizzle128B, publish_to_async_proxy, tma_store_commit,
@@ -185,7 +184,76 @@ type ParameterChunk = SharedVec<Bf16, CHUNK>;
 /// [`SharedVec::get`], one barrier apart.
 type Partials = SharedVec<F32, WARPS>;
 
-pub const SHARED_BYTES: usize = Tile::BYTES + 2 * Parameters::BYTES + 64;
+/// [`kernels::layernorm_rows`]' shared memory: the tile, `gamma`, `beta`, and
+/// the barrier all three TMA loads complete on.
+struct RowsShared {
+    tile: Tile,
+    gamma: Parameters,
+    beta: Parameters,
+    loaded: Semaphore,
+    plan: SharedPlan,
+}
+
+/// [`kernels::groupnorm_tile`]'s: the tile, the four warps' partials, and the
+/// barrier.
+///
+/// The partials still come before the barrier, and the reason is no longer a
+/// correctness argument. It used to be one — *"the partials first, because
+/// `Tile::BYTES` is the only offset in this plan a vector's 128-byte alignment
+/// is promised at; the barrier behind it needs eight"* — because a hand-walked
+/// plan puts a handle wherever the arithmetic lands it. [`SharedPlan::vec`]
+/// aligns to 128 whatever precedes it, so the other order is legal and merely
+/// costs 120 bytes of padding; `kittens`' own `plan` tests assert both
+/// spellings and the difference between them. This one is the cheaper.
+struct GroupShared {
+    tile: Tile,
+    partials: Partials,
+    loaded: Semaphore,
+    plan: SharedPlan,
+}
+
+#[inline(always)]
+const fn rows_shared(at: SharedPlan) -> RowsShared {
+    let (tile, at) = at.tile::<Bf16, ROWS, COLUMNS, Swizzle128B>();
+    let (gamma, at) = at.vec::<Bf16, COLUMNS>();
+    let (beta, at) = at.vec::<Bf16, COLUMNS>();
+    let (loaded, at) = at.semaphore();
+    RowsShared {
+        tile,
+        gamma,
+        beta,
+        loaded,
+        plan: at,
+    }
+}
+
+#[inline(always)]
+const fn group_shared(at: SharedPlan) -> GroupShared {
+    let (tile, at) = at.tile::<Bf16, ROWS, COLUMNS, Swizzle128B>();
+    let (partials, at) = at.vec::<F32, WARPS>();
+    let (loaded, at) = at.semaphore();
+    GroupShared {
+        tile,
+        partials,
+        loaded,
+        plan: at,
+    }
+}
+
+/// Dynamic shared memory a launch of *either* kernel declares — the larger of
+/// the two plans, which is [`rows_shared`]'s by two whole parameter vectors.
+///
+/// It was `Tile::BYTES + 2 * Parameters::BYTES + 64` until #125 and is the
+/// walk's own total now — 33 288 rather than 33 344. The 64 was slack from the
+/// first commit of this file, and a cursor that aligns each handle to its own
+/// type's rule cannot reproduce a round number nobody had a reason for. A
+/// strictly smaller plan cannot cost residency, and this kernel's binding term
+/// is registers in any case: see `groupnorm_tile`'s `#[launch_bounds]` below.
+pub const SHARED_BYTES: usize = {
+    let rows = rows_shared(SharedPlan::sizing()).plan.bytes();
+    let group = group_shared(SharedPlan::sizing()).plan.bytes();
+    if rows > group { rows } else { group }
+};
 pub const THREADS: u32 = (WARPS * 32) as u32;
 /// `groupnorm_tile`'s `#[launch_bounds]` spells this count as a literal — the
 /// attribute takes one, and `modal_app.py`'s occupancy gate reads it back out
@@ -219,12 +287,13 @@ pub mod kernels {
         epsilon: f32,
     ) {
         unsafe {
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tile = Tile::from_raw(smem);
-            let gamma = Parameters::from_raw(smem.add(Tile::BYTES));
-            let beta = Parameters::from_raw(smem.add(Tile::BYTES + Parameters::BYTES));
-            let loaded =
-                Semaphore::attach(smem.add(Tile::BYTES + 2 * Parameters::BYTES) as *mut Barrier);
+            let RowsShared {
+                tile,
+                gamma,
+                beta,
+                loaded,
+                ..
+            } = rows_shared(SharedPlan::attach());
 
             let lane = lane();
             let row_base = 32 * warp_id();
@@ -353,13 +422,12 @@ pub mod kernels {
         epsilon: f32,
     ) {
         unsafe {
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tile = Tile::from_raw(smem);
-            // The partials first, because `Tile::BYTES` is the only offset in
-            // this plan a vector's 128-byte alignment is promised at; the
-            // barrier behind it needs eight.
-            let partials = Partials::from_raw(smem.add(Tile::BYTES));
-            let loaded = Semaphore::attach(smem.add(Tile::BYTES + Partials::BYTES) as *mut Barrier);
+            let GroupShared {
+                tile,
+                partials,
+                loaded,
+                ..
+            } = group_shared(SharedPlan::attach());
 
             let lane = lane();
             let row_base = 32 * warp_id();

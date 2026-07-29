@@ -220,8 +220,6 @@
 //! The check the seed was strengthened for (#56, #61) therefore sees a
 //! misplaced *column* exactly as loudly as a misplaced row.
 
-use cuda_device::barrier::Barrier;
-use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel, thread};
 
@@ -230,6 +228,7 @@ use crate::bench::{Shape, Timings, time};
 use std::error::Error;
 
 use kittens::ldst::{load_tile, store_tile};
+use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, RegTile, RegVec};
 use kittens::shared::{
     Bf16, SharedTile, Swizzle128B, publish_to_async_proxy, tma_store_commit, tma_store_wait,
@@ -259,7 +258,40 @@ type Band = RegTile<32, CHUNK, BaseLdtm>;
 /// A per-row scalar of those 32 rows — the maximum, then the denominator.
 type Rows = RegVec<32, BaseLdtm>;
 
-pub const SHARED_BYTES: usize = Tile::BYTES + 32;
+/// The launch's dynamic shared memory: the tile, and the barrier the TMA
+/// completes on.
+struct Shared {
+    tile: Tile,
+    loaded: Semaphore,
+    /// The cursor past the last reservation. Its [`SharedPlan::bytes`] is
+    /// [`SHARED_BYTES`], which is the point: the number the launch declares is
+    /// the end of the same walk that produced the two handles above, not a
+    /// second expression asserted equal to it.
+    plan: SharedPlan,
+}
+
+/// The plan, run once against [`SharedPlan::sizing`] for [`SHARED_BYTES`] and
+/// once against [`SharedPlan::attach`] inside the kernel.
+#[inline(always)]
+const fn shared(at: SharedPlan) -> Shared {
+    let (tile, at) = at.tile::<Bf16, ROWS, COLUMNS, Swizzle128B>();
+    let (loaded, at) = at.semaphore();
+    Shared {
+        tile,
+        loaded,
+        plan: at,
+    }
+}
+
+/// Dynamic shared memory the launch declares.
+///
+/// It was `Tile::BYTES + 32` until #125 and is `Tile::BYTES + 8` now — 32 776
+/// rather than 32 800. The 32 was slack from the first commit of this file,
+/// and a cursor that aligns each handle to its own type's rule cannot
+/// reproduce a round number nobody had a reason for. A strictly smaller plan
+/// cannot cost residency, and this kernel is bandwidth-bound on a tile it
+/// touches once.
+pub const SHARED_BYTES: usize = shared(SharedPlan::sizing()).plan.bytes();
 pub const THREADS: u32 = (ROWS / 32) as u32 * 32;
 
 #[cuda_module]
@@ -275,9 +307,7 @@ pub mod kernels {
         mut plane: i32,
     ) {
         unsafe {
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tile = Tile::from_raw(smem);
-            let loaded = Semaphore::attach(smem.add(Tile::BYTES) as *mut Barrier);
+            let Shared { tile, loaded, .. } = shared(SharedPlan::attach());
 
             let lane = lane();
             let row_base = 32 * warp_id();

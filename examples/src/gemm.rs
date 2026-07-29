@@ -111,9 +111,7 @@
 //! and #46, and this file is where that allocator's participation rules were
 //! worked out against silicon.
 
-use cuda_device::barrier::Barrier;
 use cuda_device::cluster;
-use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{
@@ -126,6 +124,7 @@ use kittens::global::{GlobalRows, store_shared_rows};
 use kittens::ldst::store_tile_x4;
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, Job};
+use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
@@ -176,7 +175,7 @@ pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32;
 /// staging tile's width and `SharedTile::WIDTH_OK` wants a whole swizzle
 /// subtile: **at bf16 under `Swizzle128B` 64 columns is the narrowest tile that
 /// exists**, and the widest one the budget admits. At 2 CTAs an SM a CTA gets
-/// `233 472 / 2 = 116 736` B and [`SHARED_BYTES`] spends 98 368 of it; four
+/// `233 472 / 2 = 116 736` B and [`SHARED_BYTES`] spends 98 364 of it; four
 /// warps × `[32, 64]` bf16 is 16 384 B and fits, and anything wider is 32 768
 /// and does not.
 const STAGE_N: usize = 64;
@@ -223,9 +222,14 @@ type Atom<const R: usize> = SharedTile<Bf16, R, ATOM_K, Swizzle128B>;
 /// the `512 / columns` half of the residency this kernel gets.
 type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
 
-/// Barriers and the TMEM staging word, in the tail of the shared plan: the two
-/// [`STAGES`]-deep rings' semaphores, the MMA-complete semaphore, and one `u32`.
-const SCRATCH_BYTES: usize = 2 * STAGES * 8 + 8 + 8;
+/// Warps in the block, and so buffers in the staging run.
+const WARPS: usize = THREADS as usize / 32;
+/// The staging run, as a ring of one [`StageTile`] per warp.
+///
+/// A ring rather than four tiles at a stride the kernel writes down: the
+/// per-warp offset is [`SharedTileRing::tile`]'s arithmetic, which is the same
+/// `warp_id * StageTile::BYTES` and lives in the library.
+type StageRun = SharedTileRing<Bf16, 32, STAGE_N, Swizzle128B, WARPS>;
 
 /// The UMMA shape this pair tile issues.
 ///
@@ -240,52 +244,98 @@ const fn pair_shape(block_n: usize) -> MmaShape {
     }
 }
 
+/// Everything the launch's dynamic shared memory holds before the staging run,
+/// in declaration order: the two operand rings, the two stage barrier rings,
+/// the MMA-complete semaphore, and the word `alloc_cluster` stages its result
+/// through.
+///
+/// The item's own handles, minus the ones that are launch parameters rather
+/// than shared memory — [`kernels::attach`] copies these into [`Tile`] and
+/// adds the maps.
+struct Shared {
+    a_ring: ARing,
+    b_ring: BRing,
+    load: SemaphoreRing<STAGES>,
+    free: SemaphoreRing<STAGES>,
+    done: Semaphore,
+    tmem_slot: *mut u32,
+    /// The cursor past the last reservation, which is both [`SHARED_BYTES`]
+    /// and where [`staged`] picks up.
+    plan: SharedPlan,
+}
+
+/// The operand half of the envelope, as one walk.
+///
+/// Run against [`SharedPlan::sizing`] it is [`SHARED_BYTES`]; run against
+/// [`SharedPlan::attach`] it is the handles. Before #125 those were two
+/// programs — an arithmetic `SHARED_BYTES` here and a pointer walk in
+/// `attach` — joined by a `const { assert!(..) }` that had to be written by
+/// hand and could only ever check the total, never an offset.
+#[inline(always)]
+const fn shared(at: SharedPlan) -> Shared {
+    let (a_ring, at) = at.tile_ring::<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>();
+    let (b_ring, at) = at.tile_ring::<Bf16, HALF_N, BLOCK_K, Swizzle128B, STAGES>();
+    let (load, at) = at.semaphores::<STAGES>();
+    let (free, at) = at.semaphores::<STAGES>();
+    let (done, at) = at.semaphore();
+    let (tmem_slot, at) = at.tmem_slot();
+    Shared {
+        a_ring,
+        b_ring,
+        load,
+        free,
+        done,
+        tmem_slot,
+        plan: at,
+    }
+}
+
+/// The staging run on the end of it.
+///
+/// [`SharedPlan::tile_ring`] aligns the run to the 128 bytes a
+/// [`SharedTile`] base owes, which is the `next_multiple_of(128)` this file
+/// used to carry beside a `STAGE_OFFSET` constant. It is not cosmetic: the run
+/// would otherwise start at the end of a four-byte staging word, which is not
+/// a swizzle atom's alignment and would put the phase
+/// [`kittens::shared::SwizzledChunks`] derives from the base somewhere the
+/// `stmatrix` and the read-back would still agree on but no reader could check.
+#[inline(always)]
+const fn staged(at: SharedPlan) -> (StageRun, SharedPlan) {
+    at.tile_ring::<Bf16, 32, STAGE_N, Swizzle128B, WARPS>()
+}
+
 /// The operand half of the envelope: the two rings and the scratch tail, and
 /// everything but the staging run.
 ///
-/// Stated as arithmetic because `#[launch_contract]` takes a literal and this
-/// is where the two have to agree. It is not trusted either: [`kernels::attach`]
-/// carries a codegen-time assert against the rings' own `BYTES`, which is the
-/// only place the two could ever drift.
-const SHARED_BYTES: usize = {
-    let a = BLOCK_M * BLOCK_K * 2 * STAGES;
-    let b = HALF_N * BLOCK_K * 2 * STAGES;
-    a + b + SCRATCH_BYTES
-};
-const _: () = assert!(THREADS == 128 && SHARED_BYTES == 98_368);
+/// 98 364 B rather than the 98 368 this file carried until #125 — the staging
+/// word is a `u32` and [`SharedPlan::tmem_slot`] reserves four bytes for it
+/// where the hand-written tail charged eight. It changes nothing downstream:
+/// the staging run is 128-byte aligned, so both numbers round to the same
+/// 98 432 and [`STAGED_SHARED_BYTES`], which is the figure the launch actually
+/// declares and the one residency is set by, is unmoved.
+const SHARED_BYTES: usize = shared(SharedPlan::sizing()).plan.bytes();
+const _: () = assert!(THREADS == 128 && SHARED_BYTES == 98_364);
 
-/// Where the first warp's [`StageTile`] starts, as a byte offset into the
-/// launch's dynamic shared memory.
-///
-/// Rounded up to the 128-byte alignment a [`SharedTile`] base owes. The
-/// staging run would otherwise start at the end of an 8-byte semaphore, which
-/// is not a swizzle atom's alignment and would put the phase
-/// [`kittens::shared::SwizzledChunks`] derives from the base somewhere the
-/// `stmatrix` and the read-back would still agree on but no reader could check.
-const STAGE_OFFSET: usize = SHARED_BYTES.next_multiple_of(128);
-
-/// Dynamic shared memory the launch declares — the second literal
+/// Dynamic shared memory the launch declares — the literal
 /// `#[launch_contract]` needs.
 ///
 /// **It must stay at or under 116 736 B**, which is the 233 472 an SM has
 /// divided by the 2 CTAs [`CTAS_PER_SM`] counts. 1920 B of headroom is left,
 /// which is why the staging ring is one buffer deep: another is 16 384.
-pub const STAGED_SHARED_BYTES: usize = STAGE_OFFSET + (THREADS as usize / 32) * (32 * STAGE_N * 2);
-
-/// The envelope, the staging run and the alignment are three spellings of the
-/// same bytes, and this is where they have to agree.
 ///
 /// The contract is not decoration: 112 KiB is far past the 48 KiB a block gets
 /// by default, and the opt-in (`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`)
 /// is issued by the prepared-launch path. `cluster_launch` has nothing to do
 /// with it; [`kittens::launch::admit_shared_plan`] is the same opt-in for a
 /// kernel whose output partition no contract describes.
+pub const STAGED_SHARED_BYTES: usize = staged(shared(SharedPlan::sizing()).plan).1.bytes();
+
+/// What the envelope leaves, which is what says the staging ring is one buffer
+/// deep by arithmetic rather than by preference.
 const _: () = {
-    let run = (THREADS as usize / 32) * StageTile::BYTES;
+    let run = WARPS * StageTile::BYTES;
     assert!(run == 16_384);
-    assert!(STAGE_OFFSET >= SHARED_BYTES && STAGE_OFFSET.is_multiple_of(128));
     assert!(STAGED_SHARED_BYTES == 114_816 && STAGED_SHARED_BYTES <= 116_736);
-    assert!(STAGE_OFFSET + run == STAGED_SHARED_BYTES);
     assert!(STAGED_SHARED_BYTES + run > 116_736);
 };
 
@@ -625,30 +675,21 @@ pub mod kernels {
         ldc: u32,
         c: &mut DisjointSlice<u16>,
     ) -> Tile {
-        // The join `SHARED_BYTES`' arithmetic cannot make on its own, fired at
-        // codegen — which is the only place the ring byte counts are known, and
-        // the reason `cargo check` cannot stand in for a device build.
-        const {
-            assert!(SHARED_BYTES == ARing::BYTES + BRing::BYTES + SCRATCH_BYTES);
-        };
         unsafe {
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let scratch = smem.add(ARing::BYTES + BRing::BYTES);
-            let tmem_slot = scratch.add(2 * STAGES * 8 + 8) as *mut u32;
+            let shared = shared(SharedPlan::attach());
+            let (run, _) = staged(shared.plan);
             let warp_id = warp_id();
 
             Tile {
-                a_ring: ARing::attach(smem),
-                b_ring: BRing::attach(smem.add(ARing::BYTES)),
-                load: SemaphoreRing::<STAGES>::attach(scratch as *mut Barrier),
-                free: SemaphoreRing::<STAGES>::attach((scratch as *mut Barrier).add(STAGES)),
-                done: Semaphore::attach((scratch as *mut Barrier).add(2 * STAGES)),
+                a_ring: shared.a_ring,
+                b_ring: shared.b_ring,
+                load: shared.load,
+                free: shared.free,
+                done: shared.done,
                 a_map,
                 b_map,
-                accumulator: Accumulator::from_raw(alloc_cluster(tmem_slot, BLOCK_N as u32)),
-                stage: StageTile::from_raw(
-                    smem.add(STAGE_OFFSET + warp_id as usize * StageTile::BYTES),
-                ),
+                accumulator: Accumulator::from_raw(alloc_cluster(shared.tmem_slot, BLOCK_N as u32)),
+                stage: run.tile(warp_id),
                 c: GlobalRows::<Bf16>::from_slice(c, ldc as usize),
                 tiles_m,
                 tiles_n,

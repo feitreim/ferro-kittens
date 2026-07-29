@@ -27,12 +27,14 @@ pub mod launch;
 pub mod ldst;
 pub mod mma;
 pub mod pipeline;
+pub mod plan;
 pub mod reg;
 pub mod shared;
 pub mod sync;
 pub mod tmem;
 
 pub use epilogue::{Cta, Scope, StoreRing, Warp};
+pub use plan::SharedPlan;
 pub use reg::{
     BaseLdtm, BinaryOp, ColLayout, ColVec, Fragment, FragmentLayout, ReduceOp, RegTile, RegVec,
     RowLayout, TernaryOp, UnaryOp,

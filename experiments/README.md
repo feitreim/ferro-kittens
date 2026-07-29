@@ -478,6 +478,12 @@ and the register table's "failure" is a win.
 
 #### and a zero in that column is two different things (#70)
 
+Every `flash_forward` figure in this subsection is quoted at the 147536 B its
+shared plan was before #125 handed it to `kittens::plan::SharedPlan`, which
+reserves the `tcgen05.alloc` staging word as the four-byte `u32` it is: the
+plan is 147532 B now. Four bytes out of 144 KiB decides none of what follows,
+and the measurements are left at the sizes they were taken at.
+
 `flash_forward` printed **0 blocks/SM** at 147536 B, which reads like a plan
 too big for the SM and was not. Dynamic shared memory over 48 KiB is opt-in per
 function — `cuFuncSetAttribute` with

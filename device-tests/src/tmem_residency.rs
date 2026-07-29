@@ -201,7 +201,7 @@ const GEMM_PLAN_ONE: u32 = GEMM_PLAN + 49_152;
 ///
 /// Spelled here rather than imported for the same reason [`GEMM_SHARED`] is —
 /// `device-tests` does not depend on the examples crate — and they are the
-/// arithmetic `examples/src/gemm.rs`'s `shared_plan` states: two operand rings
+/// arithmetic `experiments/src/gemm.rs`'s `shared_plan` states: two operand rings
 /// `stages` deep over a `[128, 64]` `A` tile and a `[block_n / 2, 64]` `B`
 /// tile, bf16, plus the barrier and work-queue tail.
 ///
