@@ -623,10 +623,9 @@ pub mod kernels {
         ldc: u32,
         c: &mut DisjointSlice<u16>,
     ) -> Tile {
-        // The join [`SHARED_BYTES`]' arithmetic cannot make on its own, fired at
-        // codegen —
-        // which is the only place the ring byte counts are known, and the
-        // reason `cargo check` cannot stand in for a device build.
+        // The join `SHARED_BYTES`' arithmetic cannot make on its own, fired at
+        // codegen — which is the only place the ring byte counts are known, and
+        // the reason `cargo check` cannot stand in for a device build.
         const {
             assert!(SHARED_BYTES == ARing::BYTES + BRing::BYTES + SCRATCH_BYTES);
         };
@@ -735,10 +734,12 @@ pub mod kernels {
     }
 }
 
-/// Rows of `C` the correctness run computes — two clusters' worth of `M`, so
-/// the `item → (tile_m, tile_n)` map is exercised in both axes.
+/// Rows of `C` the correctness run computes — two clusters' worth of `M`, so a
+/// cluster's rank arithmetic and the `item → tile_m` half of the map both run
+/// against a second tile-row.
 const M: usize = 512;
-/// Columns of `C`: two [`BLOCK_N`] tiles.
+/// Columns of `C`: one [`BLOCK_N`] tile, so this size is two items wide in `M`
+/// and one in `N`. [`ITEMS_N`] is what walks the other axis.
 const N: usize = 256;
 /// Reduction depth: four [`BLOCK_K`] stages against a three-deep pipeline, so
 /// the ring wraps and `wait_recycled` is on trial rather than skipped.
@@ -747,7 +748,7 @@ const K: usize = 256;
 /// A second correctness size, whose only job is to give every cluster **more
 /// than one work item**.
 ///
-/// [`M`]`x`[`N`] is four tiles and the grid holds 148 clusters, so it never
+/// [`M`]`x`[`N`] is two tiles and the grid holds 148 clusters, so it never
 /// enters [`pipeline::run`]'s loop a second time — it would pass identically
 /// against a launch-per-tile kernel, which is exactly what makes it not a test
 /// of this one. The failure modes the persistent scaffold introduces all live
