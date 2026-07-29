@@ -132,6 +132,160 @@ fn shared_vectors_move_and_are_read<E: Element, const N: usize, L: ColLayout<N>>
     }
 }
 
+/// §2.2 — the global movers are generic over the element, not fp32-only.
+///
+/// The 2026-07-29 audit's worst find, and the section's own failure mode again:
+/// §2.2 read "It is **fp32 only**: `GlobalRows` names a `*mut f32` outright
+/// rather than carrying an `Element`" for the whole of #108's life, having been
+/// written as the reason a bf16 `C` was out of reach. `GlobalRows<E>` is what
+/// makes the rounding happen once, in the store instruction, and naming it here
+/// is what stops the entry going back to fp32 in prose.
+///
+/// `CONTIGUOUS_VALUES` is named beside them because the pairing (#91) is a
+/// claim the *layout* makes and the movers spend; a layout that dropped it
+/// would leave both of them silently scalar.
+fn global_movers_carry_an_element<E: Element, const M: usize, const N: usize, L>(
+    rows: kittens::global::GlobalRows<E>,
+    lane: u32,
+    tile: RegTile<M, N, L>,
+) where
+    L: RowLayout<M> + ColLayout<N>,
+{
+    unsafe {
+        kittens::global::store_rows(rows, 0, 0, lane, tile);
+        let _: RegTile<M, N, L> = kittens::global::load_rows(rows, 0, 0, lane);
+        let _: usize = kittens::global::access_width(rows, 0);
+        let _: bool = rows.runs_aligned(0, L::CONTIGUOUS_VALUES);
+    }
+}
+
+/// §2.6 — shared → global with no engine between them (#113), and the wide
+/// register→shared store the epilogue in front of it uses (#116).
+///
+/// `store_shared_rows` is the only mover in the crate whose *source* is shared
+/// memory, and both shipping GEMMs' epilogues are made of these two calls. It
+/// is named here because §2.6 says it landed and because the pair is what the
+/// unwritten epilogue type of §7 would be built out of.
+fn a_staged_drain_is_two_calls<E: Element<Unpacked = [f32; 2]>, const M: usize, const N: usize>(
+    chunks: kittens::shared::SwizzledChunks<E>,
+    tile: kittens::SharedTile<E, M, N, kittens::Swizzle128B>,
+    rows: kittens::global::GlobalRows<E>,
+    lane: u32,
+    band: RegTile<M, N, BaseLdtm>,
+) where
+    BaseLdtm: RowLayout<M> + ColLayout<N>,
+{
+    unsafe {
+        kittens::ldst::store_tile_x4(chunks, 0, 0, lane, band);
+        kittens::ldst::store_fragment_x4(chunks, 0, 0, lane, kittens::Fragment::zero());
+        kittens::global::store_shared_rows::<E, M, N, kittens::Swizzle128B, 32>(
+            rows, 0, 0, lane, tile,
+        );
+    }
+}
+
+/// §2.1 — the `.x8` drain (#117), beside the `.x1` one it is eight times fewer
+/// issues than.
+fn the_tmem_drain_has_both_widths<const M: usize, const N: usize>(
+    accumulator: kittens::TmemTile<M, N>,
+) where
+    BaseLdtm: RowLayout<M> + ColLayout<N>,
+{
+    unsafe {
+        let _: RegTile<M, N, BaseLdtm> = accumulator.tile(0, 0);
+        let _: RegTile<M, N, BaseLdtm> = accumulator.tile_x8(0, 0);
+        let _: [kittens::Fragment; 4] = accumulator.fragments_x8(0, 0);
+        accumulator.store_tile(0, 0, accumulator.tile(0, 0));
+    }
+}
+
+/// §7 — the store ring's scope is in the type (#123), which is the one place in
+/// the crate where a collective's scope is named rather than baked into its
+/// index math.
+///
+/// Named here because §7's whole argument is that this is the shape the rest of
+/// the crate has not taken, so a `Scope` that quietly went away would take the
+/// argument with it.
+fn the_store_ring_names_its_scope<SC: kittens::Scope>(
+    ring: &mut kittens::StoreRing<kittens::Bf16, 128, 64, kittens::Swizzle128B, 1, SC>,
+    map: *const cuda_device::tma::TmaDescriptor,
+) {
+    unsafe {
+        let _: kittens::SharedTile<kittens::Bf16, 128, 64, kittens::Swizzle128B> = ring.acquire();
+        ring.commit(map, 0, 0);
+        ring.commit_2d(map, 0, 0);
+        (*ring).drain();
+    }
+    let _: (bool, ()) = (SC::issuing(), SC::converge());
+    let _: [u32; 2] = [
+        kittens::StoreRing::<kittens::Bf16, 128, 64, kittens::Swizzle128B, 1, kittens::Cta>::DEPTH,
+        kittens::StoreRing::<kittens::Bf16, 128, 64, kittens::Swizzle128B, 1, kittens::Warp>::DEPTH,
+    ];
+}
+
+/// §2.4 — a peer's barrier is addressable (#50) and a load can complete on it,
+/// and the charge for a symmetric cluster stage is derived rather than written
+/// down (#29).
+fn a_cluster_stage_charges_one_barrier<E: Element, const R: usize, const C: usize>(
+    tile: kittens::SharedTile<E, R, C, kittens::Swizzle128B>,
+    map: *const cuda_device::tma::TmaDescriptor,
+    sem: kittens::Semaphore,
+) {
+    unsafe {
+        let peer = sem.at_rank(0);
+        peer.arrive();
+        let charge = tile.tma_load_2d_arriving_at(map, 0, 0, peer);
+        sem.expect_tx(charge.across_ranks(2));
+        let _ = tile.tma_load_2d_multicast_cg2(map, 0, 0, peer, 0b11);
+    }
+}
+
+/// §3.3 — the operand-order square, and the `mm_*` twin of each walk (#12).
+fn every_operand_order_has_an_entry_point<
+    E: kittens::MmaElement,
+    const K: usize,
+    const M: usize,
+    const N: usize,
+>(
+    tmem: u32,
+    k_major: kittens::SharedTile<E, M, K, kittens::Swizzle128B>,
+    mn_major: kittens::SharedTile<E, K, N, kittens::Swizzle128B>,
+    shape: kittens::mma::MmaShape,
+) {
+    use kittens::mma::{mm_ab, mm_abt, mm_atb, mm_atbt, mma_ab, mma_abt, mma_atb, mma_atbt};
+    unsafe {
+        mma_abt(tmem, k_major, k_major, shape, true);
+        mma_ab(tmem, k_major, mn_major, shape, true);
+        mma_atb(tmem, mn_major, mn_major, shape, true);
+        mma_atbt(tmem, mn_major, k_major, shape, true);
+        mm_abt(tmem, k_major, k_major, shape);
+        mm_ab(tmem, k_major, mn_major, shape);
+        mm_atb(tmem, mn_major, mn_major, shape);
+        mm_atbt(tmem, mn_major, k_major, shape);
+
+        // The runtime-layout pair, whose walks carry their own transpose bits.
+        let (a, b) = (k_major.k_walk(), mn_major.mn_walk());
+        let _: [bool; 2] = [a.transposed(), b.transposed()];
+        kittens::mma::mma_walk_cg2::<E, 4>(tmem, a, b, shape, true);
+        kittens::mma::mm_walk_cg2::<E, 4>(tmem, a, b, shape);
+    }
+}
+
+/// §4 — the scaffold, both item sources, the item map, and the rank scope
+/// (#51, #88, #89). §4 read "still uncalled by anything in `examples/`" until
+/// this audit; `gemm` has run on it since #83.
+fn the_scaffold_has_two_item_sources<J: kittens::pipeline::Job>(
+    job: &mut J,
+    queue: kittens::pipeline::ClcQueue,
+) {
+    unsafe {
+        kittens::pipeline::run(job, 64);
+        kittens::pipeline::run_stealing(job, queue);
+    }
+    let _: (u32, u32) = kittens::pipeline::grouped(0, 4, 4, J::RANKS);
+    let _: usize = kittens::pipeline::ClcQueue::BYTES;
+}
+
 /// The one claim here cheap enough to assert rather than merely name: the
 /// identities §3.2 says every fold seeds from. A `ReduceOp` whose identity is
 /// wrong yields a plausible wrong number rather than a crash, which is the

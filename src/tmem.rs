@@ -21,16 +21,25 @@
 //! | ---: | ---: | --- |
 //! | 32 | 16 | the allocator's smallest unit |
 //! | 64 | 8 | |
-//! | 128 | 4 | `gemm`, through [`alloc_cluster`] |
-//! | 256 | 2 | `flash_forward`, through [`alloc_block`] |
+//! | 128 | 4 | `gemm` before #104, through [`alloc_cluster`] |
+//! | 256 | 2 | `gemm` and `flash_forward` today |
 //! | 512 | 1 | the whole SM |
 //!
 //! Tensor memory is one of two per-CTA resources an SM divides, and residency
 //! is **whichever of the two is tighter**: `min(512 / columns, shared per SM /
-//! shared plan)`. Both of this repo's tcgen05 kernels are capped by the shared
-//! side rather than this one — `gemm` at 3 CTAs where its columns would allow 4,
-//! `flash_forward` at 1 where its columns would allow 2 — so read the table
-//! above as a ceiling that another resource may be sitting under.
+//! shared plan)`. Read the table above as a ceiling another resource may be
+//! sitting under — which it was for both kernels when this was written, at a
+//! `gemm` capped by shared memory at 3 CTAs where 128 columns would have
+//! allowed 4.
+//!
+//! **For `gemm` that has inverted, and this table is the resource that now
+//! binds it.** #104 promoted the pair tile to `[256, 256]`, so the kernel asks
+//! [`alloc_cluster`] for `BLOCK_N = 256` columns — 2 CTAs by this table — while
+//! its shared plan (114 816 B for the staged epilogue that ships, against the
+//! 116 736 B half of an SM) admits the same 2 with room left over.
+//! `examples/src/gemm.rs`'s `staged_ctas_per_sm` is that `min` written out and
+//! says which term is tight. `flash_forward` is unchanged and still capped by
+//! shared memory alone, at 1 CTA where its 256 columns would allow 2 (#84, #85).
 //!
 //! Measured on a B200 by `device-tests`' `tmem residency census`, which counts
 //! CTAs rather than asking about them: every CTA writes down its `%smid` and
