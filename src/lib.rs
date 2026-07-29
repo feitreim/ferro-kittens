@@ -45,3 +45,47 @@ pub use sync::{
     PhasedSemaphore, Semaphore, SemaphoreRing, TransactionBytes, block_reduce, block_reduce_sum,
 };
 pub use tmem::TmemTile;
+
+/// The calling thread's lane in its warp — **the `lane` argument**.
+///
+/// Every warp-scope entry point in the crate takes one:
+/// [`ldst::load_tile`], [`ldst::store_tile`], [`ldst::load_vec`],
+/// [`global::store_rows`], [`RegTile::mask`], [`RegVec::row`], and the rest of
+/// the register surface. Which lane holds which element of a
+/// [`RegTile<M, N, BaseLdtm>`](RegTile) is the layout's business and not the
+/// caller's; the lane is how a warp-collective op knows which thread it is
+/// running on, and passing another thread's is how a tile ends up transposed
+/// by 32 rows rather than faulting.
+///
+/// This wraps `cuda_device::warp::lane_id()` rather than re-exporting it, and
+/// the reason is this paragraph: without it a kernel that calls nothing but
+/// `kittens` still has to reach past the library for its first three lines,
+/// and the argument's meaning is stated only in the six signatures that take
+/// it (#127).
+///
+/// One `%laneid` read per warp is the convention — hoist it into the entry
+/// block and thread it through, which `device-tests`' `lane probe` prices at
+/// 0 registers at 128 columns and +16 at 32 against reading it per op. The
+/// wrapper is `#[inline(always)]` over an `#[inline(never)]` lowering target,
+/// so it is the same instruction either way.
+#[inline(always)]
+pub fn lane() -> u32 {
+    cuda_device::warp::lane_id()
+}
+
+/// The calling warp's index in its block, `threadIdx.x / 32`.
+///
+/// `32 * warp_id()` is a [`BaseLdtm`] **band origin**: the layout gives a warp
+/// 32 consecutive rows, so that product is the first row of this warp's band
+/// in a shared tile, in a TMEM accumulator ([`TmemTile::tile`]), and in the
+/// global rows a drain writes. It is the number every kernel in the repo
+/// open-codes; the `32` is the layout's rows-per-warp, which the library does
+/// not yet name (#126).
+///
+/// A *derived* value and not a hardware register, so it is only the warp index
+/// for a **1-D block**. A block with a `threadIdx.y` gets the wrong answer
+/// here as it would from the division written out.
+#[inline(always)]
+pub fn warp_id() -> u32 {
+    cuda_device::warp::warp_id()
+}

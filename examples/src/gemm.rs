@@ -84,13 +84,14 @@
 //! no spill.
 //!
 //! There is **no proxy fence** in the drain and its absence is not an oversight:
-//! `fence.proxy.async.shared::cta` orders a generic-proxy write against an
-//! *async*-proxy read, and both ends here are generic — `stmatrix` writes and
-//! `ld.shared` reads. `stmatrix.sync.aligned` is the convergence. The one hazard
-//! left is the next pass overwriting a tile this pass is still reading, which is
-//! what the `bar.warp.sync` is for, and it is a warp barrier because
-//! [`StageTile`] is one warp's 4096 B and nobody else's. Handing the same hop to
-//! the TMA engine instead was built, measured and lost by 1.0–1.7% (#123).
+//! [`kittens::shared::publish_to_async_proxy`] orders a generic-proxy write
+//! against an *async*-proxy read, and both ends here are generic — `stmatrix`
+//! writes and `ld.shared` reads. `stmatrix.sync.aligned` is the convergence.
+//! The one hazard left is the next pass overwriting a tile this pass is still
+//! reading, which is what the `bar.warp.sync` is for, and it is a warp barrier
+//! because [`StageTile`] is one warp's 4096 B and nobody else's. Handing the
+//! same hop to the TMA engine instead was built, measured and lost by 1.0–1.7%
+//! (#123).
 //!
 //! ## `C` is bf16 and the accumulator is not
 //!
@@ -129,6 +130,7 @@ use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
+use kittens::{lane, warp_id};
 
 /// Rows of `C` one CTA owns. The pair covers `2 * BLOCK_M`, which is the `M`
 /// the instruction descriptor names — and the widest `M` tcgen05 has, which is
@@ -633,7 +635,7 @@ pub mod kernels {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
             let scratch = smem.add(ARing::BYTES + BRing::BYTES);
             let tmem_slot = scratch.add(2 * STAGES * 8 + 8) as *mut u32;
-            let warp_id = warp::warp_id();
+            let warp_id = warp_id();
 
             Tile {
                 a_ring: ARing::attach(smem),
@@ -654,7 +656,7 @@ pub mod kernels {
                 k_blocks,
                 rank: cluster::block_rank(),
                 warp_id,
-                lane: warp::lane_id(),
+                lane: lane(),
             }
         }
     }

@@ -220,10 +220,10 @@
 //! The check the seed was strengthened for (#56, #61) therefore sees a
 //! misplaced *column* exactly as loudly as a misplaced row.
 
-use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
+use cuda_device::barrier::Barrier;
 use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
-use cuda_device::{cuda_module, kernel, thread, warp};
+use cuda_device::{cuda_module, kernel, thread};
 
 // Host side: the launcher's error type, and the benchmark's size and clock.
 use crate::bench::{Shape, Timings, time};
@@ -231,8 +231,11 @@ use std::error::Error;
 
 use kittens::ldst::{load_tile, store_tile};
 use kittens::reg::{BaseLdtm, RegTile, RegVec};
-use kittens::shared::{Bf16, SharedTile, Swizzle128B, tma_store_commit, tma_store_wait};
+use kittens::shared::{
+    Bf16, SharedTile, Swizzle128B, publish_to_async_proxy, tma_store_commit, tma_store_wait,
+};
 use kittens::sync::Semaphore;
+use kittens::{lane, warp_id};
 
 /// Rows per CTA — four warps of 32.
 const ROWS: usize = 128;
@@ -276,14 +279,13 @@ pub mod kernels {
             let tile = Tile::from_raw(smem);
             let loaded = Semaphore::attach(smem.add(Tile::BYTES) as *mut Barrier);
 
-            let warp_id = warp::warp_id();
-            let lane = warp::lane_id();
-            let row_base = 32 * warp_id;
+            let lane = lane();
+            let row_base = 32 * warp_id();
             plane += thread::blockIdx_y() as i32;
 
             if thread::threadIdx_x() == 0 {
                 loaded.init(1);
-                fence_proxy_async_shared_cta();
+                publish_to_async_proxy();
             }
             thread::sync_threads();
             if thread::threadIdx_x() == 0 {
@@ -348,7 +350,7 @@ pub mod kernels {
             }
             // `stmatrix` writes through the generic proxy; the TMA engine reads
             // through the async one.
-            fence_proxy_async_shared_cta();
+            publish_to_async_proxy();
             thread::sync_threads();
 
             // The store completes on a group, not on a barrier: nothing

@@ -733,16 +733,39 @@ built twice with no rung in common. Everything else keeps its scope in its index
 math: `tmem::alloc_block` *is* `warp_id() == 0` plus `sync_threads`, and does
 not say so. **#124**, and 1.1 for why #3's argument does not reach it.
 
-### 7.2 A kernel cannot call one register-side function without `cuda_device`
+### 7.2 A kernel cannot call one register-side function without `cuda_device` — closed (#127)
 
-Every warp-scope entry point takes `lane: u32` and the crate exposes no way to
-get one — it uses `warp::lane_id()` internally in two modules and re-exports
-neither it nor `warp_id()`. So all five kernels import `cuda_device::warp` in
-their first three lines. Worse in kind: `ldst::store_fragment`'s contract says
-the caller *owes a `fence.proxy.async.shared::cta`*, and the only thing in the
-crate that issues that fence is `StoreRing::publish`, which is private. The
-library creates an obligation and does not export the instruction that
-discharges it, at seven sites in the three small kernels. **#127.**
+As filed: every warp-scope entry point took `lane: u32` and the crate exposed no
+way to get one, so all five kernels imported `cuda_device::warp` in their first
+three lines; and `ldst::store_fragment`'s contract said the caller *owed a
+`fence.proxy.async.shared::cta`* while the only thing that issued that fence was
+the private `StoreRing::publish` — an obligation created by a `kittens` function
+and discharged by a `cuda_device` one, at seven sites in the three small kernels.
+
+`kittens::lane()`, `kittens::warp_id()` and `shared::publish_to_async_proxy()`
+are those three, wrappers rather than re-exports because the wrapper is where
+the doc can say that `lane` is the argument the whole register surface takes,
+that `32 * warp_id()` is a `BaseLdtm` band origin, and that a barrier after the
+fence is what carries one thread's ordering to the thread that issues the store.
+The eight safety contracts that state the obligation now name the function that
+discharges it, and `block_reduce`'s — which states that it is *not* owed — names
+it too. Named in `tests/gaps.rs`.
+
+`warp::lane_id()` and `warp::warp_id()` are now called in exactly one place in
+the repo outside `device-tests`, which is the body of the two wrappers.
+`softmax`, `layernorm` and `flash_forward` dropped the `cuda_device::warp` and
+`cuda_device::barrier::fence_proxy_async_shared_cta` imports outright; the three
+GEMMs keep `cuda_device::warp` for `warp::sync_mask` and nothing else, which is
+the epilogue's inter-band convergence and **#126's**.
+
+What is *not* closed and was judged rather than deferred: the
+`tcgen05_fence_before_thread_sync` + `cluster_sync` pair three kernels write out
+before `dealloc_cluster` stays two lines, documented on `tmem::dealloc_cluster`.
+Welding a scope into it would add a fifth spelling of scope beside the four §7.1
+counts, and it would close no leak — a kernel calling `cluster_sync` there
+already imports `cuda_device::cluster` for `block_rank`. What remains in the
+small kernels' `use cuda_device` lines is §7.4's shared plan (#125) and `thread`
+(#124), not the register surface.
 
 ### 7.3 The handles pick two conventions each
 
@@ -824,7 +847,6 @@ argument for keeping this table dated and short rather than complete.
 | 124 | Scope is in the type once and spelled three other ways | 1.1, 7.1 |
 | 125 | The shared plan is open-coded, in bytes, twice per kernel | 7.4 |
 | 126 | The shipped epilogue is open-coded in both GEMMs | 7.4 |
-| 127 | No way to obtain a `lane`, and the proxy fence is private | 7.2 |
 | 128 | TMEM columns unchecked; the MMA takes an address, not a tile | 3.3, 7.5 |
 | 129 | Two conventions each for constructors, `unsafe`, verbs, re-exports | 7.3 |
 | 130 | `RegVec` cannot reach memory; `SharedVec` cannot be sliced | 1.4, 2.2 |

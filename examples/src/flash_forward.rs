@@ -129,21 +129,32 @@
 //! first-class. And the whole register-side body — drain, mask, scale,
 //! row-reduce, correct, accumulate, restage — is now the library's own API,
 //! line for line, with no index arithmetic left in this file. Both ends are
-//! library API too: the drain in, the fp32 store out. Nothing in this file
-//! reaches past the library any more.
+//! library API too: the drain in, the fp32 store out.
+//!
+//! This paragraph used to end "nothing in this file reaches past the library
+//! any more", and the 2026-07-29 audit caught that being false in the kernel's
+//! first three lines: the thread identities and the proxy fence were
+//! `cuda_device` calls, because `kittens` exposed neither. They are
+//! [`kittens::lane`], [`kittens::warp_id`] and
+//! [`kittens::shared::publish_to_async_proxy`] since #127. What still reaches
+//! past the library is the *shared plan* — `DynamicSharedArray::get_raw`, the
+//! `*mut Barrier` cast, the byte offsets (#125, #85) — `thread`'s
+//! `sync_threads` and block indices (#124), and the kernel ABI itself, which
+//! no tile library replaces. None of it is register-side.
 
-use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
+use cuda_device::barrier::Barrier;
 use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
-use cuda_device::{DisjointSlice, cuda_module, kernel, thread, warp};
+use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
 use kittens::global::{GlobalRows, store_rows};
 use kittens::ldst::store_tile;
 use kittens::mma::{MmaShape, commit, mm_ab, mm_abt};
 use kittens::reg::{BaseLdtm, RegTile, RegVec, online_rescale};
-use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, Swizzle128B};
+use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, Swizzle128B, publish_to_async_proxy};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
+use kittens::{lane, warp_id};
 
 /// Queries per CTA — one `M128` MMA, four warps of 32 accumulator rows each.
 const QUERIES: usize = 128;
@@ -248,8 +259,8 @@ pub mod kernels {
             let accumulated = Semaphore::attach(scratch.add(2 * STAGES + 2));
             let tmem_slot = scratch.add(2 * STAGES + 3) as *mut u32;
 
-            let warp_id = warp::warp_id();
-            let lane = warp::lane_id();
+            let warp_id = warp_id();
+            let lane = lane();
             let leader = thread::threadIdx_x() == 0;
             let query_base = QUERIES as u32 * thread::blockIdx_x();
             let head = thread::blockIdx_y() as i32;
@@ -260,7 +271,7 @@ pub mod kernels {
                 q_loaded.init(1);
                 scored.init(1);
                 accumulated.init(1);
-                fence_proxy_async_shared_cta();
+                publish_to_async_proxy();
             }
             thread::sync_threads();
             // Scores and output share one allocation: `[128, KEYS]` then

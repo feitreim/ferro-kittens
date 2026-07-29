@@ -331,6 +331,7 @@ use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
+use kittens::{lane, warp_id};
 
 /// Rows of `C` one CTA owns. The pair covers `2 * BLOCK_M`, which is the `M`
 /// the instruction descriptor names.
@@ -2712,8 +2713,8 @@ pub mod kernels {
                 group,
                 k_blocks,
                 rank: cluster::block_rank(),
-                warp_id: warp::warp_id(),
-                lane: warp::lane_id(),
+                warp_id: warp_id(),
+                lane: lane(),
             };
             (
                 tile,

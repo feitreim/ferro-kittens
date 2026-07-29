@@ -27,6 +27,7 @@
 
 use core::marker::PhantomData;
 
+use cuda_device::barrier::fence_proxy_async_shared_cta;
 use cuda_device::cluster;
 use cuda_device::ptx_asm;
 use cuda_device::tcgen05::{Tcgen05ElementType, cvt_f32x2_bf16x2, tcgen05_mma_shared};
@@ -685,7 +686,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     ///   written by `stmatrix` or a plain store, including
     ///   [`crate::ldst::store_fragment`], which states the same obligation for
     ///   an MMA reading the tile — the caller owes a
-    ///   `fence.proxy.async.shared::cta` before this call. The TMA engine
+    ///   [`publish_to_async_proxy`] before this call. The TMA engine
     ///   reads through the async proxy and would otherwise be free to see
     ///   stale bytes. A tile that got here by [`Self::tma_load`] needs no
     ///   fence: that is the async proxy on both sides, ordered by the load's
@@ -822,6 +823,49 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
             transpose: true,
         }
     }
+}
+
+/// Make this thread's ordinary writes to CTA-shared memory visible to the
+/// async proxy — `fence.proxy.async.shared::cta`, and **the fence half of
+/// every "the caller owes a fence" contract in the crate.**
+///
+/// Shared memory is written two ways and read two ways. `stmatrix`, a plain
+/// store, [`crate::ldst::store_tile`], [`crate::ldst::store_fragment`] and an
+/// mbarrier's `init` all go through the *generic* proxy; the TMA engine and a
+/// tcgen05 MMA read through the *async* one. The two proxies are not coherent
+/// on their own and no barrier makes them so: `sync_threads` orders threads,
+/// not proxies, so a `bar.sync` between the write and the engine's read is a
+/// fence that was never issued.
+///
+/// This orders the writes of **the thread that executes it**, which is why it
+/// is not a collective and why every thread that wrote a row has to call it.
+/// A barrier afterwards is what carries that ordering to whichever thread
+/// issues the store or the MMA — the pairing
+/// [`crate::epilogue::StoreRing`] performs internally and three kernels write
+/// out as `publish_to_async_proxy(); sync_threads();`.
+///
+/// Both directions of "which proxy" have to be true for the fence to be owed,
+/// and the two cases where it is not are worth stating because they look
+/// alike:
+///
+/// - A tile that arrived by [`SharedTile::tma_load`] and leaves by
+///   [`SharedTile::tma_store`] is the async proxy on both sides, ordered by
+///   the load's own barrier.
+/// - A staged value written and read by ordinary threads —
+///   [`crate::sync::block_reduce`]'s scratch — is the generic proxy on both
+///   sides, ordered by its barriers.
+///
+/// It was private until #127: the crate stated the obligation in six safety
+/// contracts and exported nothing that discharged it, so three kernels
+/// imported `cuda_device::barrier` for the one instruction.
+///
+/// # Safety
+///
+/// A memory fence has no precondition of its own. What it does *not* do is
+/// the hazard: it orders this thread's writes only, and it is not a barrier.
+#[inline(always)]
+pub unsafe fn publish_to_async_proxy() {
+    unsafe { fence_proxy_async_shared_cta() }
 }
 
 /// Commit this thread's outstanding bulk stores as one group.
@@ -1131,8 +1175,8 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     /// # Safety
     ///
     /// `index < N`, no other thread writes the same index concurrently, and
-    /// the caller owes a `fence.proxy.async.shared::cta` before the TMA engine
-    /// or an MMA reads the vector.
+    /// the caller owes a [`publish_to_async_proxy`] before the TMA engine or an
+    /// MMA reads the vector.
     #[inline(always)]
     pub unsafe fn set(self, index: usize, value: f32) {
         unsafe { E::write(self.at(index), value) }
@@ -1197,8 +1241,8 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     /// As [`SharedTile::tma_store`], every clause — completion is
     /// [`tma_store_commit`] plus a wait and never a [`Semaphore`], the vector
     /// must stay unwritten until that wait, and contents that arrived through
-    /// the generic proxy ([`Self::set`]) owe a
-    /// `fence.proxy.async.shared::cta` first.
+    /// the generic proxy ([`Self::set`]) owe a [`publish_to_async_proxy`]
+    /// first.
     #[inline(always)]
     pub unsafe fn tma_store(self, map: *const TmaDescriptor, start: i32) {
         #[allow(clippy::let_unit_value)]

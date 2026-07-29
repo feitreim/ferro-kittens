@@ -29,7 +29,8 @@
 //!
 //! Three mechanisms are involved and none of them subsumes another.
 //!
-//! **`fence.proxy.async.shared::cta`, before the engine reads a buffer.**
+//! **[`crate::shared::publish_to_async_proxy`], before the engine reads a
+//! buffer.**
 //! `stmatrix` is an ordinary shared-memory write through the *generic* proxy;
 //! the TMA engine reads through the *async* proxy. Nothing orders the two but
 //! this fence, and it orders the writes of the thread that *executes* it — so
@@ -115,13 +116,13 @@
 
 use core::marker::PhantomData;
 
-use cuda_device::barrier::fence_proxy_async_shared_cta;
 use cuda_device::{thread, warp};
 
 use cuda_device::tma::TmaDescriptor;
 
 use crate::shared::{
-    Element, SharedTile, Swizzle, tma_store_commit, tma_store_wait, tma_store_wait_read,
+    Element, SharedTile, Swizzle, publish_to_async_proxy, tma_store_commit, tma_store_wait,
+    tma_store_wait_read,
 };
 
 /// The set of threads that fills one staging buffer: how they converge, and
@@ -179,7 +180,7 @@ pub struct Warp;
 impl Scope for Warp {
     #[inline(always)]
     fn issuing() -> bool {
-        warp::lane_id() == 0
+        crate::lane() == 0
     }
 
     #[inline(always)]
@@ -396,7 +397,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u3
     /// lanes exactly as `bar.sync` does among a block's threads.
     #[inline(always)]
     unsafe fn publish(self) -> SharedTile<E, R, C, S> {
-        unsafe { fence_proxy_async_shared_cta() };
+        unsafe { publish_to_async_proxy() };
         SC::converge();
         self.buffer(self.slot)
     }
