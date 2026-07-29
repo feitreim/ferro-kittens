@@ -387,6 +387,13 @@ def bench(case: str = "", m: int = 0, n: int = 0, k: int = 0) -> None:
     comparable to the same row taken before that change. The `staged` and
     `widths` cases are where both epilogues appear side by side.
 
+    **`--case repro` is the one that measures this harness rather than a
+    kernel** (#122). It is the case to run before quoting a difference between
+    two launches: it takes four whole measurements of each arm round-robin and
+    prints, beside each difference, the amplification that difference applies to
+    its arms' own repeatability. #121 found `whole - no drain` reproducing to
+    39-46% at 16384^3, and that is where the number comes from.
+
     The clock is CUDA events either side of the launch, not wall clock around
     the driver call, and the headline per size is the minimum over the timed
     launches, with the median and maximum printed beside it. Each example states
