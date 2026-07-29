@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use cuda_core::CudaContext;
 
-use crate::{gemm, gemm_sol, gemm_sol_upstream, layernorm, softmax};
+use crate::{gemm, gemm_sol, layernorm, softmax};
 
 #[path = "../../examples/src/bench.rs"]
 mod harness;
@@ -476,7 +476,8 @@ const LAYERNORM_SIZES: &[Shape] = &[
 ];
 
 fn cases() -> Vec<Case> {
-    vec![
+    #[allow(unused_mut)]
+    let mut cases = vec![
         Case {
             name: "gemm",
             bound: Bound::Compute,
@@ -493,38 +494,6 @@ fn cases() -> Vec<Case> {
             work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
             blocks: gemm_sol::grid,
             bench: gemm_sol::bench,
-            baseline: CUBLASLT_F16,
-        },
-        // The two rows above's denominator was cuBLASLt and its *numerator* had
-        // no control arm: a port that reaches 0.795 of the library at 4096³ is
-        // either carrying port overhead or standing where the kernel it ports
-        // stands, and no measurement in this tree could tell those apart. These
-        // two cases are that control arm — upstream's device code unmodified,
-        // through this clock, staged from the same generators and held to the
-        // same exact check. See [`crate::gemm_sol_upstream`].
-        //
-        // Two cases and not one because the variant policies differ. Upstream
-        // takes M256xN256 up to 8192³ and the port crosses over to M512xN256
-        // there, so `gemm-sol-upstream` is upstream's own selector and
-        // `gemm-sol-upstream-m512` forces the large entry at every size. The
-        // 8192³ rows of the three tables are only comparable through the
-        // second.
-        Case {
-            name: "gemm-sol-upstream",
-            bound: Bound::Compute,
-            sizes: GEMM_SOL_SIZES,
-            work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
-            blocks: gemm_sol_upstream::grid,
-            bench: gemm_sol_upstream::bench,
-            baseline: CUBLASLT_F16,
-        },
-        Case {
-            name: "gemm-sol-upstream-m512",
-            bound: Bound::Compute,
-            sizes: GEMM_SOL_SIZES,
-            work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
-            blocks: gemm_sol_upstream::grid,
-            bench: gemm_sol_upstream::bench_m512,
             baseline: CUBLASLT_F16,
         },
         Case {
@@ -579,7 +548,48 @@ fn cases() -> Vec<Case> {
             bench: layernorm::bench,
             baseline: None,
         },
-    ]
+    ];
+
+    // `gemm-sol`'s denominator was cuBLASLt and its *numerator* had no control
+    // arm: a port that reaches 0.795 of the library at 4096³ is either carrying
+    // port overhead or standing where the kernel it ports stands, and no
+    // measurement in this tree could tell those apart. These two cases are that
+    // control arm — upstream's device code unmodified, through this clock,
+    // staged from the same generators and held to the same exact check. See
+    // `gemm_sol_upstream.rs`.
+    //
+    // Two cases and not one because the variant policies differ: upstream takes
+    // M256xN256 up to 8192³ and the port crosses over to M512xN256 there, so
+    // `gemm-sol-upstream` is upstream's own selector and
+    // `gemm-sol-upstream-m512` forces the large entry at every size. The 8192³
+    // rows of the three tables are only comparable through the second.
+    //
+    // Feature-gated with the module, and `Cargo.toml` says why: with upstream's
+    // kernels in the bundle and no `-switch-to-lookup=false`, *nothing* in this
+    // crate loads.
+    #[cfg(feature = "gemm-sol-upstream")]
+    cases.extend([
+        Case {
+            name: "gemm-sol-upstream",
+            bound: Bound::Compute,
+            sizes: GEMM_SOL_SIZES,
+            work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
+            blocks: crate::gemm_sol_upstream::grid,
+            bench: crate::gemm_sol_upstream::bench,
+            baseline: CUBLASLT_F16,
+        },
+        Case {
+            name: "gemm-sol-upstream-m512",
+            bound: Bound::Compute,
+            sizes: GEMM_SOL_SIZES,
+            work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
+            blocks: crate::gemm_sol_upstream::grid,
+            bench: crate::gemm_sol_upstream::bench_m512,
+            baseline: CUBLASLT_F16,
+        },
+    ]);
+
+    cases
 }
 
 /// Examples with no row above, and why. There is no path through this file
