@@ -61,9 +61,16 @@
 //! warps an SM, 2 per sub-partition, 8192 registers each: 256 a thread, which
 //! is why 168 is a step and why that kernel sits at 166 with two registers of
 //! headroom. Here it is 1 CTA × 6 warps = 6 warps an SM, so the *binding*
-//! sub-partition still holds 2 and **255 registers a thread is reachable**. The
-//! epilogue warps can hold real state; whether they need to is a separate
-//! question and `regcount` is what answers it.
+//! sub-partition still holds 2 and **255 registers a thread is reachable**.
+//!
+//! **`regcount` says 168 and no spill**, against [`crate::gemm`]'s 166. So the
+//! headroom is real and *nothing here asked for it*: the epilogue holds the
+//! same `RegTile<32, 128>` band it always did, because 256 columns in one band
+//! is 256 fp32 a thread and past the architecture's 255 at any occupancy —
+//! [`DRAIN_N`] is a hardware limit, not an occupancy one. This is an argument
+//! that turned out to be inert, and it is recorded that way rather than
+//! deleted, because "registers stop binding" was one of the two consequences
+//! this design point was reached for.
 //!
 //! ## Why [`kittens::pipeline`] did not have to change
 //!
@@ -125,24 +132,77 @@
 //! warp-collective — its own docs say so — so a warp that does not call it
 //! leaves nothing ill-formed.
 //!
-//! ## What it measured
+//! ## What it measured, and it **loses**
 //!
 //! `cargo oxide run kittens-examples -- ws`, which is
 //! `scripts/modal-run ws_bench`, runs this kernel and [`crate::gemm`] and
 //! cuBLASLt in one container at 4096³, 8192³ and 16384³ — the three sizes the
-//! brief names, and no smaller, because below 4096³ cuBLASLt's own run-to-run
-//! spread reaches 77% and no ratio there is quotable. The control is re-run in
-//! the same session rather than quoted from `examples/README.md` §7: this
-//! change does not touch [`crate::gemm`], but #98 found 2.9% of drift between
-//! containers and #109 nearly published a false +3.6% by trusting a baseline
-//! from another one.
+//! reference publishes, and no smaller, because below 4096³ cuBLASLt's own
+//! run-to-run spread reaches 77% and no ratio there is quotable. The control is
+//! re-measured in the same session rather than quoted from
+//! `examples/README.md` §7: this change does not touch [`crate::gemm`], but #98
+//! found 2.9% of drift between containers and #109 came within a paragraph of
+//! publishing a false +3.6% against a baseline that had moved under it.
 //!
-//! The question this file answers is narrow and worth stating plainly: **does
-//! giving up the second CTA for warp specialization win, lose, or wash on a
-//! B200 with our epilogue?** The reference's 1524 / 1868 / 2162 TFLOP/s are a
-//! B300 against an FP16-in/FP16-out cuBLASLt; ours is a B200 at bf16 where
-//! cuBLASLt does 1.77–1.89 PFLOP/s. Their numbers are not a target this has any
-//! right to expect, and the honest deliverable is the sign of the delta.
+//! The question is narrow: **does giving up the second CTA for warp
+//! specialization win, lose, or wash on a B200 with our epilogue?** One B200
+//! session, min of 30 timed launches, every row checked element-by-element
+//! first:
+//!
+//! | shape | `gemm` | this, 4 stages | this, 6 stages | vs `gemm` (best) |
+//! | --- | ---: | ---: | ---: | ---: |
+//! | 4096³ | 951.9 | 988.0 | 1002.3 | **+5.3%** |
+//! | 8192³ | 1492.9 | 1390.1 | 1451.5 | **−2.8%** |
+//! | 16384³ | 1669.1 | 1536.5 | 1547.6 | **−7.3%** |
+//!
+//! in TFLOP/s, and against cuBLASLt in the same container (1569.8 / 1828.9 /
+//! 1904.6 TFLOP/s) that is 0.606 → 0.629, 0.816 → 0.760 and 0.876 → 0.807.
+//! CLC is worth a further +0.6% / +1.0% / +1.2% on top of the static schedule
+//! and does not change any sign.
+//!
+//! **So: a small win where the launch is short and a clear loss where it is
+//! not, and the loss grows with size.** The 4096³ row is not a wave-efficiency
+//! artifact — both kernels tile `C` identically and both run at 86.5% wave
+//! efficiency there, [`crate::gemm`] as two waves of 148 clusters and this as
+//! four waves of 74 — so the crossover is real and it is about what the SM is
+//! doing rather than about how the grid quantizes.
+//!
+//! ### The mechanism the numbers point at, which is the epilogue
+//!
+//! Two facts narrow it. First, `regcount` says **168 registers and no spill**,
+//! against [`crate::gemm`]'s 166 — so the whole "255 registers are reachable"
+//! argument above is *true and bought nothing*, because nothing in this kernel
+//! wanted them. The register headroom is real and unused. Second, six pipeline
+//! stages instead of four is worth +1.4% / +4.4% / +0.7% and costs nothing any
+//! resource can see, which says the K pipeline was mildly starved and is not
+//! where the missing 7% is.
+//!
+//! What is left is that **an SM holding one CTA has nothing else to hide the
+//! epilogue behind.** Under [`crate::gemm`]'s two CTAs an SM, one CTA's LDTM
+//! and its 256 scattered pair stores run against the *other* CTA's MMA, and
+//! that overlap costs no barrier and no slack. Here the same work is hidden
+//! only by the one item of slack the accumulator ping-pong provides, and every
+//! item ends in a `done.wait` that stalls the whole SM rather than one of two
+//! CTAs on it. #108's probes priced this epilogue at 21.4 µs a tile serial,
+//! 20.2% of an 8192³ launch — which is more than enough to be the whole of the
+//! gap, and is the largest thing on the SM that the second CTA used to cover.
+//!
+//! That is a statement about *this* epilogue and not about warp specialization,
+//! and it is exactly why the scope discipline was worth keeping: the reference
+//! spends its surplus shared memory on `stmatrix` into a staging buffer and
+//! hands the global write to 64-bit vectorized stores, which is the change this
+//! PR deliberately does not make. The follow-up — `kittens::epilogue::StoreRing`
+//! (#111) plus the shared→global mover being built beside it — now has a
+//! sharpened question rather than a general hope: it has to find about 7% at
+//! 16384³ before this design point is even level, and if it does, it will have
+//! found it on the kernel that has the shared memory to spend.
+//!
+//! The reference's 1524 / 1868 / 2162 TFLOP/s are a B300 against an
+//! FP16-in/FP16-out cuBLASLt; ours is a B200 at bf16 where cuBLASLt does
+//! 1.57–1.90 PFLOP/s in the session above. Their numbers were never a target
+//! this had a right to expect, and the deliverable was the sign of the delta.
+//! The sign is negative, and this file stays in the tree because
+//! `examples/README.md` §7 keeps losers on purpose.
 
 use cuda_device::barrier::Barrier;
 use cuda_device::cluster;
@@ -276,11 +336,19 @@ const SMS: u32 = 148;
 ///
 /// Both terms give 1. [`ACCUM_COLUMNS`] is 512, so `512 / 512 = 1`; and
 /// [`SHARED_BYTES`] is 131 176 against the 233 472 B an SM divides, so
-/// `233472 / 131176 = 1` as well. `device-tests`' `tmem residency census`
-/// already carries a `cg2 512` rung — a `cta_group::2` launch holding all 512
-/// columns across the counted interval — and what it counts there is this
-/// kernel's residency, on an instrument that timestamps `%globaltimer` on real
-/// CTAs rather than asking a driver.
+/// `233472 / 131176 = 1` as well.
+///
+/// **Counted, on the instrument that counts rather than asks.**
+/// `device-tests`' `tmem residency census` already carries a `cg2 512` rung — a
+/// `cta_group::2` launch holding all 512 columns across the counted interval,
+/// which is this kernel's tensor memory exactly — and at that rung it reads
+/// **1 holding, 2 resident**, against a driver prediction of 1.0 that is worth
+/// nothing here for #77's reason. The gap between resident and holding is the
+/// extra CTA `src/tmem.rs` describes: admitted to the SM and parked inside a
+/// blocking `tcgen05.alloc`. That gap closes for *this* kernel and does not for
+/// the census rung, because the census declares a 32 B shared plan where this
+/// declares 131 176 — so the second CTA is never admitted at all here, and
+/// resident and holding are both 1.
 const CTAS_PER_SM: u32 = 1;
 /// Clusters the persistent grid launches at most. A tuning constant and not a
 /// correctness one — [`pipeline::run`] walks every item whatever the grid is —
@@ -730,10 +798,12 @@ pub mod kernels {
     /// tile, and a cluster that finishes cancels one the scheduler has not
     /// launched yet.
     ///
-    /// It matters more here than it does for [`crate::gemm`]. A wave is 74
+    /// It ought to matter more here than for [`crate::gemm`]: a wave is 74
     /// clusters where that kernel's is 148, so the ragged last wave is a
     /// coarser quantization of the same tile grid and the static stride has
-    /// more to lose.
+    /// more to lose. **Measured, it is +0.6% / +1.0% / +1.2% at 4096³ / 8192³ /
+    /// 16384³** — the same order #97 found for [`crate::gemm`], and it changes
+    /// no sign in the table this file is for.
     ///
     /// # Safety
     ///
@@ -778,6 +848,11 @@ pub mod kernels {
     /// nothing to spend it on but pipeline. Under [`crate::gemm`]'s two CTAs an
     /// SM the same two stages would be an occupancy step and #98 priced that at
     /// 25–44%; here they cost nothing that any resource can see.
+    ///
+    /// **Measured: +1.4% at 4096³, +4.4% at 8192³, +0.7% at 16384³.** Free
+    /// bytes bought a real if small gain, which says the four-stage pipeline
+    /// was mildly starved — and, more usefully, that starvation is *not* where
+    /// this design point's 7% loss at 16384³ is hiding.
     ///
     /// # Safety
     ///
