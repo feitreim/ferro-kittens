@@ -25,6 +25,12 @@ Local usage:
     modal run modal_app.py::bench --case gemm-depth
                                       # one table of that sweep; --m/--n/--k
                                       # narrows it further to a single row
+    modal run modal_app.py::bench --case sol
+                                      # gemm_sol's cluster tile and N band
+                                      # against the wave arithmetic (#138)
+    modal run modal_app.py::bench --case sol-small
+                                      # the same two rungs below 4096^3, taken
+                                      # twice, where the clock is the limit
     modal run modal_app.py::bench --case swizzle
                                       # gemm's item traversal, tile held fixed
     modal run modal_app.py::bench --case tile

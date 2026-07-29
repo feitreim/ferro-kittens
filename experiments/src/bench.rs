@@ -1172,6 +1172,41 @@ pub fn main() -> ExitCode {
         };
     }
 
+    // `bench sol` is the ninth, and the first of these that is about
+    // `gemm_sol` rather than about `gemm`. It rides this argument for the
+    // reason the eight above do, and it is its own sweep rather than more rows
+    // of the `gemm-sol` case because what it varies is the *plan* — which entry
+    // and which N band — with a wave-quantization prediction printed beside
+    // every row it is a test of.
+    if let Some((name, _)) = &selected
+        && name == "sol"
+    {
+        return match crate::sol::sweep(&context, CUBLASLT_F16) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // `bench sol-small` is the same sweep's sub-4096 ladder, and it is a
+    // separate argument rather than a fifth table because it is the only table
+    // in this file whose rows are short enough that the measurement is the
+    // binding uncertainty. It takes both rungs twice round-robin for that
+    // reason, which is rule 5 at the top of this file applied where it bites.
+    if let Some((name, _)) = &selected
+        && name == "sol-small"
+    {
+        return match crate::sol::sweep_small(&context, CUBLASLT_F16) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // `bench ablation` is the fourth, and the one that decomposes rather than
     // sweeps: the same size sweep `gemm-depth` runs, with one phase of the
     // item removed per rung and everything else held at the shipped kernel's.

@@ -50,6 +50,7 @@ pub mod gemm;
 #[path = "../../examples/src/gemm_sol.rs"]
 pub mod gemm_sol;
 pub mod gemm_ws;
+pub mod sol;
 
 /// The teaching crate's kernels, compiled here so [`bench`] can time them
 /// against their own CPU references.

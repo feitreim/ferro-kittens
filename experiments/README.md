@@ -4716,6 +4716,123 @@ half's store — which is the only thing standing between the doubling probe's
 width and not about shared memory. Until that is built, "depth 1 is why" is a
 mechanism consistent with every number here and not a measured one.
 
+##### and the small end of `gemm_sol` is one wave short, which no tiling fixes — #138
+
+`gemm_sol`'s ratio against a live cuBLASLt FP16 baseline read 0.795 at 4096³,
+0.873 at 8192³ and 0.946 at 16384³, and the obvious reading of that shape is
+tile quantization. `bench sol` and `bench sol-small` are the two tables that
+test it. The arithmetic first, because it is stated before anything is launched
+and every row below is a test of it:
+
+both shared plans declare more than half of the **233472 B** an SM divides, so
+residency is **one CTA an SM**, and a `cta_group::2` MMA needs its pair
+co-resident — **74 clusters** on 148 SMs. A launch is one cluster per output
+tile and takes `ceil(tiles / 74)` waves of them, so
+`tiles / (waves · 74)` is the fraction of it not idling:
+
+| shape | entry | tiles | waves | wave eff |
+| --- | --- | ---: | ---: | ---: |
+| 4096³ | `[256, 256]` | 256 | 4 | **0.865** |
+| 4096³ | `[512, 256]` | 128 | 2 | **0.865** |
+| 4096³ | `[256, 128]` | 512 | 7 | 0.988 |
+| 8192³ | `[256, 256]` | 1024 | 14 | 0.988 |
+| 8192³ | `[512, 256]` | 512 | 7 | 0.988 |
+
+So 4096³ and 8192³ are not the same problem: 8192³ is already wave-perfect and
+13.5% of 4096³'s *grid* is idle. The two 4096³ entries quantizing **identically**
+is what makes that pair a controlled comparison of everything else.
+
+**The model is right, measured directly.** Sweeping `m` in tile steps at
+`n = k = 4096` walks the efficiency up and down a sawtooth with nothing else
+moving:
+
+| shape | tiles | waves | wave eff | TFLOP/s | ÷ wave eff |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4096x4096x4096 | 256 | 4 | 0.865 | 1351.0 | 1562 |
+| 4608x4096x4096 | 288 | 4 | 0.973 | 1469.5 | 1510 |
+| 5120x4096x4096 | 320 | 5 | 0.865 | 1354.4 | 1566 |
+| 5632x4096x4096 | 352 | 5 | 0.951 | 1463.6 | 1539 |
+
+The raw column swings 8.7% and the corrected one is flat to ±2%. **CLC work
+stealing is running throughout**, which settles what it is for: it removes the
+*static* share and cannot remove the integral one, and the sawtooth is the
+integral one surviving it in full.
+
+**And it buys nothing against the baseline, because cuBLASLt pays it too.** The
+heuristic prints its own wave count beside the algorithm it chose, and at these
+four shapes it is **3.46 / 3.89 / 4.32 / 4.76** — our 256/288/320/352 tiles over
+74 clusters, to three digits, on `tile=23` at every row from 2048³ up. cuBLASLt's
+rate divided by the *same* efficiency is 1955 / 1964 / 2018 / 2015, equally flat.
+Two implementations on the same tile with the same sawtooth: **quantization
+divides out of the ratio exactly**, and 0.795 at 4096³ is a rate deficit and not
+a tiling one. What is left is #144's per-tile constant and K-loop cadence.
+
+**Every attempt to buy the quantization back loses.** `[256, 128]` is the tile
+that reaches 0.988 at 4096³ and it is built, checked exact, and slower:
+
+| shape | `[256, 256]` | `[256, 128]` | narrow/wide | wave eff, wide → narrow |
+| --- | ---: | ---: | ---: | --- |
+| 1024³ | 124.7 | 160.9 | **1.29** | 0.216 → 0.432 |
+| 1536³ | 364.7 | 464.1 | **1.27** | 0.486 → 0.973 |
+| 2048³ | 751.9 | 697.2 | 0.93 | 0.865 → 0.865 |
+| 3072³ | 1283.2 | 1034.2 | 0.81 | 0.973 → 0.973 |
+| 4096³ | 1343.0 | 1079.4 | 0.80 | 0.865 → 0.988 |
+| 8192³ | 1682.6 | 1062.1 | 0.63 | 0.988 → 0.988 |
+
+The two rows where efficiency does not move are the price of the tile alone: at
+equal quantization the narrow tile costs 7% at 2048³, 19% at 3072³ and **37% at
+8192³**, which is 1.5× the operand traffic per flop (85.3 against 128 flops per
+operand byte) and twice as many per-tile constants to pay it on. At 4096³ that
+price is larger than the 14% of quantization it is buying, and the tile loses
+20%.
+
+`[512, 256]` at 4096³ is the other direction and is a **dead heat**: 1323.2
+against 1343.0, 0.985, inside a 4% spread. Its 0.75× operand traffic per flop —
+worth 1.12× at 8192³ where quantization is equal — is cancelled at 4096³ by
+half as many tiles to amortize a per-tile constant over. #138's crossover at
+8192 is therefore right, and it is right for a reason.
+
+**Split-K is arithmetically dead here, and the vendor agrees.** Splitting K in
+two at 4096³ takes 256 work units to 512 and the efficiency to 0.988, worth
+about 8% of the launch. It also doubles the number of epilogues, and #144 prices
+the epilogue at **19.7% of that launch** — so the cheapest possible reduction,
+one that adds no traffic at all, still pays 19.7% for an 8% return. Stream-K,
+splitting only enough tiles to level the tail, splits at most 74 of 256 and so
+pays ~5.7% for the same 8%: a ~2% return inside rows that repeat to 3–6%, for a
+k-range per work unit, a partial-tile MMA, a fixup ordering and an fp32
+workspace that the exact-output gate makes mandatory. The reduction instruction
+being reachable does not change either figure. cuBLASLt reports
+`splitk=1 reduction=0 workspace=0 B` at every shape in both tables.
+
+**The N band is worth nothing measurable.** `group` was a rule inside the kernel
+keyed on `tiles_m`; it is a launch parameter now and swept over `{1, 2, 4, 8,
+16}`. At 8192³ on `[512, 256]`: 1880.3, 1877.7, 1876.2, 1878.7, 1877.6 TFLOP/s —
+**flat to 0.2%**, which extends #138's `G=4` against `G=8` to the whole ladder.
+At 4096³ on `[256, 256]` the range is 1311 to 1367 against rows whose own
+launches spread 1.3–3.6%, so nothing there is quotable and the default is
+unchanged.
+
+**What did move: a third rung below 2048.** The narrow tile wins exactly where
+halving `N` doubles the efficiency, which happens only while both tile counts
+fit the same wave count — at or below **half a wave of wide tiles**. Both
+1.27–1.29× rows are there and both losing rows are past it, and the ladder was
+taken **twice round-robin** because a 1024³ launch is 17 µs and spreads 13–21%:
+the two passes put the ratio at 1.273/1.273 at 1024³, 1.273/1.278 at 1536³,
+0.927/0.934 at 2048³ and 0.806/0.811 at 3072³. `select_variant` is that
+sentence. It lifts 1024³ from 0.567 to 0.731 of cuBLASLt and 1536³ from 0.597 to
+0.760, and leaves every shape at and above 2048³ on the entry it already had.
+
+**The ratio was never monotonic.** 1024³ is 0.567, 2048³ is 0.846, 4096³ is
+0.795, 8192³ is 0.868 — 2048³ beats 4096³ because cuBLASLt is *also* one wave
+short there (0.86 waves, 906.8 TFLOP/s, 40% of dense peak). Three points made a
+trend that a fourth removes.
+
+**One shape did not return.** `4096x4096x1024` on `[256, 256]` printed nothing
+for 1200 s and `scripts/modal-run`'s watchdog stopped the container. It is not in
+either table and was not chased; `4096x4096x2048` runs and is (1181.9 wide,
+1004.4 narrow). A `k` shorter than `m` is otherwise unexercised by this kernel,
+so whether that is a shape contract this port does not hold or a one-off is open.
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all

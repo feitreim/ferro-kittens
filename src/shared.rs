@@ -32,8 +32,7 @@ use cuda_device::cluster;
 use cuda_device::convert::cvt_f16x2_f32;
 use cuda_device::ptx_asm;
 use cuda_device::tcgen05::{
-    Tcgen05ElementType, cvt_f32x2_bf16x2, tcgen05_mma_f16, tcgen05_mma_f16_cg2,
-    tcgen05_mma_shared,
+    Tcgen05ElementType, cvt_f32x2_bf16x2, tcgen05_mma_f16, tcgen05_mma_f16_cg2, tcgen05_mma_shared,
 };
 use cuda_device::tma::{
     TmaDescriptor, cp_async_bulk_commit_group, cp_async_bulk_tensor_1d_g2s,
@@ -691,9 +690,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
         minor: i32,
         sem: ClusterSemaphore,
     ) -> TransactionBytes {
-        unsafe {
-            self.tma_load_2d_at_arriving_at::<R>(map, 0, leading, minor, sem)
-        }
+        unsafe { self.tma_load_2d_at_arriving_at::<R>(map, 0, leading, minor, sem) }
     }
 
     /// A partial-height [`Self::tma_load_2d_arriving_at`] landing at `dst_row`.
@@ -715,7 +712,10 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
         sem: ClusterSemaphore,
     ) -> TransactionBytes {
         const {
-            assert!(BOX_ROWS <= R, "a box taller than the tile cannot land in it");
+            assert!(
+                BOX_ROWS <= R,
+                "a box taller than the tile cannot land in it"
+            );
         }
         unsafe {
             let mut i = 0usize;

@@ -5,13 +5,22 @@
 
 //! A kittens port of cuda-oxide's canonical Blackwell `gemm_sol_final`.
 //!
-//! Both entries are expressed through ferro-kittens' typed tiles and pipeline
-//! primitives. On B200 the M256xN256 entry serves 4K; M512xN256 serves 8K/16K. They
-//! share CLC work stealing, a two-CTA cluster, four TMA/shared stages, two TMEM
-//! accumulator halves, an unrolled K loop, and L2-aware output ordering.
+//! Three entries, expressed through ferro-kittens' typed tiles and pipeline
+//! primitives, differing only in the cluster tile they own: `[256, 128]`,
+//! `[256, 256]` and `[512, 256]`. They share CLC work stealing, a two-CTA
+//! cluster, four TMA/shared stages, two TMEM accumulator halves, an unrolled K
+//! loop, and L2-aware output ordering, and [`select_variant`] picks between them
+//! on wave arithmetic alone.
+//!
+//! On B200 that is `[256, 128]` at and below 36 output tiles, `[256, 256]`
+//! through 4K, and `[512, 256]` from 8K. The two narrow-tile branches are what
+//! `bench sol` and `bench sol-small` added; the doc on [`select_variant`] is the
+//! rule and the measurements that bound it.
 //!
 //! Data layout is the upstream contract: row-major FP16 A `[M, K]`, row-major
 //! FP16 B `[N, K]` (therefore `A·Bᵀ`), and packed row-major BF16 C `[M, N]`.
+//! `n` is a multiple of 256 for the two 256-wide entries and of 128 for
+//! `[256, 128]`, which is the one place the shape contract widens.
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::cluster;
@@ -39,7 +48,8 @@ const HALF_N: usize = BLOCK_N / 2;
 const BLOCK_K: usize = 64;
 const CHUNKS: usize = BLOCK_K / 16;
 const STAGES: usize = 4;
-const ACCUM_COLUMNS: u32 = 512;
+const NARROW_N: usize = BLOCK_N / 2;
+const HALF_NARROW_N: usize = NARROW_N / 2;
 const EPILOGUE_WARPS: u32 = (BLOCK_M / 32) as u32;
 const TMA_WARP: u32 = EPILOGUE_WARPS;
 const MMA_WARP: u32 = TMA_WARP + 1;
@@ -48,13 +58,16 @@ const RANKS: u32 = 2;
 const LEADER: u32 = 0;
 const PAIR: u16 = 0b11;
 const BAND_N: usize = 64;
-const SMALL_STAGE_N: usize = BLOCK_N;
+/// The TMA box `B` arrives in, and therefore the step the load loop takes
+/// through the half-panel a rank owns.
+const B_BOX: usize = 64;
 const LARGE_STAGE_N: usize = HALF_N;
 
 const _: () = {
     assert!(THREADS == 192);
     assert!(CHUNKS == 4);
-    assert!(2 * BLOCK_N as u32 == ACCUM_COLUMNS);
+    assert!(HALF_N.is_multiple_of(B_BOX));
+    assert!(HALF_NARROW_N.is_multiple_of(B_BOX));
 };
 
 type ATile = SharedTile<F16, BLOCK_M, BLOCK_K, Swizzle128B>;
@@ -62,8 +75,21 @@ type ATile = SharedTile<F16, BLOCK_M, BLOCK_K, Swizzle128B>;
 type BPanel = SharedTile<F16, 64, BLOCK_K, Swizzle128B>;
 type ARing = SharedTileRing<F16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>;
 type BRing = SharedTileRing<F16, HALF_N, BLOCK_K, Swizzle128B, STAGES>;
+type NarrowBRing = SharedTileRing<F16, HALF_NARROW_N, BLOCK_K, Swizzle128B, STAGES>;
 type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
 type StageBand = RegTile<32, BAND_N, BaseLdtm>;
+
+/// The `tcgen05` shape a `[256, N]` cluster tile issues. It is a `const fn`
+/// rather than a `Variant` method because the MMA warp reads it inside a
+/// width-generic body, where the width is a const parameter and the shape has
+/// to fold away with it.
+const fn mma_shape(n: usize) -> MmaShape {
+    match n {
+        NARROW_N => MmaShape::M256_N128,
+        BLOCK_N => MmaShape::M256_N256,
+        _ => panic!("only the 128- and 256-wide cluster tiles are built"),
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -80,6 +106,7 @@ const fn align_up(offset: usize, alignment: usize) -> usize {
 const A0_OFFSET: usize = 0;
 const SMALL_B_OFFSET: usize = A0_OFFSET + ARing::BYTES;
 const SMALL_RINGS_END: usize = SMALL_B_OFFSET + BRing::BYTES;
+const NARROW_RINGS_END: usize = SMALL_B_OFFSET + NarrowBRing::BYTES;
 const LARGE_A1_OFFSET: usize = A0_OFFSET + ARing::BYTES;
 const LARGE_B_OFFSET: usize = LARGE_A1_OFFSET + ARing::BYTES;
 const LARGE_RINGS_END: usize = LARGE_B_OFFSET + BRing::BYTES;
@@ -121,17 +148,18 @@ const fn shared_plan(rings_end: usize, stage_n: usize) -> usize {
     stage_offset(rings_end) + EPILOGUE_WARPS as usize * 32 * stage_n * Bf16::BYTES
 }
 
-pub const SMALL_SHARED_BYTES: usize = shared_plan(SMALL_RINGS_END, SMALL_STAGE_N);
+pub const SMALL_SHARED_BYTES: usize = shared_plan(SMALL_RINGS_END, BLOCK_N);
+pub const NARROW_SHARED_BYTES: usize = shared_plan(NARROW_RINGS_END, NARROW_N);
 pub const LARGE_SHARED_BYTES: usize = shared_plan(LARGE_RINGS_END, LARGE_STAGE_N);
 const _: () = {
     assert!(SMALL_SHARED_BYTES == 196_864);
+    assert!(NARROW_SHARED_BYTES == 131_328);
     assert!(LARGE_SHARED_BYTES == 229_632);
     assert!(LARGE_SHARED_BYTES <= 233_472);
 };
 
 #[derive(Clone, Copy)]
 struct Common {
-    b: BRing,
     load: SemaphoreRing<STAGES>,
     free: SemaphoreRing<STAGES>,
     full: SemaphoreRing<2>,
@@ -144,6 +172,7 @@ struct Common {
     tiles_m: u32,
     tiles_n: u32,
     k_blocks: u32,
+    group: u32,
     rank: u32,
     warp_id: u32,
     lane: u32,
@@ -154,16 +183,15 @@ impl Common {
     unsafe fn attach(
         smem: *mut u8,
         rings_end: usize,
-        b_offset: usize,
         tiles_m: u32,
         tiles_n: u32,
         k_blocks: u32,
+        group: u32,
         ldc: u32,
         c: &mut DisjointSlice<u16>,
     ) -> Self {
         unsafe {
             Self {
-                b: BRing::attach(smem.add(b_offset)),
                 load: SemaphoreRing::attach(smem.add(load_offset(rings_end)).cast::<Barrier>()),
                 free: SemaphoreRing::attach(smem.add(free_offset(rings_end)).cast::<Barrier>()),
                 full: SemaphoreRing::attach(smem.add(full_offset(rings_end)).cast::<Barrier>()),
@@ -176,6 +204,7 @@ impl Common {
                 tiles_m,
                 tiles_n,
                 k_blocks,
+                group,
                 rank: cluster::block_rank(),
                 warp_id: warp::warp_id(),
                 lane: warp::lane_id(),
@@ -217,17 +246,12 @@ impl Common {
     }
 
     #[inline(always)]
-    fn accumulator(base: Accumulator, index: u32) -> Accumulator {
+    fn accumulator<const N: usize>(base: TmemTile<BLOCK_M, N>, index: u32) -> TmemTile<BLOCK_M, N> {
         if index.is_multiple_of(2) {
             base
         } else {
-            base.columns_right(BLOCK_N as u32)
+            base.columns_right(N as u32)
         }
-    }
-
-    #[inline(always)]
-    fn swizzle_group(self) -> u32 {
-        if self.tiles_m <= 16 { 2 } else { 8 }
     }
 
     #[inline(always)]
@@ -263,16 +287,16 @@ impl Common {
     }
 
     #[inline(always)]
-    unsafe fn drain<const STAGE_N: usize>(
+    unsafe fn drain<const N: usize, const STAGE_N: usize>(
         self,
-        accumulator: Accumulator,
+        accumulator: TmemTile<BLOCK_M, N>,
         tile_row: u32,
         tile_column: u32,
     ) {
         unsafe {
             const {
                 assert!(STAGE_N.is_multiple_of(BAND_N));
-                assert!(BLOCK_N.is_multiple_of(STAGE_N));
+                assert!(N.is_multiple_of(STAGE_N));
             };
             let stage =
                 SharedTile::<Bf16, 32, STAGE_N, Swizzle128B>::from_raw(self.stage_base.add(
@@ -280,7 +304,7 @@ impl Common {
                 ));
             let row = tile_row + self.rank * BLOCK_M as u32 + self.warp_id * 32;
             let mut column = 0u32;
-            while column < BLOCK_N as u32 {
+            while column < N as u32 {
                 let mut band_column = 0u32;
                 while band_column < STAGE_N as u32 {
                     let band: StageBand =
@@ -303,38 +327,42 @@ impl Common {
     }
 }
 
+/// The one-accumulator entry, generic in the cluster tile's width.
+///
+/// `N` is the tile's columns of `C`, `HALF` the half-panel of `B` a rank
+/// loads, and `STAGE` the columns of the shared epilogue staging buffer. Two
+/// widths are instantiated — `[256, 256]` and `[256, 128]` — and they differ in
+/// nothing else, which is what makes the pair a controlled comparison of tile
+/// quantization against operand traffic.
 #[derive(Clone, Copy)]
-struct Small {
+struct Small<const N: usize, const HALF: usize, const STAGE: usize> {
     common: Common,
     a: ARing,
-    accumulator: Accumulator,
+    b: SharedTileRing<F16, HALF, BLOCK_K, Swizzle128B, STAGES>,
+    accumulator: TmemTile<BLOCK_M, N>,
     a_map: *const TmaDescriptor,
     b_map: *const TmaDescriptor,
 }
 
-impl Small {
+impl<const N: usize, const HALF: usize, const STAGE: usize> Small<N, HALF, STAGE> {
     #[inline(always)]
     unsafe fn producer(self) {
         unsafe {
+            const { assert!(N == 2 * HALF, "a rank loads exactly half the panel") };
             let common = self.common;
             let mut cursor: ClcCursor = common.queue.cursor();
             let mut raw_item = cluster::cluster_idx();
             let mut sequence = 0u32;
-            let wide_tiles_n = common.tiles_n / 2;
-            let valid_items = common.tiles_m * wide_tiles_n;
+            let valid_items = common.tiles_m * common.tiles_n;
 
             loop {
                 if raw_item < valid_items {
-                    let (tile_n, tile_m) = pipeline::grouped(
-                        raw_item,
-                        wide_tiles_n,
-                        common.tiles_m,
-                        common.swizzle_group(),
-                    );
+                    let (tile_n, tile_m) =
+                        pipeline::grouped(raw_item, common.tiles_n, common.tiles_m, common.group);
                     common.publish(tile_m, tile_n, true);
                     let a_row =
                         (tile_m * (2 * BLOCK_M) as u32 + common.rank * BLOCK_M as u32) as i32;
-                    let b_row = (tile_n * BLOCK_N as u32 + common.rank * HALF_N as u32) as i32;
+                    let b_row = (tile_n * N as u32 + common.rank * HALF as u32) as i32;
 
                     let mut k = 0u32;
                     while k < common.k_blocks {
@@ -342,21 +370,23 @@ impl Small {
                         common.free.wait_recycled(global_k);
                         let load = common.load.sem(global_k).at_rank(LEADER);
                         let k_base = (k * BLOCK_K as u32) as i32;
-                        let b = common.b.tile(global_k);
-                        let bytes = self
+                        let mut bytes = self
                             .a
                             .tile(global_k)
-                            .tma_load_2d_arriving_at(self.a_map, k_base, a_row, load)
-                            + b.tma_load_2d_at_arriving_at::<64>(
-                                self.b_map, 0, k_base, b_row, load,
-                            )
-                            + b.tma_load_2d_at_arriving_at::<64>(
-                                self.b_map,
-                                64,
-                                k_base,
-                                b_row + 64,
-                                load,
-                            );
+                            .tma_load_2d_arriving_at(self.a_map, k_base, a_row, load);
+                        let b = self.b.tile(global_k);
+                        let mut box_row = 0usize;
+                        while box_row < HALF {
+                            bytes = bytes
+                                + b.tma_load_2d_at_arriving_at::<B_BOX>(
+                                    self.b_map,
+                                    box_row,
+                                    k_base,
+                                    b_row + box_row as i32,
+                                    load,
+                                );
+                            box_row += B_BOX;
+                        }
                         if common.rank == LEADER {
                             common
                                 .load
@@ -378,7 +408,7 @@ impl Small {
     }
 
     #[inline(always)]
-    unsafe fn multiply_stage(self, accumulator: Accumulator, sequence: u32, k: u32) {
+    unsafe fn multiply_stage(self, accumulator: TmemTile<BLOCK_M, N>, sequence: u32, k: u32) {
         unsafe {
             let common = self.common;
             let global_k = sequence * common.k_blocks + k;
@@ -387,8 +417,8 @@ impl Small {
                 mma_walk_cg2::<F16, CHUNKS>(
                     accumulator.raw(),
                     self.a.tile(global_k).k_walk(),
-                    common.b.tile(global_k).k_walk(),
-                    MmaShape::M256_N256,
+                    self.b.tile(global_k).k_walk(),
+                    mma_shape(N),
                     k > 0,
                 );
                 commit_multicast_cg2(common.free.sem(global_k), PAIR);
@@ -437,10 +467,10 @@ impl Small {
                     break;
                 }
                 common.full.wait(sequence);
-                common.drain::<SMALL_STAGE_N>(
+                common.drain::<N, STAGE>(
                     Common::accumulator(self.accumulator, sequence),
                     info.row * (2 * BLOCK_M) as u32,
-                    info.column * BLOCK_N as u32,
+                    info.column * N as u32,
                 );
                 common.release_accumulator(sequence);
                 sequence += 1;
@@ -454,6 +484,7 @@ struct Large {
     common: Common,
     a0: ARing,
     a1: ARing,
+    b: BRing,
     accumulator: Accumulator,
     a_map: *const TmaDescriptor,
     b_map: *const TmaDescriptor,
@@ -468,17 +499,12 @@ impl Large {
             let mut raw_item = cluster::cluster_idx();
             let mut sequence = 0u32;
             let macro_tiles_m = common.tiles_m / 2;
-            let wide_tiles_n = common.tiles_n / 2;
-            let valid_items = macro_tiles_m * wide_tiles_n;
+            let valid_items = macro_tiles_m * common.tiles_n;
 
             loop {
                 if raw_item < valid_items {
-                    let (tile_n, macro_m) = pipeline::grouped(
-                        raw_item,
-                        wide_tiles_n,
-                        macro_tiles_m,
-                        common.swizzle_group(),
-                    );
+                    let (tile_n, macro_m) =
+                        pipeline::grouped(raw_item, common.tiles_n, macro_tiles_m, common.group);
                     common.publish(macro_m, tile_n, true);
                     let a_row0 = (macro_m * 512 + common.rank * BLOCK_M as u32) as i32;
                     let a_row1 = a_row0 + 256;
@@ -490,7 +516,7 @@ impl Large {
                         common.free.wait_recycled(global_k);
                         let load = common.load.sem(global_k).at_rank(LEADER);
                         let k_base = (k * BLOCK_K as u32) as i32;
-                        let b = common.b.tile(global_k);
+                        let b = self.b.tile(global_k);
                         let bytes = self
                             .a0
                             .tile(global_k)
@@ -539,7 +565,7 @@ impl Large {
                 mma_walk_cg2::<F16, CHUNKS>(
                     self.accumulator.raw(),
                     self.a0.tile(global_k).k_walk(),
-                    common.b.tile(global_k).k_walk(),
+                    self.b.tile(global_k).k_walk(),
                     MmaShape::M256_N256,
                     k > 0,
                 );
@@ -554,7 +580,7 @@ impl Large {
                 mma_walk_cg2::<F16, CHUNKS>(
                     self.accumulator.columns_right(BLOCK_N as u32).raw(),
                     self.a1.tile(global_k).k_walk(),
-                    common.b.tile(global_k).k_walk(),
+                    self.b.tile(global_k).k_walk(),
                     MmaShape::M256_N256,
                     k > 0,
                 );
@@ -605,7 +631,7 @@ impl Large {
                 let mut half = 0u32;
                 while half < 2 {
                     common.full.sem(half).wait(sequence & 1);
-                    common.drain::<LARGE_STAGE_N>(
+                    common.drain::<BLOCK_N, LARGE_STAGE_N>(
                         self.accumulator.columns_right(half * BLOCK_N as u32),
                         info.row * 512 + half * 256,
                         info.column * BLOCK_N as u32,
@@ -646,6 +672,7 @@ pub mod kernels {
         tiles_m: u32,
         tiles_n: u32,
         k_blocks: u32,
+        group: u32,
         ldc: u32,
         mut c: DisjointSlice<u16>,
     ) {
@@ -655,20 +682,21 @@ pub mod kernels {
             let common = Common::attach(
                 smem,
                 SMALL_RINGS_END,
-                SMALL_B_OFFSET,
                 tiles_m,
                 tiles_n,
                 k_blocks,
+                group,
                 ldc,
                 &mut c,
             );
             common.initialize(1);
-            let state = Small {
+            let state = Small::<BLOCK_N, HALF_N, BLOCK_N> {
                 common,
                 a: ARing::attach(smem.add(A0_OFFSET)),
-                accumulator: Accumulator::from_raw(alloc_cluster(
+                b: BRing::attach(smem.add(SMALL_B_OFFSET)),
+                accumulator: TmemTile::from_raw(alloc_cluster(
                     smem.add(tmem_offset(SMALL_RINGS_END)).cast(),
-                    ACCUM_COLUMNS,
+                    2 * BLOCK_N as u32,
                 )),
                 a_map,
                 b_map,
@@ -683,7 +711,72 @@ pub mod kernels {
             }
 
             common.retire();
-            dealloc_cluster(state.accumulator.raw(), ACCUM_COLUMNS);
+            dealloc_cluster(state.accumulator.raw(), 2 * BLOCK_N as u32);
+        }
+    }
+
+    /// The same entry at half the width: a `[256, 128]` cluster tile, which
+    /// quadruples the tile count of a square problem against
+    /// [`gemm_sol_m256`]'s and is what a shape too small to fill a wave of the
+    /// wider one is for.
+    ///
+    /// # Safety
+    ///
+    /// As [`gemm_sol_m256`], with `n` a multiple of 128 rather than 256.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 131_328,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m256_n128(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            const { assert!(NARROW_SHARED_BYTES == 131_328) };
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let common = Common::attach(
+                smem,
+                NARROW_RINGS_END,
+                tiles_m,
+                tiles_n,
+                k_blocks,
+                group,
+                ldc,
+                &mut c,
+            );
+            common.initialize(1);
+            let state = Small::<NARROW_N, HALF_NARROW_N, NARROW_N> {
+                common,
+                a: ARing::attach(smem.add(A0_OFFSET)),
+                b: NarrowBRing::attach(smem.add(SMALL_B_OFFSET)),
+                accumulator: TmemTile::from_raw(alloc_cluster(
+                    smem.add(tmem_offset(NARROW_RINGS_END)).cast(),
+                    2 * NARROW_N as u32,
+                )),
+                a_map,
+                b_map,
+            };
+
+            if common.warp_id == TMA_WARP && common.lane == 0 {
+                state.producer();
+            } else if common.warp_id == MMA_WARP && common.lane == 0 {
+                state.multiply();
+            } else if common.warp_id < EPILOGUE_WARPS {
+                state.epilogue();
+            }
+
+            common.retire();
+            dealloc_cluster(state.accumulator.raw(), 2 * NARROW_N as u32);
         }
     }
 
@@ -704,6 +797,7 @@ pub mod kernels {
         tiles_m: u32,
         tiles_n: u32,
         k_blocks: u32,
+        group: u32,
         ldc: u32,
         mut c: DisjointSlice<u16>,
     ) {
@@ -713,10 +807,10 @@ pub mod kernels {
             let common = Common::attach(
                 smem,
                 LARGE_RINGS_END,
-                LARGE_B_OFFSET,
                 tiles_m,
                 tiles_n,
                 k_blocks,
+                group,
                 ldc,
                 &mut c,
             );
@@ -725,9 +819,10 @@ pub mod kernels {
                 common,
                 a0: ARing::attach(smem.add(A0_OFFSET)),
                 a1: ARing::attach(smem.add(LARGE_A1_OFFSET)),
+                b: BRing::attach(smem.add(LARGE_B_OFFSET)),
                 accumulator: Accumulator::from_raw(alloc_cluster(
                     smem.add(tmem_offset(LARGE_RINGS_END)).cast(),
-                    ACCUM_COLUMNS,
+                    2 * BLOCK_N as u32,
                 )),
                 a_map,
                 b_map,
@@ -742,60 +837,135 @@ pub mod kernels {
             }
 
             common.retire();
-            dealloc_cluster(state.accumulator.raw(), ACCUM_COLUMNS);
+            dealloc_cluster(state.accumulator.raw(), 2 * BLOCK_N as u32);
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Variant {
+    M256xN128,
     M256xN256,
     M512xN256,
 }
 
 impl Variant {
+    pub const ALL: [Variant; 3] = [Variant::M256xN128, Variant::M256xN256, Variant::M512xN256];
+
     pub const fn name(self) -> &'static str {
         match self {
+            Self::M256xN128 => "M256xN128",
             Self::M256xN256 => "M256xN256",
             Self::M512xN256 => "M512xN256",
         }
     }
 
-    const fn m_tile(self) -> usize {
+    pub const fn m_tile(self) -> usize {
         match self {
-            Self::M256xN256 => 256,
+            Self::M256xN128 | Self::M256xN256 => 256,
             Self::M512xN256 => 512,
         }
     }
 
-    const fn shared_bytes(self) -> usize {
+    pub const fn n_tile(self) -> usize {
         match self {
+            Self::M256xN128 => NARROW_N,
+            Self::M256xN256 | Self::M512xN256 => BLOCK_N,
+        }
+    }
+
+    pub const fn shared_bytes(self) -> usize {
+        match self {
+            Self::M256xN128 => NARROW_SHARED_BYTES,
             Self::M256xN256 => SMALL_SHARED_BYTES,
             Self::M512xN256 => LARGE_SHARED_BYTES,
         }
     }
 }
 
-pub const fn select_variant(m: usize) -> Variant {
-    if m >= 8_192 {
+/// Clusters this device holds at once: 148 SMs, one CTA per SM, two CTAs to a
+/// cluster.
+///
+/// Both the one CTA and the two are facts rather than choices — every shared
+/// plan here declares more than half of the 233472 B an SM divides, and a
+/// `cta_group::2` MMA has to have its pair co-resident — so this is a device
+/// property, not a tuning knob. It is written down rather than queried because
+/// [`select_variant`] is a `const fn` that [`grid`] calls with a shape and
+/// nothing else; `bench sol`'s table 0 prints the same number off
+/// `cuDeviceGetAttribute` beside every row it divides, which is where a device
+/// that disagrees with this would show up.
+const RESIDENT_CLUSTERS: usize = 74;
+
+/// The entry a shape gets. All three branches are wave arithmetic.
+///
+/// A launch is one cluster per output tile and takes `ceil(tiles / 74)` waves of
+/// them, so `tiles / (waves * 74)` is the fraction of it that is not idling and
+/// halving the tile's `N` doubles the tile count. That doubling raises the
+/// fraction **only** while both counts fit the same number of waves — at or
+/// below half a wave of wide tiles — and above it the two are equal and the
+/// narrow tile is left paying its costs for nothing. `bench sol-small` measures
+/// exactly that boundary: at 16 and 36 wide tiles the narrow entry is 1.27x,
+/// and at 64 and 144 it is 0.93x and 0.81x, both reproduced twice.
+///
+/// `M512xN256` above 8192 is #138's crossover, which upstream takes at 16384;
+/// `bench sol` has it 1.12x at 8192³ against a wave efficiency both entries
+/// share, so what it wins there is operand traffic per flop and not tiles.
+pub const fn select_variant(m: usize, n: usize) -> Variant {
+    if !n.is_multiple_of(BLOCK_N) {
+        // The only entry whose contract admits this `n` at all.
+        Variant::M256xN128
+    } else if m >= 8_192 && m.is_multiple_of(2 * 256) {
         Variant::M512xN256
+    } else if 2 * (m / 256) * (n / BLOCK_N) <= RESIDENT_CLUSTERS {
+        Variant::M256xN128
     } else {
         Variant::M256xN256
+    }
+}
+
+/// The N-band width [`pipeline::grouped`] walks, which was a rule inside the
+/// kernel until it became a launch parameter.
+///
+/// The rule is unchanged and the default is what it computed, because the sweep
+/// that could have changed it found nothing to change it to: `bench sol`'s
+/// table 3 takes `G` over `{1, 2, 4, 8, 16}` and gets 1880.3 to 1876.2 TFLOP/s
+/// at 8192³ — flat to 0.2% — and a 1311 to 1367 range at 4096³ against rows
+/// whose own launches spread 1.3 to 3.6%. Tuning on the second of those would be
+/// tuning on noise.
+pub const fn default_group(m: usize) -> u32 {
+    if m / 256 <= 16 { 2 } else { 8 }
+}
+
+/// Everything the launch decides that is not the shape: which entry, and how
+/// wide a band of `N` its traversal walks before it steps in `M`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Plan {
+    pub variant: Variant,
+    pub group: u32,
+}
+
+impl Plan {
+    pub const fn shipped(shape: crate::bench::Shape) -> Plan {
+        Plan {
+            variant: select_variant(shape.m, shape.n),
+            group: default_group(shape.m),
+        }
     }
 }
 
 fn validate_shape(m: usize, n: usize, k: usize, variant: Variant) -> Result<(), Box<dyn Error>> {
     if m < variant.m_tile()
         || !m.is_multiple_of(variant.m_tile())
-        || n < BLOCK_N
-        || !n.is_multiple_of(BLOCK_N)
+        || n < variant.n_tile()
+        || !n.is_multiple_of(variant.n_tile())
         || k < STAGES * BLOCK_K
         || !k.is_multiple_of(STAGES * BLOCK_K)
     {
         return Err(format!(
-            "{m}x{n}x{k} violates {}'s M{}xN256, K%256 contract",
+            "{m}x{n}x{k} violates {}'s M{}xN{}, K%256 contract",
             variant.name(),
             variant.m_tile(),
+            variant.n_tile(),
         )
         .into());
     }
@@ -871,7 +1041,7 @@ fn run<T>(
     m: usize,
     n: usize,
     k: usize,
-    variant: Variant,
+    plan: Plan,
     initialize: bool,
     then: impl FnOnce(
         &cuda_core::CudaStream,
@@ -880,6 +1050,7 @@ fn run<T>(
 ) -> Result<(String, T), Box<dyn Error>> {
     use cuda_core::{DeviceBuffer, LaunchConfig1D};
 
+    let Plan { variant, group } = plan;
     validate_shape(m, n, k, variant)?;
     let stream = context.default_stream();
     let module = unsafe { kernels::load(context)? };
@@ -904,7 +1075,7 @@ fn run<T>(
 
     let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
     let tiles_m = (m / 256) as u32;
-    let tiles_n = (n / 128) as u32;
+    let tiles_n = (n / variant.n_tile()) as u32;
     let config = LaunchConfig1D::new(
         grid_for(crate::bench::Shape { m, n, k }, variant),
         THREADS,
@@ -916,12 +1087,24 @@ fn run<T>(
 
     let launch_once: Box<dyn Fn(&mut DeviceBuffer<u16>) -> Result<(), Box<dyn Error>>> =
         match variant {
+            Variant::M256xN128 => {
+                let prepared = module_ref.prepare_gemm_sol_m256_n128(config)?;
+                Box::new(move |output| {
+                    unsafe {
+                        module_ref.gemm_sol_m256_n128(
+                            stream_ref, &prepared, a_ptr, b_ptr, tiles_m, tiles_n, k_blocks, group,
+                            n as u32, output,
+                        )?
+                    };
+                    Ok(())
+                })
+            }
             Variant::M256xN256 => {
                 let prepared = module_ref.prepare_gemm_sol_m256(config)?;
                 Box::new(move |output| {
                     unsafe {
                         module_ref.gemm_sol_m256(
-                            stream_ref, &prepared, a_ptr, b_ptr, tiles_m, tiles_n, k_blocks,
+                            stream_ref, &prepared, a_ptr, b_ptr, tiles_m, tiles_n, k_blocks, group,
                             n as u32, output,
                         )?
                     };
@@ -933,7 +1116,7 @@ fn run<T>(
                 Box::new(move |output| {
                     unsafe {
                         module_ref.gemm_sol_m512(
-                            stream_ref, &prepared, a_ptr, b_ptr, tiles_m, tiles_n, k_blocks,
+                            stream_ref, &prepared, a_ptr, b_ptr, tiles_m, tiles_n, k_blocks, group,
                             n as u32, output,
                         )?
                     };
@@ -968,26 +1151,46 @@ fn nothing_after(
 
 pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String, Box<dyn Error>> {
     let mut notes = Vec::new();
-    for variant in [Variant::M256xN256, Variant::M512xN256] {
-        notes.push(run(context, 1024, 1024, 512, variant, true, nothing_after)?.0);
+    for variant in Variant::ALL {
+        let plan = Plan {
+            variant,
+            group: default_group(1024),
+        };
+        notes.push(run(context, 1024, 1024, 512, plan, true, nothing_after)?.0);
     }
     Ok(notes.join("; "))
+}
+
+/// Check the plan at the gate size, then time it at `shape` — the order every
+/// number in this file comes out of, and the entry point a sweep varying the
+/// plan calls instead of [`bench`].
+pub fn bench_plan(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    shape: crate::bench::Shape,
+    plan: Plan,
+) -> Result<crate::bench::Timings, Box<dyn Error>> {
+    let crate::bench::Shape { m, n, k } = shape;
+    run(context, 1024, 1024, 512, plan, true, nothing_after)?;
+    Ok(run(context, m, n, k, plan, false, crate::bench::time)?.1)
 }
 
 pub fn bench(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     shape: crate::bench::Shape,
 ) -> Result<crate::bench::Timings, Box<dyn Error>> {
-    let crate::bench::Shape { m, n, k } = shape;
-    let variant = select_variant(m);
-    run(context, 1024, 1024, 512, variant, true, nothing_after)?;
-    Ok(run(context, m, n, k, variant, false, crate::bench::time)?.1)
+    bench_plan(context, shape, Plan::shipped(shape))
 }
 
 fn grid_for(shape: crate::bench::Shape, variant: Variant) -> u32 {
-    RANKS * (shape.m / variant.m_tile() * (shape.n / BLOCK_N)) as u32
+    RANKS * (shape.m / variant.m_tile() * (shape.n / variant.n_tile())) as u32
 }
 
 pub fn grid(shape: crate::bench::Shape) -> u32 {
-    grid_for(shape, select_variant(shape.m))
+    grid_for(shape, select_variant(shape.m, shape.n))
+}
+
+/// Clusters the launch asks for, which is one per output tile — the number the
+/// wave arithmetic divides by residency.
+pub fn clusters(shape: crate::bench::Shape, variant: Variant) -> u32 {
+    grid_for(shape, variant) / RANKS
 }
