@@ -902,7 +902,7 @@ fn run(
     // `2·BLOCK_M` by `BLOCK_N` tile and a stage is a whole `BLOCK_K`, and the
     // kernel bounds-checks none of it. A size that does not divide is rejected
     // rather than launched into somebody else's memory.
-    if m % (2 * BLOCK_M) != 0 || n % BLOCK_N != 0 || k % BLOCK_K != 0 {
+    if !m.is_multiple_of(2 * BLOCK_M) || !n.is_multiple_of(BLOCK_N) || !k.is_multiple_of(BLOCK_K) {
         return Err(format!(
             "{m}x{n}x{k} does not divide the {}x{BLOCK_N}x{BLOCK_K} tiling",
             2 * BLOCK_M
