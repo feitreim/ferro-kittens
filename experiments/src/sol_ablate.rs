@@ -1735,6 +1735,12 @@ pub fn check(context: &Arc<CudaContext>) -> Result<String, Box<dyn Error>> {
                 (Variant::M512xN256, _) => {
                     launch!(prepare_gemm_sol_m512_wide, gemm_sol_m512_wide)
                 }
+                // The narrow entry has no arms, as `measure` says: the drain rungs
+                // are instantiated for it through the shipped kernel's own body
+                // and `examples`' gate covers them there.
+                (Variant::M256xN128, _) => {
+                    return Err("the narrow entry has no drain rungs of its own".into());
+                }
             }
             stream.synchronize()?;
             let worst = crate::gemm_sol::check_output(&c.to_host_vec(&stream)?, m, n, k)
