@@ -1067,6 +1067,59 @@ def _print_census() -> None:
         )
 
 
+# The kernels whose MMA warp's issue stream is itself an argument, and the
+# opcode that brackets it.
+#
+# `bench sol-ablate`'s `mma only` arm runs the MMA warp with no barrier wait, no
+# TMA and no drain, and the `[256, 256]` entry still reaches only 88.7% of
+# tensor-core peak where `[512, 256]` reaches 97.6%. Nothing memory-shaped is
+# left in that arm, so what is left is the scalar work the warp does *between*
+# `tcgen05.mma` issues -- ring index, byte multiply, two operand descriptors, an
+# accumulate predicate -- which is the same per K block at both entries while the
+# work per K block is 4 MMA against 8.
+#
+# That is a claim about instructions, and the PTX is where it is either true or
+# not. `mma` counts alone cannot see it: 16 and 32 is exactly what the two
+# entries should carry. What matters is how many non-`mma` instructions sit
+# between them, so this prints the span rather than a count of it.
+MMA_STREAM_KERNELS = ("gemm_sol_m256", "gemm_sol_m512")
+
+
+def _print_mma_stream() -> None:
+    """The instruction span between the first and last `tcgen05.mma` of a kernel.
+
+    Split on `.visible .entry` exactly as `_census` does, for the same reason:
+    the bodies carry `ptx_asm!` verbatim and that text is the thing worth
+    reading. `mma` is one warp's stream in a warp-specialized kernel, so the span
+    between the first and last of them is that warp's K-loop body and nothing
+    else -- no other warp's code is interleaved into it by the compiler, because
+    each warp's path is a separate branch.
+    """
+    for ptx in sorted(Path(EXAMPLES_DIR).rglob("*.ptx")):
+        for chunk in ptx.read_text().split(".visible .entry ")[1:]:
+            name = chunk.split("(", 1)[0].strip()
+            if name not in MMA_STREAM_KERNELS:
+                continue
+            lines = [line.strip() for line in chunk.splitlines()]
+            # Substring rather than prefix: cuda-oxide emits `ptx_asm!` bodies
+            # verbatim, and a `tcgen05.mma` can arrive with a predicate or a
+            # brace in front of it. `_census` counts the same substring, so the
+            # two agree by construction.
+            issues = [i for i, line in enumerate(lines) if "tcgen05.mma" in line]
+            if not issues:
+                continue
+            span = lines[issues[0] : issues[-1] + 1]
+            code = [line for line in span if line and not line.startswith("//")]
+            mma = [line for line in code if "tcgen05.mma" in line]
+            print(
+                f"\n  {name}: {len(mma)} tcgen05.mma over {len(code)} instructions "
+                f"({len(code) - len(mma)} between them, "
+                f"{(len(code) - len(mma)) / len(mma):.1f} per issue)"
+            )
+            for line in span:
+                print(f"    {line}")
+
+
 def _print_kernels(measured: dict[tuple[str, str], dict[str, int]]) -> None:
     for ptx in sorted({source for source, _ in measured}):
         kernels = {name: counts for (source, name), counts in measured.items() if source == ptx}
@@ -1632,6 +1685,7 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     print(f"\nregisters per thread, {arch}" + (f" — {label}" if label else ""))
     _print_kernels(measured)
     _print_census()
+    _print_mma_stream()
     _print_ladder(measured)
     _print_timed_twins(measured)
     _check_occupancy_step(measured)

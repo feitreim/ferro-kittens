@@ -508,8 +508,94 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
         }
     }
 
+    /// One K block at a **compile-time** stage.
+    ///
+    /// `k_blocks` is a multiple of `STAGES` — every entry's shape contract is
+    /// `k % (STAGES * BLOCK_K) == 0` — so `global_k % STAGES == k % STAGES`, and
+    /// the four positions of a four-way unroll are always stages 0, 1, 2, 3 in
+    /// that order. Handing each position its stage as a const is what turns two
+    /// operand descriptors and two barrier addresses from runtime arithmetic
+    /// into folded offsets. The phase parity is the one thing that genuinely
+    /// moves with `global_k`, and it moves once a turn instead of four times.
+    ///
+    /// Upstream's `gemm_sol_final` states the same fact — *"`k_iters % 4 == 0`,
+    /// so the producer's global stage and this local stage agree at every tile
+    /// boundary. Keeping this expression loop-local lets the unroll pass fold
+    /// each stage match."* — and spells it as `#[unroll(4)]` over a loop-local
+    /// `k_idx & 3` with a `match` on it. That attribute is rewritten only inside
+    /// a `#[kernel]` or `#[device_function]` body, so a const parameter is the
+    /// spelling reachable from a plain `impl` method; it also does not depend on
+    /// an unroll pass firing.
     #[inline(always)]
-    unsafe fn multiply<const ABLATE: u8>(self) {
+    unsafe fn multiply_at<const ABLATE: u8, const SLOT: u32>(
+        self,
+        accumulator: TmemTile<BLOCK_M, N>,
+        parity: u32,
+        accumulate: bool,
+    ) {
+        unsafe {
+            let common = self.common;
+            if common.rank == LEADER {
+                if waits_on_load(ABLATE) {
+                    common.load.sem(SLOT).wait(parity);
+                }
+                if multiplies(ABLATE) {
+                    mma_walk_cg2::<F16, CHUNKS>(
+                        accumulator.raw(),
+                        self.a.tile(SLOT).k_walk(),
+                        self.b.tile(SLOT).k_walk(),
+                        mma_shape(N),
+                        accumulate,
+                    );
+                }
+                commit_multicast_cg2(common.free.sem(SLOT), PAIR);
+            }
+        }
+    }
+
+    /// The K walk, `STAGES` blocks a turn.
+    ///
+    /// `FOLD` picks the spelling: [`Self::multiply_at`]'s const stage, or
+    /// [`Self::multiply_stage`]'s `global_k`, which is what the port carried
+    /// before the two were measured against each other. The two compute the same
+    /// `C` by construction — the const is `global_k % STAGES` and nothing else —
+    /// so the difference between them is entirely how much of the MMA warp's
+    /// issue stream is scalar arithmetic.
+    #[inline(always)]
+    unsafe fn walk_k<const ABLATE: u8, const FOLD: bool>(
+        self,
+        accumulator: TmemTile<BLOCK_M, N>,
+        sequence: u32,
+    ) {
+        unsafe {
+            let common = self.common;
+            if FOLD {
+                let turns = common.k_blocks / STAGES as u32;
+                let cycle = sequence * turns;
+                let mut turn = 0u32;
+                while turn < turns {
+                    let parity = (cycle + turn) & 1;
+                    self.multiply_at::<ABLATE, 0>(accumulator, parity, turn > 0);
+                    self.multiply_at::<ABLATE, 1>(accumulator, parity, true);
+                    self.multiply_at::<ABLATE, 2>(accumulator, parity, true);
+                    self.multiply_at::<ABLATE, 3>(accumulator, parity, true);
+                    turn += 1;
+                }
+            } else {
+                let mut k = 0u32;
+                while k < common.k_blocks {
+                    self.multiply_stage::<ABLATE>(accumulator, sequence, k);
+                    self.multiply_stage::<ABLATE>(accumulator, sequence, k + 1);
+                    self.multiply_stage::<ABLATE>(accumulator, sequence, k + 2);
+                    self.multiply_stage::<ABLATE>(accumulator, sequence, k + 3);
+                    k += 4;
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn multiply<const ABLATE: u8, const FOLD: bool>(self) {
         unsafe {
             let common = self.common;
             let mut sequence = 0u32;
@@ -522,14 +608,7 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
                     common.empty.wait(sequence - 2);
                 }
 
-                let mut k = 0u32;
-                while k < common.k_blocks {
-                    self.multiply_stage::<ABLATE>(accumulator, sequence, k);
-                    self.multiply_stage::<ABLATE>(accumulator, sequence, k + 1);
-                    self.multiply_stage::<ABLATE>(accumulator, sequence, k + 2);
-                    self.multiply_stage::<ABLATE>(accumulator, sequence, k + 3);
-                    k += 4;
-                }
+                self.walk_k::<ABLATE, FOLD>(accumulator, sequence);
                 if common.rank == LEADER {
                     commit_multicast_cg2(common.full.sem(sequence), PAIR);
                 }
@@ -692,8 +771,94 @@ impl<const BOX: usize> Large<BOX> {
         }
     }
 
+    /// One K block at a compile-time stage, per [`Small::multiply_at`].
+    ///
+    /// `first` and `last` are the two places this entry's K block is not
+    /// interchangeable with its neighbours — the `empty` wait at `k == 0` and the
+    /// `full` commit at `k + 1 == k_blocks` — and both are literals at three of
+    /// the four positions, so they fold away with the stage.
     #[inline(always)]
-    unsafe fn multiply<const ABLATE: u8>(self) {
+    unsafe fn multiply_at<const ABLATE: u8, const SLOT: u32>(
+        self,
+        sequence: u32,
+        parity: u32,
+        accumulate: bool,
+        first: bool,
+        last: bool,
+    ) {
+        unsafe {
+            let common = self.common;
+            if common.rank == LEADER {
+                if waits_on_load(ABLATE) {
+                    common.load.sem(SLOT).wait(parity);
+                }
+                if multiplies(ABLATE) {
+                    mma_walk_cg2::<F16, CHUNKS>(
+                        self.accumulator.raw(),
+                        self.a0.tile(SLOT).k_walk(),
+                        self.b.tile(SLOT).k_walk(),
+                        MmaShape::M256_N256,
+                        accumulate,
+                    );
+                }
+                commit_multicast_cg2(common.free.sem(SLOT), PAIR);
+                if last {
+                    commit_multicast_cg2(common.full.sem(0), PAIR);
+                }
+
+                if sequence > 0 && first {
+                    common.empty.sem(1).wait((sequence - 1) & 1);
+                }
+                if multiplies(ABLATE) {
+                    mma_walk_cg2::<F16, CHUNKS>(
+                        self.accumulator.columns_right(BLOCK_N as u32).raw(),
+                        self.a1.tile(SLOT).k_walk(),
+                        self.b.tile(SLOT).k_walk(),
+                        MmaShape::M256_N256,
+                        accumulate,
+                    );
+                }
+                commit_multicast_cg2(common.free.sem(SLOT), PAIR);
+                if last {
+                    commit_multicast_cg2(common.full.sem(1), PAIR);
+                }
+            }
+        }
+    }
+
+    /// The K walk, per [`Small::walk_k`].
+    #[inline(always)]
+    unsafe fn walk_k<const ABLATE: u8, const FOLD: bool>(self, sequence: u32) {
+        unsafe {
+            let common = self.common;
+            if FOLD {
+                let turns = common.k_blocks / STAGES as u32;
+                let cycle = sequence * turns;
+                let mut turn = 0u32;
+                while turn < turns {
+                    let parity = (cycle + turn) & 1;
+                    let last = turn + 1 == turns;
+                    self.multiply_at::<ABLATE, 0>(sequence, parity, turn > 0, turn == 0, false);
+                    self.multiply_at::<ABLATE, 1>(sequence, parity, true, false, false);
+                    self.multiply_at::<ABLATE, 2>(sequence, parity, true, false, false);
+                    self.multiply_at::<ABLATE, 3>(sequence, parity, true, false, last);
+                    turn += 1;
+                }
+            } else {
+                let mut k = 0u32;
+                while k < common.k_blocks {
+                    self.multiply_stage::<ABLATE>(sequence, k);
+                    self.multiply_stage::<ABLATE>(sequence, k + 1);
+                    self.multiply_stage::<ABLATE>(sequence, k + 2);
+                    self.multiply_stage::<ABLATE>(sequence, k + 3);
+                    k += 4;
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn multiply<const ABLATE: u8, const FOLD: bool>(self) {
         unsafe {
             let common = self.common;
             let mut sequence = 0u32;
@@ -704,15 +869,7 @@ impl<const BOX: usize> Large<BOX> {
                 if common.rank == LEADER && sequence > 0 {
                     common.empty.sem(0).wait((sequence - 1) & 1);
                 }
-
-                let mut k = 0u32;
-                while k < common.k_blocks {
-                    self.multiply_stage::<ABLATE>(sequence, k);
-                    self.multiply_stage::<ABLATE>(sequence, k + 1);
-                    self.multiply_stage::<ABLATE>(sequence, k + 2);
-                    self.multiply_stage::<ABLATE>(sequence, k + 3);
-                    k += 4;
-                }
+                self.walk_k::<ABLATE, FOLD>(sequence);
                 sequence += 1;
             }
         }
@@ -771,6 +928,7 @@ pub unsafe fn small_body<
     const STAGE: usize,
     const RINGS_END: usize,
     const ABLATE: u8,
+    const FOLD: bool,
 >(
     a_map: *const TmaDescriptor,
     b_map: *const TmaDescriptor,
@@ -800,7 +958,7 @@ pub unsafe fn small_body<
         if common.warp_id == TMA_WARP && common.lane == 0 {
             state.producer::<ABLATE>();
         } else if common.warp_id == MMA_WARP && common.lane == 0 {
-            state.multiply::<ABLATE>();
+            state.multiply::<ABLATE, FOLD>();
         } else if common.warp_id < EPILOGUE_WARPS {
             state.epilogue::<ABLATE>();
         }
@@ -817,7 +975,7 @@ pub unsafe fn small_body<
 /// As [`kernels::gemm_sol_m512`].
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn large_body<const BOX: usize, const ABLATE: u8>(
+pub unsafe fn large_body<const BOX: usize, const ABLATE: u8, const FOLD: bool>(
     a_map: *const TmaDescriptor,
     b_map: *const TmaDescriptor,
     tiles_m: u32,
@@ -856,7 +1014,7 @@ pub unsafe fn large_body<const BOX: usize, const ABLATE: u8>(
         if common.warp_id == TMA_WARP && common.lane == 0 {
             state.producer::<ABLATE>();
         } else if common.warp_id == MMA_WARP && common.lane == 0 {
-            state.multiply::<ABLATE>();
+            state.multiply::<ABLATE, FOLD>();
         } else if common.warp_id < EPILOGUE_WARPS {
             state.epilogue::<ABLATE>();
         }
@@ -895,7 +1053,7 @@ pub mod kernels {
     ) {
         unsafe {
             const { assert!(SMALL_SHARED_BYTES == 196_864) };
-            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, WHOLE>(
+            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, WHOLE, true>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             );
         }
@@ -929,7 +1087,7 @@ pub mod kernels {
     ) {
         unsafe {
             const { assert!(NARROW_SHARED_BYTES == 131_328) };
-            small_body::<NARROW_N, HALF_NARROW_N, B_BOX, NARROW_N, NARROW_RINGS_END, WHOLE>(
+            small_body::<NARROW_N, HALF_NARROW_N, B_BOX, NARROW_N, NARROW_RINGS_END, WHOLE, true>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             );
         }
@@ -958,7 +1116,7 @@ pub mod kernels {
     ) {
         unsafe {
             const { assert!(LARGE_SHARED_BYTES == 229_632) };
-            large_body::<B_BOX, WHOLE>(
+            large_body::<B_BOX, WHOLE, true>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             );
         }

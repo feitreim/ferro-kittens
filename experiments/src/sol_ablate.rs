@@ -137,7 +137,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, NO_DRAIN>(
+            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, NO_DRAIN, true>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -168,7 +168,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, ISSUE_ONLY>(
+            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, ISSUE_ONLY, true>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -199,7 +199,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, FEED_ONLY>(
+            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, FEED_ONLY, true>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -231,7 +231,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, MMA_ONLY>(
+            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, MMA_ONLY, true>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -264,7 +264,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            small_body::<BLOCK_N, HALF_N, WIDE_B_BOX, BLOCK_N, SMALL_RINGS_END, WHOLE>(
+            small_body::<BLOCK_N, HALF_N, WIDE_B_BOX, BLOCK_N, SMALL_RINGS_END, WHOLE, true>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -296,7 +296,72 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            small_body::<BLOCK_N, HALF_N, WIDE_B_BOX, BLOCK_N, SMALL_RINGS_END, FEED_ONLY>(
+            small_body::<BLOCK_N, HALF_N, WIDE_B_BOX, BLOCK_N, SMALL_RINGS_END, FEED_ONLY, true>(
+                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
+            )
+        }
+    }
+
+    /// The shipped kernel with the MMA warp's ring index computed from
+    /// `global_k` at runtime, which is what the port carried before the stage
+    /// became a const. Identical `C`, and the control for the fold.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m256`], with `b_map`'s box the height
+    /// this arm's `BOX` names. Computes a wrong `C` unless its arm is `WHOLE`.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 196_864,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m256_runtime(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, WHOLE, false>(
+                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
+            )
+        }
+    }
+
+    /// [`gemm_sol_m256_mma`] at the runtime ring index: the arm with nothing
+    /// memory-shaped left in it, on both spellings of the same walk.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m256`], with `b_map`'s box the height
+    /// this arm's `BOX` names. Computes a wrong `C` unless its arm is `WHOLE`.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 196_864,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m256_runtime_mma(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, MMA_ONLY, false>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -327,7 +392,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, NO_DRAIN>(
+            large_body::<B_BOX, NO_DRAIN, true>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -358,7 +423,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, ISSUE_ONLY>(
+            large_body::<B_BOX, ISSUE_ONLY, true>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -389,7 +454,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, FEED_ONLY>(
+            large_body::<B_BOX, FEED_ONLY, true>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -420,7 +485,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, MMA_ONLY>(
+            large_body::<B_BOX, MMA_ONLY, true>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -453,7 +518,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<WIDE_B_BOX, WHOLE>(
+            large_body::<WIDE_B_BOX, WHOLE, true>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -484,7 +549,70 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<WIDE_B_BOX, FEED_ONLY>(
+            large_body::<WIDE_B_BOX, FEED_ONLY, true>(
+                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
+            )
+        }
+    }
+
+    /// [`gemm_sol_m256_runtime`] at the `[512, 256]` entry, whose K loop is
+    /// already at 99.4% of peak and so has nothing for the fold to buy.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m512`], with `b_map`'s box the height
+    /// this arm's `BOX` names. Computes a wrong `C` unless its arm is `WHOLE`.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 229_632,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m512_runtime(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            large_body::<B_BOX, WHOLE, false>(
+                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
+            )
+        }
+    }
+
+    /// [`gemm_sol_m256_runtime_mma`] at the `[512, 256]` entry.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m512`], with `b_map`'s box the height
+    /// this arm's `BOX` names. Computes a wrong `C` unless its arm is `WHOLE`.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 229_632,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m512_runtime_mma(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            large_body::<B_BOX, MMA_ONLY, false>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -501,6 +629,8 @@ pub enum Arm {
     MmaOnly,
     WideWhole,
     WideFeed,
+    RuntimeWhole,
+    RuntimeMma,
 }
 
 impl Arm {
@@ -514,6 +644,21 @@ impl Arm {
     ];
     /// The wide-`B` comparison: two whole kernels and two feeds, one box apart.
     const BOXES: [Arm; 4] = [Arm::Whole, Arm::WideWhole, Arm::FeedOnly, Arm::WideFeed];
+    /// Every arm the depth table turns into a rate. The two levers under test
+    /// come last, because they are not phases removed.
+    const LADDER: [Arm; 7] = [
+        Arm::Whole,
+        Arm::NoDrain,
+        Arm::IssueOnly,
+        Arm::MmaOnly,
+        Arm::FeedOnly,
+        Arm::WideWhole,
+        Arm::RuntimeWhole,
+    ];
+    /// The fold comparison: the shipped kernel and the runtime ring index, whole
+    /// and stripped to the MMA warp. `mma only` is the pair that isolates the
+    /// mechanism, because nothing memory-shaped is left in it.
+    const FOLDS: [Arm; 4] = [Arm::RuntimeWhole, Arm::Whole, Arm::RuntimeMma, Arm::MmaOnly];
 
     fn name(self) -> &'static str {
         match self {
@@ -524,6 +669,8 @@ impl Arm {
             Arm::MmaOnly => "mma only",
             Arm::WideWhole => "wide B",
             Arm::WideFeed => "wide B feed",
+            Arm::RuntimeWhole => "runtime stage",
+            Arm::RuntimeMma => "runtime mma",
         }
     }
 
@@ -536,6 +683,8 @@ impl Arm {
             Arm::MmaOnly => "issue only, minus the MMA warp's load.wait",
             Arm::WideWhole => "the shipped kernel, B in one TMA not two",
             Arm::WideFeed => "feed only, B in one TMA not two",
+            Arm::RuntimeWhole => "the shipped kernel, ring index off global_k",
+            Arm::RuntimeMma => "mma only, ring index off global_k",
         }
     }
 
@@ -552,7 +701,7 @@ impl Arm {
     /// the count the wide-box prediction is about, derived here so the table can
     /// be read without the census beside it.
     fn tma_per_k_block(self, variant: Variant) -> usize {
-        if self == Arm::IssueOnly || self == Arm::MmaOnly {
+        if matches!(self, Arm::IssueOnly | Arm::MmaOnly | Arm::RuntimeMma) {
             return 0;
         }
         let a_tiles = if variant == Variant::M512xN256 { 2 } else { 1 };
@@ -678,6 +827,20 @@ pub fn measure(
                 gemm_sol_m256_wideb_feed
             )
         }
+        (Variant::M256xN256, Arm::RuntimeWhole) => {
+            launcher!(
+                &ablated,
+                prepare_gemm_sol_m256_runtime,
+                gemm_sol_m256_runtime
+            )
+        }
+        (Variant::M256xN256, Arm::RuntimeMma) => {
+            launcher!(
+                &ablated,
+                prepare_gemm_sol_m256_runtime_mma,
+                gemm_sol_m256_runtime_mma
+            )
+        }
         (Variant::M512xN256, Arm::Whole) => {
             launcher!(&shipped, prepare_gemm_sol_m512, gemm_sol_m512)
         }
@@ -705,6 +868,20 @@ pub fn measure(
                 &ablated,
                 prepare_gemm_sol_m512_wideb_feed,
                 gemm_sol_m512_wideb_feed
+            )
+        }
+        (Variant::M512xN256, Arm::RuntimeWhole) => {
+            launcher!(
+                &ablated,
+                prepare_gemm_sol_m512_runtime,
+                gemm_sol_m512_runtime
+            )
+        }
+        (Variant::M512xN256, Arm::RuntimeMma) => {
+            launcher!(
+                &ablated,
+                prepare_gemm_sol_m512_runtime_mma,
+                gemm_sol_m512_runtime_mma
             )
         }
         (Variant::M256xN128, _) => return Err("the narrow entry has no arms".into()),
@@ -971,17 +1148,72 @@ fn box_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn fold_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
+    println!(
+        "\n3. the ring index, folded against computed. the MMA warp indexes both operand\n\
+         rings and both stage barriers off `global_k = sequence * k_blocks + k`, a runtime\n\
+         value, so every offset and both operand descriptors are runtime arithmetic inside\n\
+         its issue stream. but `k_blocks` is a multiple of `STAGES` — the shape contract is\n\
+         `k % 256 == 0` — so `global_k % STAGES == k % STAGES`, and the four positions of the\n\
+         four-way unroll are always stages 0, 1, 2, 3. `whole` hands each position its stage\n\
+         as a const; `runtime stage` is the spelling the port carried. same `C`, same bytes,\n\
+         same barriers — the only difference is how much of the warp's stream is scalar.\n\n\
+         the `mma only` pair is the one that isolates it: no TMA, no drain, no barrier wait,\n\
+         so a difference there is the issue stream and nothing else. upstream states the same\n\
+         fact and folds it with `#[unroll(4)]` over a loop-local `k_idx & 3`. taken twice\n\
+         round-robin."
+    );
+    for pass in 1..=2 {
+        println!("\n  pass {pass}");
+        println!(
+            "  {:<14}{:<18}{:>11}{:>12}{:>10}{:>13}{:>9}",
+            "arm", "shape", "min ms", "TFLOP/s", "of peak", "vs runtime", "spread"
+        );
+        for (shape, variant) in HEADLINE {
+            let mut reference = None;
+            for arm in Arm::FOLDS {
+                let timings = measure(context, shape, variant, arm)?;
+                let rate = tflops(shape, timings.min());
+                let against = match arm {
+                    Arm::RuntimeWhole | Arm::RuntimeMma => {
+                        reference = Some(rate);
+                        None
+                    }
+                    _ => reference.take(),
+                };
+                println!(
+                    "  {:<14}{:<18}{:>11.4}{:>12.1}{:>9.1}%{:>13}{:>8.1}%",
+                    arm.name(),
+                    shape.to_string(),
+                    timings.min(),
+                    rate,
+                    100.0 * rate / PEAK,
+                    against
+                        .map(|against| format!("{:.3}", rate / against))
+                        .unwrap_or_else(|| "-".to_string()),
+                    100.0 * timings.spread(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn depth_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
     println!(
-        "\n3. the depth ladder — `K` alone, so the tile grid and the waves are fixed and only\n\
+        "\n4. the depth ladder — `K` alone, so the tile grid and the waves are fixed and only\n\
          the arithmetic each tile amortizes over moves. the fit line under each rung set is\n\
          the per-tile constant and the per-K-block rate the ladder decomposes into, and the\n\
-         percent it quotes is the K loop's own — the number this file exists for. each entry\n\
-         is laddered at both B boxes, so the wide-box claim is tested on the rate and not\n\
-         only on the launch."
+         percent it quotes is the K loop's own — the number this file exists for.\n\n\
+         **every arm is laddered, not only `whole`.** table 1's arms are launches, and a\n\
+         launch cannot tell a per-K-block cadence from a per-tile constant the arm happens to\n\
+         carry — an arm's TMEM allocation, CLC query and retire are a per-tile cost like any\n\
+         other, and at 64 k blocks one microsecond of it is 5.7 points of `of peak`. laddering\n\
+         each arm is what makes its number a rate. `wide B` is here for the same reason: it is\n\
+         the claim that the producer's instruction count moves the rate, tested on the rate."
     );
     for (base, variant) in HEADLINE {
-        for arm in [Arm::Whole, Arm::WideWhole] {
+        for arm in Arm::LADDER {
             depth_ladder(
                 &format!("{} {}", variant.name(), arm.name()),
                 base,
@@ -997,7 +1229,7 @@ fn depth_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
 #[cfg(feature = "gemm-sol-upstream")]
 fn upstream_depth_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
     println!(
-        "\n4. the same ladder on upstream's own `gemm_sol_final`, byte for byte, at the same\n\
+        "\n5. the same ladder on upstream's own `gemm_sol_final`, byte for byte, at the same\n\
          `[256, 256]` tile and on this clock. the fit's percent-of-peak is the reference the\n\
          port's own K loop is short of: a difference here is the port's, and a shortfall\n\
          both share is the algorithm's at this tile."
@@ -1013,7 +1245,7 @@ fn upstream_depth_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>
 #[cfg(not(feature = "gemm-sol-upstream"))]
 fn upstream_depth_table(_: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
     println!(
-        "\n4. no upstream ladder: this build has no `gemm-sol-upstream` feature.\n\
+        "\n5. no upstream ladder: this build has no `gemm-sol-upstream` feature.\n\
          `modal_app.py::upstream_bench` is the entry point that turns it on."
     );
     Ok(())
@@ -1025,6 +1257,7 @@ pub fn decompose(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
     denominator(context)?;
     ablation_table(context)?;
     box_table(context)?;
+    fold_table(context)?;
     depth_table(context)?;
     upstream_depth_table(context)?;
     println!(
