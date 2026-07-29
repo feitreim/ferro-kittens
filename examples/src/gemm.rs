@@ -260,6 +260,13 @@
 //! and [`SharedTile::tma_store_2d`] already takes it out. §7 is where that is
 //! priced rather than assumed.
 //!
+//! Both halves of that route are now built and both are on the correctness
+//! gate: [`Tile::drain_staged`] is the `stmatrix` half (#116) and
+//! [`Tile::drain_staged_tma`] is the engine (#123). The first was worth
+//! +8.0% / +4.2% / +1.9% and ships; the second is **1.0–1.7% slower** than what
+//! it replaces, so the route is half taken on purpose, and §7 is where that is
+//! a measurement rather than the sentence above.
+//!
 //! ## What this kernel had to reach past the library for
 //!
 //! **Nothing.** There is no `GAP` block left in this file, and the last one to
@@ -315,6 +322,7 @@ use cuda_device::{
 use crate::bench::{Shape, Timings, time};
 use std::error::Error;
 
+use kittens::epilogue::{StoreRing, Warp};
 use kittens::global::{GlobalRows, store_rows, store_shared_rows};
 use kittens::ldst::{store_tile, store_tile_x4};
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
@@ -435,6 +443,44 @@ const STAGE_N: usize = 64;
 /// is 8 rows and the XOR is over the row index, so a tile starting at a
 /// multiple of 8 rows reproduces the layout it would have had on its own.
 type StageTile = SharedTile<Bf16, 32, STAGE_N, Swizzle128B>;
+/// [`StageTile`] as a depth-1 **warp-scope** store ring — the same 4096 B, with
+/// the proxy fence, the `cp.async.bulk.tensor` issue and the read-wait a TMA
+/// store owes stated by [`kittens::epilogue::StoreRing`] instead of here.
+///
+/// Depth 1 and not 2, and the shared budget is the whole of why: a second
+/// buffer of this shape is another 16 384 B across the four warps and
+/// [`STAGED_SHARED_BYTES`] has 1920 B left. So there is no overlap to be had
+/// here — band `k + 1`'s `stmatrix` waits out band `k`'s store reads, which is
+/// the shape `examples/src/softmax.rs` writes by hand.
+///
+/// **That wait is the leading explanation for why the TMA rungs lose**, and the
+/// experiment that would settle it fits in the bytes this one already has: a
+/// depth-2 ring of `[16, 64]` buffers is `2 × 2048 = 4096 B` a warp, exactly
+/// what this costs, so a warp could drain its 32 rows as two 16-row halves with
+/// the second half's `stmatrix` overlapping the first half's store and the
+/// envelope would not move. What it needs is a 16-row band out of
+/// [`TmemTile::tile_x8`], whose `.x8` shape is 32 — so the obstacle is the LDTM
+/// width and not shared memory, and it is a follow-up rather than a variant of
+/// this type.
+///
+/// **Warp scope is the point.** The CTA-scope ring the type shipped with would
+/// put a `bar.sync` on both sides of every band, and [`StageTile`] is per warp
+/// precisely so that there are none — see [`Tile::drain_staged_tma`], which is
+/// the arm that measures whether that matters.
+type StageRing = StoreRing<Bf16, 32, STAGE_N, Swizzle128B, 0, Warp>;
+/// The four [`StageTile`]s read as **one CTA-wide tile**: the same 16 384 B run
+/// at the same offset, addressed as `[BLOCK_M, STAGE_N]` rather than as four
+/// row-quarters of it.
+///
+/// A row-subrange of a `Swizzle128B` tile is a swizzled tile whenever it starts
+/// at a multiple of the 8-row period, which is what lets one run be read both
+/// ways ([`StageTile`] says the same thing from the other side). So the two TMA
+/// rungs differ in the *box* — `[128, 64]` in one instruction against `[32, 64]`
+/// in four — and in the barriers that box implies, and in nothing else.
+type CtaStage = SharedTile<Bf16, BLOCK_M, STAGE_N, Swizzle128B>;
+/// [`CtaStage`] as a depth-1 CTA-scope store ring — [`kittens::epilogue::StoreRing`]
+/// exactly as #111 built it, unparameterized.
+type CtaRing = StoreRing<Bf16, BLOCK_M, STAGE_N, Swizzle128B, 0>;
 /// The band a staged pass drains — [`Band`] at [`STAGE_N`] columns, so **64
 /// fp32 a thread where the register epilogue holds 128**.
 type StagedBand = RegTile<32, STAGE_N, BaseLdtm>;
@@ -579,6 +625,25 @@ fn staged_ctas_per_sm(shared_per_sm: usize) -> u32 {
 /// stays 2 until shared memory passes that line. 1920 B of headroom is left.
 pub const STAGED_SHARED_BYTES: usize = staged_plan(BLOCK_N, BLOCK_K, STAGES);
 const _: () = assert!(STAGED_SHARED_BYTES == 114_816 && STAGED_SHARED_BYTES <= 116_736);
+
+/// The three readings of the staging run agree, which is what makes the TMA
+/// rungs an epilogue A/B and not an envelope one: four per-warp [`StageTile`]s,
+/// four [`StageRing`] buffers and one [`CtaRing`] buffer are the same
+/// 16 384 bytes at the same offset, and every rung that carries any of them
+/// declares [`STAGED_SHARED_BYTES`].
+///
+/// **A second staging buffer does not fit and this is where that is stated.**
+/// The envelope leaves 1920 B under the 116 736 a CTA gets at two per SM;
+/// another depth is 16 384. So both TMA rungs are depth 1 by arithmetic rather
+/// than by preference.
+const _: () = {
+    let run = (THREADS as usize / 32) * StageTile::BYTES;
+    assert!(run == 16_384);
+    assert!(STAGE_OFFSET + run == STAGED_SHARED_BYTES);
+    assert!((THREADS as usize / 32) * StageRing::BYTES == run);
+    assert!(CtaRing::BYTES == run);
+    assert!(STAGED_SHARED_BYTES + run > 116_736);
+};
 
 /// SMs on the device this project targets and measures on — a B200, as
 /// `modal run modal_app.py::bench` prints in its header.
@@ -1439,16 +1504,201 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAG
         }
     }
 
-    /// Where in `C` this warp's band of `item` starts — the whole of what the
-    /// item index means to the epilogue, split out so [`Self::drain`] and
-    /// [`Self::drain_storing_twice`] cannot disagree about it.
+    /// [`Self::drain_staged`] with the **shared→global hop handed to the TMA
+    /// engine**: the same `.x8` LDTM, the same `.x4` `stmatrix` into the same
+    /// per-warp [`StageTile`], and `cp.async.bulk.tensor.2d.global.shared::cta`
+    /// where `ld.shared` + `st.global.v4` were. #15's route, finally with the
+    /// engine in it.
+    ///
+    /// # What it replaces, per warp band of `[32, 64]`
+    ///
+    /// | | instructions a thread |
+    /// |---|---|
+    /// | `store_shared_rows` | 32 `ld.shared.v4.b32` + 32 `st.global.v4.b32` |
+    /// | this | **one** `cp.async.bulk.tensor`, on lane 0 |
+    ///
+    /// Plus, on every lane, one `fence.proxy.async.shared::cta`; plus, on lane
+    /// 0, one `cp.async.bulk.commit_group` and one
+    /// `cp.async.bulk.wait_group.read`; plus two `bar.warp.sync` where the plain
+    /// path had one. So the trade is 64 memory instructions a thread for a
+    /// fence a thread and a barrier, and the whole claim is issue.
+    ///
+    /// **The bandwidth claim is dead and this rung does not make it.** #121's
+    /// `s84 hot` deleted the epilogue's entire HBM traffic and moved throughput
+    /// by −2.3% to +1.8%, so there is no memory pressure for an engine to
+    /// relieve. What #15 said this would buy is not what it can buy.
+    ///
+    /// # And the issue claim came out below zero
+    ///
+    /// **This rung is 1.0–1.7% slower than `staged84`**, in four paired cells
+    /// across two containers at the shortened geometries #122 built, none of
+    /// whose ranges reaches 1.000. The full-depth 8192³ A/B cannot see it —
+    /// `1/share` of 458–709 there, so three containers of it read `+0.2`,
+    /// `+0.4` and `−0.2` percent and mean nothing.
+    ///
+    /// The doubling probe never promised the ~+2.7% either: `ld.shared` +
+    /// `st.global` is 2.33–2.58 µs a tile and this hop is 1.57–1.99, so the
+    /// most the change was ever worth is 0.42–0.75 µs — 2.7% was that term
+    /// going to *zero*, and the engine takes it to about three quarters of
+    /// itself.
+    ///
+    /// **Why the realised value is below even that, and why the probe cannot
+    /// see it.** A *doubled* store is an extra one left in flight beside work
+    /// that continues; a *replacing* store is on the critical path of the next
+    /// band. At [`StageRing`]'s `IN_FLIGHT = 0` the `acquire` below is
+    /// `cp.async.bulk.wait_group.read` at zero groups, so band `k + 1`'s
+    /// `stmatrix` waits out the engine's read of band `k`'s buffer — four times
+    /// an item — where `store_shared_rows` retires into the memory pipeline and
+    /// blocks on nothing. The kernel trades 64 pipelined instructions a thread
+    /// for one instruction and one exposed engine latency, and the latency is
+    /// dearer. That is a mechanism consistent with every number and not a
+    /// measured one; [`StageRing`] carries what measuring it would take.
+    ///
+    /// # The proxy fence, which the plain path correctly does not have
+    ///
+    /// `stmatrix` writes through the generic proxy and the TMA engine reads
+    /// through the async one, so nothing but `fence.proxy.async.shared::cta`
+    /// orders them — and it orders the writes of the thread that *executes* it,
+    /// which is why every lane fences and a barrier carries that to the lane
+    /// that issues. [`Self::drain_staged`]'s doc says there is no fence there
+    /// and that its absence is not a bug; both ends are generic there. This is
+    /// the other case, and the fence is part of what is being measured.
+    ///
+    /// # Why the ring is warp-scope
+    ///
+    /// [`StageTile`] is one warp's 4096 B and nobody else's, so the convergence
+    /// the fence needs is `bar.warp.sync` and the thread that owns the store
+    /// group is lane 0. [`Self::drain_staged_tma_cta`] is the same epilogue at
+    /// CTA scope through the ring exactly as #111 built it, and the difference
+    /// between the two is what a block barrier costs here.
+    ///
+    /// # `TWICE` is the doubling instrument, and it doubles the whole hop
+    ///
+    /// A second `acquire`-less `commit_2d` per band, aimed at the cluster's own
+    /// first tile so the extra bytes stay in L2. It adds a link rather than
+    /// deleting one, for [`Tile::drain_staged_twice`]'s reason, and what it
+    /// adds is a fence, a barrier, an issue and a commit — the *whole* of the
+    /// TMA global half, which is what makes its difference comparable with the
+    /// 2.0–2.3 µs a tile `s84 2g` prices `ld.shared` + `st.global` at.
+    ///
+    /// At `TWICE` it computes a wrong `C` and is never checked.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::drain_staged`], plus [`kittens::epilogue::StoreRing`]'s: every
+    /// lane of the warp calls this together, `ring` is this warp's alone, and
+    /// the ring is drained before the kernel ends — nothing else makes a bulk
+    /// store's bytes visible. `c_map` must describe `C` with a `[32, 64]` box.
     #[inline(always)]
-    fn origin(&self, item: u32) -> (u32, u32) {
+    unsafe fn drain_staged_tma<const TWICE: bool>(
+        &self,
+        item: u32,
+        again: u32,
+        ring: &mut StageRing,
+        c_map: *const TmaDescriptor,
+    ) {
+        unsafe {
+            let (row_base, column_base) = self.origin(item);
+            let (again_row, again_column) = self.origin(again);
+            let mut column = 0u32;
+            while column < BLOCK_N as u32 {
+                // The engine must be done *reading* the buffer before this
+                // band's `stmatrix` refills it. Before the first band the wait
+                // is trivially satisfied, so there is no fill phase.
+                let staging = ring.acquire();
+                let band: StagedBand = self.accumulator.tile_x8(32 * self.warp_id, column);
+                store_tile_x4(staging.chunk_writer(), 0, 0, self.lane, band);
+                ring.commit_2d(c_map, (column_base + column) as i32, row_base as i32);
+                if TWICE {
+                    ring.commit_2d(c_map, (again_column + column) as i32, again_row as i32);
+                }
+                column += STAGE_N as u32;
+            }
+        }
+    }
+
+    /// [`Self::drain_staged_tma`] with the four warps' tiles read as **one
+    /// [`CtaStage`]** and one `cp.async.bulk.tensor` a band, through
+    /// [`kittens::epilogue::StoreRing`] at the CTA scope it was written for.
+    ///
+    /// Same bytes into `C`, same LDTM, same `stmatrix` addresses — warp `w`
+    /// still writes rows `32w..32w + 32`, of a taller tile — and the same
+    /// 16 384 B of staging. What moves is the box, `[128, 64]` in one
+    /// instruction against `[32, 64]` in four, and what that box costs: the
+    /// fence has to reach a thread in another warp, so `acquire` and `commit`
+    /// are a `bar.sync` each and the item pays **eight** block barriers where
+    /// the shipped epilogue pays none.
+    ///
+    /// That is the trade this rung exists to price, and it is the one #116
+    /// decided the other way without an engine in the picture. It is also the
+    /// answer to whether the ring was usable as built: it was, at this scope,
+    /// and the epilogue wanted the other one.
+    ///
+    /// **The eight barriers are cheaper than the three boxes they save, and the
+    /// hypothesis was backwards.** This arm *wins* against
+    /// [`Self::drain_staged_tma`] by 0.6–1.6% of the launch in four paired
+    /// cells across two containers, and it is the one that ties `staged84`
+    /// rather than losing by 1.0–1.7%. The opcode census reads 5 `bar.sync` and
+    /// 0 `bar.warp.sync` here against 2 and 3 there, so the barriers are real
+    /// and visible; what they buy is one `[128, 64]` box a band instead of
+    /// four `[32, 64]` ones, and the engine's per-instruction overhead is the
+    /// term that decides this pair.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::drain_staged_tma`], at CTA scope: every thread of the block
+    /// calls this together, and `c_map` must describe `C` with a `[128, 64]`
+    /// box.
+    #[inline(always)]
+    unsafe fn drain_staged_tma_cta(
+        &self,
+        item: u32,
+        ring: &mut CtaRing,
+        c_map: *const TmaDescriptor,
+    ) {
+        unsafe {
+            let (row_base, column_base) = self.cta_origin(item);
+            let mut column = 0u32;
+            while column < BLOCK_N as u32 {
+                let staging = ring.acquire();
+                let band: StagedBand = self.accumulator.tile_x8(32 * self.warp_id, column);
+                store_tile_x4(
+                    staging.chunk_writer(),
+                    32 * self.warp_id,
+                    0,
+                    self.lane,
+                    band,
+                );
+                ring.commit_2d(c_map, (column_base + column) as i32, row_base as i32);
+                column += STAGE_N as u32;
+            }
+        }
+    }
+
+    /// Where in `C` this **CTA's** tile of `item` starts — the item index's
+    /// whole meaning to the epilogue, before the warp's own rows are added.
+    ///
+    /// Split from [`Self::origin`] because a CTA-wide staging tile is aimed by
+    /// this and a per-warp one by that, and the four warps' bands are
+    /// contiguous: warp `w` owns rows `32w..32w + 32` of the same 128 this
+    /// names, which is what lets [`CtaStage`] and [`StageTile`] describe one
+    /// run.
+    #[inline(always)]
+    fn cta_origin(&self, item: u32) -> (u32, u32) {
         let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, self.group);
         (
-            2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank + 32 * self.warp_id,
+            2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank,
             BLOCK_N as u32 * tile_n,
         )
+    }
+
+    /// Where in `C` this warp's band of `item` starts — split out so
+    /// [`Self::drain`] and [`Self::drain_storing_twice`] cannot disagree about
+    /// it.
+    #[inline(always)]
+    fn origin(&self, item: u32) -> (u32, u32) {
+        let (row, column) = self.cta_origin(item);
+        (row + 32 * self.warp_id, column)
     }
 
     /// [`Self::drain`] with **one LDTM and two sets of stores** — the second
@@ -2255,6 +2505,123 @@ impl<const STAGE: u32> Job for StagedTwice<STAGE> {
     }
 }
 
+/// [`Epilogue::StagedTma`]'s job: the shipped item with
+/// [`Tile::drain_staged_tma`] where [`Tile::drain_staged`] was, and nothing
+/// else moved.
+///
+/// The ring is a field rather than a local because its cursor and its
+/// outstanding store groups span *items*: a persistent cluster's last band of
+/// item `k` is still being read out of shared memory when item `k + 1`'s first
+/// `stmatrix` wants the buffer, and `acquire` is what stands between them. At
+/// depth 1 the cursor never moves, so what the field really carries is the
+/// obligation — which is why the entry point drains it after the item loop and
+/// not inside one.
+///
+/// `TWICE` is [`Tile::drain_staged_tma`]'s doubling instrument; at `true` it
+/// computes a wrong `C` and is never checked.
+#[derive(Clone, Copy)]
+struct StagedTma<const TWICE: bool> {
+    tile: Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>,
+    ring: StageRing,
+    /// The descriptor for `C`, with a `[32, 64]` box — the one operand this
+    /// epilogue needs that no other one does, and the reason the TMA entry
+    /// points take an argument the rest do not.
+    c_map: *const TmaDescriptor,
+    /// As [`DoubleDrain::home`], and only read at `TWICE`.
+    home: u32,
+}
+
+impl<const TWICE: bool> Job for StagedTma<TWICE> {
+    const RANKS: u32 = crate::gemm::RANKS;
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn init(&self, item: u32) {
+        unsafe { self.tile.init(item) }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn inval(&self) {
+        unsafe { self.tile.inval() }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Staged`]'s, plus [`Tile::drain_staged_tma`]'s.
+    #[inline(always)]
+    unsafe fn work(&mut self, item: u32) {
+        unsafe {
+            let tile = self.tile;
+            let (tile_m, tile_n) = pipeline::grouped(item, tile.tiles_m, tile.tiles_n, tile.group);
+            if tile.warp_id == 0 && tile.lane == 0 {
+                tile.produce::<true>(tile_m, tile_n, 0, tile.k_blocks);
+            }
+            if tile.rank == LEADER && tile.warp_id == 1 && tile.lane == 0 {
+                tile.multiply::<true>();
+            }
+            tile.done.wait(0);
+            thread::sync_threads();
+            tile.drain_staged_tma::<TWICE>(item, self.home, &mut self.ring, self.c_map);
+        }
+    }
+}
+
+/// [`Epilogue::StagedTmaCta`]'s job: [`StagedTma`] with the four staging tiles
+/// read as one and the ring at CTA scope — see [`Tile::drain_staged_tma_cta`].
+#[derive(Clone, Copy)]
+struct StagedTmaCta {
+    tile: Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>,
+    ring: CtaRing,
+    /// The descriptor for `C`, with a `[128, 64]` box — a different map from
+    /// [`StagedTma`]'s, because a box is the tile's own shape.
+    c_map: *const TmaDescriptor,
+}
+
+impl Job for StagedTmaCta {
+    const RANKS: u32 = crate::gemm::RANKS;
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn init(&self, item: u32) {
+        unsafe { self.tile.init(item) }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn inval(&self) {
+        unsafe { self.tile.inval() }
+    }
+
+    /// # Safety
+    ///
+    /// As [`StagedTma`]'s, at CTA scope.
+    #[inline(always)]
+    unsafe fn work(&mut self, item: u32) {
+        unsafe {
+            let tile = self.tile;
+            let (tile_m, tile_n) = pipeline::grouped(item, tile.tiles_m, tile.tiles_n, tile.group);
+            if tile.warp_id == 0 && tile.lane == 0 {
+                tile.produce::<true>(tile_m, tile_n, 0, tile.k_blocks);
+            }
+            if tile.rank == LEADER && tile.warp_id == 1 && tile.lane == 0 {
+                tile.multiply::<true>();
+            }
+            tile.done.wait(0);
+            thread::sync_threads();
+            tile.drain_staged_tma_cta(item, &mut self.ring, self.c_map);
+        }
+    }
+}
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
@@ -2397,6 +2764,59 @@ pub mod kernels {
                 smem.add(STAGE_OFFSET + tile.warp_id as usize * StageTile::BYTES),
             );
             (tile, stage)
+        }
+    }
+
+    /// [`attach_staged`] with the warp's staging tile handed back as a
+    /// [`StageRing`] — the same base address, since a ring of one buffer *is*
+    /// its buffer and taking it from [`SharedTile::base`] is what stops the
+    /// per-warp offset being written down twice.
+    ///
+    /// # Safety
+    ///
+    /// [`attach_staged`]'s.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn attach_staged_ring(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        c: &mut DisjointSlice<u16>,
+    ) -> (Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>, StageRing) {
+        unsafe {
+            let (tile, stage) =
+                attach_staged(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, c);
+            (tile, StageRing::attach(stage.base()))
+        }
+    }
+
+    /// [`attach_staged`] with the whole staging run handed back as one
+    /// CTA-scope [`CtaRing`] — the same 16 384 B from the same offset, read as
+    /// one `[BLOCK_M, STAGE_N]` tile rather than as four.
+    ///
+    /// # Safety
+    ///
+    /// [`attach_staged`]'s.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn attach_staged_cta_ring(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        c: &mut DisjointSlice<u16>,
+    ) -> (Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>, CtaRing) {
+        unsafe {
+            let (tile, _) = attach_staged(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, c);
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            (tile, CtaRing::attach(smem.add(STAGE_OFFSET)))
         }
     }
 
@@ -2693,6 +3113,158 @@ pub mod kernels {
                 attach_staged(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             let mut job = Staged::<true, true, true> { tile, stage };
             pipeline::run(&mut job, tiles_m * tiles_n);
+            release(&job.tile);
+        }
+    }
+
+    /// [`gemm_cg2_staged_x8x4`] with the **shared→global hop handed to the TMA
+    /// engine** — #15's route, and the one lever #121 left with a number on it.
+    ///
+    /// Identical to that kernel in grid, tensor memory, operand maps, item map,
+    /// schedule, shared plan, LDTM width and `stmatrix` width; identical in
+    /// every byte written to `C`. What differs is one `cp.async.bulk.tensor` a
+    /// band where 32 `ld.shared.v4` and 32 `st.global.v4` a thread were, and
+    /// the fence, the barrier and the group wait that instruction owes. See
+    /// [`Tile::drain_staged_tma`].
+    ///
+    /// The extra `c_map` argument is the whole of what the host has to build
+    /// for this: a rank-2 descriptor for `C` with a `[32, 64]` box. The plain
+    /// staged path writes through a `GlobalRows` cursor carrying `ldc`, which
+    /// is still passed because [`attach`] builds one either way.
+    ///
+    /// **It computes the GEMM and is on the correctness gate.**
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_cg2_staged`]'s, plus: `c_map` must describe the same `C` as `c`,
+    /// `[n, m]` bf16 with a `[32, 64]` box.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 114_816,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_cg2_staged_x8x4_tma(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        c_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, ring) =
+                attach_staged_ring(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let mut job = StagedTma::<false> {
+                tile,
+                ring,
+                c_map,
+                home: 0,
+            };
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            // The one obligation the ring cannot discharge incrementally, and
+            // the only thing that makes the last bands' bytes readable at all —
+            // not the kernel ending, and not the `cluster_sync` in `release`.
+            job.ring.drain();
+            release(&job.tile);
+        }
+    }
+
+    /// [`gemm_cg2_staged_x8x4_tma`] with the four staging tiles read as **one
+    /// `[128, 64]` tile** and the ring at CTA scope — the same epilogue through
+    /// [`kittens::epilogue::StoreRing`] exactly as #111 built it.
+    ///
+    /// One `cp.async.bulk.tensor` a band instead of four, at the price of eight
+    /// `bar.sync` an item where the shipped epilogue has none. Its difference
+    /// from the rung above is that price and nothing else. See
+    /// [`Tile::drain_staged_tma_cta`].
+    ///
+    /// **It computes the GEMM and is on the correctness gate.**
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_cg2_staged_x8x4_tma`]'s, for a `[128, 64]` box.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 114_816,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_cg2_staged_x8x4_tma_cta(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        c_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, ring) = attach_staged_cta_ring(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
+            let mut job = StagedTmaCta { tile, ring, c_map };
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            job.ring.drain();
+            release(&job.tile);
+        }
+    }
+
+    /// **A deliberately wrong GEMM** — [`gemm_cg2_staged_x8x4_tma`] with a
+    /// second TMA store per band: the TMA global half doubled and nothing else,
+    /// so this minus that kernel is what the hop costs, measured by addition.
+    ///
+    /// The twin of [`gemm_cg2_staged_x8x4_2g`], which is the same question
+    /// asked of `ld.shared` + `st.global` — and the comparison the two are for
+    /// is between those two differences, not between either and a whole
+    /// epilogue. See [`Tile::drain_staged_tma`].
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_cg2_staged_x8x4_tma`]'s. Both tiles it writes are tiles this
+    /// cluster owns.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 114_816,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_cg2_staged_x8x4_tma_2g(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        c_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, ring) =
+                attach_staged_ring(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let mut job = StagedTma::<true> {
+                tile,
+                ring,
+                c_map,
+                home: cluster::cluster_idx().min(tiles_m * tiles_n - 1),
+            };
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            job.ring.drain();
             release(&job.tile);
         }
     }
@@ -3825,7 +4397,10 @@ impl Plan {
             | Epilogue::StagedHot
             | Epilogue::StagedTwiceGlobal
             | Epilogue::StagedTwiceShared
-            | Epilogue::StagedTwiceAll => {
+            | Epilogue::StagedTwiceAll
+            | Epilogue::StagedTma
+            | Epilogue::StagedTmaCta
+            | Epilogue::StagedTmaTwiceGlobal => {
                 staged_plan(self.rung.block_n, self.rung.block_k, self.rung.stages)
             }
             _ => self.rung.shared(),
@@ -4154,6 +4729,50 @@ pub enum Epilogue {
     /// [`Epilogue::StagedTwiceShared`] is the LDTM half — the issue and the
     /// wait together, which is the term #117 found and did not exhaust.
     StagedTwiceAll,
+    /// `s84 tma`: [`Epilogue::StagedWideX4`] with the shared→global hop handed
+    /// to the **TMA engine** — one `cp.async.bulk.tensor` a band where 32
+    /// `ld.shared.v4` and 32 `st.global.v4` a thread were (#15, #111).
+    ///
+    /// The staging tile stays per warp, so the ring is warp-scope and the item
+    /// still pays no block barrier; what it adds is a
+    /// `fence.proxy.async.shared::cta` per lane, a `bar.warp.sync`, a commit
+    /// and a group wait. See [`Tile::drain_staged_tma`].
+    ///
+    /// **The claim was issue and not bandwidth, and it came out below zero.**
+    /// #121's `s84 hot` deleted the epilogue's entire HBM traffic for −2.3% to
+    /// +1.8%, which retired the premise this rung was originally scoped from;
+    /// what was left is the 2.0–2.3 µs a tile that `ld.shared` + `st.global`
+    /// cost at 8192³, worth about +2.7% of the launch *if it went to zero*. It
+    /// does not go to zero — the engine's hop is 1.57–1.99 µs a tile against
+    /// 2.33–2.58 — and this rung is **1.0–1.7% slower than `staged84`** at the
+    /// geometries where a difference this size can be measured at all. #15's
+    /// TMA-store idea is retired with a number.
+    ///
+    /// Same 114 816 B, same two CTAs an SM, same `staged no drain` control. On
+    /// the correctness gate.
+    StagedTma,
+    /// `s84 tmac`: [`Epilogue::StagedTma`] with the four per-warp staging tiles
+    /// read as **one `[128, 64]` tile** and the ring at CTA scope — one TMA
+    /// instruction a band instead of four, at eight `bar.sync` an item instead
+    /// of none.
+    ///
+    /// This is [`kittens::epilogue::StoreRing`] as #111 built it, unmodified,
+    /// and the pair with the rung above is what says which scope the epilogue
+    /// wanted. **It wanted this one**: this arm beats the warp-scope one by
+    /// 0.6–1.6% in four paired cells across two containers, so the eight block
+    /// barriers cost less than the three extra `[32, 64]` boxes they save. It
+    /// still does not beat `staged84` — 0.2–0.5% behind at 8192², and the two
+    /// containers disagree in sign at 16384². Same plan, same control, on the
+    /// correctness gate.
+    StagedTmaCta,
+    /// **Not a GEMM. Never checked.** [`Epilogue::StagedTma`] with a second TMA
+    /// store per band — the TMA global half doubled and nothing else.
+    ///
+    /// The twin of [`Epilogue::StagedTwiceGlobal`], and the two differences are
+    /// what the comparison is: `2g − staged84` prices `ld.shared` +
+    /// `st.global`, this minus `s84 tma` prices the engine's hop, and a lever
+    /// that is worth anything has the second smaller than the first.
+    StagedTmaTwiceGlobal,
     /// **Not a GEMM. This computes a wrong `C` on purpose and is never checked.**
     ///
     /// The fused epilogue with every item's store aimed at the *cluster's own
@@ -4240,6 +4859,9 @@ impl Epilogue {
             Epilogue::StagedTwiceGlobal => "s84 2g",
             Epilogue::StagedTwiceShared => "s84 2m",
             Epilogue::StagedTwiceAll => "s84 2x",
+            Epilogue::StagedTma => "s84 tma",
+            Epilogue::StagedTmaCta => "s84 tmac",
+            Epilogue::StagedTmaTwiceGlobal => "s84t 2g",
             Epilogue::HotStore => "hot",
             Epilogue::DoubleDrain => "2x",
             Epilogue::DoubleStore => "2s",
@@ -4258,6 +4880,7 @@ impl Epilogue {
                 | Epilogue::StagedTwiceGlobal
                 | Epilogue::StagedTwiceShared
                 | Epilogue::StagedTwiceAll
+                | Epilogue::StagedTmaTwiceGlobal
         )
     }
 }
@@ -4354,7 +4977,7 @@ fn run<T>(
     ) -> Result<T, Box<dyn Error>>,
 ) -> Result<(String, T), Box<dyn Error>> {
     use cuda_core::{DeviceBuffer, LaunchConfig1D};
-    use kittens::global::GlobalLayout;
+    use kittens::global::{GlobalLayout, TensorMap};
 
     // The tiling is the constraint on what sizes exist: a cluster owns a whole
     // `2·BLOCK_M` by `BLOCK_N` tile and a stage is a whole `BLOCK_K`, and the
@@ -4404,6 +5027,27 @@ fn run<T>(
     };
 
     let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
+    // The TMA epilogues are the only ones that need a descriptor for the
+    // *output* — every other rung writes `C` through a `GlobalRows` cursor
+    // carrying `ldc` and nothing else — so one is built only where one is
+    // launched, and every other row of every sweep costs the two encodes it
+    // always did. The box is the staging tile's own shape, which is why the two
+    // scopes need two maps: `[32, 64]` for the per-warp ring and `[128, 64]`
+    // for the CTA-wide one. `C` is row-major `[m, n]`, so the layout's extents
+    // are `[n, m]` in the driver's fastest-first order, exactly as `A`'s are
+    // `[k, m]`.
+    //
+    // SAFETY: `c` outlives every launch consuming the map, and holds `m * n`
+    // bf16 elements.
+    let c_layout = unsafe { GlobalLayout::<Bf16, 2>::packed(c.cu_deviceptr(), [n, m]) };
+    let c_map = match plan.epilogue {
+        Epilogue::StagedTma | Epilogue::StagedTmaTwiceGlobal => {
+            Some(c_layout.tensor_map::<StageTile>(&stream)?)
+        }
+        Epilogue::StagedTmaCta => Some(c_layout.tensor_map::<CtaStage>(&stream)?),
+        _ => None,
+    };
+    let c_ptr = c_map.as_ref().map_or(core::ptr::null(), TensorMap::as_ptr);
     let cap = rung.max_clusters(shared_per_sm(context)?);
     let blocks = grid_for(plan.scheduler, m, n, rung, cap);
     let (tiles_m, tiles_n) = tile_grid(m, n, rung.block_n);
@@ -4433,6 +5077,25 @@ fn run<T>(
                 unsafe {
                     module_ref.$launch(
                         stream_ref, &prepared, a_ptr, b_ptr, tiles_m, tiles_n, plan.group,
+                        k_blocks, n as u32, c,
+                    )?
+                };
+                Ok(())
+            };
+            Box::new(launch) as Box<dyn Fn(&mut DeviceBuffer<u16>) -> Result<(), Box<dyn Error>>>
+        }};
+    }
+    // The same thing for an entry point that also takes a descriptor for `C`.
+    // A second macro rather than an `Option` threaded through the first: the
+    // argument list is the kernel's ABI and the arms that use it are exactly
+    // the arms that built a map above.
+    macro_rules! tma_launcher {
+        ($prepare:ident, $launch:ident) => {{
+            let prepared = module_ref.$prepare(config)?;
+            let launch = move |c: &mut DeviceBuffer<u16>| -> Result<(), Box<dyn Error>> {
+                unsafe {
+                    module_ref.$launch(
+                        stream_ref, &prepared, a_ptr, b_ptr, c_ptr, tiles_m, tiles_n, plan.group,
                         k_blocks, n as u32, c,
                     )?
                 };
@@ -4510,6 +5173,25 @@ fn run<T>(
         }
         (Entry::Shipped, Scheduler::Static, Epilogue::StagedTwiceAll, Ablation::Whole) => {
             launcher!(prepare_gemm_cg2_staged_x8x4_2x, gemm_cg2_staged_x8x4_2x)
+        }
+        // The TMA store, at both scopes, and its own doubling probe. Same
+        // 114 816 B once more, so `staged no drain` is their control too — and
+        // the three are the only arms in this match that take a descriptor for
+        // `C`.
+        (Entry::Shipped, Scheduler::Static, Epilogue::StagedTma, Ablation::Whole) => {
+            tma_launcher!(prepare_gemm_cg2_staged_x8x4_tma, gemm_cg2_staged_x8x4_tma)
+        }
+        (Entry::Shipped, Scheduler::Static, Epilogue::StagedTmaCta, Ablation::Whole) => {
+            tma_launcher!(
+                prepare_gemm_cg2_staged_x8x4_tma_cta,
+                gemm_cg2_staged_x8x4_tma_cta
+            )
+        }
+        (Entry::Shipped, Scheduler::Static, Epilogue::StagedTmaTwiceGlobal, Ablation::Whole) => {
+            tma_launcher!(
+                prepare_gemm_cg2_staged_x8x4_tma_2g,
+                gemm_cg2_staged_x8x4_tma_2g
+            )
         }
         (Entry::Shipped, Scheduler::Static, Epilogue::HotStore, Ablation::Whole) => {
             launcher!(prepare_gemm_cg2_hot, gemm_cg2_hot)
@@ -6614,6 +7296,18 @@ const RESIDUAL_PARTS: [&str; 3] = [
 ///    staged arm alone. `lcf8` is the arm that A/B never had, and `lcf8`
 ///    against `staged8` is whether the round trip still earns its `stmatrix`
 ///    and its `ld.shared`.
+/// 6. **The instrument's own reproducibility**, from the two places tables 1
+///    and 3 both take the same subtraction. No extra launch.
+/// 7. **The TMA store** (#123), which is the one thing table 3 leaves with a
+///    number on it. Two arms — [`Epilogue::StagedTma`] at warp scope and
+///    [`Epilogue::StagedTmaCta`] at CTA scope — against `staged84`, and then
+///    the hop itself priced by addition on both store shapes so the two
+///    doubling differences can be read against each other rather than against
+///    a whole epilogue.
+/// 8. **The same A/B at a share it can be measured at** — [`tma_ordering`],
+///    #122's correction applied to table 7 rather than to the epilogue
+///    subtraction, and the table that decides whether table 7's fraction of a
+///    percent is a result or a rounding.
 pub fn residual_sweep(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     baseline: Option<crate::bench::Baseline>,
@@ -6889,7 +7583,266 @@ pub fn residual_sweep(
             format!("{:+.0}%", 100.0 * (second / first - 1.0))
         );
     }
+
+    println!(
+        "\n7. the TMA store, which is the one lever table 3 left with a number on it. Both arms\n\
+         keep `staged84`'s `.x8` LDTM, its `.x4` `stmatrix` and its staging tiles, and replace\n\
+         32 `ld.shared.v4` + 32 `st.global.v4` a thread a band with one `cp.async.bulk.tensor`.\n\
+         `s84 tma` keeps the tile **per warp**, so the ring is warp-scope and the item still\n\
+         pays no block barrier; `s84 tmac` reads the same 16 384 B as one [128,64] tile through\n\
+         `kittens::epilogue::StoreRing` at the CTA scope #111 built it at — one TMA instruction\n\
+         a band instead of four, and eight `bar.sync` an item instead of none. Both compute the\n\
+         GEMM and both are checked. Same 114 816 B and the same `staged no drain` control, so\n\
+         the µs/tile columns are the same subtraction table 3's `exposed` is."
+    );
+    println!(
+        "{:<18}{:>11}{:>11}{:>11}{:>10}{:>10}{:>12}{:>12}{:>12}",
+        "shape",
+        "s84 ms",
+        "tma ms",
+        "tmac ms",
+        "tma vs",
+        "tmac vs",
+        "s84 us/t",
+        "tma us/t",
+        "tmac us/t"
+    );
+    let mut engine = Vec::new();
+    for (shape, arms, bare) in &ladder {
+        let tma = timed(context, *shape, plan.with(Epilogue::StagedTma))?;
+        let cta = timed(context, *shape, plan.with(Epilogue::StagedTmaCta))?;
+        let per_tile =
+            |milliseconds: f64| milliseconds * 1e3 / items_on_critical_path(shape.m, shape.n);
+        println!(
+            "{:<18}{:>11.4}{:>11.4}{:>11.4}{:>10}{:>10}{:>12.2}{:>12.2}{:>12.2}",
+            shape,
+            arms[0],
+            tma,
+            cta,
+            format!("{:+.1}%", 100.0 * (arms[0] / tma - 1.0)),
+            format!("{:+.1}%", 100.0 * (arms[0] / cta - 1.0)),
+            per_tile(arms[0] - bare),
+            per_tile(tma - bare),
+            per_tile(cta - bare)
+        );
+        engine.push((*shape, arms[0], arms[1], tma, cta, *bare));
+    }
+
+    println!(
+        "\n   and the hop itself, priced by addition on both store shapes. `s84 2g` is table 3's\n\
+         first rung — a second `store_shared_rows` per band — and `s84t 2g` is the same probe\n\
+         with a second TMA store instead, fence and barrier and commit included, both aimed at\n\
+         the cluster's own tile so the extra bytes stay in L2. The lever is worth something\n\
+         exactly when the second column is smaller than the first, and the difference between\n\
+         them is the most this change can ever recover."
+    );
+    println!(
+        "{:<18}{:>18}{:>18}{:>14}{:>16}",
+        "shape", "ld+st us/tile", "tma hop us/tile", "the lever", "of the epilogue"
+    );
+    for (shape, shipped, doubled, tma, _, bare) in &engine {
+        let doubled_tma = timed(context, *shape, plan.with(Epilogue::StagedTmaTwiceGlobal))?;
+        let per_tile =
+            |milliseconds: f64| milliseconds * 1e3 / items_on_critical_path(shape.m, shape.n);
+        let (plain, engine_hop) = (per_tile(doubled - shipped), per_tile(doubled_tma - tma));
+        println!(
+            "{:<18}{:>18.2}{:>18.2}{:>14.2}{:>16}",
+            shape,
+            plain,
+            engine_hop,
+            plain - engine_hop,
+            format!(
+                "{:.0}%",
+                100.0 * (plain - engine_hop) / per_tile(shipped - bare)
+            )
+        );
+    }
+
+    println!("\n   and both arms against the library, from table 1's own denominator");
+    println!(
+        "{:<18}{:>12}{:>12}{:>12}",
+        "shape", "s84/th", "tma/th", "tmac/th"
+    );
+    for (shape, shipped, _, tma, cta, _) in &engine {
+        let Some((_, _, _, _, theirs)) = ceiling.iter().find(|row| same(row.0, *shape)) else {
+            continue;
+        };
+        println!(
+            "{:<18}{:>12.3}{:>12.3}{:>12.3}",
+            shape,
+            theirs.min() / shipped,
+            theirs.min() / tma,
+            theirs.min() / cta
+        );
+    }
+
+    tma_ordering(context)
+}
+
+/// The two shortened geometries #122 built, and the cube they replace.
+///
+/// `M` and `N` are what an epilogue's cost is a function of — the tile grid,
+/// the waves, the items a cluster walks and the whole of `C` — and `K` is the
+/// only axis it does not sit on. So these hold the output geometry of the two
+/// sizes every epilogue claim in this file is quoted at and shorten the
+/// reduction, which leaves the difference the same absolute size over a launch
+/// it is a tenth of instead of a thousandth. `bench repro`'s own reasoning,
+/// applied to the comparison this section is about.
+const TMA_SIZES: [Shape; 3] = [
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 1024,
+    },
+    Shape {
+        m: 16384,
+        n: 16384,
+        k: 1024,
+    },
+    // The anchor: the one full-depth size §7 trusts, so the shortened rows are
+    // judged against a number this file already carries.
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 8192,
+    },
+];
+
+/// `staged84` and the two TMA arms, in the order the ratios are taken.
+const TMA_ARMS: [Epilogue; 3] = [
+    Epilogue::StagedWideX4,
+    Epilogue::StagedTma,
+    Epilogue::StagedTmaCta,
+];
+
+/// Whole measurements each arm gets, round-robin over the arms — `bench
+/// repro`'s count and its reason. A device whose clocks step down over a sweep
+/// slows whichever arm ran last, and `A,A,A,A,B,B,B,B` cannot tell that from a
+/// difference between `A` and `B`; `A,B,C,A,B,C,…` puts each triple adjacent in
+/// time, so the four paired ratios carry any drift as a common term.
+const TMA_REPEATS: usize = 4;
+
+/// The TMA A/B taken the way a *ratio between two whole launches* has to be
+/// taken — table 8 of [`residual_sweep`].
+///
+/// # Why the tables above are not enough on their own
+///
+/// #122 established that a difference carries its arms' error divided by its
+/// own share of them, and that the correction is to take it where the share is
+/// large rather than to sample harder. That argument is usually made about the
+/// epilogue *subtraction*, but it binds hardest here: `s84 tma` against
+/// `staged84` is a fraction of a percent between two 0.65 ms launches, which is
+/// a smaller share than the epilogue is and therefore a *harder* measurement
+/// than `whole − no drain`. Table 7's `+0.2% / −0.1%` is one min against
+/// another, arm by arm, at the depth where that share is worst.
+///
+/// So this repeats it at the geometry the question is about — same tiles, same
+/// waves, same items, same `C`, same epilogue in absolute terms — with `K`
+/// shortened until the difference is visible, four paired ratios a cell, and
+/// the arms interleaved. It is the shape of #122's own `staged8`/`staged84`
+/// ordering table, asked of a different pair.
+///
+/// A ratio whose lowest-to-highest range straddles 1.000 orders nothing, and
+/// the table says so in its own column rather than leaving it to be read off
+/// the digits.
+fn tma_ordering(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<(), Box<dyn Error>> {
+    println!(
+        "\n8. the same A/B where the difference is a tenth of the launch instead of a\n\
+         thousandth. #122: a difference carries its arms' error over its own share of them,\n\
+         and `tma` against `staged84` is a *smaller* share of the launch than the epilogue\n\
+         is — so table 7 is the harder measurement, not the easier one. The two `k1024`\n\
+         shapes are 8192² and 16384²'s own output geometries with the reduction shortened:\n\
+         same tiles, same waves, same items a cluster walks, same `C`, same epilogue in\n\
+         absolute terms, over a launch it is a large fraction of. {TMA_REPEATS} whole\n\
+         measurements of each arm, taken round-robin so every triple is adjacent in time and\n\
+         a drift enters all three sides of it."
+    );
+    println!(
+        "{:<20}{:<12}{:>11}{:>11}{:>11}{:>10}{:>10}",
+        "shape", "arm", "best ms", "worst ms", "call/call", "in-call", "drift"
+    );
+    let mut sweep = Vec::new();
+    for shape in TMA_SIZES {
+        let mut taken: Vec<Vec<Timings>> = TMA_ARMS.iter().map(|_| Vec::new()).collect();
+        for pass in 1..=TMA_REPEATS {
+            for (arm, into) in TMA_ARMS.iter().zip(taken.iter_mut()) {
+                eprintln!("{shape} {} pass {pass}: staging and checking", arm.name());
+                into.push(bench_with(context, shape, *arm)?);
+            }
+        }
+        for (arm, calls) in TMA_ARMS.iter().zip(taken.iter()) {
+            let bests: Vec<f64> = calls.iter().map(Timings::min).collect();
+            let (best, worst) = span(&bests);
+            let widest = calls.iter().map(Timings::spread).fold(0.0, f64::max);
+            let drifted = calls
+                .iter()
+                .map(|call| call.drift())
+                .fold(
+                    0.0f64,
+                    |most, next| {
+                        if next.abs() > most.abs() { next } else { most }
+                    },
+                );
+            println!(
+                "{:<20}{:<12}{:>11.4}{:>11.4}{:>10.2}%{:>9.2}%{:>9.2}%",
+                shape,
+                arm.name(),
+                best,
+                worst,
+                100.0 * (worst / best - 1.0),
+                100.0 * widest,
+                100.0 * drifted,
+            );
+        }
+        sweep.push((shape, taken));
+    }
+
+    println!(
+        "\n   the paired ratios, `staged84` over each TMA arm — above 1.000 is the TMA arm\n\
+         ahead. Four pairs a cell, each one taken adjacent in time, printed as the median\n\
+         and the whole range. `1/share` is what the difference multiplies the arms' error\n\
+         by, and a range that straddles 1.000 orders nothing whatever its median reads."
+    );
+    println!(
+        "{:<20}{:>10}{:>20}{:>10}{:>10}{:>20}{:>10}",
+        "shape", "s84/tma", "lowest–highest", "1/share", "s84/tmac", "lowest–highest", "1/share"
+    );
+    for (shape, taken) in &sweep {
+        print!("{shape:<20}");
+        for arm in 1..TMA_ARMS.len() {
+            let ratios: Vec<f64> = taken[0]
+                .iter()
+                .zip(&taken[arm])
+                .map(|(base, other)| base.min() / other.min())
+                .collect();
+            let (low, high) = span(&ratios);
+            let centre = middle(&ratios);
+            print!(
+                "{:>10.4}{:>20}{:>10.0}",
+                centre,
+                format!("{low:.4} – {high:.4}"),
+                1.0 / (centre - 1.0).abs()
+            );
+        }
+        println!();
+    }
     Ok(())
+}
+
+/// Lowest and highest of a set of repeats.
+fn span(over: &[f64]) -> (f64, f64) {
+    over.iter()
+        .copied()
+        .fold((f64::MAX, f64::MIN), |(low, high), next| {
+            (low.min(next), high.max(next))
+        })
+}
+
+/// The middle of a set of repeats, which is what a range is quoted around.
+fn middle(of: &[f64]) -> f64 {
+    let mut sorted = of.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[sorted.len() / 2]
 }
 
 /// The traversal sweep — `cargo oxide run kittens-examples -- bench swizzle`,

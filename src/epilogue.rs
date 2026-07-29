@@ -73,16 +73,120 @@
 //! the parameter here is `IN_FLIGHT`, the number the *instruction*
 //! takes, and the buffer count is derived from it. A type parameterized that way
 //! could not embed a `SharedTileRing<.., { IN_FLIGHT + 1 }>` either.
+//!
+//! # Whose barrier, and why that is a parameter now
+//!
+//! Every collective half of the ring is two things: a *convergence*, and the
+//! one thread whose store groups the ring counts. Both are properties of the
+//! set of threads that write a buffer, and until #122 that set was assumed to
+//! be the whole CTA — `bar.sync` and `threadIdx.x == 0`, written into the
+//! methods.
+//!
+//! A staging tile need not be CTA-wide. `examples/src/gemm.rs` gives each warp
+//! its own `[32, 64]` tile precisely so that no `bar.sync` is needed: the four
+//! warps share no bytes, `stmatrix.sync.aligned` is already a convergence
+//! point for the warp that issues it, and a block barrier there would
+//! synchronize four warps that have nothing to say to each other. A ring
+//! hard-wired to CTA scope cannot express that layout at all — at that
+//! kernel's four bands an item it is eight `bar.sync` per output tile against
+//! zero, and the opcode census reads exactly that difference.
+//!
+//! So the scope is a parameter — [`Cta`] and [`Warp`], defaulting to the CTA
+//! the type shipped with. Nothing else moves: the fence, the two waits and
+//! their order are the same instructions in the same places, because the
+//! argument for each of them is about proxies and group counts and not about
+//! how many threads are in the barrier.
+//!
+//! **What that difference is worth was then measured, and it is negative.**
+//! `gemm` runs both scopes over the same 16 384 B — four warp-scope rings, or
+//! one CTA-scope ring over the same run read as one `[128, 64]` tile — and the
+//! **CTA-scope arm wins**, by 0.6–1.6% of the launch in four paired cells
+//! across two containers. Saving eight `bar.sync` an item does not pay for
+//! issuing four `[32, 64]` boxes where one `[128, 64]` box would do: the
+//! engine's per-instruction overhead is the term that matters and the barrier
+//! is not.
+//!
+//! So the parameter buys expressiveness and costs speed where it is used, and
+//! a kernel with no other reason should reach for [`Cta`]. It is kept because
+//! a warp-private staging tile is a real layout — it is what `gemm`'s
+//! `stmatrix` path wants and what `device-tests`' `store ring warp` covers —
+//! and because the arm that lost is what makes the arm that won a measurement
+//! rather than an assumption. `examples/README.md` §7 has the rows.
 
 use core::marker::PhantomData;
 
 use cuda_device::barrier::fence_proxy_async_shared_cta;
-use cuda_device::thread;
+use cuda_device::{thread, warp};
+
 use cuda_device::tma::TmaDescriptor;
 
 use crate::shared::{
     Element, SharedTile, Swizzle, tma_store_commit, tma_store_wait, tma_store_wait_read,
 };
+
+/// The set of threads that fills one staging buffer: how they converge, and
+/// which of them owns the buffer's store groups.
+///
+/// The two are one decision and the trait states them together, because
+/// getting them from different scopes is silently wrong rather than a type
+/// error — a CTA-wide barrier around a lane-0 issue would work and cost too
+/// much, and a warp barrier around a thread-0 issue would let three warps run
+/// ahead of a wait they never took.
+pub trait Scope {
+    /// Whether this thread is the one that issues the ring's stores and takes
+    /// its group waits. Exactly one thread of the scope may answer `true`:
+    /// `cp.async.bulk.commit_group` gathers the *calling thread's* outstanding
+    /// stores, so a group belongs to a thread and the wait that ages it has to
+    /// be taken by the same one.
+    fn issuing() -> bool;
+
+    /// Order the scope's memory accesses against each other and hold every
+    /// thread until all of them arrive — what carries a writer's proxy fence
+    /// to the issuing thread, and what releases the non-issuing threads past a
+    /// group wait they did not take.
+    fn converge();
+}
+
+/// The whole block writes a buffer: `bar.sync`, and thread 0 issues. The scope
+/// [`StoreRing`] shipped with, and the one a `[128, N]` staging tile filled by
+/// four warps needs.
+pub struct Cta;
+
+impl Scope for Cta {
+    #[inline(always)]
+    fn issuing() -> bool {
+        thread::threadIdx_x() == 0
+    }
+
+    #[inline(always)]
+    fn converge() {
+        thread::sync_threads();
+    }
+}
+
+/// One warp writes a buffer: `bar.warp.sync`, and lane 0 issues.
+///
+/// `bar.warp.sync` orders memory among the lanes it synchronizes exactly as
+/// `bar.sync` does among a block's threads, so the fence's reach is the same
+/// argument one scope down. What it buys is that a kernel whose warps each own
+/// a staging tile pays no block barrier at all — see the module docs.
+///
+/// The mask is the full warp and not `activemask`: every lane holds part of the
+/// buffer, so a ring acquired by a subset of the warp is a buffer nobody
+/// finished writing.
+pub struct Warp;
+
+impl Scope for Warp {
+    #[inline(always)]
+    fn issuing() -> bool {
+        warp::lane_id() == 0
+    }
+
+    #[inline(always)]
+    fn converge() {
+        warp::sync_mask(u32::MAX);
+    }
+}
 
 /// `IN_FLIGHT + 1` staging tiles of `[R, C]` `E` under swizzle `S`, cycled by a
 /// cursor, with the fence and wait discipline of the module docs built in.
@@ -106,26 +210,36 @@ use crate::shared::{
 /// out of shared memory before the next band's `stmatrix` touches it, which is
 /// the shape `examples/src/softmax.rs` writes by hand — and `IN_FLIGHT = 1` is
 /// the two-buffer ring that overlaps one store with one drain.
-pub struct StoreRing<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u32> {
+///
+/// `SC` is which threads fill a buffer ([`Cta`] or [`Warp`]), and the module
+/// docs carry why that is a parameter rather than the block it started as.
+pub struct StoreRing<
+    E: Element,
+    const R: usize,
+    const C: usize,
+    S: Swizzle,
+    const IN_FLIGHT: u32,
+    SC: Scope = Cta,
+> {
     base: *mut u8,
     slot: u32,
-    _marker: PhantomData<(E, S)>,
+    _marker: PhantomData<(E, S, SC)>,
 }
 
-impl<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u32> Clone
-    for StoreRing<E, R, C, S, IN_FLIGHT>
+impl<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u32, SC: Scope> Clone
+    for StoreRing<E, R, C, S, IN_FLIGHT, SC>
 {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u32> Copy
-    for StoreRing<E, R, C, S, IN_FLIGHT>
+impl<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u32, SC: Scope> Copy
+    for StoreRing<E, R, C, S, IN_FLIGHT, SC>
 {
 }
 
-impl<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u32>
-    StoreRing<E, R, C, S, IN_FLIGHT>
+impl<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u32, SC: Scope>
+    StoreRing<E, R, C, S, IN_FLIGHT, SC>
 {
     /// Staging buffers in the ring, one more than the stores that may be in
     /// flight across a buffer's reuse.
@@ -184,20 +298,20 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u3
     ///
     /// # Safety
     ///
-    /// Every thread of the CTA must call this together, and the CTA must be the
-    /// one whose thread 0 issued the ring's stores. It contains a
-    /// `sync_threads`, so a thread that skips it either hangs the block or
-    /// writes a buffer the engine is still reading — the second is silent.
+    /// Every thread of `SC` must call this together, and that scope must be the
+    /// one whose issuing thread issued the ring's stores. It contains a
+    /// [`Scope::converge`], so a thread that skips it either hangs the barrier
+    /// or writes a buffer the engine is still reading — the second is silent.
     #[inline(always)]
     pub unsafe fn acquire(&mut self) -> SharedTile<E, R, C, S> {
         // Groups belong to the thread that committed them, so this wait means
         // something only on the issuing thread; the barrier is what the other
-        // warps are released past. (The same reason `tma store early recycle`
+        // threads are released past. (The same reason `tma store early recycle`
         // in `device-tests` syncs between thread 0's wait and everyone's write.)
-        if Self::issuing() {
+        if SC::issuing() {
             tma_store_wait_read::<IN_FLIGHT>();
         }
-        thread::sync_threads();
+        SC::converge();
         self.buffer(self.slot)
     }
 
@@ -212,7 +326,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u3
     ///
     /// # Safety
     ///
-    /// Every thread of the CTA must call this together, once per
+    /// Every thread of `SC` must call this together, once per
     /// [`Self::acquire`], with every write into the buffer already issued by
     /// the calling thread. `map` must describe a live global buffer whose box
     /// shape matches `[R, SUBTILE_COLS]`, and the ring's memory must stay
@@ -221,7 +335,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u3
     pub unsafe fn commit(&mut self, map: *const TmaDescriptor, row: i32, plane: i32) {
         unsafe {
             let staging = self.publish();
-            if Self::issuing() {
+            if SC::issuing() {
                 staging.tma_store(map, row, plane);
                 tma_store_commit();
             }
@@ -239,7 +353,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u3
     pub unsafe fn commit_2d(&mut self, map: *const TmaDescriptor, leading: i32, minor: i32) {
         unsafe {
             let staging = self.publish();
-            if Self::issuing() {
+            if SC::issuing() {
                 staging.tma_store_2d(map, leading, minor);
                 tma_store_commit();
             }
@@ -259,14 +373,14 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u3
     ///
     /// # Safety
     ///
-    /// Every thread of the CTA must call this together, after the last
+    /// Every thread of `SC` must call this together, after the last
     /// [`Self::commit`].
     #[inline(always)]
     pub unsafe fn drain(self) {
-        if Self::issuing() {
+        if SC::issuing() {
             tma_store_wait::<0>();
         }
-        thread::sync_threads();
+        SC::converge();
     }
 
     /// Order every thread's `stmatrix` writes ahead of the engine's read of the
@@ -274,24 +388,17 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u3
     ///
     /// Both halves are load-bearing and in this order. The fence orders the
     /// writes of the thread executing it — so every thread that wrote a row has
-    /// to execute one — and the barrier is what carries that ordering to the
-    /// single thread that issues the store. Reversing them, or fencing only on
-    /// the issuing thread, leaves the engine free to read bytes another warp
-    /// has not published.
+    /// to execute one — and [`Scope::converge`] is what carries that ordering
+    /// to the single thread that issues the store. Reversing them, or fencing
+    /// only on the issuing thread, leaves the engine free to read bytes another
+    /// thread has not published. The scope decides which barrier that is and
+    /// nothing else about this: `bar.warp.sync` orders memory among a warp's
+    /// lanes exactly as `bar.sync` does among a block's threads.
     #[inline(always)]
     unsafe fn publish(self) -> SharedTile<E, R, C, S> {
         unsafe { fence_proxy_async_shared_cta() };
-        thread::sync_threads();
+        SC::converge();
         self.buffer(self.slot)
-    }
-
-    /// The thread whose store groups the ring counts. One thread and not one
-    /// warp: `cp.async.bulk.commit_group` gathers the *calling thread's*
-    /// outstanding stores, so a group is a thread's and the wait that ages them
-    /// has to be taken by the same one.
-    #[inline(always)]
-    fn issuing() -> bool {
-        thread::threadIdx_x() == 0
     }
 
     #[inline(always)]
@@ -310,6 +417,9 @@ mod tests {
 
     type Single = StoreRing<Bf16, 128, 64, Swizzle128B, 0>;
     type Double = StoreRing<Bf16, 128, 64, Swizzle128B, 1>;
+    /// The shape `examples/src/gemm.rs` stages per warp: a quarter of the same
+    /// bytes, acquired and committed by one warp instead of by the block.
+    type PerWarp = StoreRing<Bf16, 32, 64, Swizzle128B, 0, Warp>;
 
     #[test]
     fn depth_is_one_more_than_the_stores_in_flight() {
@@ -330,6 +440,15 @@ mod tests {
         // The shape the width parameter exists for: a full `[128, 128]` band
         // is twice that, per buffer.
         assert_eq!(StoreRing::<Bf16, 128, 128, Swizzle128B, 0>::BYTES, 32768);
+    }
+
+    /// The scope is the barrier and the issuing thread and nothing else — in
+    /// particular not a byte, which is what lets `gemm` lay four warp-scope
+    /// rings over the same run one CTA-scope ring would occupy and A/B the two.
+    #[test]
+    fn the_scope_costs_no_memory() {
+        assert_eq!(4 * PerWarp::BYTES, Single::BYTES);
+        assert_eq!(PerWarp::DEPTH, 1);
     }
 
     #[test]

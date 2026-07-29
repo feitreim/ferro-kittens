@@ -232,7 +232,13 @@ STUB_ENV = ["env", "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs"]
 # CI runs warm, ~7.5 min cold since #93 gave it a whole CPU.
 CHECKING = 900  # compile and lint, no launches: `build`, `regcount`
 RUNNING = 1200  # compile and a short harness: `device_tests`, `examples`
-SWEEPING = 2700  # 16384^3 launched dozens of times: `bench` and the profiles
+# 3600 rather than 2700 since #122 added a seventh table to `bench --case
+# residual`: three more rungs at each of 4096^3, 8192^3 and 16384^3, and the
+# host cost of that sweep is re-staging and re-checking the operands rather
+# than the launches. A ceiling is not a bill -- the container is billed for
+# what it runs -- so the only thing raising it costs is a wedge riding longer,
+# which is what `scripts/modal-run`'s silence budget is for.
+SWEEPING = 3600  # 16384^3 launched dozens of times: `bench` and the profiles
 ASKING = 300  # one driver query, nothing built: `doctor`
 
 

@@ -4546,6 +4546,155 @@ every ratio are timed the same way in the same call — but none of them is a
 sustained-clock number, and the 1178.5 / 1117.3 TFLOP/s [`GEMM_SIZES`] reports
 for two runs of this tree is that 5.5% seen from the other end.
 
+##### the TMA store, measured — it loses, and the CTA-wide ring is the better of the two — #123
+
+Two sections ago left exactly one lever with a number on it: `ld.shared` +
+`st.global` at 2.0–2.3 µs a tile, 31–36% of the residual epilogue, **~+2.7% of
+the launch** if it went away. This is that change, built two ways and measured
+in four containers. **It does not win anywhere the instrument can see it, and
+the warp-scope form loses by 1.0–1.7%.**
+
+Two entry points, both on the correctness gate, both at `staged84`'s own
+114 816 B and the same two CTAs an SM, both keeping its `.x8` LDTM, its `.x4`
+`stmatrix` and its staging tiles. What changes is 32 `ld.shared.v4` + 32
+`st.global.v4` a thread a band becoming **one `cp.async.bulk.tensor`**:
+
+- **`s84 tma`** keeps the staging tile per warp, so the ring is warp-scope —
+  `fence.proxy.async.shared::cta` on every lane, `bar.warp.sync`, lane 0
+  issues — and the item pays **no block barrier**, exactly as #116's design
+  intended. Four `[32, 64]` boxes a band, one per warp.
+- **`s84 tmac`** reads the same 16 384 B as one `[128, 64]` tile through
+  `kittens::epilogue::StoreRing` at the CTA scope #111 built it at: **one**
+  `[128, 64]` box a band, and eight `bar.sync` an item instead of none.
+
+**The full-depth A/B cannot see it, and #122 is why.** At 8192³ this comparison
+is a few tenths of a percent between two 0.65 ms launches — `1/share` of
+**458–709**, which is a *harder* measurement than `whole − no drain` and not an
+easier one. Three containers of it read `+0.2 / −0.1`, `+0.4 / +0.3` and
+`−0.2 / +0.4` percent for the two arms: noise with no sign.
+
+**So it was taken where the difference is a tenth of the launch.** #122's
+substitution — hold `M` and `N`, shorten `K`, interleave the arms round-robin,
+four whole measurements each — applied to a *ratio* rather than to a
+subtraction. `staged84` over each arm, so **above 1.000 is the TMA arm ahead**;
+median of four paired ratios and the full range, `session 1 / session 2`:
+
+| shape | `1/share` | `s84`/`s84 tma` | range, both sessions | `s84`/`s84 tmac` | range, both sessions |
+| --- | ---: | ---: | --- | ---: | --- |
+| 8192² × k1024 | 61–191 | 0.9885 / 0.9835 | **0.9743 – 0.9952** | 0.9948 / 0.9980 | **0.9924 – 0.9987** |
+| 16384² × k1024 | 85–427 | 0.9882 / 0.9899 | **0.9853 – 0.9913** | 0.9977 / 1.0061 | 0.9971 – 1.0069 |
+| 8192³ | 294–709 | 0.9978 / 1.0018 | 0.9969 – 1.0023 | 1.0014 / 1.0034 | 0.9984 – 1.0062 |
+
+**`s84 tma` loses, and it is not close to a tie.** Four independent cells across
+two geometries and two containers, and not one of the four ranges reaches
+1.000: it is behind by **1.0–1.7%**. **`s84 tmac` is a tie to a small loss** —
+0.2–0.5% behind at 8192², and the two containers disagree in sign at 16384²
+(0.9977 against 1.0061, with non-overlapping ranges), which is a shape this
+table is built to report rather than to average away. The 8192³ anchor orders
+nothing in either arm, as its `1/share` says it cannot.
+
+Against the library at 8192³ the ratio does not move at all: 0.943–0.949 for
+`staged84`, 0.941–0.948 for `tma`, 0.946 for `tmac`.
+
+**Where the 2.7% went, by addition rather than by argument.** `s84t 2g` is
+`s84 tma` with a second TMA store per band — fence, barrier, issue and commit
+included — the exact twin of the `s84 2g` probe that priced `ld.shared` +
+`st.global`. Both aim the extra pass at the cluster's own tile so its bytes stay
+in L2. Microseconds per output tile at 8192³, four containers:
+
+| | µs/tile |
+| --- | ---: |
+| `ld.shared` + `st.global` | 2.33 / 2.41 / 2.56 / 2.58 |
+| the TMA hop | **1.57 / 1.90 / 1.91 / 1.99** |
+| the difference the doubling probe attributes to the change | 0.42–0.75 |
+
+**Even the doubling probe never promised 2.7%.** 2.7% was the value of that term
+going to *zero*, and the engine does not take it to zero — it takes it to about
+three quarters of itself, worth 0.42–0.75 µs a tile, 6–11% of a ~7 µs epilogue,
+under 1% of the launch at its most generous. That is the whole of the ceiling
+this change ever had.
+
+**And the paired table says the realised value is below zero, which the doubling
+probe is structurally unable to see.** A *doubled* store is an extra one, issued
+and left in flight beside work that continues; a *replacing* store is on the
+critical path of the next band. That difference is the depth: at `IN_FLIGHT = 0`
+the ring's `acquire` is `cp.async.bulk.wait_group.read` at zero groups, so band
+`k + 1`'s `stmatrix` cannot start until the engine has finished *reading* band
+`k`'s buffer — four times an item — where `store_shared_rows` retires its stores
+into the memory pipeline and blocks on nothing. The kernel trades 64 pipelined
+instructions a thread for one instruction and one exposed engine latency, and
+the exposed latency is worth more than the instructions.
+
+**Depth 1 is not a choice and the arithmetic is the constraint.** The staged
+envelope is 114 816 B against the 116 736 a CTA gets at two per SM: **1920 B of
+headroom**, and a second set of `[32, 64]` buffers is 16 384. `STAGES` 3 → 2
+does not buy it either (−11.8% / −7.3% at unchanged residency, above). So the
+one shape this change was allowed to take is the one with no overlap in it.
+
+**The block barrier was the obvious suspect and it is the wrong way round.**
+Before running this, the live hypothesis was that `StoreRing`'s CTA-collective
+`acquire`/`commit` would cost the epilogue the barriers #116 was built to avoid.
+The barriers are real — the opcode census reads `bar.sync` 2 / 5 and
+`bar.warp.sync` 3 / 0 for `s84 tma` / `s84 tmac` against `staged84`'s 2 / 1 —
+and **the arm that pays them wins**, in all four cells of the paired table, by
+0.6–1.6%. One `[128, 64]` box a band beats four `[32, 64]` boxes by more than
+eight `bar.sync` an item cost. The engine's per-instruction overhead is the term
+that matters here and the barrier is not.
+
+**So `StoreRing` was usable as built, and it is also the faster of the two.**
+`s84 tmac` uses the type unmodified. What it could not express was the *layout* —
+a warp-private staging tile — so the type gained a `Scope` parameter (`Cta`, the
+default and the behaviour it shipped with, and `Warp`): 40 lines, no byte moved,
+changing only which barrier `converge` is and which thread `issuing` is. Every
+argument inside the type survived untouched, because the proxy fence, the two
+waits and their order are about proxies and group counts and none of them
+mentions how many threads are in the barrier. The parameter earned its keep by
+producing the arm that lost; on this evidence a kernel should reach for `Cta`.
+`device-tests` gained `store ring warp` and `store ring warp phased` for it.
+
+**One hardware fact fell out of the phased case and is worth recording.** `gemm`
+puts its staging run at a shared plan rounded to 128 bytes and not to 1024, so
+every staging tile starts mid-swizzle-period. `SharedTile::chunk_writer` folds
+that phase in; whether the *TMA engine* derives the same phase from the same
+address had only ever been checked on the load side (`swizzle roundtrip short`).
+`store ring warp phased` is the store side of it — the whole ring pushed one
+128-byte row along — and it passes, so the engine reads the phase off the
+absolute address in both directions of travel. That is why no alignment padding
+was needed and why both TMA rungs declare `staged84`'s envelope to the byte.
+
+**Residency and registers unchanged.** All three new entry points declare the
+same 114 816 B, so `gemm_cg2_staged_no_drain` serves their subtractions as it
+does `staged84`'s. `ptxas -v` reads 98 / 94 / 96 for `s84 tma` / `s84 tmac` /
+`s84t 2g` against `staged84`'s 96, zero spill, 256 B frame — all inside the step
+`min(512 / 256, 233 472 / plan)` already binds at two CTAs an SM. The census
+confirms both arms deleted what they claim: `ld.shared.v4` and `st.global.v4`
+both go 1 → **0**, and `cp.async.bulk.tensor` goes 2 → 3, the third being the
+store.
+
+**What this leaves the ranking.** Both terms #121 could name now have their
+answer, and neither was spendable:
+
+| what | µs/tile at 8192³ | share | the lever, after this |
+| --- | ---: | ---: | --- |
+| `cvt` + `stmatrix` | 3.3–4.1 | 47–64% | **none identified**, unchanged |
+| `ld.shared` + `st.global` | 2.3–2.6 | 35–37% | a TMA store: **measured, −1.7% to +0.6%, spent** |
+| LDTM after `.x8` | ~0 | 0% | spent by #117 |
+
+`staged84` still ships and nothing here asks it to move.
+
+**The one thing this does not close, with the arithmetic it would need.** The
+loss is attributed to depth 1 by mechanism and not by measurement, and the
+measurement is buildable inside the same 16 384 B: a **depth-2 warp ring of
+`[16, 64]` buffers is 2 × 2048 = 4096 B a warp**, which is exactly what a
+`[32, 64]` buffer costs today, so the envelope does not move and the residency
+question does not reopen. A warp would drain its 32 rows as two 16-row halves
+alternating buffers, and the second half's `stmatrix` would overlap the first
+half's store — which is the only thing standing between the doubling probe's
+0.42–0.75 µs a tile and the launch. What it needs is a 16-row band out of
+`TmemTile::tile_x8`, whose `.x8` shape is 32, so it is a question about the LDTM
+width and not about shared memory. Until that is built, "depth 1 is why" is a
+mechanism consistent with every number here and not a measured one.
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all
