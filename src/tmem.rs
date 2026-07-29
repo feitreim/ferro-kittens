@@ -96,8 +96,8 @@
 use cuda_device::cusimd::{CuSimd, TmemRegs4};
 use cuda_device::tcgen05::{
     tcgen05_alloc, tcgen05_alloc_cg2, tcgen05_dealloc, tcgen05_dealloc_cg2,
-    tcgen05_ld_16x256b_pure, tcgen05_ld_16x256b_x8_pure, tcgen05_load_wait,
-    tcgen05_relinquish_alloc_permit, tcgen05_relinquish_alloc_permit_cg2,
+    tcgen05_ld_16x256b_pure, tcgen05_ld_16x256b_x8_pack16, tcgen05_ld_16x256b_x8_pure,
+    tcgen05_load_wait, tcgen05_relinquish_alloc_permit, tcgen05_relinquish_alloc_permit_cg2,
     tcgen05_st_16x256b_x1_raw, tcgen05_store_wait,
 };
 use cuda_device::{cluster, thread};
@@ -667,6 +667,41 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
             let regs = tcgen05_ld_16x256b_x8_pure(self.at(row, column));
             tcgen05_load_wait();
             interleave_x8(regs)
+        }
+    }
+
+    /// One `.x8.pack::16b` arrival: 32 registers of **already-packed 16-bit
+    /// pairs**, drained through one [`tcgen05_load_wait`].
+    ///
+    /// `.pack::16b` packs the 16-bit elements of two consecutive tensor-memory
+    /// columns into one 32-bit register, so it returns the same 32 registers
+    /// [`Self::fragments_x8`] does off **twice** the columns — 64 b16 a thread
+    /// rather than 32 f32, out of the same 1024 bits of TMEM. That is the whole
+    /// of what it is: a *reinterpretation*, not a conversion.
+    ///
+    /// **So it is not a cheaper epilogue and there is no reading of it that is.**
+    /// An fp32 accumulator's columns hold floats; packing two of their low halves
+    /// yields the mantissa halves of two numbers, which is not a narrowed value of
+    /// anything. #117 said this and then argued it from the register count, which
+    /// is the weaker claim — the register count is equal because the *bits* are
+    /// equal, and equal bits is exactly why no convert was performed.
+    ///
+    /// What it is good for is **pricing** the convert. Substituted into a drain it
+    /// holds the TMEM traffic, the register count, the `stmatrix` count and the
+    /// stores, and takes the `cvt` column to zero; the launch difference is then
+    /// the convert's cost and nothing else. `experiments/`' `pack16` rung is that
+    /// substitution, and it is on no correctness gate because it cannot be.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::fragments_x8`], and the values are meaningful only if the
+    /// segment holds 16-bit data.
+    #[inline(always)]
+    pub unsafe fn fragments_pack16_x8(self, row: u32, column: u32) -> CuSimd<u32, 32> {
+        unsafe {
+            let regs = tcgen05_ld_16x256b_x8_pack16(self.at(row, column));
+            tcgen05_load_wait();
+            regs
         }
     }
 

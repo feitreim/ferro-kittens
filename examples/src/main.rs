@@ -10,7 +10,7 @@
 //! | Kernel | Status |
 //! | --- | --- |
 //! | [`gemm`] | runs — checked against a CPU reference by [`gemm::check`] |
-//! | [`gemm_sol`] | runs — both size-specialized entries checked exactly by [`gemm_sol::check`] |
+//! | [`gemm_sol`] | runs — all three size-specialized entries checked exactly by [`gemm_sol::check`] |
 //! | [`softmax`] | runs — checked against a CPU reference by [`softmax::check`] |
 //! | [`layernorm`] | runs — checked against a CPU reference by [`layernorm::check`] |
 //! | [`flash_forward`] | compiles — no launcher yet |
@@ -93,7 +93,7 @@ fn examples() -> Vec<Example> {
         },
         Example {
             name: "gemm_sol",
-            status: "runs (M256 and M512 entries)",
+            status: "runs (three cluster-tile entries)",
             threads: gemm_sol::THREADS,
             shared_bytes: gemm_sol::LARGE_SHARED_BYTES,
             entry: None,
