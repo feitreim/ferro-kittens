@@ -226,6 +226,28 @@ const TILE_N256_S3: u32 = 98_392;
 /// residency comparison instead of an epilogue one.
 const TILE_N256_S3_STAGED: u32 = 114_816;
 
+/// `gemm_ws`'s shipped plan — two operand rings four stages deep over the same
+/// `[128, 64]` `A` and `[128, 64]` `B` tiles, plus the barrier and work-queue
+/// tail. Spelled here for [`GEMM_SHARED`]'s reason.
+///
+/// The rung carrying it is the one envelope in this file where **tensor
+/// memory alone** decides: that kernel holds two 256-column accumulator stages,
+/// which is all 512 columns an SM has, so `512 / 512 = 1` before shared memory
+/// is consulted at all. The `cg2 512` rung above counts 1 holding and **2
+/// resident** at a 32 B plan — the second CTA admitted to the SM and parked
+/// inside a blocking `tcgen05.alloc`. At 131 176 B the second CTA cannot be
+/// admitted, so the prediction that separates these two rows is that resident
+/// falls to 1 as well.
+const WS_SHARED: u32 = 131_176;
+
+/// [`WS_SHARED`] with `gemm_ws`'s four per-warp staging tiles on it (#116),
+/// which is the envelope every epilogue rung of that kernel declares — #117's
+/// two instruction widths move no byte of the plan.
+///
+/// Its whole A/B rests on those 16 408 bytes being free, and free is an integer
+/// this file counts rather than a `min` this file computes.
+const WS_SHARED_STAGED: u32 = 147_584;
+
 /// How far the achieved hold may sit under [`HOLD_NS`] before the harness
 /// calls the spin broken rather than the residency low. A CTA that exited on
 /// [`CENSUS_SPIN_GUARD`](crate::CENSUS_SPIN_GUARD) instead of on the clock
@@ -486,6 +508,27 @@ fn rungs() -> Vec<Rung> {
             2,
             true,
             TILE_N256_S3_STAGED
+        ),
+        // `gemm_ws`'s own two envelopes (#112, #116, #117). The `cg2 512` rung
+        // near the top of this list holds the same 512 columns at a token
+        // shared plan and counts 1 holding against 2 resident; these two say
+        // what the real plan does to the second of those, and they are the
+        // only rows in this file where the tensor-memory term binds on its own.
+        rung!(
+            "ws envelope (cg2 512)",
+            residency_census_cluster_512,
+            Some(512),
+            2,
+            true,
+            WS_SHARED
+        ),
+        rung!(
+            "ws staged envelope",
+            residency_census_cluster_512,
+            Some(512),
+            2,
+            true,
+            WS_SHARED_STAGED
         ),
     ]
 }

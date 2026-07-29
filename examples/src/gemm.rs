@@ -4236,12 +4236,29 @@ pub fn bench(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     shape: Shape,
 ) -> Result<Timings, Box<dyn Error>> {
+    bench_with(context, shape, Epilogue::Fused)
+}
+
+/// [`bench`] on a named epilogue — the shipped rung and schedule, checked
+/// first, with only #15's variable moved.
+///
+/// It exists for [`crate::gemm_ws::compare`], which has to quote *this*
+/// kernel's best rung as a control and cannot quote it from
+/// `examples/README.md`: #98 found 2.9% of drift between containers and #109
+/// came within a paragraph of publishing a false +3.6% against a baseline that
+/// had moved under it. A control that is not moving is one measured beside the
+/// thing it controls, which means the other file needs a way to ask for one.
+pub fn bench_with(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    shape: Shape,
+    epilogue: Epilogue,
+) -> Result<Timings, Box<dyn Error>> {
     run(
         context,
         shape.m,
         shape.n,
         shape.k,
-        Plan::new(Scheduler::Static),
+        Plan::new(Scheduler::Static).with(epilogue),
         time,
     )
     .map(|(_, timings)| timings)

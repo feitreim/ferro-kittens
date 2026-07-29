@@ -3782,7 +3782,145 @@ a rung beside `staged`, every number above is an A/B, and shipping it is a
 change worth making on its own rather than folded into the measurement that
 motivates it. On this evidence it is the rung to ship, and the same two widths
 are untried on `gemm_ws`, whose staged rung carries twice the LDTM (16 against
-8) for the same reason its bands are twice as wide.
+8) for the same reason its bands are twice as wide. *(The second half of that
+sentence is wrong and #118 measured why — the bands are the same width and the
+doubling is two call sites in the PTX. See below.)*
+
+##### the same two widths on `gemm_ws`, and the floor underneath them — #118
+
+`gemm_ws` had never had `.x8`, so on instruction count it was the largest lever
+left in the repo. It is worth a separate section because the *mechanism* #117
+established makes a prediction about this kernel that the instruction count does
+not: if the win is the **wait** — `TmemTile::tile` waits after each `.x1`, so a
+`[32, 64]` band pays 16 fully exposed tensor-memory latencies against `.x8`'s 2
+— then removing a latency somebody is already covering must be worth *less*.
+`gemm_ws` covers it: the drain is deferred one item, sits on four warps of its
+own, and the producer never stops.
+
+**One container, min of 30 timed launches, static schedule, `GROUP = 8`, every
+row element-by-element exact against the CPU reference before it was timed
+(`check_c` compares bf16 words with `==` and no tolerance). All four staged rows
+declare the same 147 584 B, so one `no drain` control serves them all; `ws s4`
+is the shipped register epilogue at 131 176 B.**
+
+| shape | `ws s4` ms | `staged` ms | `staged8` ms | `staged4` ms | `staged84` ms | `8` vs | `4` vs | `84` vs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4096³ | 0.1382 | 0.1340 | **0.1158** | 0.1324 | 0.1171 | **+15.7%** | +1.2% | +14.5% |
+| 8192³ | 0.7881 | 0.7649 | 0.7201 | 0.7648 | **0.7199** | +6.2% | +0.0% | +6.2% |
+| 16384³ | 5.7904 | 5.6645 | **5.5015** | 5.6604 | 5.5028 | +3.0% | +0.1% | +2.9% |
+
+| shape | `staged` TF/s | `staged8` TF/s | `staged4` TF/s | `staged84` TF/s | best vs `ws s4` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4096³ | 1025.8 | **1187.1** | 1038.4 | 1174.1 | **+19.4%** |
+| 8192³ | 1437.5 | 1526.8 | 1437.7 | **1527.2** | **+9.5%** |
+| 16384³ | 1552.8 | **1598.9** | 1554.0 | 1598.5 | **+5.2%** |
+
+**The prediction holds.** `.x8` is worth +15.7% / +6.2% / +3.0% here against
++23.6% / +8.6% / +3.6% on `gemm_cg2` — 67%, 72% and 83% of it — and the
+shortfall is the cover this design point provides. `.x4` is the same
+clean null it was there (+1.2% / +0.0% / +0.1%), and **the two do not compose**:
+`staged8` and `staged84` are within 1.1% of each other and trade places between
+sessions, where on `gemm_cg2` composition was worth a further 1.5 points at
+16384³.
+
+**The register column says why they do not compose, and it says it in advance.**
+`ptxas -v`, zero spill everywhere, frame 256 B in every staged rung:
+
+| registers | `staged` | `staged8` | `staged4` | `staged84` |
+| --- | ---: | ---: | ---: | ---: |
+| `gemm_cg2_staged*` | 42 | 94 | 40 | **80** |
+| `gemm_ws_staged*` | 44 | 94 | 44 | **92** |
+
+`.x8` costs the same +50 either side. On `gemm_cg2`, `.x4` bought 14 of those
+registers back and that recovery *was* the composition gain; here it buys 2, and
+buys no time to go with them. Nothing was ever near a ceiling — at six warps the
+binding sub-partition holds two, so 255 a thread is reachable, and the largest
+count in the file is 94.
+
+**What the epilogue costs, by #114's `whole − no drain`, in µs a tile over the
+items the busiest cluster walks.** Two controls, one per envelope; they are
+opcode-identical PTX at 28 registers apiece and differ in 16 408 declared bytes
+no instruction touches, which is why the staged columns all subtract the staged
+one.
+
+| shape | `ws s4` | `staged` | `staged8` | `staged4` | `staged84` | LDTM half |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4096³ | 8.90 | 8.65 | 4.10 | 8.24 | 4.42 | 4.55 |
+| 8192³ | 8.62 | 6.97 | 3.77 | 6.96 | 3.76 | **3.20** |
+| 16384³ | 9.06 | 6.76 | 3.85 | 6.69 | 3.87 | 2.91 |
+
+**"Twice the LDTM" is true of the PTX and false of the work.** `regcount`'s
+opcode census does read 16 `tcgen05.ld` for `gemm_ws_staged` against
+`gemm_cg2_staged`'s 8 — and 8 against 4 for the register rungs, 8 `stmatrix`
+against 4, 16 `cvt.rn.bf16x2` against 8, *every* column doubled, which is the
+tell. The cause is that `gemm_ws` emits its epilogue at **two call sites**,
+`Ws::work` and `Ws::finish`, where `gemm_cg2`'s fused job has one; `finish`
+drains the last item once per cluster over a whole launch. The band is
+`RegTile<32, 64>` in both files, so the *dynamic* LDTM per tile is identical —
+and the subtraction says this kernel's LDTM half costs **3.20 µs a tile at
+8192³ against `gemm_cg2`'s 8.07**, 2.5× cheaper rather than twice as dear.
+The same holds for the whole epilogue: 8.62 µs exposed here against #114's
+20.43, and 6.97 staged against #117's 14.96. **That 40-47% is what warp
+specialization and the accumulator ping-pong buy, and it is the first time it
+has been a number.**
+
+**The floor, which is the finding.** `gemm_ws_no_drain` is the shipped kernel
+with the epilogue deleted — the probe #114 ran on `gemm_cg2`, where it reached
+1850 TFLOP/s against cuBLASLt's 1808 and established that that kernel's whole
+gap to the library *was* its epilogue.
+
+| shape | `ws` no drain ms | TFLOP/s | of cuBLASLt | vs `gemm`'s `staged84` |
+| --- | ---: | ---: | ---: | ---: |
+| 4096³ | 0.1026 | 1339.2 | 0.829 | +3.0% |
+| 8192³ | 0.6674 | 1647.4 | 0.923 | **−2.2%** |
+| 16384³ | 5.2828 | 1665.1 | 0.888 | **−3.0%** |
+
+**At 8192³ and 16384³ `gemm_ws` loses to `gemm`'s complete launch while running
+no epilogue at all.** So the answer to "does `gemm_ws` now beat `gemm`" is no,
+and the more useful answer is that it could not have: with each design point at
+its best it is **−9.7% / −9.4% / −6.9%**, and deleting this kernel's epilogue
+outright recovers 12.7 / 7.2 / 3.9 of those points. Epilogue work could reach
+three quarters of the 8192³ gap and 57% of the 16384³ one *if it were free*.
+#112's 7.3% at 16384³ closes to 6.9% after both kernels have spent everything
+#116 and #117 found.
+
+**Against the library, same device, same container:** cuBLASLt 1616.5 / 1784.9 /
+1876.0 TFLOP/s. The `gemm 84` column reproduces #117's 0.796 / 0.944 / 0.922
+from another session, which is the drift control.
+
+| shape | `gemm` | `gemm 84` | `ws s4` | `ws staged` | `ws staged84` | `ws` floor |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4096³ | 0.595 | 0.804 | 0.615 | 0.635 | **0.726** | 0.829 |
+| 8192³ | 0.831 | 0.944 | 0.782 | 0.805 | **0.856** | 0.923 |
+| 16384³ | 0.871 | 0.915 | 0.810 | 0.828 | **0.852** | 0.888 |
+
+**Residency is counted, not queried**, because
+`cuOccupancyMaxActiveBlocksPerMultiprocessor` returns 1 for anything containing
+a `tcgen05.alloc` whatever the truth is (#77). `device-tests`' residency census
+gained two rungs at `gemm_ws`'s own envelopes and counts **1 resident, 1
+holding** at both 131 176 B and 147 584 B, against a budget of 1 from
+`min(512 / 512, 233472 / plan)`. That also closes the gap the `cg2 512` rung
+left: at a 32 B plan it counts 1 holding but **2 resident**, with a second CTA
+parked 100.9 µs inside a blocking allocator; at the real plan the second CTA is
+never admitted and the wait falls to 0.9 µs.
+
+**Neither kernel's default was changed**, on #116's and #117's precedent. The
+rung to ship on `gemm_ws` is `staged8` — `.x4` is a null here, alone and in
+composition, and a lever that buys 2 registers is not worth a second entry
+point's worth of surface if one has to be chosen.
+
+**What is left, and it is not the epilogue.** #112 attributed this kernel's loss
+to the peer CTA hiding `gemm_cg2`'s epilogue; #114 refuted that by measuring
+that epilogue as fully exposed. `gemm_ws.rs` then argued the opposite — that an
+SM holding one CTA has nothing to hide *its* epilogue behind — and this refutes
+that too, by deleting the epilogue and losing anyway. Priced against the library
+(the only denominator that crosses containers) the two epilogue-free kernels are
+about 10% apart at 8192³: 1.02 of cuBLASLt for `gemm_cg2`, 0.923 for `gemm_ws`.
+The deficit is in the multiply and the operand stream at one CTA an SM, and what
+has never been measured is what an SM running one CTA of six warps does to the K
+pipeline against two CTAs of four. That is where the next probe belongs, and
+`kittens::epilogue::StoreRing` (#111) no longer has "about 7% to find" on this
+kernel — it has at most 3.0%.
 
 #### 8. Multicast has no geometry to live in
 
