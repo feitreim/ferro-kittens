@@ -191,27 +191,33 @@ every line the client prints — `Created objects`, the mount tree, the NVIDIA
 banner — resets the clock, so a cold start costs wall time without consuming a
 grace. That is what lets one pair of values work on a laptop and on a runner.
 
-Measured on the first run of the branch that wired this up, from the per-line
-timestamps in the GitHub log:
+Measured on the runs that wired this up, from the per-line timestamps in the
+GitHub log — one warm run of each of the three entry points CI invokes:
 
-| | `build` | `regcount` | budget |
-| --- | ---: | ---: | ---: |
-| first line the watchdog reads as alive | 6.5 s | 7.3 s | — |
-| longest silence before it | 3.1 s | 2.9 s | **300 s** |
-| longest silence anywhere in the run | 58.9 s | 55.7 s | **1200 s** |
-| sentinel, and the run's length | 219 / 221 s | 183 / 184 s | `timeout=900` |
+| | `build` | `regcount` | `device_tests` | budget |
+| --- | ---: | ---: | ---: | ---: |
+| first line the watchdog reads as alive | 6.5 s | 7.3 s | 9.2 s | — |
+| longest silence before it | 3.1 s | 2.9 s | 4.4 s | **300 s** |
+| longest silence anywhere in the run | 58.9 s | 55.7 s | 35.8 s | **1200 s** |
+| sentinel, and the run's length | 219 / 221 s | 183 / 184 s | 95 / 97 s | its `timeout=` |
 
-Two orders of magnitude of headroom on the startup budget, and the longest
-quiet stretch in either run — the `sm_100a` codegen, which prints nothing while
-it works — is a twentieth of the silence budget. Note also that in tier 2 the
-silence budget cannot bind: the entry point's own `timeout=900` (#99) is
-shorter, so a run that starts and then hangs dies on Modal's clock first, which
-is the right owner for it.
+Two orders of magnitude of headroom on the startup budget, and the longest quiet
+stretch anywhere — the `sm_100a` codegen, which prints nothing while it works —
+is a twentieth of the silence budget.
 
-Tier 3 is where a tighter silence budget would buy something real, and tier 3
-is the one there is no measurement for here. It keeps the value #99 chose
-against `bench`'s genuinely quiet sweeps rather than a number extrapolated from
-a CPU job.
+The startup budget is the one doing the work in CI, and that is by construction
+rather than by luck: `SILENCE_GRACE` is 1200 s while these three entry points
+carry `timeout=900`, 900 and 1200 (#99), so a run that starts and *then* hangs
+dies on Modal's clock at the same moment or sooner. What `timeout=` cannot see
+is a container that never reaches Python — that is the whole reason the wrapper
+exists — and 300 s of startup silence against a worst observed 4.4 s is what
+covers it.
+
+So a *lower* silence budget in CI is the one change these numbers would
+support: it would stop a post-start hang at a fraction of the function timeout
+instead of dead-heating with it, which on tier 3 is GPU-minutes. Not done here,
+on one warm sample per entry point. It wants a handful of cold ones first, and
+`bench` — the quiet one #99 sized 1200 against — is not run by any workflow.
 
 ## Pull requests from forks
 
