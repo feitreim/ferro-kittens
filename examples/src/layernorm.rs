@@ -69,7 +69,7 @@
 //! request: `softmax`'s own header argues for 32 at length and rewriting it
 //! belongs to its own issue, with its own controls.
 //!
-//! Note also what the ladder in `examples/README.md` says about `[32, 32]` — a
+//! Note also what the ladder in `experiments/README.md` says about `[32, 32]` — a
 //! **zero** frame, in all five spellings. This kernel gets 128 bytes at that
 //! shape. The probe is not the kernel: it carries no `ColVec` parameters and no
 //! statistics across chunks, and this kernel's extra live state moves its cliff

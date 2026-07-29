@@ -59,7 +59,7 @@ phenomenon and it cost **2.6×**. Both are right: a streamed band costs real
 time, and whether it is worth paying turns on whether the registers it frees are
 the resource actually binding that kernel — shared memory caps `softmax` either
 way, where the probe has none. So a register count is half an argument and
-occupancy is the other half. `examples/README.md` § "in-place versus by-value"
+occupancy is the other half. `experiments/README.md` § "in-place versus by-value"
 carries both tables and reads them against each other.
 
 ## Modules
@@ -95,13 +95,22 @@ with no toolkit and no credential; the host feature, a real `sm_100a` codegen,
 and the B200 harness are progressively more expensive tiers with their own
 triggers. `CI.md` has the policy, the costs, and how to ask for a GPU run.
 
-## Examples
+## Examples, and experiments
 
 `examples/` holds real kernels — a cluster GEMM, flash-attention forward,
 softmax, layernorm — written the way we want them to read, each with a header
 saying whether it **runs** against a CPU reference or only **compiles**. All
 four compile as of #3, the crate has no cargo features left, and
 `cargo oxide build kittens-examples --arch sm_100a` therefore codegens every one
-of them. `examples/README.md` is the record of the missing surface they demanded
-while they were still asking for it, mapped to issues, with the part no issue
-covered called out separately.
+of them. It ships **one** GEMM: the kernel the library ships, in about six
+hundred lines.
+
+`experiments/` is where that one was chosen. Every tile rung, every scheduler,
+the ablation cube, the four epilogue families, the doubling probes that compute
+a deliberately wrong `C` to isolate one term, the warp-specialized variant, the
+benchmark harness and the cuBLASLt denominator — thirty GEMM entry points, all
+still launchable and all still on the same correctness gate.
+`experiments/README.md` is the measurement record: what each of them measured,
+and the missing library surface the four kernels demanded while they were still
+asking for it, mapped to issues, with the part no issue covered called out
+separately.

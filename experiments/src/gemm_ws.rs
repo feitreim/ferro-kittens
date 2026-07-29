@@ -45,7 +45,7 @@
 //! [`Entry::StagedX8`], [`Entry::StagedX4`], [`Entry::StagedX8X4`] — plus the
 //! two `no drain` controls the ladder is subtracted from. All of it is
 //! [`drain`], one const on one job, and "The widths, and the floor under them"
-//! below is what it measured. `examples/README.md` §7 has both kernels' tables.
+//! below is what it measured. `experiments/README.md` §7 has both kernels' tables.
 //!
 //! [`crate::gemm`] gets it **across CTAs**. It is 114816 B of shared memory on
 //! the epilogue it ships (98392 on the register drain) and 256 accumulator
@@ -177,13 +177,13 @@
 //!
 //! ## What it measured, and it **loses**
 //!
-//! `cargo oxide run kittens-examples -- ws`, which is
+//! `cargo oxide run kittens-experiments -- ws`, which is
 //! `scripts/modal-run ws_bench`, runs this kernel and [`crate::gemm`] and
 //! cuBLASLt in one container at 4096³, 8192³ and 16384³ — the three sizes the
 //! reference publishes, and no smaller, because below 4096³ cuBLASLt's own
 //! run-to-run spread reaches 77% and no ratio there is quotable. The control is
 //! re-measured in the same session rather than quoted from
-//! `examples/README.md` §7: this change does not touch [`crate::gemm`], but #98
+//! `experiments/README.md` §7: this change does not touch [`crate::gemm`], but #98
 //! found 2.9% of drift between containers and #109 came within a paragraph of
 //! publishing a false +3.6% against a baseline that had moved under it.
 //!
@@ -257,7 +257,7 @@
 //! 1.57–1.90 PFLOP/s in the session above. Their numbers were never a target
 //! this had a right to expect, and the deliverable was the sign of the delta.
 //! The sign is negative, and this file stays in the tree because
-//! `examples/README.md` §7 keeps losers on purpose.
+//! `experiments/README.md` §7 keeps losers on purpose.
 //!
 //! ## The widths, and the floor under them — #118
 //!
@@ -2029,12 +2029,12 @@ fn rung(
     Ok(timed(context, shape, plan)?.min())
 }
 
-/// The A/B — `cargo oxide run kittens-examples -- ws`, which is
+/// The A/B — `cargo oxide run kittens-experiments -- ws`, which is
 /// `scripts/modal-run ws_bench`.
 ///
 /// **Both controls are re-measured in this session, not quoted.** Nothing here
 /// changes [`crate::gemm`], so its numbers ought to be the ones
-/// `examples/README.md` §7 already carries; #98 found 2.9% of drift between
+/// `experiments/README.md` §7 already carries; #98 found 2.9% of drift between
 /// containers and #109 came within one paragraph of publishing a false +3.6%
 /// against a baseline that had moved under it. A control that is not moving has
 /// to be one measured beside the thing it controls — which since #117 means two
@@ -2051,7 +2051,7 @@ pub fn compare(
     println!(
         "gemm warp specialization — min ms over 30 timed launches, every row checked\n\
          element-by-element against the same CPU reference before it was timed.\n\
-         `gemm` in table 1 is examples/src/gemm.rs on its REGISTER drain (`lcf`), named\n\
+         `gemm` in table 1 is experiments/src/gemm.rs on its REGISTER drain (`lcf`), named\n\
          rather than defaulted since #119: [256,256] at 3 stages, 4 warps, 98392 B, 2 CTAs\n\
          an SM, 256 accumulator columns. `ws` is this file on its own register drain at 6\n\
          warps, {} B, 1 CTA an SM, 512 accumulator columns in two ping-ponged stages.\n\

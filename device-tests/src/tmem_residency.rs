@@ -114,7 +114,7 @@
 //!
 //! `gemm`'s plan and the same plan with 8192 and 49152 dead bytes on the end
 //! count **3, 2 and 1**. Nothing in this file needs those numbers; they are
-//! here because `examples/README.md` prices what an occupancy step costs that
+//! here because `experiments/README.md` prices what an occupancy step costs that
 //! kernel's *throughput*, by declaring exactly those envelopes and touching
 //! none of the added bytes. That experiment's whole claim is that the only
 //! thing it moved was residency, and a claim about residency in this repo is
@@ -416,7 +416,7 @@ fn rungs() -> Vec<Rung> {
             GEMM_SHARED
         ),
         // #98: what one CTA an SM is worth to that kernel. The question is a
-        // throughput one and it is asked in `examples/README.md` by growing
+        // throughput one and it is asked in `experiments/README.md` by growing
         // `gemm_cg2`'s declared plan with bytes no code touches; these three
         // rungs are what says the growth moved residency, on the instrument
         // that counts rather than the query that is pinned at 1 (#77). The
@@ -739,7 +739,7 @@ fn tally(rung: &Rung, predicted: f64, rows: &[u64]) -> Result<Measured, Box<dyn 
 ///   counting something other than concurrent holders; below it means the
 ///   driver has started reserving one of the two more coarsely than asked, and
 ///   every "residency is the column arithmetic" statement in `src/tmem.rs` and
-///   `examples/README.md` is stale. The 512-column rung is the same assertion
+///   `experiments/README.md` is stale. The 512-column rung is the same assertion
 ///   doing double duty as a positive control: one CTA an SM is arithmetically
 ///   forced there, so a detector that cannot read a real 1 cannot be trusted
 ///   when it reads a 2.
@@ -776,7 +776,7 @@ fn verdict(measured: &[Measured], shared_per_sm: u32) -> Result<String, Box<dyn 
                  than concurrent holders"
             } else {
                 "Residency is no longer what the per-CTA resources divide to, and every \
-                 statement to that effect in src/tmem.rs and examples/README.md is stale"
+                 statement to that effect in src/tmem.rs and experiments/README.md is stale"
             }
         )
         .into());

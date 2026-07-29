@@ -15,7 +15,7 @@ Local usage:
                                       # the only thing here that fails a run on
                                       # a register count.
     modal run modal_app.py            # the device tests, on a B200
-    modal run modal_app.py::examples  # the examples crate's kernels, on a B200
+    modal run modal_app.py::examples  # both kernel crates' checks, on a B200
     modal run modal_app.py::bench     # those kernels timed at several sizes
     modal run modal_app.py::clc_bench # gemm's three item sources on one clock,
                                       # against the ragged-wave prediction
@@ -194,17 +194,34 @@ image = (
         str(Path(__file__).parent / "examples/Cargo.lock"),
         f"{PROJECT_DIR}/examples/Cargo.lock",
     )
-    # The `cublas` feature's link step, and the C translation unit that asserts
-    # the hand-written cuBLASLt ABI against the real headers. Both sit outside
-    # `examples/src`, so neither arrives with the directory mount above and a
-    # missing one fails as a confusing build error rather than as an absence.
-    .add_local_file(
-        str(Path(__file__).parent / "examples/build.rs"),
-        f"{PROJECT_DIR}/examples/build.rs",
+    # The experiments crate: the lab notebook -- every rung, every ablation, the
+    # benchmark sweeps and the cuBLASLt denominator. Standalone like the two
+    # above, and it reaches into `examples/src` for two kernels and the clock
+    # (`#[path]`), so both directory mounts have to be present for either crate
+    # to build.
+    .add_local_dir(
+        str(Path(__file__).parent / "experiments/src"),
+        f"{PROJECT_DIR}/experiments/src",
     )
     .add_local_file(
-        str(Path(__file__).parent / "examples/cublaslt_abi.c"),
-        f"{PROJECT_DIR}/examples/cublaslt_abi.c",
+        str(Path(__file__).parent / "experiments/Cargo.toml"),
+        f"{PROJECT_DIR}/experiments/Cargo.toml",
+    )
+    .add_local_file(
+        str(Path(__file__).parent / "experiments/Cargo.lock"),
+        f"{PROJECT_DIR}/experiments/Cargo.lock",
+    )
+    # The `cublas` feature's link step, and the C translation unit that asserts
+    # the hand-written cuBLASLt ABI against the real headers. Both sit outside
+    # `experiments/src`, so neither arrives with the directory mount above and a
+    # missing one fails as a confusing build error rather than as an absence.
+    .add_local_file(
+        str(Path(__file__).parent / "experiments/build.rs"),
+        f"{PROJECT_DIR}/experiments/build.rs",
+    )
+    .add_local_file(
+        str(Path(__file__).parent / "experiments/cublaslt_abi.c"),
+        f"{PROJECT_DIR}/experiments/cublaslt_abi.c",
     )
     .add_local_file(
         str(Path(__file__).parent / "rust-toolchain.toml"),
@@ -216,6 +233,7 @@ app = modal.App("ferro-kittens", image=image)
 
 HARNESS_DIR = f"{PROJECT_DIR}/device-tests"
 EXAMPLES_DIR = f"{PROJECT_DIR}/examples"
+EXPERIMENTS_DIR = f"{PROJECT_DIR}/experiments"
 # The driver stub satisfies cargo-oxide's link step where there is no GPU.
 STUB_ENV = ["env", "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs"]
 
@@ -316,10 +334,18 @@ def build() -> None:
     _run([*STUB_ENV, "cargo", "oxide", "build", "kittens-examples", "--arch", "sm_100a"],
          cwd=EXAMPLES_DIR)
 
-    # The `cublas` feature (#92), which the two lines above deliberately did
-    # NOT have on: the default build has to keep working for anyone without a
+    # The experiments crate, which is where the other twenty-nine GEMM entry
+    # points went. It is the expensive half of this function and the half most
+    # worth having: a probe that is not on any correctness gate is a probe whose
+    # only gate is this codegen.
+    _run(["cargo", "clippy", "--all-targets"], cwd=EXPERIMENTS_DIR)
+    _run([*STUB_ENV, "cargo", "oxide", "build", "kittens-experiments", "--arch", "sm_100a"],
+         cwd=EXPERIMENTS_DIR)
+
+    # The `cublas` feature (#92), which the line above deliberately did NOT
+    # have on: the default build has to keep working for anyone without a
     # CUDA toolkit, so "it still builds with the feature off" is the claim
-    # those lines make and this one must not weaken.
+    # that line makes and this one must not weaken.
     #
     # Everything static about the baseline is checkable here, with no GPU. The
     # C file asserts the enum values and struct offsets `cublaslt.rs`
@@ -329,11 +355,11 @@ def build() -> None:
     # at all. Finding that out here costs a CPU container; finding it out in
     # `bench` costs a B200 one.
     _run(["gcc", "-fsyntax-only", "-I/usr/local/cuda/include", "cublaslt_abi.c"],
-         cwd=EXAMPLES_DIR)
-    _run(["cargo", "clippy", "--all-targets", "--features", "cublas"], cwd=EXAMPLES_DIR)
-    _run([*STUB_ENV, "cargo", "oxide", "build", "kittens-examples", "--arch", "sm_100a",
+         cwd=EXPERIMENTS_DIR)
+    _run(["cargo", "clippy", "--all-targets", "--features", "cublas"], cwd=EXPERIMENTS_DIR)
+    _run([*STUB_ENV, "cargo", "oxide", "build", "kittens-experiments", "--arch", "sm_100a",
           "--features", "cublas"],
-         cwd=EXAMPLES_DIR)
+         cwd=EXPERIMENTS_DIR)
 
 
 # `gaps` lived here until #3, and printed each aspirational kernel's remaining
@@ -342,7 +368,7 @@ def build() -> None:
 # off the last person's memory. It is retired because every list reached empty
 # and the features are gone -- `build` above now codegens all four kernels for
 # real `sm_100a`, which is the stronger claim the gate was standing in for.
-# `examples/README.md` keeps what the lists said and how to read one, for
+# `experiments/README.md` keeps what the lists said and how to read one, for
 # whenever the next aspirational kernel is written.
 
 
@@ -365,12 +391,20 @@ def device_tests() -> None:
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=RUNNING)
 @completes
 def examples() -> None:
-    """The examples crate's own launchers. Prints the status table, then runs
-    every kernel that has one against its CPU reference; non-zero on a wrong
-    number. This is the claim `device-tests` cannot make: not that a primitive
-    behaves, but that a whole kernel written against the library computes."""
+    """Both kernel crates' correctness gates. Prints the examples' status table
+    and runs every kernel that has a launcher against its CPU reference, then
+    runs every rung and probe in `experiments/` against the same one; non-zero
+    on a wrong number. This is the claim `device-tests` cannot make: not that a
+    primitive behaves, but that a whole kernel written against the library
+    computes.
+
+    Two binaries since the crates split, and both are named here rather than in
+    one of them, because the gate is what it always was: every entry point that
+    computes a GEMM, at both check sizes and all three traversal widths."""
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
     _run(["cargo", "oxide", "run", "kittens-examples"], cwd=EXAMPLES_DIR)
+    _run(["cargo", "oxide", "run", "kittens-experiments", "--", "check"],
+         cwd=EXPERIMENTS_DIR)
 
 
 # 5400 rather than 1800 since #86 put 16384^3 in the sweep: the *device* work is
@@ -427,9 +461,9 @@ def bench(case: str = "", m: int = 0, n: int = 0, k: int = 0) -> None:
     # because this image always has one: a GEMM number with no denominator is
     # the thing the feature exists to stop shipping.
     _run(
-        ["cargo", "oxide", "run", "kittens-examples", "--features", "cublas",
+        ["cargo", "oxide", "run", "kittens-experiments", "--features", "cublas",
          "--", "bench", *narrowed],
-        cwd=EXAMPLES_DIR,
+        cwd=EXPERIMENTS_DIR,
     )
 
 
@@ -451,7 +485,7 @@ def clc_bench() -> None:
     """
     _run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
           "--format=csv"], cwd="/")
-    _run(["cargo", "oxide", "run", "kittens-examples", "--", "clc"], cwd=EXAMPLES_DIR)
+    _run(["cargo", "oxide", "run", "kittens-experiments", "--", "clc"], cwd=EXPERIMENTS_DIR)
 
 
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
@@ -459,8 +493,8 @@ def clc_bench() -> None:
 def ws_bench() -> None:
     """The warp-specialized GEMM against the one it is a variant of.
 
-    `examples/src/gemm.rs` gets its overlap across CTAs -- two per SM, so one
-    CTA's epilogue runs against another's MMA. `examples/src/gemm_ws.rs` gets it
+    `experiments/src/gemm.rs` gets its overlap across CTAs -- two per SM, so one
+    CTA's epilogue runs against another's MMA. `experiments/src/gemm_ws.rs` gets it
     inside one CTA, from six warps and a double-buffered TMEM accumulator, which
     is 512 accumulator columns and therefore one CTA per SM. Table 1 holds the
     epilogue identical in both -- the *register* drain on both sides, named
@@ -490,9 +524,9 @@ def ws_bench() -> None:
     _run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
           "--format=csv"], cwd="/")
     _run(
-        ["cargo", "oxide", "run", "kittens-examples", "--features", "cublas",
+        ["cargo", "oxide", "run", "kittens-experiments", "--features", "cublas",
          "--", "ws"],
-        cwd=EXAMPLES_DIR,
+        cwd=EXPERIMENTS_DIR,
     )
 
 
@@ -588,7 +622,7 @@ def profile(kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192) -
     capability set. It is not in the 580.95.05 `.run` package either, so it
     cannot simply be fetched. So there is no counter on this harness, which is
     why #86's L2 hit rate and DRAM byte count are answered by *interventions* —
-    `GEMM_FOOTPRINT_SIZES` and `GEMM_DEPTH_SIZES` in `examples/src/bench.rs`,
+    `GEMM_FOOTPRINT_SIZES` and `GEMM_DEPTH_SIZES` in `experiments/src/bench.rs`,
     each holding everything constant but one thing — rather than by counters.
     That is a weaker instrument for attribution and a stronger one for cause.
 
@@ -610,17 +644,17 @@ def profile(kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192) -
     )
     # Build first: `--target-processes all` would otherwise follow the compiler
     # around for ten minutes looking for a context it never creates.
-    _run(["cargo", "oxide", "build", "kittens-examples", "--arch", "sm_100a"], cwd=EXAMPLES_DIR)
+    _run(["cargo", "oxide", "build", "kittens-experiments", "--arch", "sm_100a"], cwd=EXPERIMENTS_DIR)
     _run(
         [
             NCU, "--target-processes", "all", "--clock-control", "none",
             "--kernel-name", f"regex:{kernel}", "--launch-skip", NCU_SKIP,
             "--launch-count", NCU_COUNT, "--print-details", "all",
             *[argument for section in NCU_SECTIONS for argument in ("--section", section)],
-            "cargo", "oxide", "run", "kittens-examples", "--",
+            "cargo", "oxide", "run", "kittens-experiments", "--",
             "bench", kernel, str(m), str(n), str(k),
         ],
-        cwd=EXAMPLES_DIR,
+        cwd=EXPERIMENTS_DIR,
     )
 
 
@@ -693,10 +727,21 @@ def _parse_ptxas(log: str) -> dict[str, dict[str, int]]:
 
 
 # Crates that emit PTX, as `(package, directory)`. The harness carries the
-# probes and the ladder; the examples carry the kernels a *launch* configures,
-# and their register and shared-memory counts are what an occupancy argument
-# about a real kernel has to be made of (#47).
-PTX_CRATES = (("device-tests", HARNESS_DIR), ("kittens-examples", EXAMPLES_DIR))
+# probes and the ladder; the two kernel crates carry the kernels a *launch*
+# configures, and their register and shared-memory counts are what an occupancy
+# argument about a real kernel has to be made of (#47).
+#
+# `examples` and `experiments` both emit `gemm_cg2_staged_x8x4`, because it is
+# the same kernel: the teaching crate ships it and the notebook keeps it as the
+# arm every A/B is measured against. `_measure` keys on `(ptx file, kernel)` so
+# both rows are printed, and the pair is a free check that the extraction moved
+# no instruction -- two identical rows are the claim, and a difference between
+# them is the finding.
+PTX_CRATES = (
+    ("device-tests", HARNESS_DIR),
+    ("kittens-examples", EXAMPLES_DIR),
+    ("kittens-experiments", EXPERIMENTS_DIR),
+)
 
 
 def _measure(arch: str) -> dict[tuple[str, str], dict[str, int]]:
@@ -729,7 +774,7 @@ def _measure(arch: str) -> dict[tuple[str, str], dict[str, int]]:
 
 
 # The opcode census (#114, #15). `ptxas -v` prices a kernel and never says what
-# is in it, and every ablation and epilogue rung in `examples/src/gemm.rs` is a
+# is in it, and every ablation and epilogue rung in `experiments/src/gemm.rs` is a
 # claim about exactly that: that a rung removes what it names, and that a
 # re-shaped epilogue issues the instructions its own doc counts. #114 ran this
 # by hand and reported it in prose; it is cheap, it is CPU-only, and a claim
@@ -778,16 +823,21 @@ def _census(directory: str) -> dict[str, dict[str, int]]:
 
 
 def _print_census() -> None:
-    counted = _census(EXAMPLES_DIR)
+    # Both kernel crates, because the rungs a census is *for* are the ones in
+    # `experiments/` and the kernel it is read against ships from `examples/`.
+    # The two crates share one kernel name and it is one kernel, so a later
+    # entry overwriting an earlier one loses nothing -- and if it ever did, the
+    # register table above would have said so first.
+    counted = {**_census(EXAMPLES_DIR), **_census(EXPERIMENTS_DIR)}
     if not counted:
-        print(f"\nno `{CENSUS_PREFIX}*` entry functions in the examples' PTX to census.")
+        print(f"\nno `{CENSUS_PREFIX}*` entry functions in the crates' PTX to census.")
         return
     print(
-        f"\nopcode census, per entry function — every `{CENSUS_PREFIX}*` kernel the examples\n"
-        "emit, counted in the PTX. A rung that removes a phase must show zero in that\n"
-        "phase's column, and an epilogue that re-shapes the store must show the counts its\n"
-        "own doc predicts. Counts are static instructions inside one entry function, so a\n"
-        "loop the compiler did not unroll shows as one."
+        f"\nopcode census, per entry function — every `{CENSUS_PREFIX}*` kernel the two\n"
+        "kernel crates emit, counted in the PTX. A rung that removes a phase must show\n"
+        "zero in that phase's column, and an epilogue that re-shapes the store must show\n"
+        "the counts its own doc predicts. Counts are static instructions inside one entry\n"
+        "function, so a loop the compiler did not unroll shows as one."
     )
     columns = [column for column, _ in CENSUS_OPCODES]
     print("  " + f"{'kernel':<30}" + "".join(f"{column:>12}" for column in columns))
@@ -1079,18 +1129,24 @@ def _register_ceiling(ctas: int, threads: int) -> int:
 # measured twice, by #83 on a clock and by #84 by counting `%smid`, with the
 # argument in its doc comment. A kernel joins this table by declaring both.
 GATED_KERNELS = (
-    ("gemm_cg2", "examples/src/gemm.rs"),
+    ("gemm_cg2", "experiments/src/gemm.rs"),
     # #15's staged epilogue, on the same launch geometry and the same grid
     # arithmetic. It reshapes the drained band from `[32, 128]` to `[32, 64]`,
     # which moves peak liveness, so it is exactly the kind of change this gate
     # exists for.
-    ("gemm_cg2_staged", "examples/src/gemm.rs"),
-    # `gemm::SHIPPED_EPILOGUE` since #119, which is the reason it is here: the
-    # gate is a gate on the kernel the crate launches by default, and the
-    # default moved. `.x8` returns 32 f32 in one instruction and costs +52
-    # registers over `gemm_cg2_staged`'s 42 — the largest single liveness step
-    # any epilogue rung in this tree has taken — so this is the row that would
-    # go red first.
+    ("gemm_cg2_staged", "experiments/src/gemm.rs"),
+    # The kernel `examples/` ships, and the reason it is here: the gate is a
+    # gate on the kernel a launch gets by default. `.x8` returns 32 f32 in one
+    # instruction and costs +52 registers over `gemm_cg2_staged`'s 42 — the
+    # largest single liveness step any epilogue rung in this tree has taken —
+    # so this is the row that would go red first.
+    #
+    # Both crates emit it, and the source named here is the teaching one on
+    # purpose: it is where the shipped `#[launch_contract]` and `CTAS_PER_SM`
+    # live now. `_measure` keys on `(ptx, kernel)` but `by_kernel` below keys on
+    # the name alone, so the row this gate reads is whichever crate `PTX_CRATES`
+    # visits last. That is only sound while the two are the same kernel, which
+    # is exactly what the two identical rows in the register table assert.
     ("gemm_cg2_staged_x8x4", "examples/src/gemm.rs"),
 )
 
@@ -1246,7 +1302,7 @@ def _check_occupancy_step(measured: dict[tuple[str, str], dict[str, int]]) -> No
 @app.function(cpu=8, timeout=CHECKING)
 @completes
 def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) -> None:
-    """Register pressure of every kernel the harness and the examples emit,
+    """Register pressure of every kernel the harness and the two kernel crates emit,
     from `ptxas -v`.
 
     Register count is *the* performance number for this library — a tile
@@ -1256,7 +1312,7 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     the emitted PTX back through `ptxas -v`, and print a sorted table. Run it
     before and after a change and diff the two.
 
-    The examples are here because a register count is only half an occupancy
+    The kernel crates are here because a register count is only half an occupancy
     argument and the other half is a launch: `THREADS` and registers per thread
     together say how many CTAs of a *real* kernel fit on an SM, which is what
     #47 turned out to be about. Probes have no launch and cannot say it.
