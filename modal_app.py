@@ -1148,51 +1148,82 @@ def _register_ceiling(ctas: int, threads: int) -> int:
 # measured twice, by #83 on a clock and by #84 by counting `%smid`, with the
 # argument in its doc comment. A kernel joins this table by declaring both.
 GATED_KERNELS = (
-    ("gemm_cg2", "experiments/src/gemm.rs"),
+    ("gemm_cg2", "experiments", "experiments/src/gemm.rs"),
     # #15's staged epilogue, on the same launch geometry and the same grid
     # arithmetic. It reshapes the drained band from `[32, 128]` to `[32, 64]`,
     # which moves peak liveness, so it is exactly the kind of change this gate
     # exists for.
-    ("gemm_cg2_staged", "experiments/src/gemm.rs"),
+    ("gemm_cg2_staged", "experiments", "experiments/src/gemm.rs"),
     # The kernel `examples/` ships, and the reason it is here: the gate is a
     # gate on the kernel a launch gets by default. `.x8` returns 32 f32 in one
     # instruction and costs +52 registers over `gemm_cg2_staged`'s 42 — the
     # largest single liveness step any epilogue rung in this tree has taken —
     # so this is the row that would go red first.
     #
-    # Both crates emit it, and the source named here is the teaching one on
-    # purpose: it is where the shipped `#[launch_contract]` and `CTAS_PER_SM`
-    # live now. `_measure` keys on `(ptx, kernel)` but `by_kernel` below keys on
-    # the name alone, so the row this gate reads is whichever crate `PTX_CRATES`
-    # visits last. That is only sound while the two are the same kernel, which
-    # is exactly what the two identical rows in the register table assert.
-    ("gemm_cg2_staged_x8x4", "examples/src/gemm.rs"),
+    # Both crates emit it, so both are gated: the entries carry the crate as
+    # well as the source, and `_check_occupancy_step` looks the counts up by
+    # `(crate, kernel)`. Keying on the name alone would hand this gate whichever
+    # crate `PTX_CRATES` happened to visit last.
+    ("gemm_cg2_staged_x8x4", "examples", "examples/src/gemm.rs"),
     # And `experiments/`' copy of it, which is the same source-level kernel in a
     # crate with forty-one others. It is here because the two do *not* have to
     # come out the same and did not: the extraction reads 80 registers against
-    # 96, and `groupnorm_tile` — a file neither crate edited — moves 168 -> 236
-    # the other way, so crate composition alone moves a register count here.
-    # Both copies being gated is what keeps that from turning into an occupancy
-    # step nobody watched.
-    ("gemm_cg2_staged_x8x4", "experiments/src/gemm.rs"),
+    # 96. Crate composition alone moves a register count in this tree, which is
+    # the whole reason every copy of a gated kernel is a row rather than one of
+    # them standing in for the rest.
+    ("gemm_cg2_staged_x8x4", "experiments", "experiments/src/gemm.rs"),
+    # `groupnorm_tile`, both copies, and it is here because splitting the crates
+    # took the `examples/` one 168 -> 236 registers and 3 CTAs an SM -> 2 with
+    # nothing watching. One source file, two crates: `experiments/` compiles it
+    # through `#[path]`, which is why the crate and the source are two columns.
+    # 168 is *exactly* `_register_ceiling(3, 128)`, so it had been sitting on its
+    # step without declaring one; `#[launch_bounds(128, 3)]` on the kernel is
+    # what declares it now, and this row is what checks it. Shared memory admits
+    # six CTAs at its 33 344 B plan, so registers are the binding term and no
+    # other resource was going to catch this.
+    ("groupnorm_tile", "examples", "examples/src/layernorm.rs"),
+    ("groupnorm_tile", "experiments", "examples/src/layernorm.rs"),
 )
 
 _CONTRACT_BLOCK = re.compile(r"block\s*=\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)")
 _CTAS_PER_SM = re.compile(r"\bconst\s+CTAS_PER_SM\s*:\s*u32\s*=\s*(\d+)\s*;")
+_LAUNCH_BOUNDS = re.compile(r"#\[launch_bounds\(\s*(\d+)\s*,\s*(\d+)\s*\)\]")
 
 
 def _launch_geometry(source: str, kernel: str) -> tuple[int, int]:
-    """`(threads, CTAs per SM)` for `kernel`, read out of its own source."""
+    """`(threads, CTAs per SM)` for `kernel`, read out of its own source.
+
+    Two spellings, and neither is a number written down here.
+
+    **`#[launch_bounds(threads, ctas)]`**, if the kernel carries one, is read
+    first and read alone. It is `__launch_bounds__`: `ptxas` gets the same pair
+    the gate does, as `.maxntid` and `.minnctapersm`, and caps registers to
+    reach it. So a kernel that declares this way cannot be told one residency by
+    the compiler and checked against another, which is the whole failure a
+    second constant would reintroduce.
+
+    Otherwise: an exact `#[launch_contract(block = ...)]` above the kernel and
+    the file's single `const CTAS_PER_SM`. That is the GEMM's shape, and it is
+    the right one there — `CTAS_PER_SM` is what its *grid* is sized from, a host
+    fact `launch_bounds` has no way to state, and the two GEMM entries would be
+    over-constrained by a `.minnctapersm` they measured their way to rather than
+    asked for."""
     text = Path(PROJECT_DIR, source).read_text()
     declared = text.find(f"fn {kernel}(")
+    if declared >= 0:
+        bounded = _LAUNCH_BOUNDS.findall(text[:declared])
+        if bounded:
+            threads, ctas = bounded[-1]
+            return int(threads), int(ctas)
     blocks = _CONTRACT_BLOCK.findall(text[:declared]) if declared >= 0 else []
     residencies = _CTAS_PER_SM.findall(text)
     if not blocks or len(residencies) != 1:
         raise RuntimeError(
-            f"{source} no longer states {kernel}'s launch in the two forms this gate "
-            "reads: an exact `#[launch_contract(block = (x, y, z))]` above the kernel "
-            f"(found {len(blocks)}) and one `const CTAS_PER_SM: u32 = N;` in the file "
-            f"(found {len(residencies)}). Restore them, or drop the kernel from "
+            f"{source} no longer states {kernel}'s launch in either form this gate "
+            "reads: a `#[launch_bounds(threads, ctas)]` on the kernel, or an exact "
+            "`#[launch_contract(block = (x, y, z))]` above it "
+            f"(found {len(blocks)}) plus one `const CTAS_PER_SM: u32 = N;` in the file "
+            f"(found {len(residencies)}). Restore one, or drop the kernel from "
             "GATED_KERNELS — an occupancy gate that cannot read the launch is not one."
         )
     x, y, z = (int(extent) for extent in blocks[-1])
@@ -1273,28 +1304,28 @@ def _check_occupancy_model(threads: int) -> int:
 
 def _check_occupancy_step(measured: dict[tuple[str, str], dict[str, int]]) -> None:
     """Registers against the occupancy step, per gated kernel — issue #95."""
-    # Keyed by (crate, kernel) and not by kernel alone. `examples/` and
-    # `experiments/` both emit `gemm_cg2_staged_x8x4`, and a flat map would hand
-    # this gate whichever crate `PTX_CRATES` happened to visit last -- a gate
-    # reading a kernel other than the one it names is exactly the silent failure
-    # #95 exists to prevent. The crate is the first path component of both a
-    # `GATED_KERNELS` source and a `_measure` key, so it joins them directly.
-    def crate(path: str) -> str:
-        return path.split("/", 1)[0]
-
-    by_kernel = {(crate(ptx), name): counts for (ptx, name), counts in measured.items()}
+    # Keyed by (crate, kernel) and not by kernel alone. Two kernels are emitted
+    # by both crates, and a flat map would hand this gate whichever one
+    # `PTX_CRATES` happened to visit last -- a gate reading a kernel other than
+    # the one it names is exactly the silent failure #95 exists to prevent. The
+    # crate is the first path component of a `_measure` key and a column of
+    # `GATED_KERNELS`, which is what joins them.
+    by_kernel = {
+        (ptx.split("/", 1)[0], name): counts for (ptx, name), counts in measured.items()
+    }
     print("\n  the occupancy model, against the toolkit's own (`cuda_occupancy.h`,")
     print("  compiled here — it needs no driver, and neither does this whole run):")
-    for threads in sorted({_launch_geometry(source, kernel)[0] for kernel, source in GATED_KERNELS}):
+    geometries = {kernel: _launch_geometry(source, kernel) for kernel, _, source in GATED_KERNELS}
+    for threads in sorted({threads for threads, _ in geometries.values()}):
         agreed = _check_occupancy_model(threads)
         print(f"    {threads:>4} threads: identical at all {agreed} register counts ptxas can emit")
 
     rows, crossed = [], []
-    for kernel, source in GATED_KERNELS:
-        counts = by_kernel.get((crate(source), kernel))
+    for kernel, package, source in GATED_KERNELS:
+        counts = by_kernel.get((package, kernel))
         if counts is None:
             raise RuntimeError(
-                f"{kernel} is gated on its occupancy step but {crate(source)} emitted no PTX "
+                f"{kernel} is gated on its occupancy step but {package} emitted no PTX "
                 "for it, so this run measured nothing about it. Either it stopped being "
                 "monomorphized, or it was renamed, or it moved crate; a gate that silently "
                 "watches an absent kernel is worse than none."
@@ -1304,14 +1335,22 @@ def _check_occupancy_step(measured: dict[tuple[str, str], dict[str, int]]) -> No
         registers = counts["registers"]
         allowed = _ctas_by_registers(registers, threads)
         rows.append(
-            (f"{crate(source)}/{kernel}", threads, ctas, registers, ceiling, ceiling - registers, allowed)
+            (
+                f"{package}/{kernel}",
+                threads,
+                ctas,
+                registers,
+                ceiling,
+                ceiling - registers,
+                allowed,
+            )
         )
         if allowed < ctas:
             crossed.append(
-                f"  {crate(source)}/{kernel}: {registers} registers at {threads} threads "
-                f"leaves {allowed} "
-                f"CTAs/SM where the kernel is built for {ctas}. {ceiling} is the most a "
-                f"thread may use and keep {ctas} — it is {registers - ceiling} over."
+                f"  {package}/{kernel}: {registers} registers at {threads} threads "
+                f"leaves {allowed} CTAs/SM where the kernel is built for {ctas}. "
+                f"{ceiling} is the most a thread may use and keep {ctas} — it is "
+                f"{registers - ceiling} over."
             )
 
     print("\n  the occupancy step (#95) — registers against the residency each kernel's")
