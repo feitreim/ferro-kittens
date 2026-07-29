@@ -79,14 +79,19 @@ fn examples() -> Vec<Example> {
             name: "gemm",
             status: "runs",
             threads: gemm::THREADS,
-            shared_bytes: gemm::SHARED_BYTES,
+            // The envelope `gemm::SHIPPED_EPILOGUE` declares, which since #119
+            // is the staged one. `gemm::SHARED_BYTES` is the register drain's
+            // and 16 424 B smaller; reporting it here would describe a launch
+            // this crate no longer makes by default.
+            shared_bytes: gemm::STAGED_SHARED_BYTES,
             entry: None,
         },
         Example {
             name: "gemm_ws",
             status: "runs (warp-specialized gemm)",
             threads: gemm_ws::THREADS,
-            shared_bytes: gemm_ws::SHARED_BYTES,
+            // As above: `gemm_ws::SHIPPED_ENTRY`'s envelope, not `Entry::S4`'s.
+            shared_bytes: gemm_ws::SHIPPED_ENTRY.shared(),
             // `#[cluster_launch]` too, so the same absence for the same reason
             // — and here the counted figure is `device-tests`' `ws envelope`
             // rungs, which hold this kernel's 512 accumulator columns at this

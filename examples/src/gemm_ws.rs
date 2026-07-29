@@ -8,10 +8,20 @@
 //! ## What is different, and it is one thing
 //!
 //! Both kernels compute the same `[256, 256]` pair tile with the same
-//! `cta_group::2` UMMA over the same four-chunk `BLOCK_K = 64` stages, and both
-//! drain the accumulator straight to global memory through
-//! [`kittens::global::store_rows`]. **The epilogue is deliberately identical**,
-//! down to the instruction — see "what this PR does not change" below.
+//! `cta_group::2` UMMA over the same four-chunk `BLOCK_K = 64` stages, and
+//! both drain the accumulator through the same staged epilogue — TMEM →
+//! registers → `stmatrix` into a per-warp `[32, 64]` shared tile → 16-byte
+//! stores. **The epilogue is deliberately the same shape on both sides**; the
+//! one thing that differs is the instruction width, and #118 measured why.
+//!
+//! [`SHIPPED_ENTRY`] is `staged8` here and
+//! [`crate::gemm::SHIPPED_EPILOGUE`] is `staged84` there, because `.x4` buys
+//! 14 registers on that design point and 2 on this one. See "The widths, and
+//! the floor under them" below, and do not tidy the two into one choice.
+//!
+//! **Table 1 of [`compare`] still puts both kernels on the register drain**,
+//! which is what makes it a measurement of the occupancy/specialization
+//! structure and nothing else; table 5 is where each side gets its best rung.
 //!
 //! What moves is *where the overlap comes from*.
 //!
@@ -37,10 +47,12 @@
 //! [`drain`], one const on one job, and "The widths, and the floor under them"
 //! below is what it measured. `examples/README.md` §7 has both kernels' tables.
 //!
-//! [`crate::gemm`] gets it **across CTAs**. It is 98392 B of shared memory and
-//! 256 accumulator columns, which is two CTAs an SM, so one CTA's epilogue runs
-//! against another CTA's MMA. That is what forces its whole budget: 18344 B of
-//! shared headroom and 166 registers against an occupancy step at 168.
+//! [`crate::gemm`] gets it **across CTAs**. It is 114816 B of shared memory on
+//! the epilogue it ships (98392 on the register drain) and 256 accumulator
+//! columns, which is two CTAs an SM either way, so one CTA's epilogue runs
+//! against another CTA's MMA. That is what forces its whole budget: 1920 B of
+//! shared headroom at the shipped envelope, and an occupancy step at 168 that
+//! its register drain sat two registers under.
 //!
 //! This kernel gets it **inside one CTA**, from warp specialization plus a
 //! double-buffered accumulator — which is NVIDIA's `gemm_sol_final`
@@ -85,14 +97,19 @@
 //! headroom. Here it is 1 CTA × 6 warps = 6 warps an SM, so the *binding*
 //! sub-partition still holds 2 and **255 registers a thread is reachable**.
 //!
-//! **`regcount` says 168 and no spill**, against [`crate::gemm`]'s 166. So the
-//! headroom is real and *nothing here asked for it*: the epilogue holds the
-//! same `RegTile<32, 128>` band it always did, because 256 columns in one band
-//! is 256 fp32 a thread and past the architecture's 255 at any occupancy —
-//! [`DRAIN_N`] is a hardware limit, not an occupancy one. This is an argument
-//! that turned out to be inert, and it is recorded that way rather than
-//! deleted, because "registers stop binding" was one of the two consequences
-//! this design point was reached for.
+//! **`regcount` says 168 and no spill on the register drain**, against
+//! [`crate::gemm`]'s 166. So the headroom is real and *nothing here asked for
+//! it*: that epilogue holds the same `RegTile<32, 128>` band it always did,
+//! because 256 columns in one band is 256 fp32 a thread and past the
+//! architecture's 255 at any occupancy — [`DRAIN_N`] is a hardware limit, not
+//! an occupancy one. This is an argument that turned out to be inert, and it
+//! is recorded that way rather than deleted, because "registers stop binding"
+//! was one of the two consequences this design point was reached for.
+//!
+//! The epilogue this file now ships is not near it either, from the other
+//! direction: `staged8` is **94 registers and no spill**, because a `[32, 64]`
+//! band and a block-at-a-time `stmatrix` never materialize what
+//! [`kittens::global::store_rows`]' slot-major walk forced live.
 //!
 //! ## Why [`kittens::pipeline`] did not have to change
 //!
@@ -136,16 +153,20 @@
 //! the reference's on `n`, weaker on `k`, and the item boundary is what buys
 //! the difference.
 //!
-//! ## What this file deliberately does not change
+//! ## What this file deliberately did not change, and has since
 //!
 //! The reference's epilogue is `stmatrix` into a 64 KiB shared staging buffer
-//! and 64-bit vectorized stores out of it. **That is not here.** This kernel
-//! keeps [`crate::gemm`]'s register → global epilogue exactly, because
+//! and 64-bit vectorized stores out of it. **That was not here at #112**: this
+//! kernel kept [`crate::gemm`]'s register → global epilogue exactly, because
 //! otherwise the measurement would move the occupancy/specialization structure
 //! and the epilogue in one change and no row of the table would say which one
-//! paid. `kittens::epilogue::StoreRing` (#111) exists and the shared→global
-//! vectorized store it wants is being built elsewhere; swapping it in is a
-//! **follow-up measured on its own**.
+//! paid.
+//!
+//! It is here now. #116 built the staged shape, #118 built #117's two widths on
+//! top of it, and #119 made `staged8` [`SHIPPED_ENTRY`] — each measured on its
+//! own, which is what the discipline above bought. The register drain stays as
+//! [`Entry::S4`] and table 1 of [`compare`] still runs on it, so #112's
+//! comparison is still a comparison of one variable.
 //!
 //! The epilogue needed no modification to run at six warps, which is worth
 //! stating because it was the open question: warps 0–3 cover the CTA's 128
@@ -197,7 +218,7 @@
 //! epilogue, on the grounds that an SM holding one CTA has nothing else to hide
 //! one behind. **It is not the epilogue.** #118 removed the epilogue entirely —
 //! [`kernels::gemm_ws_no_drain`], one launch parameter and one const apart from
-//! the shipped kernel — and the epilogue-free launch still runs at **0.888 of
+//! the register drain — and the epilogue-free launch still runs at **0.888 of
 //! cuBLASLt at 16384³**, where #114's identical probe on [`crate::gemm`] ran at
 //! **1.02**. It is also **3.0% slower than `gemm`'s complete `staged84`
 //! launch**. A free epilogue would not close this gap, so the gap was never
@@ -269,9 +290,11 @@
 //! `.x4` is **+1.2% / +0.0% / +0.1%** — a clean null, exactly as in
 //! [`crate::gemm`]. Composed, **+14.5% / +6.2% / +2.9%**: the two do *not*
 //! add here, and `staged8` and `staged84` are indistinguishable, trading places
-//! between sessions. Against the register epilogue this kernel ships, the best
-//! rung is **+18.1% / +9.5% / +5.2%**, taking it from 0.615 to 0.726, 0.782 to
-//! 0.856 and 0.810 to 0.852 of cuBLASLt.
+//! between sessions. Against the register epilogue this kernel shipped through
+//! #119, the best rung is **+18.1% / +9.5% / +5.2%**, taking it from 0.615 to
+//! 0.726, 0.782 to 0.856 and 0.810 to 0.852 of cuBLASLt — and it is `staged8`
+//! that ships, because a tie between it and `staged84` goes to the rung whose
+//! `.x4` bought nothing here.
 //!
 //! **The prediction holds, and the register column is why `.x4` differs.** In
 //! [`crate::gemm`] `.x8` cost +52 registers (42 → 94) and `.x4` bought 14 of
@@ -315,7 +338,7 @@
 //! ### The floor, which is the finding
 //!
 //! [`kernels::gemm_ws_no_drain`] is this kernel with the epilogue deleted — one
-//! const and one launch parameter from the shipped one — and it is the probe
+//! const and one launch parameter from [`Entry::S4`] — and it is the probe
 //! #114 ran on [`crate::gemm`] to conclude that the item boundary **is** the
 //! epilogue and is fully exposed. There it reached 1850 TFLOP/s against
 //! cuBLASLt's 1808, past parity. Here:
@@ -475,7 +498,13 @@ pub const fn shared_plan(stages: usize) -> usize {
     a + b + scratch_bytes(stages)
 }
 
-/// Dynamic shared memory the shipped entry point's launch must provide.
+/// Dynamic shared memory a **register-drain** launch must provide —
+/// [`Entry::S4`], [`Entry::S6`] at its own depth, and [`Entry::NoDrain`].
+///
+/// **Not the shipped envelope since #119.** [`SHIPPED_ENTRY`] is `staged8` and
+/// declares [`STAGED_SHARED_BYTES`]; this is the plan the staged one is laid on
+/// top of, byte for byte, which is what keeps an epilogue A/B a comparison of
+/// drains and 16 408 declared bytes and nothing else.
 pub const SHARED_BYTES: usize = shared_plan(STAGES);
 
 /// [`shared_plan`] with a staging tile per epilogue warp on the end, 128-byte
@@ -493,7 +522,13 @@ pub const fn staged_plan(stages: usize) -> usize {
 /// dynamic shared memory.
 const STAGE_OFFSET: usize = SHARED_BYTES.next_multiple_of(128);
 
-/// The staged entry point's envelope, and the literal its contract repeats.
+/// The staged entry points' envelope, and the literal their contracts repeat
+/// — since #119 **the envelope the shipped launch declares**, since
+/// [`SHIPPED_ENTRY`] is one of the four rungs that carry staging tiles.
+///
+/// All four declare it, and so does their `no drain` control: #117's two
+/// instruction widths change what the epilogue issues and not what it
+/// occupies.
 pub const STAGED_SHARED_BYTES: usize = staged_plan(STAGES);
 
 /// `#[launch_contract]` takes literals, so the envelope is written twice and
@@ -809,9 +844,9 @@ impl<const STAGES: usize> Tile<STAGES> {
 ///
 /// One code rather than a `bool` per lever. [`crate::gemm`] spells the same
 /// choice as three of them (`DRAIN`, `WIDE`, `X4`) because it has three; a
-/// fourth arrives here — the register epilogue this kernel still ships — and a
-/// launch site reading `Ws::<STAGES, true, false, false, true>` says nothing
-/// about which rung it is. These names are what the tables print.
+/// fourth arrives here — the register epilogue this kernel shipped through
+/// #119 — and a launch site reading `Ws::<STAGES, true, false, false, true>`
+/// says nothing about which rung it is. These names are what the tables print.
 ///
 /// `DRAIN` is a monomorphization constant, so exactly one arm of
 /// [`Ws::epilogue`] survives into any entry point. That is what keeps
@@ -820,7 +855,7 @@ impl<const STAGES: usize> Tile<STAGES> {
 /// the `const STAGED` bool gave before there were four rungs to name.
 mod drain {
     /// [`super::Tile::drain`] — a `RegTile<32, 128>` band straight to global,
-    /// the epilogue this kernel ships and the one #112 measured.
+    /// the epilogue this kernel shipped through #119 and the one #112 measured.
     pub const REGISTER: u8 = 0;
     /// [`super::Tile::drain_staged`] at `.x1` LDTM and `stmatrix.x2` — #116's
     /// rung, and the control every width below is quoted against.
@@ -1459,7 +1494,7 @@ pub mod kernels {
     }
 
     /// **A deliberately wrong GEMM** — [`gemm_ws`] with the epilogue removed,
-    /// at the *shipped* 131 176 B envelope.
+    /// at the *register drain's* 131 176 B envelope.
     ///
     /// This is the register epilogue's own control, and it exists because #112
     /// never established why this kernel lost. It attributed the loss to the
@@ -1468,7 +1503,7 @@ pub mod kernels {
     /// drain` at 1.01× its serial cost). What nobody has measured is how
     /// exposed *this* kernel's epilogue is, with the drain deferred one item
     /// and on warps of its own — and that is one subtraction, at the envelope
-    /// the shipped kernel actually declares.
+    /// [`Entry::S4`] actually declares.
     ///
     /// # Safety
     ///
@@ -1511,7 +1546,12 @@ pub mod kernels {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Entry {
     /// `gemm_ws` / `gemm_ws_clc` — four stages, the reference's depth, and the
-    /// register epilogue this kernel ships.
+    /// register epilogue this kernel shipped through #119.
+    ///
+    /// Still the control, and still the only entry with a
+    /// [`Scheduler::Stealing`] twin: it is what table 1 of [`compare`] holds
+    /// on **both** sides, since that table's one variable is where the overlap
+    /// comes from and an epilogue moving with it would be two.
     S4,
     /// `gemm_ws_s6` — six, static only.
     S6,
@@ -1519,19 +1559,51 @@ pub enum Entry {
     /// memory (#15/#116), static only. Same depth as [`Entry::S4`], so the
     /// pair is an epilogue comparison and nothing else.
     Staged,
-    /// `gemm_ws_staged_x8` — [`Entry::Staged`] with the LDTM half at `.x8`.
+    /// `gemm_ws_staged_x8` — [`Entry::Staged`] with the LDTM half at `.x8`,
+    /// and **[`SHIPPED_ENTRY`] since #119**.
     StagedX8,
     /// `gemm_ws_staged_x4` — [`Entry::Staged`] with `stmatrix` at `.x4`.
     StagedX4,
     /// `gemm_ws_staged_x8x4` — both of #117's widths, the composition rung.
+    ///
+    /// It is what [`crate::gemm`] ships and what this kernel does **not**,
+    /// which is the one place the two files disagree on purpose. There `.x4`
+    /// hands back 14 of the 52 registers `.x8` costs and that recovery is the
+    /// composition gain; here it hands back 2, `staged8` and `staged84` land
+    /// within 1.1% and trade places between sessions, and the rung with less
+    /// to go wrong wins the tie.
     StagedX8X4,
     /// `gemm_ws_staged_no_drain` — **not a GEMM**: the staged envelope with no
     /// epilogue at all, and the far end of the four staged rungs' subtraction.
     StagedNoDrain,
-    /// `gemm_ws_no_drain` — **not a GEMM**: the shipped envelope with no
+    /// `gemm_ws_no_drain` — **not a GEMM**: the register-drain envelope with no
     /// epilogue, which is [`Entry::S4`]'s own control.
     NoDrain,
 }
+
+/// The entry point this file ships — `staged8`, #116's staged drain with
+/// #117's `.x8` LDTM and **without** `.x4`.
+///
+/// **It was [`Entry::S4`] through #119.** #118 measured the best staged rung at
+/// **+19.4% / +9.5% / +5.2%** over the register epilogue at 4096³ / 8192³ /
+/// 16384³; measured default against default in one container with cuBLASLt
+/// re-measured in it, that reproduces at **+19.6% / +8.7% / +6.3%** and
+/// **0.599 → 0.717, 0.790 → 0.858 and 0.812 → 0.863 of cuBLASLt**. Every rung
+/// passed the same element-by-element `==` on bf16 words at both check sizes
+/// and all three traversal widths.
+///
+/// **`.x4` is left off deliberately**, which is where this file and
+/// [`crate::gemm::SHIPPED_EPILOGUE`] part company. On that kernel `.x4`
+/// recovers 14 registers (94 → 80) and the recovery *is* the composition gain;
+/// here it recovers 2 (94 → 92) and buys no time with them, so `staged8` and
+/// `staged84` are within 1.1% and trade places between sessions. Tidying the
+/// two files onto one choice would be discarding the measurement that
+/// separates them.
+///
+/// Residency does not move with it — [`ACCUM_COLUMNS`] fixed [`CTAS_PER_SM`]
+/// at 1 before shared memory was consulted, and `device-tests`' census counts
+/// 1 resident and 1 holding at both 131 176 B and 147 584 B.
+pub const SHIPPED_ENTRY: Entry = Entry::StagedX8;
 
 impl Entry {
     /// Pipeline depth, which is the only thing besides the epilogue an entry
@@ -1593,7 +1665,13 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The kernel as it ships.
+    /// The register-drain kernel at the reference's depth, walked at the
+    /// measured [`GROUP`] — **not the kernel as it ships**, which is
+    /// [`SHIPPED_ENTRY`].
+    ///
+    /// It is what table 1 of [`compare`] holds on this side of its A/B, and
+    /// the only entry that answers to both schedulers, so it stays the plan a
+    /// caller gets by naming nothing.
     pub fn new(scheduler: Scheduler) -> Self {
         Plan {
             scheduler,
@@ -1865,9 +1943,10 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
             }
         }
         notes.push(format!(
-            "{m}x{n}x{k} exact on {} ({} B)",
+            "{m}x{n}x{k} exact on {} ({} B, {} ships)",
             STAGED_ENTRIES.map(|entry| entry.name()).join(", "),
-            Entry::Staged.shared()
+            Entry::Staged.shared(),
+            SHIPPED_ENTRY.name()
         ));
         if let Some(label) = rounding {
             notes.push(label);
@@ -1972,14 +2051,15 @@ pub fn compare(
     println!(
         "gemm warp specialization — min ms over 30 timed launches, every row checked\n\
          element-by-element against the same CPU reference before it was timed.\n\
-         `gemm` is examples/src/gemm.rs unchanged: [256,256] at 3 stages, 4 warps, 98392 B,\n\
-         2 CTAs an SM, 256 accumulator columns. `ws` is this file: the same pair tile and\n\
-         the same register epilogue at 6 warps, {} B, 1 CTA an SM, 512 accumulator\n\
-         columns in two ping-ponged stages.\n\
+         `gemm` in table 1 is examples/src/gemm.rs on its REGISTER drain (`lcf`), named\n\
+         rather than defaulted since #119: [256,256] at 3 stages, 4 warps, 98392 B, 2 CTAs\n\
+         an SM, 256 accumulator columns. `ws` is this file on its own register drain at 6\n\
+         warps, {} B, 1 CTA an SM, 512 accumulator columns in two ping-ponged stages.\n\
          In table 1 one variable moves — where the overlap comes from — and the epilogue is\n\
          deliberately identical, so that delta is the occupancy/specialization structure and\n\
          nothing else. Tables 3 and 4 then move the epilogue and nothing else, and table 5\n\
-         puts each design point's best rung against the other's.",
+         puts each design point's best rung against the other's — which since #119 is also\n\
+         each one's shipped rung, `staged84` there and `staged8` here.",
         SHARED_BYTES
     );
 
@@ -1998,8 +2078,13 @@ pub fn compare(
     );
     let mut measured = Vec::new();
     for shape in SIZES {
-        eprintln!("{shape} on gemm (the control): staging and checking");
-        let control = crate::gemm::bench(context, shape)?.min();
+        eprintln!("{shape} on gemm lcf (the control): staging and checking");
+        // Named rather than taken from `gemm::bench`, and #119 is why: that
+        // function launches `gemm`'s shipped epilogue, which is now `staged84`.
+        // Table 1's whole claim is that the epilogue is identical on both
+        // sides, so this arm has to be the register drain by name — the best
+        // rungs meet in table 5, where each side is allowed to move.
+        let control = crate::gemm::bench_with(context, shape, crate::gemm::Epilogue::Fused)?.min();
         let ours = timed(context, shape, Plan::new(Scheduler::Static))?.min();
         let (waves, efficiency) = wave_efficiency(shape.m, shape.n);
         println!(

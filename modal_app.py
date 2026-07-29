@@ -378,6 +378,11 @@ def bench(case: str = "", m: int = 0, n: int = 0, k: int = 0) -> None:
     computed the right answer -- the harness has no path that prints one for a
     launch it did not verify.
 
+    **The `gemm*` rows moved in #119.** They launch `gemm::SHIPPED_EPILOGUE`,
+    which is `staged84` and not the register drain, so a row here is not
+    comparable to the same row taken before that change. The `staged` and
+    `widths` cases are where both epilogues appear side by side.
+
     The clock is CUDA events either side of the launch, not wall clock around
     the driver call, and the headline per size is the minimum over the timed
     launches, with the median and maximum printed beside it. Each example states
@@ -441,8 +446,10 @@ def ws_bench() -> None:
     CTA's epilogue runs against another's MMA. `examples/src/gemm_ws.rs` gets it
     inside one CTA, from six warps and a double-buffered TMEM accumulator, which
     is 512 accumulator columns and therefore one CTA per SM. Table 1 holds the
-    epilogue identical in both, so that delta is the occupancy/specialization
-    structure and not a store path.
+    epilogue identical in both -- the *register* drain on both sides, named
+    rather than defaulted since #119 moved each kernel's default onto a staged
+    rung -- so that delta is the occupancy/specialization structure and not a
+    store path.
 
     Since #118 it also runs the epilogue ladder on the warp-specialized kernel
     -- #116's staged shape and #117's `.x8` LDTM and `stmatrix.x4` -- with the
@@ -976,18 +983,22 @@ def _print_timed_twins(measured: dict[tuple[str, str], dict[str, int]]) -> None:
 # So: gate on the step, and on nothing else. A wobble of a couple of registers
 # inside a step is codegen noise and passes.
 #
-# **And know what it is likely to catch.** `gemm_cg2`'s ceiling works out at 168
-# and `ptxas` puts it at 167, which is not a coincidence to bank on: four
-# unrelated kernels in this tree land at 167-168 (`gemm_cg2`, `flash_forward`,
-# both `global_copy_probe_128_*`), and 168 is exactly the largest count that
-# keeps twelve warps on an SM. `ptxas`' own default target sits on this
-# kernel's step. Forcing eight registers of extra live state into the epilogue
-# moved it 167 -> 168 and no further; forcing thirty-two moved the *frame* by
-# 256 B and left the count at 168. So the way this gate is most likely to fire
-# is not a kernel drifting up into it — it is `THREADS` or `CTAS_PER_SM`
-# moving, a `#[launch_bounds]` or `-maxrregcount` being introduced, or a
-# toolkit upgrade changing that default. Those are all real, all silent today,
-# and #87 and #15 can each produce the first of them.
+# **And know what it is likely to catch.** When `gemm_cg2` wanted three CTAs an
+# SM its ceiling worked out at 168 and `ptxas` put it at 167, which was not a
+# coincidence to bank on: several kernels in this tree land at 167-168
+# (`flash_forward`, `gemm_256x128_*`, both `global_copy_probe_128_*`), because
+# 168 is exactly the largest count that keeps twelve warps on an SM and that is
+# `ptxas`' own default target.
+#
+# #87 then took the third CTA: `[256, 256]` is 256 accumulator columns, so
+# `512 / 256` fixes `CTAS_PER_SM` at 2 before shared memory is consulted, and
+# two CTAs at 128 threads admits the whole 255-register file. The gated kernels
+# read 166, 42 and 80 against a ceiling of 255 today, so nothing here is near
+# its step — which is the point of printing `headroom` rather than a verdict.
+# The way this gate is most likely to fire is not a kernel drifting up into it:
+# it is `THREADS` or `CTAS_PER_SM` moving, a `#[launch_bounds]` or
+# `-maxrregcount` being introduced, or a toolkit upgrade changing that default.
+# Those are all real and all silent today.
 
 # sm_100a's register file, and the only hardware figure below that is not
 # arithmetic: 64 K 32-bit registers per SM, from the CUDA C Programming Guide's
@@ -1057,6 +1068,13 @@ GATED_KERNELS = (
     # which moves peak liveness, so it is exactly the kind of change this gate
     # exists for.
     ("gemm_cg2_staged", "examples/src/gemm.rs"),
+    # `gemm::SHIPPED_EPILOGUE` since #119, which is the reason it is here: the
+    # gate is a gate on the kernel the crate launches by default, and the
+    # default moved. `.x8` returns 32 f32 in one instruction and costs +52
+    # registers over `gemm_cg2_staged`'s 42 — the largest single liveness step
+    # any epilogue rung in this tree has taken — so this is the row that would
+    # go red first.
+    ("gemm_cg2_staged_x8x4", "examples/src/gemm.rs"),
 )
 
 _CONTRACT_BLOCK = re.compile(r"block\s*=\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)")
@@ -1185,10 +1203,10 @@ def _check_occupancy_step(measured: dict[tuple[str, str], dict[str, int]]) -> No
 
     print("\n  the occupancy step (#95) — registers against the residency each kernel's")
     print("  own grid is sized for. `ceiling` is derived, not written down anywhere:")
-    print(f"    {'kernel':<20}{'threads':>8}{'wants':>7}{'regs':>6}{'ceiling':>9}{'headroom':>10}{'allows':>8}")
+    print(f"    {'kernel':<24}{'threads':>8}{'wants':>7}{'regs':>6}{'ceiling':>9}{'headroom':>10}{'allows':>8}")
     for kernel, threads, ctas, registers, ceiling, headroom, allowed in rows:
         print(
-            f"    {kernel:<20}{threads:>8}{ctas:>7}{registers:>6}"
+            f"    {kernel:<24}{threads:>8}{ctas:>7}{registers:>6}"
             f"{ceiling:>9}{headroom:>10}{allowed:>8}"
         )
     if crossed:
