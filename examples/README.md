@@ -3475,6 +3475,168 @@ Nothing in this section moves the shipped kernel: it is the same 166 registers,
 the same 98 392 B plan and the same two CTAs an SM, and the two new entry points
 are rungs beside it.
 
+##### and the epilogue itself, staged through shared memory — #15
+
+#114 left one lever and priced it exactly. The epilogue is the *whole* of the
+item boundary, it is **exposed rather than hidden** (`whole − no drain` = 20.43
+µs a tile at 8192³ against #108's 21.4 µs measured serially by an unrelated
+route, a ratio of 1.01), and the epilogue-free kernel beats cuBLASLt outright —
+1850 TFLOP/s against 1808 in the same container. So the epilogue is **111% of
+the entire distance to the library** and cutting it pays at close to full value.
+#109 split it 13.1 µs of stores against 8.3 µs of LDTM.
+
+`Tile::drain_staged` attacks the store half: TMEM → registers → `stmatrix` into
+a per-warp `[32, 64]` bf16 tile → plain 16-byte stores out of it, against the
+scattered 4-byte register stores `Tile::drain` issues.
+`kittens::ldst::store_tile` and `kittens::global::store_shared_rows` (#113)
+already existed; nothing in `src/` moved.
+
+**The arithmetic the issue was scoped from is wrong, and the correction is the
+first result.** Per warp band of `[32, 256]` bf16 = 16 384 B, per thread:
+
+| | today, `store_rows` | staged |
+| --- | ---: | ---: |
+| `st.global` | **128** × 4 B, on 8 discontiguous 16 B runs | **32** × 16 B, on 4 contiguous 128 B runs |
+| `stmatrix` | 0 | 64 × 256 B a warp |
+| `ld.shared` | 0 | 32 × 16 B |
+| `cvt.rn.bf16x2.f32` | 128 | 128 |
+| **total memory issue** | **128** | **128** |
+
+The scoping table read 96 and got there by leaving out the `ld.shared` half of
+`store_shared_rows`' chunk copy — that mover is deliberately a load *and* a
+store rather than one opaque snippet, and both are instructions. **Total issue
+does not fall.** The whole hypothesis is the *shape* of the global write: 4×
+fewer store instructions, each landing on full 128-byte lines instead of eight
+half-filled 32-byte sectors, so the band's global writes go from 1024 half-full
+sector transactions to 512 full ones. It is strictly more total work — a whole
+extra pass through shared memory — and wins only if that recoalescing is worth
+more than 64 `stmatrix` plus 32 `ld.shared`.
+
+**The budget is the tight part and it decided the shape.** At 2 CTAs an SM a CTA
+gets 116 736 B and the shipped plan spends 98 392, leaving 18 344. Four warps ×
+`[32, 64]` bf16 is 16 384 B and fits; `[·, 128]` is 32 768 and does not, and
+`SharedTile::WIDTH_OK` wants a whole swizzle subtile so **64 columns is the
+narrowest bf16 tile `Swizzle128B` admits** — the floor and the ceiling meet at
+one width. `STAGES` was not available to buy the difference: 3 → 2 is −11.8% /
+−7.3% at *unchanged* residency (the `[256,256] s2` row above), which is pipeline
+depth and not an occupancy step.
+
+Per *warp* rather than per CTA, which is what keeps the barrier count at zero:
+`stmatrix` is `.sync.aligned` and therefore a convergence point for the warp
+that issues it, and `store_shared_rows` is cooperative rather than collective,
+so a warp writing and reading back its own 4096 B needs no `bar.sync` — only the
+`bar.warp.sync` that separates one pass's read from the next pass's write. A
+row-subrange of a swizzled tile *is* a swizzled tile (the period is 8 rows and
+the XOR is over the row index), which is what lets four of them be carved out of
+one run. **And there is no `fence.proxy.async.shared::cta`, deliberately**: that
+fence orders a generic-proxy write against an *async*-proxy read, which is what
+`epilogue::StoreRing`'s TMA path needs. Both ends here are generic. Which is
+also why `StoreRing` was the wrong tool — its `commit` issues a TMA store and
+its `acquire` waits on a bulk-copy read group, and this path needs neither.
+
+**Min ms over 30 timed launches, static schedule, `GROUP = 8`, one container.
+`lcf` and `staged` both compute the GEMM and both were checked
+element-by-element against the CPU reference before they were timed.**
+
+| shape | `lcf` ms | `lcf` TFLOP/s | `staged` ms | `staged` TFLOP/s | vs `lcf` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4096³ | 0.1413 | 972.8 | 0.1308 | **1050.9** | **+8.0%** |
+| 8192³ | 0.7355 | 1494.9 | 0.7057 | **1558.0** | **+4.2%** |
+| 16384³ | 5.2947 | 1661.3 | 5.1966 | **1692.7** | **+1.9%** |
+
+**And the epilogue itself, by #114's own subtraction — the launch with the drain
+minus the launch without it, at the *same* envelope in each arm.** This is the
+measurement the change is really about; the throughput above is what is left of
+it after amortization.
+
+| shape | `lcf` µs/tile | `staged` µs/tile | change | share of the launch |
+| --- | ---: | ---: | ---: | --- |
+| 4096³ | 26.82 | 21.73 | **−19.0%** | 38.0% → 33.2% |
+| 8192³ | 20.14 | 16.20 | **−19.6%** | 19.2% → 16.1% |
+| 16384³ | 21.60 | 16.34 | **−24.4%** | 11.4% → 8.8% |
+
+The 20.14 at 8192³ re-measures #114's 20.43 to within 1.4%, in a different
+container, which is the control saying the instrument is the instrument.
+
+**Was the 6.2% met? No — 4.2% of it was, and the ceiling was derived from a
+premise this change does not meet.** 6.2% is half the store half: 13.1 µs of
+stores → 6.55 µs saved against a 105 µs tile at 8192³. The measured saving is
+3.94 µs, which is **60% of that ceiling and 30% of the whole store half**. The
+shortfall is exactly the correction above: the ceiling assumed the stores were
+*halved*, and total memory issue does not move at all — only the global half
+does. Getting 60% of a ceiling that assumed twice the reduction is the reading,
+and it is the one the corrected table predicts.
+
+**The envelope is not the story, and there is a control for it.**
+`gemm_cg2_staged_no_drain` declares the staged 114 816 B and runs the
+epilogue-free kernel, so it differs from `gemm_cg2_no_drain` in 16 424 bytes
+nothing touches: **−0.4% / −0.4% / +1.0%**, which is noise. `device-tests`'
+`tmem residency census` **counts 2 CTAs an SM at 114 816 B**, the same integer
+it counts at 98 392 — as `min(512 / columns, shared per SM / plan)` predicts,
+since at 256 accumulator columns the tensor-memory term binds and shared memory
+had 1920 B still to give.
+
+**Against the library, same device, same container:** cuBLASLt 1638.1 / 1819.3 /
+1895.4 TFLOP/s, taking the kernel from **0.594 → 0.642**, **0.822 → 0.856** and
+**0.877 → 0.893**.
+
+**It costs −124 registers, which is the surprise.** `ptxas -v` reads **42 for
+`gemm_cg2_staged` against 166 for `gemm_cg2`**, zero spill either way, on a
+smaller frame (256 B against 528). The mechanism is that the band never has to
+exist: `TmemTile::tile` and `ldst::store_tile` both walk `[16, 16]` blocks, so
+the compiler fuses them and only one `Fragment` — eight values — is live at a
+time, where `store_rows` walks the whole band slot-major and forces all 128 fp32
+of it into registers at once. The register column has ordered time backwards
+eight times in this file (#47, #63, #67, #76, #87, #94, #100, #109); this is the
+ninth occasion it says nothing, since residency here is tensor-memory-bound and
+the count was never the binding resource.
+
+**Counted in the PTX**, because #114's dead-code hazard applies to any epilogue
+rung. `regcount` now carries an opcode census per entry function, so this is a
+standing check rather than a paragraph: `gemm_cg2_staged` is the only `gemm_*`
+kernel carrying `stmatrix`, `ld.shared.v4` and `st.global.v4` at all, and
+`gemm_cg2_staged_no_drain` is opcode-identical to `gemm_cg2_no_drain` — zero
+LDTM, zero stores, zero `cvt`, with all four `tcgen05.mma` still there. (The
+counts are *static* instructions, so a rolled loop shows as one; the census says
+which opcodes a kernel contains, and `Tile::drain_staged` carries the dynamic
+arithmetic.)
+
+##### the same epilogue on `gemm_ws`, which is the control that says *why* it wins
+
+The obvious reading of the table above is that the epilogue was simply in the
+way — #114 measured it as fully exposed, so anything cheaper on the critical
+path shows up. `gemm_ws` is the kernel that separates that from the recoalescing
+claim: its epilogue is **already deferred one item and already on warps of its
+own**, with the producer never stopping. If staging wins only because the
+epilogue was blocking, it should be worth nothing there.
+
+It is worth roughly what it is worth in `gemm_cg2` (separate container, so the
+`ws` column moves against §7's other tables; every row checked first):
+
+| shape | `ws` ms | `ws staged` ms | `staged` TFLOP/s | vs `ws` |
+| --- | ---: | ---: | ---: | ---: |
+| 4096³ | 0.1375 | 0.1321 | **1040.4** | **+4.1%** |
+| 8192³ | 0.7902 | 0.7713 | **1425.5** | **+2.5%** |
+| 16384³ | 5.8878 | 5.7144 | **1539.3** | **+3.0%** |
+
+**So the win is the store shape and not the placement.** Four warps still doing
+the same work, still off the critical path, still one item behind, get 2.5–4.1%
+from issuing a quarter as many global stores on four times the run length. That
+also says the two levers compose rather than substitute: `ws` is +3.0% at 16384³
+where `gemm_cg2` is +1.9%, and `ws staged` moves 0.804 → 0.829 of cuBLASLt.
+
+Registers there go **168 → 44**, zero spill, by the same fusion; residency is
+unmoved and could not move, since 512 accumulator columns fixed `gemm_ws` at one
+CTA an SM before shared memory was consulted and 147 584 B is well inside the
+233 472 an SM has.
+
+**Neither kernel's default was changed.** `gemm_cg2` and `gemm_ws` still ship
+the register epilogue and `staged` is a rung beside them, on the same axis
+`lcf`/`lcsf` sit on — which is what makes every number above an A/B and keeps
+the whole of §7 quotable against one shipped kernel. On this evidence it is the
+rung to ship, at both entry points, and that is a change worth making on its own
+rather than folded into the measurement that motivates it.
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all
