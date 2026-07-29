@@ -1373,6 +1373,13 @@ what would let the two cross, and `tma_store_wait_read` (#9, landed) is the wait
 it needs — it releases the shared buffer as soon as the engine has read it,
 without blocking on global visibility.
 
+> **Both halves of that were tried and neither is worth anything here.** The
+> crossing costs no wait and no shared buffer at all — the accumulator survives
+> the boundary in tensor memory — and letting the two cross measures −5.4% to
+> +1.2% over two sessions. `tma_store_wait_read` would decouple only the global
+> write, which a probe prices at 0–1.2%. See the `lcsf` section at the end of
+> §7.
+
 ##### and the drain is roughly a third of 8192³, priced — #86
 
 The paragraph above was written from the shape of the code. It is right, and it
@@ -2019,6 +2026,18 @@ boundary does `lcsf` actually hide*, and ~70% is the number it has to beat. That
 is worth measuring on a prototype before the plumbing (`TensorMapElement` is
 `Bf16`-only, no fp32 `SharedTile` swizzle, `stmatrix` is b16) gets built.
 
+> **That prototype has since been built and it hides nothing — `f ≈ 0`, against
+> the 0.65 asked for here.** The framing above is right that this is the
+> question; two things it assumes are not. There is **no occupancy step to
+> clear** any more, because #87 made tensor memory the binding half of the
+> residency formula. And the store stage needs **no staging buffer and none of
+> the plumbing**, because an undrained accumulator survives the item boundary in
+> tensor memory — so `lcsf` is a reordering inside `Job::work` and
+> `pipeline::run` is untouched. Measured over two sessions it is −5.4% to +1.2%
+> at five sizes, and a probe that holds the epilogue's instructions fixed while
+> deleting its HBM traffic puts the write-bound part at 0–1.2%. See "and the
+> store stage was free to build and worth nothing" below.
+
 ##### and the walk was the 23%, recovered — #89
 
 `pipeline::run` and `run_stealing` answer *which item comes next*. Neither says
@@ -2580,6 +2599,193 @@ The bottom two ratios are also the reproducible ones and the top three are not �
 #92's finding that cuBLASLt's own variance dominates below 4096³ has not changed,
 and 0.354 should be read as "small, unstable, and worse" rather than to three
 digits.
+
+##### and the store stage was free to build and worth nothing — #15
+
+Every section above ends by pointing at `lcsf`. #90 called the item boundary
+"the shape `lcsf` changes"; #94 priced a staging buffer and rejected it; #98
+re-priced the occupancy step at 14–16% and set the bar at "hide ~70% of the
+boundary"; #87 then took the residency to 2 CTAs an SM for a reason that has
+nothing to do with shared memory. This is that measurement, and the answer is
+**no** by a margin that does not depend on which fit or which session.
+
+**The premise everything was ranked on is gone, and not because the arithmetic
+was wrong.** The brief for this work re-derived the shared budget as
+`233472 / 2 = 116736` B a CTA against a 98392 B plan, leaving **18344 B a CTA
+already paid for and unused**. That is right. What it does not say is that the
+step it was buying no longer exists: since #87 `CTAS_PER_SM` is **2 because 256
+accumulator columns are half of tensor memory**, and `min(512/columns,
+shared per SM/plan)` is `min(2, 2)`. So shared memory up to 18344 B a CTA is not
+"free" in the sense of being pre-paid — it is *invisible*, because the tensor
+memory half binds first and would go on binding. Above that the plan falls to
+one CTA an SM, which is #98's 25–44% cliff.
+
+**And 16384 B is not "a band" in any unit the epilogue is made of.** The
+`[32, 128]` fp32 band the arithmetic names is *one warp's* share of one drain
+step. A CTA's per-item output is `128 × 256` fp32 = **131072 B**, so 16384 B is
+an eighth of it, and four warps sharing one buffer serialise. The largest
+staging that fits is a `[128, 32]` strip — **eight single-buffered
+fill → fence → TMA-store → wait-read round trips an item**, since double
+buffering wants 32768 B and does not fit. That is the shape the "18344 B is
+enough" reading actually buys, and it is worth knowing before costing it.
+
+**None of which mattered, because the store stage does not need a staging buffer
+at all.** #15 files `lcsf` as a shape `pipeline::run` would have to grow, and
+#94 scoped it at 250–400 lines of missing plumbing — `TensorMapElement` is
+`Bf16`-only, there is no fp32 `SharedTile` swizzle, `stmatrix` is b16. What
+stands between item `i`'s epilogue and item `i + 1`'s first loads is none of
+that. It is that `drain` is the last thing `work` does. **The pair's accumulator
+lives in tensor memory allocated once outside the item loop, and the item
+boundary re-arms mbarriers and touches no tensor memory** — so an undrained
+accumulator survives it intact, and deferring the drain by one item is a
+reordering of phases inside `Job::work`. `src/pipeline.rs` is **unmodified**:
+the pending item is job state, and `lcf`'s scaffold already admits an `lcsf`
+job. The whole epilogue, the LDTM *and* the scattered fp32 stores, then runs
+while the next item's first `STAGES` loads are in flight, for **no shared
+memory, no deferred registers, no fp32 TMA path and no occupancy step**.
+
+That is `Lcsf` in `examples/src/gemm.rs`, and it is the cheapest honest
+prototype there is: the thing #94 said had to be built to find out is not on the
+path to finding out.
+
+**It does need a synchronisation the boundary does not supply, and that is a
+finding on its own.** The MMA is `cta_group::2`, issued by the leader alone and
+writing *both* ranks' halves of the accumulator. Under the fused epilogue the
+pair is separated by `run`'s cluster boundary. Here the peer's drain of item `i`
+and the leader's MMA for item `i + 1` are inside one `work`, and a `bar.sync`
+orders one CTA — the leader would overwrite tensor memory the peer is still
+reading, silently, as a wrong `C`. So `lcsf` does not want an extra barrier at
+the boundary; it wants the boundary's **scope** moved inside the item. The
+`bar.sync` before the drain is load-bearing too, and for an unrelated reason:
+`LDTM` is warp-collective and the producer branch leaves warp 0's lane 0
+somewhere its other 31 lanes are not.
+
+**The prediction, written into the sweep before it ran:** +4% to +11% at 8192³
+and 16384³, **nothing at 1024³**, monotone between — the boundary is a fixed
+per-tile cost, so what `lcsf` moves is amortized against the arithmetic between
+one boundary and the next. And 168 registers with no spill, because nothing is
+held across the boundary.
+
+**The register half was right and the throughput half was wrong.** Two sessions,
+one B200 each, min ms over 30 timed launches, static schedule, `GROUP = 8`,
+every row checked element-by-element against the CPU reference before it was
+timed. Identical grid, identical 98392 B shared plan, identical 256 accumulator
+columns, identical 2 CTAs an SM — **the diff is where one function is called
+from**:
+
+| shape | tiles | items/cluster | lcf ms | lcsf ms | vs lcf | session 2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024³ | 16 | 1.0 | 0.0288 | 0.0304 | **−5.4%** | −2.2% |
+| 2048³ | 64 | 1.0 | 0.0366 | 0.0372 | −1.6% | −2.8% |
+| 4096³ | 256 | 1.7 | 0.1447 | 0.1490 | −2.9% | −1.4% |
+| 8192³ | 1024 | 6.9 | 0.7506 | 0.7521 | **−0.2%** | −0.0% |
+| 16384³ | 4096 | 27.7 | 5.3869 | 5.4421 | **−1.0%** | **+1.2%** |
+
+**Across two sessions the deferred epilogue is −5.4% to +1.2% and never reliably
+positive.** The two headline rows are −0.2%/−0.0% and −1.0%/+1.2%: zero, inside
+this file's own spread. The 16384³ sign flip is the row §7 has twice called its
+least reproducible, and the *control* is what moved (5.3869 → 5.4972, 2.0%)
+while the treatment held to 0.2% — which is the cross-run spread behaving
+exactly as documented rather than a result.
+
+**The 1024³ row is the pre-registered falsifier and it did what it was supposed
+to.** Sixteen tiles over 148 clusters is one item each, so every epilogue is the
+*last* epilogue, `Lcsf::finish` pays it un-hidden, and the extra cluster
+rendezvous is pure cost. It loses most, at both sessions. So the cost model is
+right and it is the **benefit that is absent**: `f ≈ 0`, against the `f ≈ 0.65`
+#98 set as the bar for a route that also had to buy an occupancy step. This one
+had no step to buy and still did not clear zero.
+
+**What was left open, and the probe that closes it.** The deferred drain hides
+`{LDTM + global stores}` behind one pipeline fill. #15's TMEM → shared → TMA
+route would hide the same LDTM behind the same window — tensor memory has to be
+free before the item's first MMA either way — and *additionally* decouple the
+shared → global write. So exactly one question survived: **is the epilogue
+bandwidth-bound?** `Epilogue::HotStore` answers it by holding the epilogue's
+instructions fixed and moving only where they land: every item stores to the
+cluster's own first tile, so the same LDTM and the same count of
+`st.global.v2.f32` rewrite 38 MB that stays in L2 instead of streaming 268 MB or
+1 GB. **It computes a wrong `C` on purpose, is excluded from the correctness
+gate, and its number is an upper bound rather than a throughput** — the one
+deliberate exception to rule 1 in this file, stated in the launch's own label.
+
+| shape | lcf ms | hot ms | hot TFLOP/s | write-bound part |
+| --- | ---: | ---: | ---: | ---: |
+| 1024³ | 0.0268 | 0.0270 | 79.5 | −0.8% |
+| 2048³ | 0.0342 | 0.0340 | 505.1 | 0.6% |
+| 4096³ | 0.1437 | 0.1437 | 956.6 | 0.0% |
+| 8192³ | 0.7517 | 0.7502 | 1465.6 | **0.2%** |
+| 16384³ | 5.4972 | 5.4293 | 1620.1 | **1.2%** |
+
+**Deleting a gigabyte of streaming HBM writes is worth nothing.** The epilogue
+is issue-bound, not bandwidth-bound: the threads pay for the LDTM and for
+issuing the stores, and not for where the stores land. #91 already halved the
+instructions and doubled the sector fill and was worth 14–28%; what is left
+after it is not a memory-system term, and a staging buffer whose entire benefit
+is decoupling the global write has **≤1.2%** to recover at any size measured.
+
+**So #15 is answered in both of its forms, and the second answer did not need
+the 250–400 lines.** The cheap form hides the half that could be hidden and
+measures zero; the expensive form's only remaining advantage over the cheap form
+is worth at most 1.2%. Neither is worth building on this kernel.
+
+**Why, structurally, and this is the part that generalizes.** The overlap window
+is bounded by `STAGES` of loads and cannot be widened. The accumulator is
+**single-buffered in tensor memory**, so the drain must complete before the
+item's first MMA; a second accumulator is 512 columns, which is the whole of
+tensor memory and one CTA an SM. Meanwhile #98 measured a lone CTA at a flat
+~585–640 TFLOP/s against 900–1299 for three, which says *more than half of what
+this kernel achieves is already one CTA's stall covered by another's work* — the
+neighbouring CTA's K loop is what the epilogue's issue slots are already
+overlapping with. `lcsf` proposes to spend a resource that inter-CTA overlap has
+already spent. That reading is #102's too, at `K = 32768`, and it is now three
+measurements taken for unrelated reasons pointing the same way.
+
+**The denominator either side, same device, same container, minutes apart:**
+
+| shape | cuBLASLt TFLOP/s | lcf/theirs | lcsf/theirs |
+| --- | ---: | ---: | ---: |
+| 8192³ (session 1) | 1769.7 | **0.828** | 0.826 |
+| 16384³ (session 1) | 1854.5 | **0.881** | 0.872 |
+| 8192³ (session 2) | 1774.4 | **0.824** | 0.824 |
+| 16384³ (session 2) | 1870.7 | 0.855 | 0.866 |
+
+The `lcf` control reproduces #87's published **0.826 and 0.886** to within this
+file's spread, which is what says the container is not the story. Nothing here
+moves the shipped kernel, and 0.826/0.886 stands.
+
+**Registers and residency, both unchanged and both checked rather than
+asserted.** `ptxas -v -arch=sm_100a` through `modal_app.py::regcount` reports
+**168 registers, 0 spill store, 0 spill load, 528 B stack frame** on
+`gemm_cg2_lcsf`, byte-identical to `gemm_cg2`, `gemm_cg2_clc` and all four sweep
+rungs — the pre-registered prediction, and the direct evidence that the deferral
+holds nothing across the boundary. The occupancy-step gate reads 168 against
+255. Residency is **2 CTAs an SM, counted**: #87's census row counted 2 at
+exactly this envelope (256 columns, 98392 B, `wait 0.9 µs`), and no byte of the
+shared plan and no accumulator column moved, so the count carries by identity
+rather than by extrapolation. **No new census rung was run, and that is the
+reason** — a rung at an envelope already counted would have spent a B200 to
+reproduce a number.
+
+**What is kept, and why the losing attempt stays in the tree.** `gemm` still
+ships `lcf`. `Lcsf`, `HotStore`, the `Epilogue` axis and
+`bench --case epilogue` stay, and `Lcsf` stays on the correctness gate at both
+shapes and all three traversal widths — including `4096x4096x256`, where 256
+tiles over 148 clusters means every cluster carries a pending accumulator across
+boundaries and one past the loop, which is the way this change fails silently.
+The reason to keep it runnable is that the constraint that decided it is a
+property of **this tile**: the overlap window is one pipeline fill, and #87 moved
+`STAGES` and `BLOCK_N` once already. A tile whose fill is longer, or a kernel
+whose epilogue is genuinely latency-exposed, would re-run this sweep rather than
+inherit its answer.
+
+**One thing this does not claim.** `lcsf` is a bad trade *for a GEMM whose
+accumulator is single-buffered in tensor memory and whose epilogue is
+issue-bound*. #15's original motivation — a training kernel with a
+producer-consumer epilogue — is a different kernel, and nothing here prices it.
+What is now established is the method: the store stage costs one reordering to
+try, so the next kernel that wants one should measure it before anyone scopes a
+tensor map.
 
 #### 8. Multicast has no geometry to live in
 

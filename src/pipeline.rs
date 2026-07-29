@@ -150,6 +150,39 @@
 //! boundary that retires the item is also what says no thread is still reading
 //! the response the next request will land on. It costs no extra barrier.
 //!
+//! # The store stage `lcf` is supposed to lack, which this already carries
+//!
+//! ThunderKittens' next prototype up is `lcsf` — load-compute-**store**-finish
+//! — and #15 files it as a shape this module would have to grow, on the
+//! grounds that with the store folded into the item it cannot overlap the next
+//! item's load. **Nothing here had to change to get that overlap**, and the
+//! reason is a property of what the item boundary touches rather than of the
+//! loop above it.
+//!
+//! [`run`] re-initializes mbarriers per item. It does not touch tensor memory,
+//! which a [`Job`] allocates once *outside* the loop precisely because an
+//! allocation spans items. So a job may finish `work` with its accumulator
+//! **undrained**, carry it across the boundary intact, and drain it at the top
+//! of the next item — after that item's first stages are issued and while they
+//! are in flight. The pending item is job state, `work` is where the phases are
+//! ordered, and `lcsf` is therefore a reordering inside a [`Job`] rather than a
+//! stage this scaffold sequences. `examples/src/gemm.rs`'s `Lcsf` is one, built
+//! against this file unmodified.
+//!
+//! Two obligations move to the job with it, and both are silent when missed.
+//! The drain reads tensor memory the *next* item's MMA will overwrite, so
+//! whatever rendezvous separates them must cover every CTA that MMA writes —
+//! for a `cta_group::2` accumulator that is the cluster, not the block, and
+//! the item boundary's scope has to appear inside `work` and not only around it.
+//! And a job that defers its last item's store owes one drain after [`run`]
+//! returns, which is a whole output tile computed by nobody if it is forgotten.
+//!
+//! What that buys is a separate question from whether it can be expressed, and
+//! for the GEMM the answer is nothing — `examples/README.md` §7 has the two
+//! sessions and the probe that says why. The fact worth carrying here is that
+//! the experiment cost a reordering, so the next job with a store phase should
+//! measure one before anyone scopes a second scaffold.
+//!
 //! # Which item, and which tile: [`grouped`]
 //!
 //! Both loops above answer *which item comes next*. Neither says what an item

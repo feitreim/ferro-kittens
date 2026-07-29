@@ -421,6 +421,20 @@ Missing from `prototype/` (**#15**):
 - **`lcsf`** — load-compute-**store**-finish. The store stage is what a training
   kernel with a producer-consumer epilogue needs; without it the store is folded
   into `finish` and can't overlap the next work item's load.
+
+  **Built, measured and not adopted for the GEMM — and the scaffold needed no
+  change to carry it.** An undrained accumulator survives the item boundary in
+  tensor memory, so deferring the epilogue by one item is a reordering of
+  phases inside `Job::work` and `pipeline::run` is untouched: `lcf`'s scaffold
+  already admits an `lcsf` job. Measured over two sessions it is **−5.4% to
+  +1.2%** and never reliably positive, and a probe holding the epilogue's
+  instructions fixed while removing its HBM traffic puts the write-bound part
+  of the epilogue at **0–1.2%**. So the term `lcsf` exists to overlap is not
+  costing this kernel anything to begin with. `examples/README.md` §7 has both
+  tables and what they leave open. A kernel whose epilogue is genuinely
+  latency-exposed may still want this; a `Job` whose accumulator is
+  single-buffered in TMEM cannot overlap more than one pipeline fill's worth of
+  it, which is the constraint that decided this one.
 - **`lcsc`** — the store-compute variant.
 - **`interpreter`** — TK's instruction-driven "VM" kernel, where a persistent
   grid dispatches over an opcode stream. This is the newest and most speculative
