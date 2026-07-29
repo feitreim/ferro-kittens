@@ -185,6 +185,14 @@ type Partials = SharedVec<F32, WARPS>;
 
 pub const SHARED_BYTES: usize = Tile::BYTES + 2 * Parameters::BYTES + 64;
 pub const THREADS: u32 = (WARPS * 32) as u32;
+/// `groupnorm_tile`'s `#[launch_bounds]` spells this count as a literal — the
+/// attribute takes one, and `modal_app.py`'s occupancy gate reads it back out
+/// of the source with a digit regex. So [`THREADS`] derives from [`ROWS`] and
+/// the attribute does not, and a tile that changed shape would move one and
+/// leave the other: `ptxas` would be told a residency for a launch that no
+/// longer exists, and the gate would check the step at the wrong width. This
+/// is the two of them saying the same number out loud.
+const _: () = assert!(THREADS == 128);
 
 #[cuda_module]
 pub mod kernels {
@@ -313,7 +321,7 @@ pub mod kernels {
     ///
     /// # The residency is declared, because it used to be luck
     ///
-    /// `#[launch_bounds(THREADS, 3)]` is `__launch_bounds__`: it puts
+    /// `#[launch_bounds(128, 3)]` is `__launch_bounds__`: it puts
     /// `.maxntid 128, 1, 1` and `.minnctapersm 3` on the entry, so **`ptxas` is
     /// told the residency this kernel is written for** and caps registers to
     /// reach it. Three CTAs an SM at 128 threads is 168 registers a thread,
