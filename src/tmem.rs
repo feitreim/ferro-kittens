@@ -619,7 +619,7 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     {
         const {
             assert!(
-                N % 64 == 0,
+                N.is_multiple_of(64),
                 "tcgen05.ld.16x256b.x8 covers 64 columns; a band it drains has to be a multiple of that"
             )
         };
