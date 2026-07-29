@@ -19,7 +19,7 @@ target *of the library*.)
 
 | Kernel | Status | Blocked on |
 | --- | --- | --- |
-| [`gemm`](src/gemm.rs) | **runs** — exact against a CPU reference | — (and no gap worked around in-file any more) |
+| [`gemm`](src/gemm.rs) | **runs** — exact against a CPU reference, `==` on a bf16 `C` against a reference rounded the same way (#108) | — (and no gap worked around in-file any more) |
 | [`softmax`](src/softmax.rs) | **runs** — within 2⁻⁸ of a CPU reference | — |
 | [`layernorm`](src/layernorm.rs) | **runs** — `layernorm_rows` within 2⁻⁷ of a CPU reference; `groupnorm_tile` compiles, no launcher | — |
 | [`flash_forward`](src/flash_forward.rs) | **compiles** — no launcher yet | — |
@@ -2805,6 +2805,341 @@ producer-consumer epilogue — is a different kernel, and nothing here prices it
 What is now established is the method: the store stage costs one reordering to
 try, so the next kernel that wants one should measure it before anyone scopes a
 tensor map.
+
+##### and `C` is bf16 now, on both sides of the ratio — #108
+
+`gemm_cg2` accumulated in fp32 and *wrote* fp32 through #107. `bf16` in, fp32
+accumulate, `bf16` out is the ordinary training-GEMM signature, so it was the
+output that was the unusual half here, and this is the change that moves it.
+**The accumulator does not move**: the accumulator is still 256 fp32 columns of
+tensor memory, the drained band is still 128 fp32 a thread, and the single
+`cvt.rn.bf16x2.f32` lives inside the store.
+
+**The cuBLASLt baseline moved in the same commit and had to.** At 8192³ an fp32
+`C` is 268 MB and a bf16 `C` is 134 MB. Timing our kernel writing half as much
+against a baseline still writing twice as much, and reporting the difference as
+ours, is the way this change goes wrong — so `cublaslt.rs`'s output layout is
+`CUDA_R_16BF` and both columns below were re-measured in one container.
+`CUBLAS_COMPUTE_32F` and the `CUDA_R_16BF` operands are untouched; the library
+accumulates in fp32 exactly as we do. That module's own doc used to say
+upstream's C file "uses a 2-byte output and is not the same measurement", which
+had the asymmetry backwards — the baseline had been bent to match *us*.
+
+**Which earlier rows survive this, because most do not.** Every `ours/theirs`
+ratio in §7 above — #92's 0.573–0.694, #102's 0.742/0.793, #87's 0.826/0.886,
+#107's 0.824–0.881 — is a *pair* of fp32-output measurements, as is every
+absolute millisecond and every TFLOP/s figure. None is comparable to a number
+below, and rescaling one is not available either, since the two sides did not
+have to lose the same amount. What survives, being a property of the tile rather
+than of the output: the counted residency, the register count and its zero
+spill, `GROUP = 8`, the 98392 B shared plan, wave efficiency, `wave_reuse`, and
+the whole structural argument about the item boundary. #87's rungs stay
+comparable to *each other* across this change and not to their published
+figures.
+
+**The predictions, written into this file before the run.** They are in the
+commit that added the section with these tables empty, which is the only way a
+pre-registration in a repo is worth anything.
+
+1. **bf16 `C` is worth roughly nothing, and might cost.** #107's `HotStore`
+   deleted a gigabyte of streaming writes for 0–1.2%, so the epilogue is
+   issue-bound and halving its bytes cannot buy more than that. And it does not
+   reduce the instruction count: under `BaseLdtm` the contiguous run is 2 (#94's
+   `CONTIGUOUS_VALUES`; the columns are `{0,1}` then `{8,9}`, eight apart), so a
+   bf16 pair is a **4-byte store where an fp32 pair was 8 — the same number of
+   stores, half as wide** — plus a `cvt` that was not there before. Predicted
+   **−1% to +1.5%** at 8192³ and 16384³.
+2. **The ratio moves against us, slightly.** cuBLASLt gets the cheaper output
+   too and sits closer to the machine, so if the write is worth anything it is
+   worth at least as much to them. Predicted **0 to −3 points** off #107's 0.828
+   and 0.881.
+3. **168 registers, 0 spill, 528 B frame, unchanged.** The `cvt` takes two fp32
+   and yields one packed word, so peak liveness cannot rise.
+4. **2 CTAs an SM, unchanged, and not for a shared-memory reason.** Since #87
+   the binding half of `min(512 / columns, shared per SM / plan)` is tensor
+   memory — `512 / 256 = 2` — and a narrower `C` moves neither term. To be
+   *counted* rather than assumed.
+5. **Exactness survives with no tolerance at all**, and the worst relative error
+   of the output against the exact fp32 reference is **2⁻⁸ ≈ 3.9e-3**.
+
+And a sixth, for a probe this change adds rather than for the change itself:
+`Epilogue::DoubleDrain` runs the epilogue twice per item and prices it directly
+instead of as a share of a fitted boundary. Predicted **5–12 µs a tile at
+8192³**, so 5–12% of that launch.
+
+**1. Both columns, both output elements, four B200 containers in one session.**
+`fp32` is `a68c390` — the commit before this one, with `cublaslt.rs` still at
+`CUDA_R_32F` — run back to back with the branch through the same
+`bench --case gemm`. Every row on both sides is checked against the same CPU
+reference before it is timed, and cuBLASLt's heuristic returned a **byte-identical
+algorithm at every size in both runs** (`id=66`, same tile, `splitk=1`, no
+workspace used), so nothing below is a different kernel being compared.
+
+| shape | ours fp32 | ours bf16 | ours | theirs fp32 | theirs bf16 | theirs | fp32 ratio | bf16 ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256x256x256 | 0.0228 | 0.0244 | −6.6% | 0.0076 | 0.0113 | −32.7% | 0.336 | 0.463 |
+| 512x256x256 | 0.0231 | 0.0247 | −6.5% | 0.0075 | 0.0111 | −32.4% | 0.325 | 0.449 |
+| 1024³ | 0.0268 | 0.0297 | −9.8% | 0.0101 | 0.0140 | −27.9% | 0.378 | 0.473 |
+| 2048³ | 0.0341 | 0.0359 | −5.0% | 0.0210 | 0.0229 | −8.3% | 0.615 | 0.638 |
+| 4096³ | 0.1426 | 0.1441 | −1.0% | 0.0859 | 0.0898 | −4.3% | 0.603 | 0.623 |
+| **8192³** | 0.7489 | **0.7344** | **+2.0%** | 0.6163 | 0.5964 | +3.3% | 0.823 | **0.812** |
+| **16384³** | 5.4025 | **5.2326** | **+3.2%** | 4.7637 | 4.5619 | +4.4% | 0.882 | **0.872** |
+
+In TFLOP/s the two large rows are **1468.1 → 1497.1** and **1628.2 → 1681.0**
+for us, against **1784.0 → 1843.5** and **1846.5 → 1928.2** for cuBLASLt.
+
+**And a single pair of containers is not enough to read those two rows, which
+is the first thing to say about them.** The branch was measured three times at
+8192³ across this session's containers — 0.7344, 0.7456 and 0.7440 ms — where
+the fp32 control was measured once, at 0.7489. So the gain at 8192³ is
+**+0.4% to +2.0%, about +1.1% on the mean**, against a cross-container spread on
+this row of 1.5%. At 16384³ the three bf16 measurements are 5.2326, 5.5193 and
+5.4765 against the control's 5.4025 — they **straddle it**, which is what §7 has
+twice said about 16384³ and is not new information about this change.
+
+| | ours fp32 | ours bf16, three containers | theirs fp32 | theirs bf16, three containers |
+| --- | ---: | --- | ---: | --- |
+| 8192³ | 0.7489 | 0.7344 / 0.7456 / 0.7440 | 0.6163 | 0.5964 / 0.6154 / 0.6137 |
+| 16384³ | 5.4025 | 5.2326 / 5.5193 / 5.4765 | 4.7637 | 4.5619 / 4.6969 / 4.7119 |
+
+**So prediction 1 is confirmed and prediction 2 is confirmed.** bf16 `C` is
+worth about **+1% at 8192³ and nothing resolvable at 16384³**, inside the
+predicted −1% to +1.5%; and the ratio to cuBLASLt is **0.812–0.825 against the
+control's 0.823** at 8192³ and **0.851–0.872 against 0.882** at 16384³ — flat to
+two points down, inside the predicted 0 to −3. The library gains at least as
+much from the cheaper output as we do, which is exactly why moving only our side
+would have been a fabricated win: read against the *published* fp32 ratios of
+0.826 and 0.886, our unmoved-baseline numbers would have looked like +3.6% and
++4.9%.
+
+**The small end is the loud part of the table and none of it is readable.**
+Ours loses 5–10% at and below 2048³ and cuBLASLt loses 28–33% at and below
+1024³ — with, again, an identical algorithm pick. #92 measured cuBLASLt's own
+run-to-run variance at **33% to 77%** below 2048³ and ours at 5–11%, and this
+session has one measurement per size down there. Every one of those deltas is
+inside the variance already documented for its own side. The `bf16 ratio` column
+at the top of the table therefore says *nothing good about us*: 0.336 → 0.463 at
+256³ is the baseline getting worse, not the kernel getting better, and it is the
+clearest example in this file of why a ratio whose denominator moved must not be
+read as a numerator result.
+
+What is worth a second look, if anyone wants it, is that our own small-size loss
+is at least the right *shape* for the mechanism: a `cvt` per pair is pure added
+issue, and a launch that is one item per cluster has no operand stream for the
+halved bytes to pay it back out of. Four rows in a row lean that way. It is not
+established by this session and would want its own.
+
+**The fp32 path is kept in the library and not in the kernel, and that is a
+choice worth stating.** `GlobalRows<E>` carries the element, `store_rows` and
+`load_rows` are generic over it, and `flash_forward` and `device-tests` still
+write fp32 through exactly the code they did — so the losing side of this change
+is reachable, tested and on the CPU gate. What is *not* kept is an fp32 entry
+point in `gemm.rs`. That is not one line: the kernel signature, the device
+buffer, the launcher's closure type and the reference the check compares against
+all key off the element, so a permanent in-tree A/B is 80–120 lines and a fork
+in `run`, for a configuration this issue decided against. The comparison it
+would buy is the one table 1 already has, obtained the cheaper way — run the
+parent commit back to back — and `a68c390` does not stop being available.
+
+**2. The accuracy change, and the tolerance that did not move.**
+
+The output rounds where it did not before, so the obvious expectation is that
+the exactness check acquires a tolerance. **It does not, and that is worth being
+precise about rather than glossing.** The comparison is still `==`, on the
+16-bit words, at every element of `C`, for the kernel and for cuBLASLt alike.
+
+What made that available is that **the rounding is put in the reference**.
+`gemm::check_c` computes the exact fp32 dot product as it always did and then
+applies `to_bf16` — the same round-to-nearest-even, ties included, that
+`cvt.rn.bf16x2.f32` applies — and compares words. That works because the sum
+itself is still exact: every operand is exact in bf16 and every partial sum
+stays under 2²⁴, so the fp32 value arriving at the `cvt` is the same integer
+whatever order it was summed in, and rounding a known integer once is a
+deterministic function of it.
+
+| | before #108 | after |
+| --- | --- | --- |
+| comparison | `==` on fp32 | `==` on bf16 words |
+| tolerance | none | **none** |
+| worst relative error against the exact fp32 reference | 0 | **3.86e-3** |
+
+3.86e-3 is 2⁻⁸, it is what was predicted, and it is a property of bf16 and of
+the magnitudes this reference produces rather than of the kernel — which is why
+it is *reported* by `check_c` and not asserted against a bound. It is printed on
+every checked size by `modal_app.py::examples`.
+
+**The alternative was considered and is strictly weaker.** Widening the observed
+bf16 back to fp32 and comparing against the unrounded reference within a
+tolerance would have needed a tolerance of at least 2⁻⁸ — and a tolerance wide
+enough to admit correct rounding admits everything smaller than it too, so a
+wrong tile that happened to land close would pass. Rounding the reference keeps
+the gate exact.
+
+**What the check is now blind to, stated plainly.** Two fp32 accumulators
+differing by less than half an ulp of bf16 round to the same word, so an error
+under roughly 0.2% of an element's magnitude is invisible where it was not
+before. Every failure this gate exists for — a wrong coordinate, a wrong stride,
+a dropped or doubled tile, a wrong operand half, a mis-walked K — moves an
+element by far more than that or leaves it at zero, so none of them got harder
+to see. The case it can no longer *promise* to catch at every element is a
+kernel that accumulated in bf16 rather than fp32; at these reduction depths it
+would still fail most elements, but that is an argument and not a guarantee, and
+it is the price of the output format.
+
+One thing the shared check buys that is new: cuBLASLt goes through the same
+`check_c`, so the baseline is now held to rounding **once, from an fp32
+accumulator**. A library that rounded a partial sum would fail there rather than
+be timed.
+
+**3. Registers, spill and residency — two of the three as predicted.**
+
+`ptxas -v -arch=sm_100a` through `modal_app.py::regcount`, on the whole examples
+artifact:
+
+| entry point | regs | spill st | spill ld | frame |
+| --- | ---: | ---: | ---: | ---: |
+| `gemm_cg2` | **166** | 0 | 0 | 528 B |
+| `gemm_cg2_clc` | 168 | 0 | 0 | 528 B |
+| `gemm_cg2_lcsf` | **172** | 0 | 0 | 528 B |
+| `gemm_cg2_hot` | 168 | 0 | 0 | 528 B |
+| `gemm_cg2_2x` | 168 | 0 | 0 | 528 B |
+| `gemm_cg2_2s` | **255** | 0 | 0 | 528 B |
+| `gemm_256x256_s2` | 166 | 0 | 0 | 528 B |
+| `gemm_256x128_s2` / `s3` / `s4` | 168 | 0 | 0 | 528 B |
+
+**Prediction 3 said 168 and unchanged, and it is 166.** The direction that
+mattered held — zero spill, and the occupancy gate reads 166 against a ceiling
+of 255 with 89 registers of headroom — but the count moved, in both directions
+across the entry points: the shipped kernel is two lower, `lcsf` is four higher.
+Six times now the register column has failed to say what it was expected to say
+here (#47, #63, #67, #76, #94), and this is the seventh; nothing in the TFLOP/s
+column follows it.
+
+A plausible reading of the −2, offered as a reading: the fp32 pair store is
+inline PTX carrying `clobber("memory")`, and the bf16 pair store is a plain
+4-byte word — `Element::write_pair`'s override needs no asm at all, because two
+bf16 *are* one packed word. So the store loop lost a scheduling barrier. That
+would also be a candidate mechanism for the +1% in table 1, and neither claim is
+established here.
+
+**`gemm_cg2_2s` at 255 is a finding about the probe and it qualifies table 4.**
+Holding a band live across two store loops raises peak liveness, which is #63's
+"register cost is liveness" arriving exactly where that rule predicts it. It
+does not spill, and 255 still admits the two CTAs an SM the kernel is sized for,
+so the probe's residency is the kernel's. But a measurement taken at the
+architectural ceiling may be paying for the pressure as well as for the stores,
+which biases its number **up** — so table 4's split is read as a bound and not
+as a partition.
+
+**Residency is 2 CTAs an SM and it is counted, not assumed.** #87's
+`tmem residency census` counted 2 at exactly this envelope — 256 accumulator
+columns, 98392 B of shared, `wait 0.9 µs` — and this change moves neither term
+of `min(512 / columns, shared per SM / plan)`: not one accumulator column and
+not one byte of the shared plan. The binding half is still tensor memory,
+`512 / 256 = 2`, which is why a smaller `C` could not have moved it. **No new
+census rung was run, and that is deliberate** — a rung at an envelope already
+counted spends a B200 to reproduce an integer. Prediction 4 confirmed.
+
+**4. Is `stmatrix` reachable now, and what would it be worth.**
+
+**Reachable: yes, and there is no plumbing left to build.** #94 scoped this
+route at 250–400 lines on three missing pieces — *"`TensorMapElement` is
+`Bf16`-only, there is no fp32 `SharedTile` swizzle, `stmatrix` is b16"* — and
+all three were the same fact, which was that `C` was fp32. With a bf16 `C` the
+library already holds every piece, and none of them is new work:
+
+| what the route needs | what exists |
+| --- | --- |
+| fp32 registers → swizzled bf16 shared tile | `kittens::ldst::store_tile`, `stmatrix.m8n8.x2` per `[16, 16]` block |
+| the fp32 → bf16 rounding | `Element::pack`, one `cvt.rn.bf16x2.f32` per pair — the same count the direct store already pays |
+| shared → global | `SharedTile::tma_store_2d`, `tma_store_commit`, `tma_store_wait_read` (#9) |
+| the descriptor | `GlobalLayout::<Bf16, 2>::tensor_map` |
+
+So #107's rejection of the staging route really was conditional on a constraint
+this change removes, and the estimate it rejected is now zero.
+
+**Worth: bounded at about 6% of 8192³, and the bound is the interesting part.**
+`Epilogue::DoubleDrain` (`2x`) runs the whole epilogue twice per item and
+`Epilogue::DoubleStore` (`2s`) runs the LDTM once and the stores twice, both
+aiming the extra pass at the cluster's home tile so its bytes stay in L2. Both
+compute a wrong `C` on purpose and are excluded from the gate. `2x - lcf` is one
+epilogue, `2s - lcf` is one store loop, `2x - 2s` is the LDTM — no fit, and
+nothing deleted for a dead-code pass to have an opinion about. Per item on the
+critical path:
+
+| shape | lcf ms | 2x ms | 2s ms | epilogue µs | stores µs | LDTM µs | epilogue % of launch |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024³ | 0.0268 | 0.0376 | 0.0341 | 10.78 | 7.26 | 3.52 | 40.2% |
+| 2048³ | 0.0338 | 0.0464 | 0.0413 | 12.58 | 7.52 | 5.06 | 37.2% |
+| 4096³ | 0.1420 | 0.1928 | 0.1744 | 25.39 | 16.18 | 9.22 | 35.8% |
+| **8192³** | 0.7440 | 0.8941 | 0.8357 | **21.44** | **13.11** | 8.33 | **20.2%** |
+| **16384³** | 5.4765 | 6.2259 | 6.0314 | **26.76** | **19.82** | 6.95 | **13.7%** |
+
+The `2x` column was run twice in two containers and gives 20.74 and 21.44 µs at
+8192³ — 3.4% apart, which is this benchmark's own spread.
+
+**Prediction 6 was 5–12 µs a tile at 8192³ and the answer is 21.4. Refuted, by
+about a factor of two**, and the way it is wrong is the useful part. 21.4 µs sits
+*above* the whole item boundary as #104 fits it (8.6–18.3 µs) — and the epilogue
+is only part of that boundary. Both numbers can be right only if the epilogue is
+**partly overlapped in the real kernel and not at all in the probe**: the second
+epilogue has no loads in flight to hide behind, so `2x - lcf` is the epilogue's
+*serial* cost and the fit sees only its *exposed* residue. The pre-registration
+argued this bias would run the other way, that a marginal epilogue would be
+cheaper than the first. It is dearer.
+
+**Which makes the ceiling arithmetic explicit.** `stmatrix` keeps the LDTM
+untouched and halves the stores — 128 pair stores a thread an item become 64
+warp-collective `stmatrix.x2`, at the same `cvt` count, with the global write
+handed to the TMA engine. So its ceiling is half the `stores` column and none of
+the `LDTM` one: **6.6 µs a tile at 8192³ and 9.9 at 16384³, which is 6.2% and
+5.1% of those launches.** Under it, `gemm_cg2_2s`'s 255 registers say part of
+that 13.11 µs may be register pressure rather than stores, so 6.2% is an upper
+bound on an upper bound.
+
+**Against that sits a cost the earlier sections already measured.** At two CTAs
+an SM the shared budget is `233472 / 2 = 116736` B against a 98392 B plan, so
+**18344 B a CTA is free without moving residency** — and a bf16 `[128, 64]`
+strip is 16384 B and fits, where the fp32 version of the same argument (#107)
+only reached a `[128, 32]`. A CTA's per-item output is `128 × 256` bf16 =
+65536 B, so that is **four single-buffered fill → fence → TMA-store → wait-read
+round trips an item**, against eight for fp32. Double buffering wants 32768 B
+and still does not fit. The drain would therefore serialize into four phases
+inside a window that must close before the item's first MMA, because the
+accumulator is single-buffered in tensor memory and a second one is 512 columns
+— the whole of it, and one CTA an SM.
+
+**So the direct answer, in one line: reachable with no missing plumbing, worth
+at most ~6% at 8192³ and ~5% at 16384³, and it has to buy that out of four
+serialized TMA round trips it did not previously have.** That is a real lever
+and the largest one currently identified — #102's traversal was 8.4% and is
+spent, #87's tile was 11.6–21.6% and is spent — but it is an upper bound with a
+known cost against it, and the honest statement is that it is now a
+**build-and-measure** question rather than a plumbing one.
+
+**Two things argue it will deliver less than the ceiling, and they should be
+read before anyone starts.** `Epilogue::Deferred` moves the entire epilogue
+behind a pipeline fill and `Epilogue::HotStore` deletes its HBM traffic, and
+both are worth nothing now that there is half as much traffic to delete — both
+re-run in each of this session's two epilogue containers, so both columns below
+carry their own spread:
+
+| probe | what it moves | at 8192³ | at 16384³ |
+| --- | --- | ---: | ---: |
+| `lcsf` | *when* the epilogue runs | +1.0% / +1.7% | +1.1% / −0.5% |
+| `hot` | *where* its bytes land | +0.5% / −0.0% | −1.9% / −1.0% |
+| `2x` | *how many* epilogues run | **−20.2%** | **−13.7%** |
+| `2s` | how many *store loops* run | **−12.3%** | **−10.1%** |
+
+Neither of the top two is a store-count experiment, so neither refutes the 6% —
+but between them they say the epilogue's *placement* and its *bytes* are both
+worth nothing here, and what is left for `stmatrix` is the narrow claim that its
+**issue count** is worth something. The bottom two are the first evidence in this
+file that it might be: adding epilogue work costs 20% of the launch and adding
+half of it costs 12%, so epilogue work is plainly not free, whatever moving it
+around fails to buy. (`lcsf` also stops being reliably negative here where #107
+had it at zero — +1.0/+1.7 at 8192³ against that section's −0.2/−0.0 — which is
+inside both sections' spread and is not a reason to ship it.)
 
 #### 8. Multicast has no geometry to live in
 

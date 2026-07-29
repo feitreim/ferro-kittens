@@ -261,9 +261,10 @@ pub const CUBLASLT: Option<Baseline> = None;
 /// does *not* settle is what the kernel could do, and [`GEMM_DEPTH_SIZES`]
 /// below reaches 1369.9 TFLOP/s with no constant changed.
 ///
-/// It costs 2.1 GiB of device memory — `A` and `B` are 512 MiB of bf16 each and
-/// `C` is 1 GiB of fp32 — against the 180 GiB a B200 carries, so the size is
-/// bounded by host staging time and not by the device.
+/// It costs 1.6 GiB of device memory — `A` and `B` are 512 MiB of bf16 each and
+/// `C` is 512 MiB of bf16 since #108, where it was 1 GiB of fp32 — against the
+/// 180 GiB a B200 carries, so the size is bounded by host staging time and not
+/// by the device.
 const GEMM_SIZES: &[Shape] = &[
     // The smallest shape that is **one cluster running exactly one item**, and
     // therefore §7's "the small-size floor is one item boundary" row. It was
@@ -316,8 +317,9 @@ const GEMM_SIZES: &[Shape] = &[
 /// `384 · K` elements and computes `2 · 256 · 128 · K` flops whatever the
 /// problem is. **Arithmetic intensity is a property of the tile, not of the
 /// shape** — 85.3 FLOP/byte, always — so every shape below requests the same
-/// 12.9 GB of operands from the memory system and writes the same 268 MB of
-/// `C`. Holding `M · N` and `K` fixed at 8192³'s values holds all of that
+/// 12.9 GB of operands from the memory system and writes the same 134 MB of
+/// `C` (268 MB before #108 made the output bf16; it is the same in every row
+/// either way, which is all this table needs of it). Holding `M · N` and `K` fixed at 8192³'s values holds all of that
 /// fixed: 2048 tiles, 10 waves of 222 clusters, 92.3% wave efficiency,
 /// 1.1 TFLOP, one grid of 444 blocks. Only the aspect ratio moves.
 ///
@@ -383,14 +385,14 @@ pub const GEMM_FOOTPRINT_SIZES: &[Shape] = &[
 ///
 /// `M` and `N` are 8192 throughout, so every row has the same 2048 tiles, the
 /// same 10 waves over 222 clusters, the same 92.3% wave efficiency, the same
-/// grid of 444 blocks, and writes the same 268 MB of `C`. Every row also has
+/// grid of 444 blocks, and writes the same 134 MB of `C`. Every row also has
 /// the same operand traffic *per flop* and the same L2 working set per K block,
 /// because neither depends on `K`. What changes is how much arithmetic sits
 /// between one boundary and the next: 8, 32, 128 and 512 K blocks.
 ///
 /// The boundary is not free and #83 said so without pricing it. `lcf` folds the
 /// epilogue into the item, so a cluster finishing a tile drains its accumulator
-/// through LDTM, writes 64 KiB of fp32 per CTA to global memory, and only then
+/// through LDTM, writes 64 KiB of bf16 per CTA to global memory, and only then
 /// issues the next tile's first `STAGES` loads — the store and the refill
 /// cannot cross, which is exactly what #15's `lcsf` is for. That cost is per
 /// *tile* and constant, so as a fraction of the run it goes as `1/K`, and a

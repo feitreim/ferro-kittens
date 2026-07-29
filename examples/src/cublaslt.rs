@@ -24,10 +24,20 @@
 //!
 //! ## The configuration, and the trap in it
 //!
-//! [`crate::gemm`] computes `C = A·Bᵀ` with **bf16 operands and an fp32 `C`**,
-//! `C` row-major with `ldc = n`. So: `CUDA_R_16BF` in, `CUBLAS_COMPUTE_32F`
-//! across, `CUDA_R_32F` out. Upstream's C file uses a 2-byte output and is not
-//! the same measurement.
+//! [`crate::gemm`] computes `C = A·Bᵀ` with **bf16 operands, an fp32
+//! accumulator and a bf16 `C`**, `C` row-major with `ldc = n`. So:
+//! `CUDA_R_16BF` in, `CUBLAS_COMPUTE_32F` across, `CUDA_R_16BF` out.
+//!
+//! **The output was fp32 on both sides through #107, and #108 moved both.**
+//! This paragraph used to say that upstream's C file uses a 2-byte output and
+//! is therefore not the same measurement — which was true, and had the
+//! asymmetry the wrong way round: it is a training GEMM's ordinary signature
+//! that upstream was using and our fp32 `C` that was unusual. The two halves
+//! have to move together or the comparison is worthless: at 8192³ an fp32 `C`
+//! is 268 MB and a bf16 one is 134 MB, so leaving this line at `CUDA_R_32F`
+//! would time a baseline writing twice what the kernel it divides writes, and
+//! report the difference as ours. Every ratio published before #108 is against
+//! the fp32 pair and is not comparable to one measured after it.
 //!
 //! cuBLASLt is column-major and ours is row-major, and reconciling that is
 //! where a baseline goes wrong. Written out, with `Â` meaning "the bytes of
@@ -56,10 +66,17 @@
 //! exact in bf16, and every partial sum stays under 983,040 against fp32's
 //! exact integer range of 2²⁴. Integer addition in fp32 below that bound is
 //! exact **in any order**, so it does not matter which tiling cuBLASLt picks,
-//! whether it splits K, or in what order it reduces the pieces: the answer is
-//! the same integer ours is, and the comparison stays `==` rather than a
-//! tolerance. A tolerance is what would have let a subtly wrong baseline
-//! through.
+//! whether it splits K, or in what order it reduces the pieces: the fp32 value
+//! reaching the epilogue is the same integer ours is.
+//!
+//! **A bf16 output does not cost that**, which is the part worth stating
+//! plainly. Rounding one exactly-known integer to bf16 is a deterministic
+//! function of it, so the comparison stays `==` on the 16-bit words against a
+//! reference [`gemm::check_c`] rounds the same way, and no tolerance was
+//! introduced on either side. A tolerance is what would have let a subtly wrong
+//! baseline through — and here it would also have hidden a library that rounded
+//! a *partial* sum, which is the one new way this baseline could differ from
+//! ours and the one this comparison still catches.
 //!
 //! ## What is fair here, and what is not
 //!
@@ -417,7 +434,7 @@ pub fn bench(
     // a re-implementation of the operands: the same function.
     let a = DeviceBuffer::from_host(&stream, &gemm::stage(m, k, gemm::a_value))?;
     let b = DeviceBuffer::from_host(&stream, &gemm::stage(n, k, gemm::b_value))?;
-    let c = DeviceBuffer::<f32>::zeroed(&stream, m * n)?;
+    let c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
     // Outside the timed region, as every allocation on both sides is.
     let workspace = DeviceBuffer::<u8>::zeroed(&stream, WORKSPACE_BYTES)?;
 
@@ -439,7 +456,12 @@ pub fn bench(
     set_transpose(session.desc, DESC_TRANSB, CUBLAS_OP_N)?;
     layout(&mut session.a, CUDA_R_16BF, k, n, k)?;
     layout(&mut session.b, CUDA_R_16BF, k, m, k)?;
-    layout(&mut session.d, CUDA_R_32F, n, m, n)?;
+    // bf16 out since #108, and this line is half of that change: ours writes
+    // 134 MB of `C` at 8192³ where it wrote 268, and a baseline left at
+    // `CUDA_R_32F` would be writing twice as much as the kernel it is the
+    // denominator for. The compute type is untouched — both sides still
+    // accumulate in fp32.
+    layout(&mut session.d, CUDA_R_16BF, n, m, n)?;
 
     checked(
         unsafe { cublasLtMatmulPreferenceCreate(&mut session.preference) },
@@ -526,6 +548,11 @@ pub fn bench(
 
     launch()?;
     stream.synchronize()?;
+    // `==` on the bf16 words, against a reference rounded the way
+    // `cvt.rn.bf16x2.f32` rounds — so this asserts the library's epilogue
+    // rounds once, from an fp32 accumulator, exactly as ours does. The worst
+    // relative error it returns is the same property of bf16 both sides carry,
+    // and `gemm::check` is where it is reported.
     gemm::check_c(&c.to_host_vec(&stream)?, m, n, k)?;
 
     Ok((time(&stream, &mut launch)?, describe(&heuristic)))

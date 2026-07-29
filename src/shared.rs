@@ -28,6 +28,7 @@
 use core::marker::PhantomData;
 
 use cuda_device::cluster;
+use cuda_device::ptx_asm;
 use cuda_device::tcgen05::{Tcgen05ElementType, cvt_f32x2_bf16x2, tcgen05_mma_shared};
 use cuda_device::tma::{
     TmaDescriptor, cp_async_bulk_commit_group, cp_async_bulk_tensor_1d_g2s,
@@ -99,6 +100,43 @@ pub trait Element {
     ///
     /// As [`Self::read`], and writable.
     unsafe fn write(at: *mut u8, value: f32);
+
+    /// Write two *adjacent* elements in one memory access — what
+    /// [`crate::reg::ColLayout::CONTIGUOUS_VALUES`] is spent on, and the only
+    /// thing about a fragment mover that depends on the element.
+    ///
+    /// The default is the two scalar writes it replaces, so an element that
+    /// has no wider spelling is correct without stating one. Both elements
+    /// here do have one and they are different in kind: a 2-byte element packs
+    /// the pair into a single word ([`Self::pack`]), where fp32 needs a vector
+    /// instruction to move two.
+    ///
+    /// **The overrides are global-memory instructions**, which is what the
+    /// contract below says and the reason there is no shared-memory caller: a
+    /// `SharedVec`'s neighbouring elements belong to different lanes, and this
+    /// pairs values one lane owns.
+    ///
+    /// # Safety
+    ///
+    /// `at` must be aligned to `2 * BYTES` and name two writable elements of a
+    /// global buffer.
+    #[inline(always)]
+    unsafe fn write_pair(at: *mut u8, first: f32, second: f32) {
+        unsafe {
+            Self::write(at, first);
+            Self::write(at.add(Self::BYTES), second);
+        }
+    }
+
+    /// The read direction of [`Self::write_pair`], under the same contract.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::write_pair`], reading instead of writing.
+    #[inline(always)]
+    unsafe fn read_pair(at: *const u8) -> (f32, f32) {
+        unsafe { (Self::read(at), Self::read(at.add(Self::BYTES))) }
+    }
 }
 
 /// `collector::a::discard` — the `COLLECTOR_A` selector every walk here
@@ -198,6 +236,21 @@ impl Element for Bf16 {
     unsafe fn write(at: *mut u8, value: f32) {
         unsafe { *(at as *mut u16) = cvt_f32x2_bf16x2(value, value) as u16 }
     }
+
+    /// Two adjacent bf16 **are** one packed word, so the pair is a plain
+    /// 4-byte store of [`Self::pack`] and needs no vector instruction: one
+    /// `cvt.rn.bf16x2.f32` and one `st.global.u32` where the fp32 element
+    /// needs a `st.global.v2.f32` carrying twice the bytes.
+    #[inline(always)]
+    unsafe fn write_pair(at: *mut u8, first: f32, second: f32) {
+        unsafe { *(at as *mut u32) = Self::pack([first, second]) }
+    }
+
+    #[inline(always)]
+    unsafe fn read_pair(at: *const u8) -> (f32, f32) {
+        let [first, second] = Self::unpack(unsafe { *(at as *const u32) });
+        (first, second)
+    }
 }
 
 impl MmaElement for Bf16 {
@@ -279,6 +332,48 @@ impl Element for F32 {
     #[inline(always)]
     unsafe fn write(at: *mut u8, value: f32) {
         unsafe { *(at as *mut f32) = value }
+    }
+
+    /// `st.global.v2.f32` — the two fp32 at `at` and `at + 4` in one
+    /// instruction.
+    ///
+    /// Inline PTX for the reason [`crate::ldst::stmatrix_m8n8_x2`] is: the
+    /// instruction has to be *asked for*. Widening a pair of adjacent stores is
+    /// a transformation ptxas may only make when the address is provably
+    /// aligned, and an address built from a runtime leading dimension never is
+    /// — so the caller that has actually checked
+    /// ([`crate::global::GlobalRows::runs_aligned`]) is the only one in a
+    /// position to spell it. Where [`Bf16::write_pair`] moves a pair in four
+    /// bytes, this one moves it in eight; the instruction count is the same and
+    /// that is the whole of what a narrower `C` changes here (#108).
+    #[inline(always)]
+    unsafe fn write_pair(at: *mut u8, first: f32, second: f32) {
+        unsafe {
+            ptx_asm!(
+                "st.global.v2.f32 [%0], {%1, %2};",
+                in("l") at as u64,
+                in("f") first,
+                in("f") second,
+                clobber("memory"),
+            );
+        }
+    }
+
+    /// `ld.global.v2.f32` — the read direction of [`Self::write_pair`].
+    #[inline(always)]
+    unsafe fn read_pair(at: *const u8) -> (f32, f32) {
+        unsafe {
+            let first: f32;
+            let second: f32;
+            ptx_asm!(
+                "ld.global.v2.f32 {%0, %1}, [%2];",
+                out("=f") first,
+                out("=f") second,
+                in("l") at as u64,
+                clobber("memory"),
+            );
+            (first, second)
+        }
     }
 }
 
