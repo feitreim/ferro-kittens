@@ -223,6 +223,30 @@ fn the_store_ring_names_its_scope<SC: kittens::Scope>(
     ];
 }
 
+/// §7.2 — the thread identities and the proxy fence (#127), in the shape a
+/// kernel makes them: a whole warp-scope store with nothing from `cuda_device`
+/// in it.
+///
+/// The three names are the whole of the entry. `lane` is the argument every
+/// function above takes, `32 * warp_id()` is the [`BaseLdtm`] band origin
+/// under it, and `publish_to_async_proxy` is the fence six safety contracts in
+/// the crate oblige the caller to issue — which only `StoreRing::publish` used
+/// to make, privately. All five kernels opened with `use cuda_device::warp`
+/// until these existed, so a rename that dropped one would put that import
+/// back without failing anything else.
+fn a_warp_scope_store_names_nothing_outside_kittens<E, const M: usize, const N: usize>(
+    chunks: kittens::shared::SwizzledChunks<E>,
+    band: RegTile<M, N, BaseLdtm>,
+) where
+    E: Element<Unpacked = [f32; 2]>,
+    BaseLdtm: kittens::reg::FragmentLayout<M, N>,
+{
+    unsafe {
+        kittens::ldst::store_tile(chunks, 32 * kittens::warp_id(), 0, kittens::lane(), band);
+        kittens::shared::publish_to_async_proxy();
+    }
+}
+
 /// §2.4 — a peer's barrier is addressable (#50) and a load can complete on it,
 /// and the charge for a symmetric cluster stage is derived rather than written
 /// down (#29).

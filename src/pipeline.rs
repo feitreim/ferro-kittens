@@ -199,7 +199,6 @@
 //! construction, and the swizzle and the scheduler can be swept independently.
 
 use cuda_device::barrier::Barrier;
-use cuda_device::barrier::fence_proxy_async_shared_cta;
 use cuda_device::clc::{
     clc_query_get_first_ctaid_x, clc_query_is_canceled, clc_try_cancel_multicast,
 };
@@ -207,6 +206,7 @@ use cuda_device::cluster;
 use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 use cuda_device::thread;
 
+use crate::shared::publish_to_async_proxy;
 use crate::sync::{Semaphore, TransactionBytes};
 
 /// One persistent kernel's work, split at the points the scaffold owns.
@@ -331,7 +331,7 @@ pub unsafe fn run<J: Job>(job: &mut J, items: u32) {
                     job.inval();
                 }
                 job.init(item);
-                fence_proxy_async_shared_cta();
+                publish_to_async_proxy();
             }
             initialized = true;
             boundary::<J>();
@@ -517,7 +517,7 @@ pub unsafe fn run_stealing<J: Job>(job: &mut J, queue: ClcQueue) {
         loop {
             if leader {
                 job.init(item);
-                fence_proxy_async_shared_cta();
+                publish_to_async_proxy();
             }
             boundary::<J>();
             job.work(item);

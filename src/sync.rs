@@ -125,7 +125,7 @@ use cuda_device::barrier::{
     mbarrier_inval, mbarrier_try_wait_parity,
 };
 use cuda_device::cluster::map_shared_rank_mut;
-use cuda_device::{thread, warp};
+use cuda_device::thread;
 
 use crate::reg::{Add, ReduceOp};
 use crate::shared::{F32, SharedVec};
@@ -522,7 +522,7 @@ impl<const N: usize> SemaphoreRing<N> {
 ///   `WARPS` and the same `Op`. It contains `sync_threads`, so a thread that
 ///   skips the call hangs the block or lets a partial be read before it is
 ///   written.
-/// - **The block is 1-D and exactly `WARPS * 32` threads.** `warp::warp_id()`
+/// - **The block is 1-D and exactly `WARPS * 32` threads.** [`crate::warp_id`]
 ///   is `threadIdx.x / 32`, so a `WARPS` smaller than the block's warp count
 ///   writes past the vector, and a larger one folds elements no warp wrote.
 /// - **`value` is warp-uniform** — the same in all 32 lanes. This does *not*
@@ -534,8 +534,9 @@ impl<const N: usize> SemaphoreRing<N> {
 /// - **`scratch` is `WARPS` live fp32 elements** no other thread and no engine
 ///   is using across the call. Both the write and the read are ordinary shared
 ///   accesses through the generic proxy, so the barriers order them and no
-///   `fence.proxy.async.shared::cta` is owed — that fence is for a TMA or an
-///   MMA reading the same bytes, which is a use this collective does not have.
+///   [`crate::shared::publish_to_async_proxy`] is owed — that fence is for a
+///   TMA or an MMA reading the same bytes, which is a use this collective does
+///   not have.
 /// - **The first call in a kernel owes a barrier only if something else wrote
 ///   `scratch` first.** The function's own precondition — no thread still
 ///   reading the vector — is what its trailing barrier establishes, so back to
@@ -547,8 +548,8 @@ pub unsafe fn block_reduce<Op: ReduceOp, const WARPS: usize>(
     value: f32,
 ) -> f32 {
     unsafe {
-        if warp::lane_id() == 0 {
-            scratch.set(warp::warp_id() as usize, value);
+        if crate::lane() == 0 {
+            scratch.set(crate::warp_id() as usize, value);
         }
         thread::sync_threads();
         let folded = fold_partials::<Op, WARPS>(scratch);
@@ -610,7 +611,7 @@ mod tests {
     use crate::reg::{Max, Mul};
 
     /// `block_reduce`'s fold over a real four-element buffer. The barriers and
-    /// `warp::warp_id()` are device-only, so this is as far as the host reaches
+    /// [`crate::warp_id`] are device-only, so this is as far as the host reaches
     /// — but it is the half that decides the *number*, and the device case is
     /// what says the staging under it lands each warp's partial in its own
     /// slot.

@@ -81,7 +81,10 @@ pub const fn fragment_address(row: u32, column: u32, lane: u32, slot: usize) -> 
 /// its own values unwritten. `row` and `column` are the *shared tile's*
 /// coordinates and nothing here reads tensor memory: `chunks` must belong to a
 /// tile at least `row + 16` rows tall into which `column + 16` fits. The caller
-/// owes a `fence.proxy.async.shared::cta` before any MMA or TMA reads the tile.
+/// owes a `fence.proxy.async.shared::cta` before any MMA or TMA reads the tile
+/// — [`crate::shared::publish_to_async_proxy`] is that fence, and a barrier
+/// after it is what carries this thread's ordering to whichever thread issues
+/// the read.
 #[inline(always)]
 pub unsafe fn store_fragment<E: Element<Unpacked = [f32; 2]>>(
     chunks: SwizzledChunks<E>,
@@ -128,7 +131,8 @@ pub unsafe fn store_fragment<E: Element<Unpacked = [f32; 2]>>(
 /// call this together — all 32 of them supply addresses here, not just the
 /// first 16 — `chunks` must belong to a tile at least `row + 16` rows tall into
 /// which `column + 16` fits, and the caller owes a
-/// `fence.proxy.async.shared::cta` before any MMA or TMA reads the tile.
+/// [`crate::shared::publish_to_async_proxy`] before any MMA or TMA reads the
+/// tile.
 #[inline(always)]
 pub unsafe fn store_fragment_x4<E: Element<Unpacked = [f32; 2]>>(
     chunks: SwizzledChunks<E>,
@@ -155,8 +159,8 @@ pub unsafe fn store_fragment_x4<E: Element<Unpacked = [f32; 2]>>(
 /// # Safety
 ///
 /// As [`store_fragment_x4`], for every block of the band — including the
-/// `fence.proxy.async.shared::cta` the caller owes before any MMA or TMA reads
-/// the tile.
+/// [`crate::shared::publish_to_async_proxy`] the caller owes before any MMA
+/// or TMA reads the tile.
 #[inline(always)]
 pub unsafe fn store_tile_x4<E: Element<Unpacked = [f32; 2]>, const M: usize, const N: usize>(
     chunks: SwizzledChunks<E>,
@@ -288,8 +292,8 @@ where
 /// # Safety
 ///
 /// As [`store_fragment`], for every block of the band — including the
-/// `fence.proxy.async.shared::cta` the caller owes before any MMA or TMA reads
-/// the tile.
+/// [`crate::shared::publish_to_async_proxy`] the caller owes before any MMA
+/// or TMA reads the tile.
 #[inline(always)]
 pub unsafe fn store_tile<E: Element<Unpacked = [f32; 2]>, const M: usize, const N: usize>(
     chunks: SwizzledChunks<E>,
@@ -362,7 +366,8 @@ pub unsafe fn load_vec<E: Element, const N: usize, L: ColLayout<N>>(
 /// # Safety
 ///
 /// All 32 lanes of the warp must call this together, and the caller owes a
-/// `fence.proxy.async.shared::cta` before the TMA engine reads the vector.
+/// [`crate::shared::publish_to_async_proxy`] before the TMA engine reads the
+/// vector.
 #[inline(always)]
 pub unsafe fn store_vec<E: Element, const N: usize, L: ColLayout<N>>(
     vec: SharedVec<E, N>,

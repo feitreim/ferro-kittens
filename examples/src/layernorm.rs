@@ -124,10 +124,10 @@
 //! layernorm's answer exactly. A softmax seed cannot see the difference
 //! between the two kernels in this file.
 
-use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
+use cuda_device::barrier::Barrier;
 use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
-use cuda_device::{cuda_module, kernel, launch_bounds, thread, warp};
+use cuda_device::{cuda_module, kernel, launch_bounds, thread};
 
 // Host side: the launcher's error type, and the benchmark's size and clock.
 use crate::bench::{Shape, Timings, time};
@@ -136,9 +136,11 @@ use std::error::Error;
 use kittens::ldst::{load_tile, load_vec, store_tile};
 use kittens::reg::{BaseLdtm, ColVec, RegTile, RegVec, rsqrt};
 use kittens::shared::{
-    Bf16, F32, SharedTile, SharedVec, Swizzle128B, tma_store_commit, tma_store_wait,
+    Bf16, F32, SharedTile, SharedVec, Swizzle128B, publish_to_async_proxy, tma_store_commit,
+    tma_store_wait,
 };
 use kittens::sync::{Semaphore, block_reduce_sum};
+use kittens::{lane, warp_id};
 
 const ROWS: usize = 128;
 const COLUMNS: usize = 128;
@@ -224,13 +226,13 @@ pub mod kernels {
             let loaded =
                 Semaphore::attach(smem.add(Tile::BYTES + 2 * Parameters::BYTES) as *mut Barrier);
 
-            let lane = warp::lane_id();
-            let row_base = 32 * warp::warp_id();
+            let lane = lane();
+            let row_base = 32 * warp_id();
             let row = (ROWS as u32 * thread::blockIdx_x()) as i32;
 
             if thread::threadIdx_x() == 0 {
                 loaded.init(1);
-                fence_proxy_async_shared_cta();
+                publish_to_async_proxy();
             }
             thread::sync_threads();
             if thread::threadIdx_x() == 0 {
@@ -305,7 +307,7 @@ pub mod kernels {
             // `store_tile` writes through the generic proxy and the TMA engine
             // reads through the async one, so the store side owes this fence
             // exactly as an MMA reading the same tile would.
-            fence_proxy_async_shared_cta();
+            publish_to_async_proxy();
             thread::sync_threads();
             if thread::threadIdx_x() == 0 {
                 tile.tma_store(destination, row, 0);
@@ -359,14 +361,14 @@ pub mod kernels {
             let partials = Partials::from_raw(smem.add(Tile::BYTES));
             let loaded = Semaphore::attach(smem.add(Tile::BYTES + Partials::BYTES) as *mut Barrier);
 
-            let lane = warp::lane_id();
-            let row_base = 32 * warp::warp_id();
+            let lane = lane();
+            let row_base = 32 * warp_id();
             let row = (ROWS as u32 * thread::blockIdx_x()) as i32;
             let scale = 1.0 / (ROWS * COLUMNS) as f32;
 
             if thread::threadIdx_x() == 0 {
                 loaded.init(1);
-                fence_proxy_async_shared_cta();
+                publish_to_async_proxy();
             }
             thread::sync_threads();
             if thread::threadIdx_x() == 0 {
@@ -397,7 +399,7 @@ pub mod kernels {
             // `store_tile` writes through the generic proxy and the TMA engine
             // reads through the async one, so the store side owes this fence
             // exactly as an MMA reading the same tile would.
-            fence_proxy_async_shared_cta();
+            publish_to_async_proxy();
             thread::sync_threads();
             if thread::threadIdx_x() == 0 {
                 tile.tma_store(destination, row, 0);

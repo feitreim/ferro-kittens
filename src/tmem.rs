@@ -100,7 +100,7 @@ use cuda_device::tcgen05::{
     tcgen05_relinquish_alloc_permit, tcgen05_relinquish_alloc_permit_cg2,
     tcgen05_st_16x256b_x1_raw, tcgen05_store_wait,
 };
-use cuda_device::{cluster, thread, warp};
+use cuda_device::{cluster, thread};
 
 use crate::reg::{BaseLdtm, Fragment, FragmentLayout, RegTile};
 
@@ -134,7 +134,7 @@ use crate::reg::{BaseLdtm, Fragment, FragmentLayout, RegTile};
 #[inline(always)]
 pub unsafe fn alloc_block(slot: *mut u32, columns: u32) -> u32 {
     unsafe {
-        if warp::warp_id() == 0 {
+        if crate::warp_id() == 0 {
             tcgen05_alloc(slot, columns);
             tcgen05_relinquish_alloc_permit();
         }
@@ -146,6 +146,10 @@ pub unsafe fn alloc_block(slot: *mut u32, columns: u32) -> u32 {
 /// Release the CTA's TMEM allocation from warp 0, after the caller's own
 /// fence/sync has retired every outstanding read of it.
 ///
+/// "The caller's own fence/sync" is the pair spelled out on
+/// [`dealloc_cluster`], at block scope: `tcgen05_fence_before_thread_sync()`
+/// immediately in front of a `sync_threads()`.
+///
 /// # Safety
 ///
 /// No thread may touch the allocation afterwards; `columns` must match the
@@ -153,7 +157,7 @@ pub unsafe fn alloc_block(slot: *mut u32, columns: u32) -> u32 {
 #[inline(always)]
 pub unsafe fn dealloc_block(address: u32, columns: u32) {
     unsafe {
-        if warp::warp_id() == 0 {
+        if crate::warp_id() == 0 {
             tcgen05_dealloc(address, columns);
         }
     }
@@ -189,12 +193,12 @@ pub unsafe fn dealloc_block(address: u32, columns: u32) {
 #[inline(always)]
 pub unsafe fn alloc_cluster(slot: *mut u32, columns: u32) -> u32 {
     unsafe {
-        if warp::warp_id() == 0 {
+        if crate::warp_id() == 0 {
             tcgen05_alloc_cg2(slot, columns);
         }
         thread::sync_threads();
         cluster::cluster_sync();
-        if warp::warp_id() == 0 {
+        if crate::warp_id() == 0 {
             tcgen05_relinquish_alloc_permit_cg2();
         }
         *(slot as *const u32)
@@ -205,6 +209,35 @@ pub unsafe fn alloc_cluster(slot: *mut u32, columns: u32) -> u32 {
 /// half — [`dealloc_block`]'s `cta_group::2` twin, and as with that one the
 /// fence and the syncs that retire the pair's reads are the caller's.
 ///
+/// # What "the caller's" is, and why it stays two lines
+///
+/// A tcgen05 read — an LDTM drain, an MMA — is retired against a thread
+/// rendezvous by `tcgen05_fence_before_thread_sync()` issued *immediately* in
+/// front of it, and for a `cta_group::2` allocation that rendezvous is
+/// `cluster::cluster_sync()`, because the reads being retired live in two
+/// CTAs:
+///
+/// ```ignore
+/// tcgen05_fence_before_thread_sync();
+/// cluster::cluster_sync();
+/// dealloc_cluster(accumulator.raw(), COLUMNS);
+/// ```
+///
+/// [`crate::pipeline::run`] performs exactly this pair at every item boundary,
+/// so a job whose accumulator dies with the item loop has already had it. Both
+/// GEMMs rendezvous once *outside* `run` — before this call, for the cluster
+/// that took no items at all — and write the two lines out.
+///
+/// **They stay two lines rather than becoming a `kittens` entry point (#127),
+/// and the reason is the second one.** The fence is tcgen05's and would belong
+/// here; the rendezvous is a *scope* choice, and welding `cluster_sync` into
+/// the pair would put a fifth spelling of scope beside the four §7.1 of
+/// `GAPS.md` counts — [`crate::epilogue::Scope`], `Job::RANKS`,
+/// `block_reduce`'s `WARPS`, `store_shared_rows`' `THREADS` — at the point
+/// #124 is about to unify them. It would also close no leak: a kernel calling
+/// `cluster_sync` here already imports `cuda_device::cluster` for
+/// `block_rank` in its `attach`, which all three call sites in tree do.
+///
 /// # Safety
 ///
 /// No thread of either CTA may touch the allocation afterwards; `address` and
@@ -212,7 +245,7 @@ pub unsafe fn alloc_cluster(slot: *mut u32, columns: u32) -> u32 {
 #[inline(always)]
 pub unsafe fn dealloc_cluster(address: u32, columns: u32) {
     unsafe {
-        if warp::warp_id() == 0 {
+        if crate::warp_id() == 0 {
             tcgen05_dealloc_cg2(address, columns);
         }
     }
