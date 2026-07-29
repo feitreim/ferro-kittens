@@ -129,8 +129,14 @@
 //! offsets `{0, 1, 8, 9}` — two adjacent pairs, `CONTIGUOUS_VALUES = 2` — so a
 //! pair store is one instruction at either element and only its width moves,
 //! 8 bytes to 4. The `cvt` is new and the stores are not fewer, which is why
-//! the honest prediction here was neutral-to-slightly-negative on an epilogue
-//! #107 measured as issue-bound rather than write-bound.
+//! the prediction was neutral-to-slightly-negative on an epilogue #107 measured
+//! as issue-bound rather than write-bound.
+//!
+//! **Measured, against an fp32 control run back to back: about +1% at 8192³ and
+//! nothing resolvable at 16384³**, with the ratio to cuBLASLt flat to two points
+//! down because the library gains at least as much from the cheaper output as we
+//! do. Throughput was not the reason to do this and it did not have to pay for
+//! itself; that it costs nothing is the result.
 //!
 //! What it *does* change is what the epilogue could be. `stmatrix` is b16 and
 //! was unusable here for exactly one reason — `C` was fp32 — and #94 and #107
@@ -776,10 +782,7 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Tile<BLOCK_
     #[inline(always)]
     unsafe fn drain(&self, item: u32) {
         unsafe {
-            let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, self.group);
-            let row_base =
-                2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank + 32 * self.warp_id;
-            let column_base = BLOCK_N as u32 * tile_n;
+            let (row_base, column_base) = self.origin(item);
             let mut column = 0u32;
             while column < BLOCK_N as u32 {
                 // This warp's 32 TMEM lanes by `DRAIN_N` columns of the
@@ -787,6 +790,50 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Tile<BLOCK_
                 // delivers.
                 let band: Band = self.accumulator.tile(32 * self.warp_id, column);
                 store_rows(self.c, row_base, column_base + column, self.lane, band);
+                column += DRAIN_N as u32;
+            }
+        }
+    }
+
+    /// Where in `C` this warp's band of `item` starts — the whole of what the
+    /// item index means to the epilogue, split out so [`Self::drain`] and
+    /// [`Self::drain_storing_twice`] cannot disagree about it.
+    #[inline(always)]
+    fn origin(&self, item: u32) -> (u32, u32) {
+        let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, self.group);
+        (
+            2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank + 32 * self.warp_id,
+            BLOCK_N as u32 * tile_n,
+        )
+    }
+
+    /// [`Self::drain`] with **one LDTM and two sets of stores** — the second
+    /// probe of #108's pair, and the one that splits the epilogue.
+    ///
+    /// [`Epilogue::DoubleDrain`] runs the whole epilogue twice and prices it;
+    /// this runs the load once and the stores twice, so the difference between
+    /// the two probes is **the LDTM**, and what is left is what the store loop
+    /// costs on its own. That is the number `stmatrix` is worth arguing about,
+    /// because a `stmatrix` epilogue keeps the LDTM exactly as it is and halves
+    /// the stores.
+    ///
+    /// The band is held across both stores, which is the one thing to watch: it
+    /// was live across the first store already, so peak liveness does not move
+    /// and `regcount` is what says so rather than this comment.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::drain`], for both `item` and `again`.
+    #[inline(always)]
+    unsafe fn drain_storing_twice(&self, item: u32, again: u32) {
+        unsafe {
+            let (row_base, column_base) = self.origin(item);
+            let (again_row, again_column) = self.origin(again);
+            let mut column = 0u32;
+            while column < BLOCK_N as u32 {
+                let band: Band = self.accumulator.tile(32 * self.warp_id, column);
+                store_rows(self.c, row_base, column_base + column, self.lane, band);
+                store_rows(self.c, again_row, again_column + column, self.lane, band);
                 column += DRAIN_N as u32;
             }
         }
@@ -968,6 +1015,62 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
             // cannot prove equal, so this is a second epilogue and not a dead
             // store the first one subsumes.
             self.tile.drain(self.home);
+        }
+    }
+}
+
+/// [`Epilogue::DoubleStore`]'s job: [`Tile`] with the epilogue's **stores**
+/// doubled and its LDTM not.
+///
+/// **It computes a wrong `C` and is never checked.** Paired with
+/// [`DoubleDrain`], whose extra pass includes the load: the difference between
+/// the two is what the LDTM costs, and the remainder is the store loop.
+#[derive(Clone, Copy)]
+struct DoubleStore<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
+    tile: Tile<BLOCK_N, HALF_N, STAGES>,
+    /// As [`DoubleDrain::home`], and for both of its reasons.
+    home: u32,
+}
+
+impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
+    for DoubleStore<BLOCK_N, HALF_N, STAGES>
+{
+    const RANKS: u32 = crate::gemm::RANKS;
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn init(&self, item: u32) {
+        unsafe { self.tile.init(item) }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn inval(&self) {
+        unsafe { self.tile.inval() }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s, and [`Tile::drain_storing_twice`]'s: both tiles are ones
+    /// this cluster owns.
+    #[inline(always)]
+    unsafe fn work(&mut self, item: u32) {
+        unsafe {
+            let tile = self.tile;
+            let (tile_m, tile_n) = pipeline::grouped(item, tile.tiles_m, tile.tiles_n, tile.group);
+            if tile.warp_id == 0 && tile.lane == 0 {
+                tile.produce(tile_m, tile_n, 0, tile.k_blocks);
+            }
+            if tile.rank == LEADER && tile.warp_id == 1 && tile.lane == 0 {
+                tile.multiply();
+            }
+            tile.done.wait(0);
+            thread::sync_threads();
+            tile.drain_storing_twice(item, self.home);
         }
     }
 }
@@ -1414,6 +1517,45 @@ pub mod kernels {
                 a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
             );
             let mut job = DoubleDrain {
+                tile,
+                home: cluster::cluster_idx().min(tiles_m * tiles_n - 1),
+            };
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            release(&job.tile);
+        }
+    }
+
+    /// **A deliberately wrong GEMM** — [`Epilogue::DoubleStore`]'s probe, which
+    /// doubles the epilogue's stores and not its LDTM. Never checked, never
+    /// shipped.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_cg2`]'s. Both tiles it writes are tiles this cluster owns.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 98_392,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_cg2_2s(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, _) = attach::<BLOCK_N, HALF_N, STAGES>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
+            let mut job = DoubleStore {
                 tile,
                 home: cluster::cluster_idx().min(tiles_m * tiles_n - 1),
             };
@@ -1906,8 +2048,23 @@ pub enum Epilogue {
     /// whose result a dead-code pass decides: with nothing consuming the band,
     /// the LDTM goes too and the measurement is of an empty loop. So this
     /// number bounds the epilogue and does not decompose it, and it is quoted
-    /// that way.
+    /// that way. [`Epilogue::DoubleStore`] is what does.
     DoubleDrain,
+    /// **Not a GEMM either, and never checked.**
+    ///
+    /// The other half of [`Epilogue::DoubleDrain`]'s pair: one LDTM and **two**
+    /// sets of stores, where that one is two of each. So `2s - lcf` is the
+    /// store loop on its own and `2x - 2s` is the LDTM, and the epilogue is
+    /// split into the two things it is made of without either probe having to
+    /// delete anything a dead-code pass could then delete more of.
+    ///
+    /// That split is the whole question `stmatrix` turns on. A `stmatrix`
+    /// epilogue keeps the LDTM exactly as it is and halves the stores — 128
+    /// pair stores a thread an item become 64 warp-collective `stmatrix.x2`,
+    /// with the same `cvt` count and the global write handed to a TMA engine.
+    /// Its ceiling is therefore **half of `2s - lcf`**, and no part of
+    /// `2x - 2s` is available to it at all.
+    DoubleStore,
 }
 
 impl Epilogue {
@@ -1918,13 +2075,17 @@ impl Epilogue {
             Epilogue::Deferred => "lcsf",
             Epilogue::HotStore => "hot",
             Epilogue::DoubleDrain => "2x",
+            Epilogue::DoubleStore => "2s",
         }
     }
 
     /// Whether a launch on this epilogue computes the GEMM. The two probes do
     /// not, and each says so everywhere it appears.
     fn exact(self) -> bool {
-        !matches!(self, Epilogue::HotStore | Epilogue::DoubleDrain)
+        !matches!(
+            self,
+            Epilogue::HotStore | Epilogue::DoubleDrain | Epilogue::DoubleStore
+        )
     }
 }
 
@@ -2115,6 +2276,9 @@ fn run<T>(
         }
         (Entry::Shipped, Scheduler::Static, Epilogue::DoubleDrain) => {
             launcher!(prepare_gemm_cg2_2x, gemm_cg2_2x)
+        }
+        (Entry::Shipped, Scheduler::Static, Epilogue::DoubleStore) => {
+            launcher!(prepare_gemm_cg2_2s, gemm_cg2_2s)
         }
         (Entry::Shipped, Scheduler::Stealing, Epilogue::Fused) => {
             launcher!(prepare_gemm_cg2_clc, gemm_cg2_clc)
@@ -2888,6 +3052,16 @@ const EPILOGUE_SIZES: [Shape; 5] = [
 /// be cheaper than the first if the second finds its addresses in L2 and its
 /// issue slots idle. That biases this number **down**, which is the safe
 /// direction for a ceiling.
+///
+/// **It measured 21.4 µs and 20.2% of 8192³ — refuted, by about a factor of
+/// two, and the bias argument above is refuted with it.** 21.4 µs is *above* the
+/// whole item boundary as #104 fits it, and the epilogue is only part of that
+/// boundary; both can be true only if the epilogue is partly overlapped in the
+/// real kernel and not at all in the probe, which makes this the epilogue's
+/// **serial** cost and the fit's intercept its **exposed** residue. `2s` — one
+/// LDTM, two store loops — then splits it: 13.1 µs of stores against 8.3 µs of
+/// LDTM at 8192³. `examples/README.md` §7 has both, and what they say about
+/// `stmatrix`.
 pub fn epilogue_sweep(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     baseline: Option<crate::bench::Baseline>,
@@ -2918,6 +3092,7 @@ pub fn epilogue_sweep(
         let deferred = timed(context, shape, plan.with(Epilogue::Deferred))?;
         let hot = timed(context, shape, plan.with(Epilogue::HotStore))?;
         let twice = timed(context, shape, plan.with(Epilogue::DoubleDrain))?;
+        let restored = timed(context, shape, plan.with(Epilogue::DoubleStore))?;
         let items = tiles(shape.m, shape.n, BLOCK_N);
         let clusters = grid_for(Scheduler::Static, shape.m, shape.n, SHIPPED, MAX_CLUSTERS) / RANKS;
         println!(
@@ -2931,7 +3106,7 @@ pub fn epilogue_sweep(
             tflops(shape, deferred),
             format!("{:+.1}%", 100.0 * (fused / deferred - 1.0))
         );
-        measured.push((shape, fused, deferred, hot, twice));
+        measured.push((shape, fused, deferred, hot, twice, restored));
     }
 
     println!(
@@ -2945,7 +3120,7 @@ pub fn epilogue_sweep(
         "{:<18}{:>12}{:>14}{:>16}{:>18}",
         "shape", "items/cl", "saved ms", "saved us/item", "hidden of boundary"
     );
-    for &(shape, fused, deferred, _, _) in &measured {
+    for &(shape, fused, deferred, _, _, _) in &measured {
         let items = tiles(shape.m, shape.n, BLOCK_N);
         let clusters = grid_for(Scheduler::Static, shape.m, shape.n, SHIPPED, MAX_CLUSTERS) / RANKS;
         // Items on the critical path, which is what #90 and #104 divide a
@@ -2983,7 +3158,7 @@ pub fn epilogue_sweep(
         "{:<18}{:>12}{:>12}{:>14}{:>18}",
         "shape", "lcf ms", "hot ms", "hot TF/s", "write-bound part"
     );
-    for &(shape, fused, _, hot, _) in &measured {
+    for &(shape, fused, _, hot, _, _) in &measured {
         println!(
             "{:<18}{:>12.4}{:>12.4}{:>14.1}{:>18}",
             shape,
@@ -3004,27 +3179,34 @@ pub fn epilogue_sweep(
          no fit involved — where every figure this file has quoted for the epilogue is a\n\
          share of the item boundary read off an intercept whose own spread is 2.1x.\n\
          It is the CEILING on every epilogue change at once, `stmatrix` included: an\n\
-         epilogue that cost nothing could not save more than this. It does not split LDTM\n\
-         from stores, because the probe that would — drop the stores, keep the load — is\n\
-         one a dead-code pass decides the answer to."
+         epilogue that cost nothing could not save more than this.\n\
+         `2s` is the other half of the pair — ONE LDTM and TWO sets of stores, also to\n\
+         the home tile and also unchecked — so `2s - lcf` is the store loop alone and\n\
+         `2x - 2s` is the LDTM alone. Neither probe deletes anything, which is why a\n\
+         dead-code pass has no say in either: the version that keeps the load and drops\n\
+         the stores would measure whatever the optimizer left of it.\n\
+         `stmatrix` keeps the LDTM and halves the stores, so its ceiling is half the\n\
+         `stores` column and none of the `LDTM` one."
     );
     println!(
-        "{:<18}{:>12}{:>12}{:>16}{:>18}{:>16}",
-        "shape", "lcf ms", "2x ms", "one epilogue", "us/item", "of the launch"
+        "{:<18}{:>10}{:>10}{:>10}{:>14}{:>12}{:>12}{:>14}",
+        "shape", "lcf ms", "2x ms", "2s ms", "epilogue us", "stores us", "LDTM us", "epilogue %"
     );
-    for &(shape, fused, _, _, twice) in &measured {
+    for &(shape, fused, _, _, twice, restored) in &measured {
         let items = tiles(shape.m, shape.n, BLOCK_N);
         let clusters = grid_for(Scheduler::Static, shape.m, shape.n, SHIPPED, MAX_CLUSTERS) / RANKS;
         let critical = items.div_ceil(clusters) as f64;
-        let epilogue = twice - fused;
+        let per_item = |milliseconds: f64| milliseconds * 1e3 / critical;
         println!(
-            "{:<18}{:>12.4}{:>12.4}{:>16.4}{:>18.2}{:>16}",
+            "{:<18}{:>10.4}{:>10.4}{:>10.4}{:>14.2}{:>12.2}{:>12.2}{:>14}",
             shape,
             fused,
             twice,
-            epilogue,
-            epilogue * 1e3 / critical,
-            format!("{:.1}%", 100.0 * epilogue / fused)
+            restored,
+            per_item(twice - fused),
+            per_item(restored - fused),
+            per_item(twice - restored),
+            format!("{:.1}%", 100.0 * (twice - fused) / fused)
         );
     }
 
@@ -3036,7 +3218,7 @@ pub fn epilogue_sweep(
         "{:<18}{:>14}{:>14}{:>14}{:>16}",
         "shape", "cuBLASLt ms", "theirs TF/s", "lcf/theirs", "lcsf/theirs"
     );
-    for &(shape, fused, deferred, _, _) in &measured {
+    for &(shape, fused, deferred, _, _, _) in &measured {
         if shape.m < 8192 {
             continue;
         }
