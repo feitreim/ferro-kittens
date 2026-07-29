@@ -214,6 +214,18 @@ const TILE_N128_S4: u32 = 98_408;
 const TILE_N256_S2: u32 = 65_608;
 const TILE_N256_S3: u32 = 98_392;
 
+/// The shipped rung with a **staged epilogue** on it (#15): [`TILE_N256_S3`]
+/// rounded up to a 128-byte tile base, plus one `[32, 64]` bf16 staging tile
+/// per warp — `98 392 → 98 432 + 4 · 4096`.
+///
+/// It is here because the staged epilogue's whole case rests on the claim that
+/// those 16 424 bytes are free, and "free" is an integer this file counts
+/// rather than a `min` this file computes. 512 / 256 columns says two and
+/// 233 472 / 114 816 says two, so the prediction is that nothing moves; the
+/// row is worth running precisely because a step down would make the A/B a
+/// residency comparison instead of an epilogue one.
+const TILE_N256_S3_STAGED: u32 = 114_816;
+
 /// How far the achieved hold may sit under [`HOLD_NS`] before the harness
 /// calls the spin broken rather than the residency low. A CTA that exited on
 /// [`CENSUS_SPIN_GUARD`](crate::CENSUS_SPIN_GUARD) instead of on the clock
@@ -462,6 +474,18 @@ fn rungs() -> Vec<Rung> {
             2,
             true,
             TILE_N256_S3
+        ),
+        // #15's staged epilogue: the same rung carrying four per-warp staging
+        // tiles. See `TILE_N256_S3_STAGED` — the prediction is that it counts
+        // the same 2, and the A/B above it is only an epilogue comparison if
+        // it does.
+        rung!(
+            "#15 [256,256] s3 staged",
+            residency_census_cluster_256,
+            Some(256),
+            2,
+            true,
+            TILE_N256_S3_STAGED
         ),
     ]
 }

@@ -120,6 +120,39 @@
 //! `examples/README.md` §7 has the tables, the PTX census that says each rung
 //! removes what it names, and the three corners that do not run.
 //!
+//! ## And the epilogue can be staged, which is worth 2–8%
+//!
+//! [`Epilogue::Staged`] is what that conclusion was worth spending:
+//! [`Tile::drain_staged`] moves the band TMEM → registers → `stmatrix` into a
+//! per-warp `[32, 64]` shared tile → 16-byte stores, where [`Tile::drain`]
+//! stores 4 bytes a thread straight out of registers. **+8.0% at 4096³, +4.2%
+//! at 8192³ and +1.9% at 16384³**, taking the kernel to 1558.0 and 1692.7
+//! TFLOP/s and from 0.822 to 0.856 and 0.877 to 0.893 of cuBLASLt.
+//!
+//! Measured on the *epilogue* rather than on the launch it is amortized into,
+//! by #114's own `whole − no drain` subtraction at a fixed envelope, it is
+//! **−19.0% / −19.6% / −24.4%**. The `lcf` arm of that subtraction reproduces
+//! #114's 20.43 µs a tile at 20.14 in a different container.
+//!
+//! **Total memory issue does not fall — it is 128 instructions a thread in
+//! both**, which corrects the arithmetic #15 was scoped from; the whole of the
+//! gain is that global stores fall 4× and land on full 128-byte lines. The
+//! `stmatrix` ceiling of ~6.2% at 8192³ was set by a premise this does not
+//! meet (that the stores *halve*), and 4.2% of it is what arrived.
+//!
+//! Two things it does not cost. **Residency**: 114 816 B against 98 392, still
+//! two CTAs an SM because 256 accumulator columns bind first, counted by
+//! `device-tests`' census and controlled for by
+//! [`gemm_cg2_staged_no_drain`](kernels::gemm_cg2_staged_no_drain). And
+//! **registers**: `ptxas` reads **42 against `gemm_cg2`'s 166** with no spill,
+//! because a block-at-a-time LDTM → `stmatrix` never materializes the band that
+//! [`kittens::global::store_rows`]' slot-major walk forces live.
+//!
+//! `gemm_ws` carries the same epilogue and gains 2.5–4.1% from it — which is
+//! the control that says the win is the store's *shape* and not its placement,
+//! since that kernel's epilogue was already deferred and already on warps of
+//! its own. §7 has both, and why this file still ships the register drain.
+//!
 //! ## The item map is grouped, not row-major
 //!
 //! That aspect-ratio sweep is what #89 was started from, and it is worth
@@ -228,7 +261,8 @@ use cuda_device::{
 use crate::bench::{Shape, Timings, time};
 use std::error::Error;
 
-use kittens::global::{GlobalRows, store_rows};
+use kittens::global::{GlobalRows, store_rows, store_shared_rows};
+use kittens::ldst::store_tile;
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, ClcQueue, Job};
 use kittens::reg::{BaseLdtm, RegTile};
@@ -311,6 +345,41 @@ pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32;
 /// the loop below is a single iteration at `BLOCK_N = 128` and the shipped
 /// kernel's codegen is unchanged, which `regcount` is what confirms.
 const DRAIN_N: usize = 128;
+/// Accumulator columns one warp drains in a single band of the **staged**
+/// epilogue ([`Epilogue::Staged`]) — and not a swept parameter.
+///
+/// The band goes to shared memory through `stmatrix`, so its width is the
+/// staging tile's width, and `SharedTile::WIDTH_OK` wants a whole swizzle
+/// subtile: **at bf16 under `Swizzle128B` 64 columns is the narrowest tile that
+/// exists**, and the widest one the budget below admits. So this is 64 because
+/// both bounds meet there.
+///
+/// The budget is the whole of the arithmetic. At 2 CTAs an SM a CTA gets
+/// `233 472 / 2 = 116 736` B and [`SHARED_BYTES`] spends 98 392 of it, leaving
+/// 18 344. Four warps × `[32, 64]` bf16 is 16 384 B and fits; anything wider is
+/// 32 768 and does not, and **`STAGES` is not available to buy the difference**
+/// — `examples/README.md` §7 prices a 3 → 2 step at −11.8% / −7.3% at
+/// *unchanged* residency, which is pipeline depth and not an occupancy step.
+const STAGE_N: usize = 64;
+/// One warp's staging tile: its own 32 rows of `C` by [`STAGE_N`] columns,
+/// 4096 B, and nobody else's.
+///
+/// **Per warp and not per CTA**, which is what keeps the barrier count at zero.
+/// `stmatrix` is `.sync.aligned` and so is a convergence point for the warp
+/// that issues it, and [`kittens::global::store_shared_rows`] is cooperative
+/// rather than collective — so a warp that writes and then reads back its own
+/// 4096 B needs no `bar.sync` at all, only the `bar.warp.sync` that separates
+/// one pass's read from the next pass's write. A CTA-wide `[128, 64]` tile is
+/// the same 16 384 B and would want two block barriers per pass instead.
+///
+/// A row-subrange of a swizzled tile *is* a swizzled tile here, which is why
+/// four of these can be carved out of one 16 384 B run: `SWIZZLE_128B`'s period
+/// is 8 rows and the XOR is over the row index, so a tile starting at a
+/// multiple of 8 rows reproduces the layout it would have had on its own.
+type StageTile = SharedTile<Bf16, 32, STAGE_N, Swizzle128B>;
+/// The band a staged pass drains — [`Band`] at [`STAGE_N`] columns, so **64
+/// fp32 a thread where the register epilogue holds 128**.
+type StagedBand = RegTile<32, STAGE_N, BaseLdtm>;
 /// CTAs in the cluster. Also the multiplier on a stage's transaction charge:
 /// both ranks stage the same two tile types at the same shared offsets, so the
 /// whole stage is one rank's charge twice over.
@@ -397,6 +466,47 @@ pub const SHARED_BYTES: usize = shared_plan(BLOCK_N, BLOCK_K, STAGES);
 /// [`kittens::launch::admit_shared_plan`] is the same opt-in for a kernel
 /// whose output partition no contract describes.
 const _: () = assert!(THREADS == 128 && SHARED_BYTES == 98_392);
+
+/// Dynamic shared memory a **staged** epilogue's launch declares: the shipped
+/// plan, rounded up to the 128-byte alignment a [`SharedTile`] base owes, plus
+/// one [`StageTile`] per warp.
+///
+/// The rounding is 40 bytes and is not free-floating: [`SHARED_BYTES`] ends on
+/// a 24-byte [`ClcQueue`], so the staging run would otherwise start at 98 392,
+/// which is not a swizzle atom's alignment and would put the phase
+/// [`kittens::shared::SwizzledChunks`] derives from the base somewhere the
+/// `stmatrix` and the read-back would still agree on but no reader could check.
+pub const fn staged_plan(block_n: usize, block_k: usize, stages: usize) -> usize {
+    let warps = THREADS as usize / 32;
+    shared_plan(block_n, block_k, stages).next_multiple_of(128) + warps * (32 * STAGE_N * 2)
+}
+
+/// Where the first warp's [`StageTile`] starts, as a byte offset into the
+/// launch's dynamic shared memory.
+const STAGE_OFFSET: usize = SHARED_BYTES.next_multiple_of(128);
+
+/// CTAs of a staged launch an SM holds — [`Rung::ctas_per_sm`]'s
+/// `min(512 / columns, shared per SM / plan)` at [`STAGED_SHARED_BYTES`].
+///
+/// It is 2, the same integer the shipped envelope gets, because the
+/// tensor-memory term binds at [`BLOCK_N`] columns and the staging tiles come
+/// out of slack the shared term still had. `device-tests`' `tmem residency
+/// census` counts the same 2 at this envelope, which is what makes the A/B an
+/// epilogue comparison rather than a residency one.
+fn staged_ctas_per_sm(shared_per_sm: usize) -> u32 {
+    (512 / BLOCK_N).min(shared_per_sm / STAGED_SHARED_BYTES) as u32
+}
+
+/// The staged epilogue's envelope, and the second literal
+/// `#[launch_contract]` needs.
+///
+/// **It must stay at or under 116 736 B**, which is the 233 472 an SM has
+/// divided by the 2 CTAs [`CTAS_PER_SM`] counts — and the residency itself does
+/// not move, because at [`BLOCK_N`] `= 256` the binding term of
+/// `min(512 / columns, shared per SM / plan)` is the tensor-memory one and
+/// stays 2 until shared memory passes that line. 1920 B of headroom is left.
+pub const STAGED_SHARED_BYTES: usize = staged_plan(BLOCK_N, BLOCK_K, STAGES);
+const _: () = assert!(STAGED_SHARED_BYTES == 114_816 && STAGED_SHARED_BYTES <= 116_736);
 
 /// SMs on the device this project targets and measures on — a B200, as
 /// `modal run modal_app.py::bench` prints in its header.
@@ -985,6 +1095,90 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAG
         }
     }
 
+    /// [`Self::drain`] **staged through shared memory**: TMEM → registers →
+    /// `stmatrix` into this warp's own [`StageTile`] → plain 16-byte stores out
+    /// to `C`. #15's route, minus the engine.
+    ///
+    /// # What it is trying to buy, counted per warp band of `[32, 256]`
+    ///
+    /// | | instructions a thread | what one touches |
+    /// |---|---|---|
+    /// | [`Self::drain`] | **128** `st.global.b32` | 4 B a thread, on **8 discontiguous 16 B runs** — [`BaseLdtm`] spreads a warp over 8 rows × 4 column-quads |
+    /// | staged, `stmatrix` | 64 `stmatrix.m8n8.x2` | 256 B a warp |
+    /// | staged, `ld.shared` | 32 `ld.shared.v4.b32` | 16 B a thread |
+    /// | staged, `st.global` | **32** `st.global.v4.b32` | 16 B a thread, on **4 contiguous 128 B runs** |
+    ///
+    /// **Total memory issue does not fall — it is 128 either way.** The version
+    /// of this table #15 was scoped from counted 96, by leaving out the
+    /// `ld.shared` half of [`kittens::global::store_shared_rows`]' chunk copy;
+    /// that mover is deliberately a load and a store rather than one opaque
+    /// snippet, and both are instructions. So the entire hypothesis is the
+    /// **shape** of the global write and not its count: 4× fewer store
+    /// instructions, and each one landing on full 128-byte lines instead of on
+    /// eight half-filled 32-byte sectors. Counting sectors rather than
+    /// instructions, the band's global writes go from 1024 half-full to 512
+    /// full.
+    ///
+    /// It is strictly more total work — a whole extra pass over the data
+    /// through shared memory — so it wins only if that recoalescing is worth
+    /// more than 64 `stmatrix` plus 32 `ld.shared`. `examples/README.md` §7 is
+    /// where that is measured rather than argued.
+    ///
+    /// The `cvt.rn.bf16x2.f32` count is unchanged at 128: [`kittens::shared::Element::pack`] is
+    /// called twice per `stmatrix` where `Element::write_pair` was called once
+    /// per pair store.
+    ///
+    /// # The LDTM half is untouched, and is 39% of the cost
+    ///
+    /// #109 split the epilogue into 13.1 µs of stores and 8.3 µs of LDTM at
+    /// 8192³. Every column above is the store half. What does change on the
+    /// load side is the *band*: [`StagedBand`] is 64 fp32 a thread where
+    /// [`Band`] is 128, because the pass is as wide as the staging tile — the
+    /// same TMEM reads in twice as many passes, and `regcount` is what says
+    /// where peak liveness went.
+    ///
+    /// # There is no proxy fence here and its absence is not a bug
+    ///
+    /// `fence.proxy.async.shared::cta` orders a generic-proxy write against an
+    /// *async*-proxy read, which is what the TMA path in
+    /// [`kittens::epilogue::StoreRing`] needs. Both ends of this one are
+    /// generic — `stmatrix` writes and `ld.shared` reads — so nothing but
+    /// convergence stands between them, and `stmatrix.sync.aligned` is
+    /// convergence. The one hazard left is the *next* pass overwriting a tile
+    /// this pass is still reading, which is why the `bar.warp.sync` below is
+    /// there and why it is a warp barrier and not a block one.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::drain`], plus: `stage` must be 4096 B of shared memory no
+    /// other warp writes.
+    #[inline(always)]
+    unsafe fn drain_staged(&self, item: u32, stage: StageTile) {
+        unsafe {
+            let (row_base, column_base) = self.origin(item);
+            let chunks = stage.chunk_writer();
+            let mut column = 0u32;
+            while column < BLOCK_N as u32 {
+                let band: StagedBand = self.accumulator.tile(32 * self.warp_id, column);
+                store_tile(chunks, 0, 0, self.lane, band);
+                store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
+                    self.c,
+                    row_base,
+                    column_base + column,
+                    self.lane,
+                    stage,
+                );
+                // The write-after-read the loop owes itself, at warp scope
+                // because the tile is this warp's alone. `bar.warp.sync` orders
+                // memory among the lanes it synchronizes, so the next pass's
+                // `stmatrix` cannot overtake a lane still reading this one's
+                // chunks.
+                warp::sync_mask(u32::MAX);
+                column += STAGE_N as u32;
+            }
+        }
+    }
+
     /// Where in `C` this warp's band of `item` starts — the whole of what the
     /// item index means to the epilogue, split out so [`Self::drain`] and
     /// [`Self::drain_storing_twice`] cannot disagree about it.
@@ -1550,6 +1744,71 @@ impl Job for Idle {
     unsafe fn work(&mut self, _item: u32) {}
 }
 
+/// [`Epilogue::Staged`]'s job: the shipped item with [`Tile::drain_staged`]
+/// where [`Tile::drain`] was, and nothing else moved.
+///
+/// The three phases are the *shipped* ones ([`Tile::produce`],
+/// [`Tile::multiply`]) rather than copies of them, for [`Ablated`]'s reason: a
+/// second spelling of the K walk is a place for the A/B's two arms to drift.
+/// What differs from `Tile::work` is one call and one extra field.
+///
+/// `DRAIN` is the ablation switch, and it is here rather than reached through
+/// [`Ablated`] because the two rungs must declare the *same* 114 816 B shared
+/// plan: `whole − no drain` at the staged envelope is what makes the staged
+/// epilogue's exposed cost comparable with #114's 20.43 µs, and a control at a
+/// different envelope would be measuring the plan as well as the drain. At
+/// `false` it computes a wrong `C` and is never checked.
+#[derive(Clone, Copy)]
+struct Staged<const DRAIN: bool> {
+    tile: Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>,
+    /// This warp's 4096 B of the staging run — see [`StageTile`] for why it is
+    /// the warp's and not the CTA's.
+    stage: StageTile,
+}
+
+impl<const DRAIN: bool> Job for Staged<DRAIN> {
+    const RANKS: u32 = crate::gemm::RANKS;
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn init(&self, item: u32) {
+        unsafe { self.tile.init(item) }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn inval(&self) {
+        unsafe { self.tile.inval() }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s, plus [`Tile::drain_staged`]'s: `stage` is this warp's
+    /// alone, which [`kernels::attach_staged`] is what establishes.
+    #[inline(always)]
+    unsafe fn work(&mut self, item: u32) {
+        unsafe {
+            let tile = self.tile;
+            let (tile_m, tile_n) = pipeline::grouped(item, tile.tiles_m, tile.tiles_n, tile.group);
+            if tile.warp_id == 0 && tile.lane == 0 {
+                tile.produce::<true>(tile_m, tile_n, 0, tile.k_blocks);
+            }
+            if tile.rank == LEADER && tile.warp_id == 1 && tile.lane == 0 {
+                tile.multiply::<true>();
+            }
+            tile.done.wait(0);
+            thread::sync_threads();
+            if DRAIN {
+                tile.drain_staged(item, self.stage);
+            }
+        }
+    }
+}
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
@@ -1647,6 +1906,51 @@ pub mod kernels {
                 tile,
                 ClcQueue::attach(smem.add(rings + 2 * STAGES * 8 + 8 + 8)),
             )
+        }
+    }
+
+    /// [`attach`] on the shipped rung, plus this warp's [`StageTile`] out of
+    /// the run that follows the shipped plan.
+    ///
+    /// The staging run is at the *end* of the envelope rather than folded into
+    /// [`shared_plan`], and that is what keeps the A/B honest: every offset
+    /// `attach` lays out is byte for byte the one [`gemm_cg2`] uses, so the two
+    /// arms differ in the epilogue and in 16 424 declared bytes and in nothing
+    /// else.
+    ///
+    /// # Safety
+    ///
+    /// [`attach`]'s, and the launch must declare [`STAGED_SHARED_BYTES`].
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn attach_staged(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        c: &mut DisjointSlice<u16>,
+    ) -> (Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>, StageTile) {
+        // The staging run's own half of the join `attach` makes for the rings:
+        // the offset, the per-warp stride and the envelope are three spellings
+        // of the same bytes and this is where they have to agree.
+        const {
+            assert!(STAGE_OFFSET >= SHARED_BYTES && STAGE_OFFSET.is_multiple_of(128));
+            assert!(
+                STAGED_SHARED_BYTES == STAGE_OFFSET + (THREADS as usize / 32) * StageTile::BYTES
+            );
+        };
+        unsafe {
+            let (tile, _) = attach::<BLOCK_N, HALF_N, BLOCK_K, STAGES>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, c,
+            );
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let stage = StageTile::from_raw(
+                smem.add(STAGE_OFFSET + tile.warp_id as usize * StageTile::BYTES),
+            );
+            (tile, stage)
         }
     }
 
@@ -1775,6 +2079,95 @@ pub mod kernels {
             // pays an un-hidden epilogue — one per cluster over the whole
             // launch, against one per *item* under the fused shape.
             job.finish();
+            release(&job.tile);
+        }
+    }
+
+    /// The same GEMM with its epilogue **staged through shared memory** —
+    /// `stmatrix` into a per-warp tile and 16-byte stores out of it, where
+    /// [`gemm_cg2`] stores 4 bytes a thread straight out of registers.
+    ///
+    /// Identical to [`gemm_cg2`] in grid, tensor memory, operand maps, item map
+    /// and schedule, and in every byte of the shared plan `attach` lays out.
+    /// What differs is [`Tile::drain_staged`] and 16 424 more declared bytes,
+    /// which is 114 816 against 98 392 and still **2 CTAs an SM** — the tensor
+    /// memory term of `min(512 / columns, shared per SM / plan)` is what binds
+    /// at 256 accumulator columns, so shared memory has 1920 B left to give
+    /// before anything moves.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_cg2`]'s, at [`STAGED_SHARED_BYTES`].
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 114_816,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_cg2_staged(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, stage) =
+                attach_staged(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let mut job = Staged::<true> { tile, stage };
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            release(&job.tile);
+        }
+    }
+
+    /// **A deliberately wrong GEMM** — [`gemm_cg2_staged`] with the epilogue
+    /// removed, which is the staged arm's own `no drain` control.
+    ///
+    /// [`gemm_cg2_no_drain`] would not do. It declares 98 392 B where this one
+    /// declares 114 816, and the whole point of the subtraction is that
+    /// everything but the drain is held: `staged − staged no drain` is then the
+    /// staged epilogue's exposed cost on exactly the instrument that measured
+    /// the register epilogue's at 20.43 µs a tile (#114), and the difference
+    /// between the two subtractions is the answer this issue is after.
+    ///
+    /// Running it *against* [`gemm_cg2_no_drain`] is the second thing it buys:
+    /// two kernels that differ only in 16 424 bytes of shared memory nothing
+    /// touches, which is what says the envelope itself costs nothing at this
+    /// residency.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_cg2_staged`]'s, less the epilogue: it writes no `C` at all.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 114_816,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_cg2_staged_no_drain(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, stage) =
+                attach_staged(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let mut job = Staged::<false> { tile, stage };
+            pipeline::run(&mut job, tiles_m * tiles_n);
             release(&job.tile);
         }
     }
@@ -2632,6 +3025,19 @@ impl Plan {
     fn ablated(self, ablation: Ablation) -> Self {
         Plan { ablation, ..self }
     }
+
+    /// Dynamic shared memory this plan's launch declares.
+    ///
+    /// The rung's own plan for every epilogue but [`Epilogue::Staged`], which
+    /// carries a staging tile per warp on the end of it — the one place a
+    /// launch's envelope is not a function of the rung alone, and the reason
+    /// this is a method rather than `rung.shared()` at the call site.
+    fn shared(self) -> usize {
+        match self.epilogue {
+            Epilogue::Staged => staged_plan(self.rung.block_n, self.rung.block_k, self.rung.stages),
+            _ => self.rung.shared(),
+        }
+    }
 }
 
 /// Which phases of an output tile a launch runs — the ablation ladder.
@@ -2836,12 +3242,19 @@ impl Phase {
     }
 }
 
-/// Where an item's store phase runs — #15, and the axis [`Lcsf`] adds.
+/// **What an item's store phase is, and where it runs** — #15, and the axis
+/// [`Lcsf`] adds.
 ///
-/// It is not a scheduler and not a rung: the grid, the shared plan, the tensor
-/// memory, the item map and the tile are identical across the two, and the only
-/// thing that moves is whether [`Tile::drain`] runs at the end of its own item
-/// or at the start of the next one.
+/// It is not a scheduler and not a rung: the grid, the tensor memory, the item
+/// map and the tile are identical across all of it, and between
+/// [`Epilogue::Fused`] and [`Epilogue::Deferred`] so is the shared plan — the
+/// only thing that moves there is whether [`Tile::drain`] runs at the end of
+/// its own item or at the start of the next one.
+///
+/// [`Epilogue::Staged`] moves a second thing and says so in its own doc: it
+/// keeps the placement and changes the *shape* of the store, which costs
+/// 16 424 declared bytes it cannot get any other way. Residency does not move
+/// with them, which is what keeps this one axis rather than two.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Epilogue {
     /// `lcf`: the store folds into the item and cannot overlap the next item's
@@ -2850,6 +3263,21 @@ pub enum Epilogue {
     /// `lcsf`: the store is deferred one item and runs while the next item's
     /// first [`Tile::FILL`] stages are in flight.
     Deferred,
+    /// `staged`: the store stays where [`Epilogue::Fused`] puts it and changes
+    /// **shape** — TMEM → registers → `stmatrix` into a per-warp shared tile →
+    /// 16-byte stores to `C` ([`Tile::drain_staged`]).
+    ///
+    /// This is the one member of this axis that moves the shared plan, and it
+    /// has to: the staging tiles are 16 384 B that did not exist. 114 816 B is
+    /// still 2 CTAs an SM — the tensor-memory term binds at 256 accumulator
+    /// columns — so the A/B is still taken at one residency, but the sentence
+    /// above about the plan being identical across this axis is false here and
+    /// [`gemm_cg2_staged_no_drain`](kernels::gemm_cg2_staged_no_drain) is the
+    /// control that prices the difference.
+    ///
+    /// **It computes the GEMM and is on the correctness gate**, unlike the
+    /// three probes below.
+    Staged,
     /// **Not a GEMM. This computes a wrong `C` on purpose and is never checked.**
     ///
     /// The fused epilogue with every item's store aimed at the *cluster's own
@@ -2927,6 +3355,7 @@ impl Epilogue {
         match self {
             Epilogue::Fused => "lcf",
             Epilogue::Deferred => "lcsf",
+            Epilogue::Staged => "staged",
             Epilogue::HotStore => "hot",
             Epilogue::DoubleDrain => "2x",
             Epilogue::DoubleStore => "2s",
@@ -3089,7 +3518,7 @@ fn run<T>(
     let blocks = grid_for(plan.scheduler, m, n, rung, cap);
     let (tiles_m, tiles_n) = tile_grid(m, n, rung.block_n);
     let k_blocks = (k / rung.block_k) as u32;
-    let config = LaunchConfig1D::new(blocks, THREADS, rung.shared() as u32);
+    let config = LaunchConfig1D::new(blocks, THREADS, plan.shared() as u32);
 
     // One prepared launch per call, boxed because the handle's type is the
     // kernel's. Preparing is a driver call opting the entry point into its
@@ -3148,6 +3577,15 @@ fn run<T>(
         }
         (Entry::Shipped, Scheduler::Static, Epilogue::Deferred, Ablation::Whole) => {
             launcher!(prepare_gemm_cg2_lcsf, gemm_cg2_lcsf)
+        }
+        // The staged epilogue and its own `no drain` control. They are the one
+        // pair on this axis that declares a different envelope, which
+        // `Plan::shared` is what supplies to the launch config above.
+        (Entry::Shipped, Scheduler::Static, Epilogue::Staged, Ablation::Whole) => {
+            launcher!(prepare_gemm_cg2_staged, gemm_cg2_staged)
+        }
+        (Entry::Shipped, Scheduler::Static, Epilogue::Staged, Ablation::NoDrain) => {
+            launcher!(prepare_gemm_cg2_staged_no_drain, gemm_cg2_staged_no_drain)
         }
         (Entry::Shipped, Scheduler::Static, Epilogue::HotStore, Ablation::Whole) => {
             launcher!(prepare_gemm_cg2_hot, gemm_cg2_hot)
@@ -3461,6 +3899,34 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
              accumulator per cluster in flight)",
             Epilogue::Deferred.name(),
             tiles(m, n, BLOCK_N)
+        ));
+        // The staged store phase, under the same widths and the same `==`.
+        //
+        // It is on this gate and not beside a benchmark row for a sharper
+        // reason than the deferred one: `stmatrix` and the read-back address
+        // the same swizzled tile through two different derivations, the
+        // per-warp staging tiles are four row-subranges of one 16 384 B run,
+        // and the loop reuses each tile four times with only a `bar.warp.sync`
+        // between the read of one pass and the write of the next. Every one of
+        // those is a wrong `C` rather than a fault if it is wrong, and this is
+        // the only thing that looks.
+        for group in CHECK_GROUPS {
+            let plan = Plan {
+                scheduler: Scheduler::Static,
+                group,
+                rung: SHIPPED,
+                epilogue: Epilogue::Staged,
+                ablation: Ablation::Whole,
+            };
+            run(context, m, n, k, plan, nothing_after)?;
+        }
+        notes.push(format!(
+            "{m}x{n}x{k} exact on {} at groups {CHECK_GROUPS:?} ({} tiles, {} B, \
+             {} CTAs/SM)",
+            Epilogue::Staged.name(),
+            tiles(m, n, BLOCK_N),
+            STAGED_SHARED_BYTES,
+            staged_ctas_per_sm(per_sm)
         ));
         // #87's rungs, on the static schedule they are swept on. A wider pair
         // tile is a different item map, a different accumulator and a
@@ -4657,6 +5123,195 @@ pub fn epilogue_sweep(
             tflops(shape, theirs),
             theirs / fused,
             theirs / deferred
+        );
+    }
+    Ok(())
+}
+
+/// Sizes the staged epilogue is measured at.
+///
+/// **Nothing below 4096³**, and that is a property of the denominator rather
+/// than a choice about ours: `examples/README.md` §7 records cuBLASLt's own
+/// run-to-run spread reaching 77% at the small end, where a ratio is not a
+/// quantity. The three here are the three every recent epilogue claim in this
+/// file is quoted at.
+const STAGED_SIZES: [Shape; 3] = [
+    Shape {
+        m: 4096,
+        n: 4096,
+        k: 4096,
+    },
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 8192,
+    },
+    Shape {
+        m: 16384,
+        n: 16384,
+        k: 16384,
+    },
+];
+
+/// The staged epilogue's A/B — `cargo oxide run kittens-examples -- bench
+/// staged`, which is `modal run modal_app.py::bench --case staged`.
+///
+/// # What is being asked, and what the answer is bounded by
+///
+/// #114 left the epilogue as the *whole* of the gap to cuBLASLt: the
+/// epilogue-free kernel measures 1850 TFLOP/s at 8192³ against the library's
+/// 1808 in the same container, and `whole − no drain` is 20.43 µs a tile
+/// against #108's 21.4 µs measured serially by an unrelated route — a ratio of
+/// 1.01, so the epilogue is exposed rather than hidden and cutting it pays at
+/// close to full value. #109 then split it 13.1 µs of stores against 8.3 µs of
+/// LDTM.
+///
+/// [`Epilogue::Staged`] attacks the store half only. **Its ceiling at 8192³ is
+/// about 6.2%** — the stores' share of the launch — and it cannot reach even
+/// that, because it does not delete the stores, it re-shapes them and buys 64
+/// `stmatrix` and 32 `ld.shared` a thread to do it. [`Tile::drain_staged`] has
+/// the instruction count, and the headline of it is that **total memory issue
+/// does not move**: 128 either way. What moves is that global stores fall 4×
+/// and land on full 128-byte lines.
+///
+/// # The three tables
+///
+/// 1. **The A/B**, staged against fused at the three sizes, with cuBLASLt in
+///    the same container as the denominator both are quoted against.
+/// 2. **The epilogue's exposed cost, in each arm, by the same subtraction**.
+///    `staged − staged no drain` against `lcf − no drain`, in microseconds per
+///    output tile on the critical path. This is the measurement the whole issue
+///    turns on, and it is the one that can say *where* a null result went: an
+///    epilogue that got cheaper while the launch did not is a different finding
+///    from one that did not get cheaper.
+/// 3. **The envelope control.** `staged no drain` against `no drain` is two
+///    kernels differing in 16 424 bytes of shared memory nothing touches. It
+///    should be zero — residency is 2 CTAs an SM on both, set by the
+///    tensor-memory term — and if it is not, table 2's subtraction is
+///    attributing a plan to a drain.
+pub fn staged_sweep(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    baseline: Option<crate::bench::Baseline>,
+) -> Result<(), Box<dyn Error>> {
+    println!(
+        "gemm staged epilogue (#15) — min ms over 30 timed launches, static schedule,\n\
+         GROUP = {GROUP}, the shipped [256,{BLOCK_N}] @ k{BLOCK_K} s{STAGES} rung throughout.\n\
+         `lcf` drains TMEM -> registers -> {} scattered 4-byte stores a thread per warp band;\n\
+         `staged` drains TMEM -> registers -> stmatrix into a per-warp [32,{STAGE_N}] bf16 tile\n\
+         -> 32 contiguous 16-byte stores. Same grid, same tensor memory, same item map, same\n\
+         {CTAS_PER_SM} CTAs an SM; the shared plan is {SHARED_BYTES} B against {STAGED_SHARED_BYTES} B,\n\
+         which is the staging tiles and is the one thing this axis cannot hold fixed.\n\
+         TOTAL MEMORY ISSUE IS 128 INSTRUCTIONS A THREAD IN BOTH — see Tile::drain_staged.\n\
+         The `lcf` and `staged` rows compute the GEMM and are checked element-by-element\n\
+         against the CPU reference before they are timed; both `no drain` rows are UNCHECKED\n\
+         and write no `C` at all.",
+        BLOCK_N / 2
+    );
+
+    println!("\n1. the A/B");
+    println!(
+        "{:<18}{:>8}{:>12}{:>12}{:>12}{:>14}{:>10}",
+        "shape", "tiles", "lcf ms", "lcf TF/s", "staged ms", "staged TF/s", "vs lcf"
+    );
+    let mut measured = Vec::new();
+    for shape in STAGED_SIZES {
+        let plan = Plan::new(Scheduler::Static);
+        let fused = timed(context, shape, plan)?;
+        let staged = timed(context, shape, plan.with(Epilogue::Staged))?;
+        let bare = timed(context, shape, plan.ablated(Ablation::NoDrain))?;
+        let staged_bare = timed(
+            context,
+            shape,
+            plan.with(Epilogue::Staged).ablated(Ablation::NoDrain),
+        )?;
+        println!(
+            "{:<18}{:>8}{:>12.4}{:>12.1}{:>12.4}{:>14.1}{:>10}",
+            shape,
+            tiles(shape.m, shape.n, BLOCK_N),
+            fused,
+            tflops(shape, fused),
+            staged,
+            tflops(shape, staged),
+            format!("{:+.1}%", 100.0 * (fused / staged - 1.0))
+        );
+        measured.push((shape, fused, staged, bare, staged_bare));
+    }
+
+    println!(
+        "\n2. what the epilogue costs in each arm, by #114's own subtraction: the launch with\n\
+         the drain minus the launch without it, over the items on the critical path. The\n\
+         `lcf` column is the 20.43 us/tile #114 measured at 8192^3, re-measured here as its\n\
+         own control rather than quoted across sessions."
+    );
+    println!(
+        "{:<18}{:>16}{:>18}{:>14}{:>18}",
+        "shape", "lcf us/tile", "staged us/tile", "change", "of the launch"
+    );
+    for &(shape, fused, staged, bare, staged_bare) in &measured {
+        let per_tile =
+            |milliseconds: f64| milliseconds * 1e3 / items_on_critical_path(shape.m, shape.n);
+        let (theirs, ours) = (per_tile(fused - bare), per_tile(staged - staged_bare));
+        println!(
+            "{:<18}{:>16.2}{:>18.2}{:>14}{:>18}",
+            shape,
+            theirs,
+            ours,
+            format!("{:+.1}%", 100.0 * (ours / theirs - 1.0)),
+            format!(
+                "{:.1}% -> {:.1}%",
+                100.0 * (fused - bare) / fused,
+                100.0 * (staged - staged_bare) / staged
+            )
+        );
+    }
+
+    println!(
+        "\n3. the envelope control — `no drain` at {SHARED_BYTES} B against `no drain` at\n\
+         {STAGED_SHARED_BYTES} B. The extra bytes are declared and never touched, so this row\n\
+         is what says table 2 is comparing two drains and not two shared plans. Both are\n\
+         {CTAS_PER_SM} CTAs an SM by `min(512 / columns, shared per SM / plan)`, whose binding\n\
+         term at {BLOCK_N} accumulator columns is the tensor-memory one."
+    );
+    println!(
+        "{:<18}{:>16}{:>20}{:>12}",
+        "shape", "no drain ms", "staged no drain ms", "delta"
+    );
+    for &(shape, _, _, bare, staged_bare) in &measured {
+        println!(
+            "{:<18}{:>16.4}{:>20.4}{:>12}",
+            shape,
+            bare,
+            staged_bare,
+            format!("{:+.1}%", 100.0 * (staged_bare / bare - 1.0))
+        );
+    }
+
+    println!(
+        "\n4. against cuBLASLt on the same device in the same container. #114 measured the\n\
+         epilogue-free kernel at 1850 TF/s against the library's 1808 at 8192^3, so this\n\
+         column is the whole of what the epilogue is being asked to buy."
+    );
+    println!(
+        "{:<18}{:>14}{:>14}{:>14}{:>16}",
+        "shape", "cuBLASLt ms", "theirs TF/s", "lcf/theirs", "staged/theirs"
+    );
+    for &(shape, fused, staged, _, _) in &measured {
+        let Some(baseline) = baseline else {
+            println!(
+                "no cuBLASLt column: built without --features cublas. modal_app.py::bench\n\
+                 turns it on, and a ratio is the point of this table."
+            );
+            break;
+        };
+        eprintln!("{shape}: staging and checking {}", baseline.name);
+        let theirs = (baseline.bench)(context, shape)?.0.min();
+        println!(
+            "{:<18}{:>14.4}{:>14.1}{:>14.3}{:>16.3}",
+            shape,
+            theirs,
+            tflops(shape, theirs),
+            theirs / fused,
+            theirs / staged
         );
     }
     Ok(())

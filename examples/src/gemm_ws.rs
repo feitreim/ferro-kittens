@@ -15,6 +15,23 @@
 //!
 //! What moves is *where the overlap comes from*.
 //!
+//! ## Since #15 there is a second entry point, and it is a control
+//!
+//! [`Entry::Staged`] is [`Tile::drain_staged`] in place of [`Tile::drain`]:
+//! `stmatrix` into a per-warp `[32, 64]` shared tile and 16-byte stores out of
+//! it, which is the epilogue [`crate::gemm`] gained 2–8% from. It is here
+//! because this kernel is the one that can say *why* that worked. There the
+//! epilogue is the critical path — #114 measured it as fully exposed — and here
+//! it is already deferred one item and already on warps of its own, so a gain
+//! that survives the move is the store's shape and not its placement.
+//!
+//! **It survives: +4.1% / +2.5% / +3.0% at 4096³ / 8192³ / 16384³**, moving
+//! this kernel from 0.804 to 0.829 of cuBLASLt at the largest size. Registers
+//! go 168 → 44 with no spill, and residency cannot move — 512 accumulator
+//! columns fixed it at one CTA an SM before shared memory was consulted, and
+//! 147 584 B is well inside the 233 472 an SM has. `examples/README.md` §7 has
+//! both kernels' tables.
+//!
 //! [`crate::gemm`] gets it **across CTAs**. It is 98392 B of shared memory and
 //! 256 accumulator columns, which is two CTAs an SM, so one CTA's epilogue runs
 //! against another CTA's MMA. That is what forces its whole budget: 18344 B of
@@ -215,7 +232,8 @@ use crate::bench::{Baseline, Shape, Timings, time};
 use crate::gemm::{Scheduler, a_value, b_value, check_c, stage};
 use std::error::Error;
 
-use kittens::global::{GlobalRows, store_rows};
+use kittens::global::{GlobalRows, store_rows, store_shared_rows};
+use kittens::ldst::store_tile;
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, ClcQueue, Job};
 use kittens::reg::{BaseLdtm, RegTile};
@@ -270,6 +288,22 @@ pub const THREADS: u32 = 32 * WARPS;
 /// widest band that fits and a 256-column stage drains in two of them, exactly
 /// as [`crate::gemm`] does.
 const DRAIN_N: usize = 128;
+/// Accumulator columns one warp drains in a single band of the **staged**
+/// epilogue — see [`crate::gemm`]'s `STAGE_N`, which this is a copy of and for
+/// the same two reasons: `SharedTile::WIDTH_OK` wants a whole swizzle subtile,
+/// and 64 columns is the narrowest bf16 tile `Swizzle128B` admits.
+///
+/// The budget argument is *not* the same one, and it is much slacker here. This
+/// kernel is one CTA an SM by tensor memory alone — [`ACCUM_COLUMNS`] is all
+/// 512 an SM has — so it has the whole 233 472 B to spend and
+/// [`SHARED_BYTES`] spends 131 176. What decides the width is therefore the
+/// register file and the tile shape, not the plan.
+const STAGE_N: usize = 64;
+/// One epilogue warp's staging tile — [`crate::gemm`]'s `StageTile`, at this
+/// kernel's four epilogue warps.
+type StageTile = SharedTile<Bf16, 32, STAGE_N, Swizzle128B>;
+/// The band a staged pass drains: 64 fp32 a thread against [`Band`]'s 128.
+type StagedBand = RegTile<32, STAGE_N, BaseLdtm>;
 /// CTAs in the cluster, and the multiplier on a stage's transaction charge.
 const RANKS: u32 = 2;
 /// The CTA mask naming every half of the pair.
@@ -310,6 +344,24 @@ pub const fn shared_plan(stages: usize) -> usize {
 /// Dynamic shared memory the shipped entry point's launch must provide.
 pub const SHARED_BYTES: usize = shared_plan(STAGES);
 
+/// [`shared_plan`] with a staging tile per epilogue warp on the end, 128-byte
+/// aligned — the envelope [`Entry::Staged`] declares.
+///
+/// See [`crate::gemm`]'s `staged_plan`, whose arithmetic this is. What differs
+/// is that nothing here is close to a limit: this kernel is one CTA an SM
+/// because [`ACCUM_COLUMNS`] is the SM's entire tensor memory, so the 16 384 B
+/// come out of 102 296 B of slack rather than out of 18 344.
+pub const fn staged_plan(stages: usize) -> usize {
+    shared_plan(stages).next_multiple_of(128) + EPILOGUE_WARPS as usize * (32 * STAGE_N * 2)
+}
+
+/// Where the first epilogue warp's [`StageTile`] starts in the launch's
+/// dynamic shared memory.
+const STAGE_OFFSET: usize = SHARED_BYTES.next_multiple_of(128);
+
+/// The staged entry point's envelope, and the literal its contract repeats.
+pub const STAGED_SHARED_BYTES: usize = staged_plan(STAGES);
+
 /// `#[launch_contract]` takes literals, so the envelope is written twice and
 /// this is what keeps the two in step — the same join [`crate::gemm`]'s
 /// `SHARED_BYTES` assert makes, and for the same reason: past 48 KiB the plan
@@ -321,6 +373,7 @@ pub const SHARED_BYTES: usize = shared_plan(STAGES);
 const _: () = {
     assert!(THREADS == 192);
     assert!(SHARED_BYTES == 131_176);
+    assert!(STAGED_SHARED_BYTES == 147_584 && STAGED_SHARED_BYTES <= 233_472);
     assert!(shared_plan(6) == 196_744);
     assert!(ACCUM_COLUMNS == 512);
     assert!(BLOCK_N % DRAIN_N == 0);
@@ -502,6 +555,78 @@ impl<const STAGES: usize> Tile<STAGES> {
             }
         }
     }
+
+    /// [`Self::drain`] **staged through shared memory** — `stmatrix` into this
+    /// warp's own [`StageTile`] and 16-byte stores out of it.
+    ///
+    /// [`crate::gemm::Tile::drain_staged`] is where the instruction arithmetic
+    /// and the fence argument are written down; this is that epilogue on an
+    /// epilogue warp, and the reason it is worth a second kernel is that the
+    /// two kernels expose it differently. In [`crate::gemm`] the epilogue is on
+    /// the critical path — #114 measured `whole − no drain` at 1.01× the same
+    /// epilogue's serial cost — and here it is on warps of its own, one item
+    /// behind, with the producer never stopping. **So this is the control for
+    /// what the staged shape is actually buying**: if the win in `gemm_cg2` is
+    /// recoalescing global writes it should survive being moved off the
+    /// critical path, and if it is only that the epilogue was in the way, it
+    /// should not.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::drain`], and the launch must declare
+    /// [`STAGED_SHARED_BYTES`] — which is what makes [`Self::stage_tile`]'s
+    /// address one this launch owns.
+    #[inline(always)]
+    unsafe fn drain_staged(&self, item: u32, stage: u32) {
+        unsafe {
+            let tile = self.stage_tile();
+            let accumulator = self.accumulator(stage);
+            let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, self.group);
+            let row_base =
+                2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank + 32 * self.warp_id;
+            let column_base = BLOCK_N as u32 * tile_n;
+            let chunks = tile.chunk_writer();
+            let mut column = 0u32;
+            while column < BLOCK_N as u32 {
+                let band: StagedBand = accumulator.tile(32 * self.warp_id, column);
+                store_tile(chunks, 0, 0, self.lane, band);
+                store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
+                    self.c,
+                    row_base,
+                    column_base + column,
+                    self.lane,
+                    tile,
+                );
+                warp::sync_mask(u32::MAX);
+                column += STAGE_N as u32;
+            }
+        }
+    }
+
+    /// This epilogue warp's 4096 B of the staging run.
+    ///
+    /// Carved here rather than handed down from `attach` so that a launch at
+    /// the *shipped* envelope never forms the address at all: the only caller
+    /// is [`Self::drain_staged`], which is behind a `const STAGED` a
+    /// non-staged entry point makes false.
+    ///
+    /// # Safety
+    ///
+    /// The launch must declare [`STAGED_SHARED_BYTES`], and `warp_id` must be
+    /// below [`EPILOGUE_WARPS`].
+    #[inline(always)]
+    unsafe fn stage_tile(&self) -> StageTile {
+        const {
+            assert!(STAGE_OFFSET >= SHARED_BYTES && STAGE_OFFSET.is_multiple_of(128));
+            assert!(
+                STAGED_SHARED_BYTES == STAGE_OFFSET + EPILOGUE_WARPS as usize * StageTile::BYTES
+            );
+        };
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            StageTile::from_raw(smem.add(STAGE_OFFSET + self.warp_id as usize * StageTile::BYTES))
+        }
+    }
 }
 
 /// The warp-specialized job: one output tile per item, with the epilogue one
@@ -512,8 +637,15 @@ impl<const STAGES: usize> Tile<STAGES> {
 /// split is what makes the deferral pay. Under `Lcsf` the drain sits *between*
 /// the producer's fill prefix and the rest of its walk, because warp 0 is both
 /// the producer and a quarter of the epilogue; here the producer never stops.
+///
+/// `STAGED` picks which epilogue the drain warps run — [`Tile::drain`] or
+/// [`Tile::drain_staged`] — and is a const parameter of the *same* job rather
+/// than a second one, for [`crate::gemm`]'s reason: a second spelling of this
+/// ordering argument is a place for the two arms to drift, and the argument is
+/// the hard part. Both arms compute the GEMM and both are on the correctness
+/// gate.
 #[derive(Clone, Copy)]
-struct Ws<const STAGES: usize> {
+struct Ws<const STAGES: usize, const STAGED: bool> {
     tile: Tile<STAGES>,
     /// The item whose accumulator is still in tensor memory, or [`Self::NONE`].
     pending: u32,
@@ -529,7 +661,7 @@ struct Ws<const STAGES: usize> {
     sequence: u32,
 }
 
-impl<const STAGES: usize> Ws<STAGES> {
+impl<const STAGES: usize, const STAGED: bool> Ws<STAGES, STAGED> {
     /// No accumulator owed. `u32::MAX` is not a reachable item: the tile grid
     /// is `tiles_m * tiles_n` and both are `u32`.
     const NONE: u32 = u32::MAX;
@@ -569,13 +701,17 @@ impl<const STAGES: usize> Ws<STAGES> {
     unsafe fn finish(&self) {
         unsafe {
             if self.pending != Self::NONE && self.tile.warp_id < EPILOGUE_WARPS {
-                self.tile.drain(self.pending, self.pending_stage());
+                if STAGED {
+                    self.tile.drain_staged(self.pending, self.pending_stage());
+                } else {
+                    self.tile.drain(self.pending, self.pending_stage());
+                }
             }
         }
     }
 }
 
-impl<const STAGES: usize> Job for Ws<STAGES> {
+impl<const STAGES: usize, const STAGED: bool> Job for Ws<STAGES, STAGED> {
     /// The pair shares one barrier set — the peer aims its TMA at the leader's
     /// stage barrier and the leader's MMA arrives in the peer's `free` and
     /// `done` — so the item boundary that re-arms them is the cluster's.
@@ -648,7 +784,11 @@ impl<const STAGES: usize> Job for Ws<STAGES> {
                 tile.multiply(stage);
             }
             if tile.warp_id < EPILOGUE_WARPS && self.pending != Self::NONE {
-                tile.drain(self.pending, self.pending_stage());
+                if STAGED {
+                    tile.drain_staged(self.pending, self.pending_stage());
+                } else {
+                    tile.drain(self.pending, self.pending_stage());
+                }
             }
 
             // Every thread, including the epilogue warps that have just
@@ -787,7 +927,7 @@ pub mod kernels {
         unsafe {
             let (tile, _) =
                 attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
-            let mut job = Ws::new(tile);
+            let mut job = Ws::<STAGES, false>::new(tile);
             pipeline::run(&mut job, tiles_m * tiles_n);
             job.finish();
             release(&job.tile);
@@ -831,7 +971,7 @@ pub mod kernels {
         unsafe {
             let (tile, queue) =
                 attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
-            let mut job = Ws::new(tile);
+            let mut job = Ws::<STAGES, false>::new(tile);
             pipeline::run_stealing(&mut job, queue);
             job.finish();
             release(&job.tile);
@@ -879,7 +1019,55 @@ pub mod kernels {
         unsafe {
             let (tile, _) =
                 attach::<6>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
-            let mut job = Ws::new(tile);
+            let mut job = Ws::<6, false>::new(tile);
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            job.finish();
+            release(&job.tile);
+        }
+    }
+
+    /// [`gemm_ws`] with its epilogue **staged through shared memory** — #15,
+    /// and the control for what the staged shape buys.
+    ///
+    /// Identical to [`gemm_ws`] in grid, tensor memory, warp split, operand
+    /// maps, item map, schedule and pipeline depth, and in every byte of the
+    /// plan `attach` lays out; it declares 16 408 more of them for the four
+    /// epilogue warps' staging tiles. **Residency does not move and cannot**:
+    /// this kernel is one CTA an SM because [`ACCUM_COLUMNS`] is the SM's
+    /// whole tensor memory, and 147 584 B is still well inside the 233 472 an
+    /// SM has.
+    ///
+    /// What makes it worth a kernel rather than a footnote is that the
+    /// epilogue is *already* off the critical path here — deferred one item
+    /// and on warps of its own — where in [`crate::gemm`] it is the critical
+    /// path. See [`Tile::drain_staged`].
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_ws`]'s, at [`STAGED_SHARED_BYTES`].
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 147_584,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_ws_staged(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, _) =
+                attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let mut job = Ws::<STAGES, true>::new(tile);
             pipeline::run(&mut job, tiles_m * tiles_n);
             job.finish();
             release(&job.tile);
@@ -894,6 +1082,10 @@ pub enum Entry {
     S4,
     /// `gemm_ws_s6` — six, static only.
     S6,
+    /// `gemm_ws_staged` — four stages with the epilogue staged through shared
+    /// memory (#15), static only. Same depth as [`Entry::S4`], so the pair is
+    /// an epilogue comparison and nothing else.
+    Staged,
 }
 
 impl Entry {
@@ -902,17 +1094,25 @@ impl Entry {
         match self {
             Entry::S4 => STAGES,
             Entry::S6 => 6,
+            Entry::Staged => STAGES,
         }
     }
 
-    /// Dynamic shared memory its launch declares.
+    /// Dynamic shared memory its launch declares — the staging tiles are the
+    /// one thing that is not a function of the depth.
     pub fn shared(self) -> usize {
-        shared_plan(self.stages())
+        match self {
+            Entry::Staged => staged_plan(self.stages()),
+            _ => shared_plan(self.stages()),
+        }
     }
 
     /// What the tables call it.
     pub fn name(self) -> String {
-        format!("ws s{}", self.stages())
+        match self {
+            Entry::Staged => format!("ws s{} staged", self.stages()),
+            _ => format!("ws s{}", self.stages()),
+        }
     }
 }
 
@@ -1052,6 +1252,9 @@ fn run<T>(
         (Entry::S4, Scheduler::Static) => launcher!(prepare_gemm_ws, gemm_ws),
         (Entry::S4, Scheduler::Stealing) => launcher!(prepare_gemm_ws_clc, gemm_ws_clc),
         (Entry::S6, Scheduler::Static) => launcher!(prepare_gemm_ws_s6, gemm_ws_s6),
+        (Entry::Staged, Scheduler::Static) => {
+            launcher!(prepare_gemm_ws_staged, gemm_ws_staged)
+        }
         // A depth comparison under a moving scheduler would be two variables.
         (entry, scheduler) => {
             return Err(format!(
@@ -1133,6 +1336,24 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
             "{m}x{n}x{k} exact on {} ({} B)",
             Entry::S6.name(),
             Entry::S6.shared()
+        ));
+        // #15's staged epilogue, under the same widths and the same `==`. It
+        // is the same gate `crate::gemm`'s staged rung is on and for the same
+        // reasons — a swizzled tile addressed through two derivations, four
+        // warp-private tiles carved out of one run, and each reused four times
+        // with only a `bar.warp.sync` between a read and the next write.
+        for group in CHECK_GROUPS {
+            let plan = Plan {
+                scheduler: Scheduler::Static,
+                group,
+                entry: Entry::Staged,
+            };
+            run(context, m, n, k, plan, nothing_after)?;
+        }
+        notes.push(format!(
+            "{m}x{n}x{k} exact on {} ({} B)",
+            Entry::Staged.name(),
+            Entry::Staged.shared()
         ));
         if let Some(label) = rounding {
             notes.push(label);
@@ -1295,14 +1516,53 @@ pub fn compare(
     }
 
     println!(
+        "\n2b. #15's staged epilogue on this kernel, and it is a CONTROL rather than a\n\
+         candidate. `gemm_cg2` gains from staging because its epilogue is the critical\n\
+         path — #114 measured `whole - no drain` at 1.01x the same epilogue's serial cost.\n\
+         Here the epilogue is already deferred one item and on warps of its own, so if the\n\
+         staged shape is worth something because it recoalesces the global write, it should\n\
+         still be worth something here; if it was only worth something because the epilogue\n\
+         was in the way, it should be worth nothing here.\n\
+         Same depth, same warp split, same schedule, {SHARED_BYTES} B against\n\
+         {STAGED_SHARED_BYTES} B — and 1 CTA an SM either way, because 512 accumulator\n\
+         columns fixed that before shared memory was consulted."
+    );
+    println!(
+        "{:<18}{:>12}{:>14}{:>14}{:>12}",
+        "shape", "ws ms", "ws staged ms", "staged TF/s", "vs ws"
+    );
+    let mut staged_ms = Vec::new();
+    for &(shape, _, ours) in &measured {
+        let staged = timed(
+            context,
+            shape,
+            Plan {
+                scheduler: Scheduler::Static,
+                group: GROUP,
+                entry: Entry::Staged,
+            },
+        )?
+        .min();
+        println!(
+            "{:<18}{:>12.4}{:>14.4}{:>14.1}{:>12}",
+            shape,
+            ours,
+            staged,
+            tflops(shape, staged),
+            format!("{:+.1}%", 100.0 * (ours / staged - 1.0))
+        );
+        staged_ms.push(staged);
+    }
+
+    println!(
         "\n3. against cuBLASLt on the same device in the same container — the denominator,\n\
          and the drift control that says how much of the delta above is the session."
     );
     println!(
-        "{:<18}{:>14}{:>14}{:>16}{:>16}",
-        "shape", "cuBLASLt ms", "theirs TF/s", "gemm/theirs", "ws/theirs"
+        "{:<18}{:>14}{:>14}{:>16}{:>16}{:>18}",
+        "shape", "cuBLASLt ms", "theirs TF/s", "gemm/theirs", "ws/theirs", "ws staged/theirs"
     );
-    for &(shape, control, ours) in &measured {
+    for (&(shape, control, ours), &staged) in measured.iter().zip(&staged_ms) {
         let Some(baseline) = baseline else {
             println!(
                 "no cuBLASLt column: built without --features cublas. modal_app.py::ws_bench\n\
@@ -1313,12 +1573,13 @@ pub fn compare(
         eprintln!("{shape}: staging and checking {}", baseline.name);
         let theirs = (baseline.bench)(context, shape)?.0.min();
         println!(
-            "{:<18}{:>14.4}{:>14.1}{:>16.3}{:>16.3}",
+            "{:<18}{:>14.4}{:>14.1}{:>16.3}{:>16.3}{:>18.3}",
             shape,
             theirs,
             tflops(shape, theirs),
             theirs / control,
-            theirs / ours
+            theirs / ours,
+            theirs / staged
         );
     }
     Ok(())

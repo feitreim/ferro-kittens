@@ -852,6 +852,24 @@ pub fn main() -> ExitCode {
         };
     }
 
+    // `bench staged` is the fifth: the epilogue's *shape* where `epilogue`
+    // sweeps its placement — a register drain against one staged through
+    // shared memory by `stmatrix`. It rides this argument for the reason the
+    // four above do, and it is its own sweep rather than two more columns of
+    // `epilogue` because it is the one thing on that axis that moves the
+    // shared plan, so it carries its own envelope control.
+    if let Some((name, _)) = &selected
+        && name == "staged"
+    {
+        return match gemm::staged_sweep(&context, CUBLASLT) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // `bench ablation` is the fourth, and the one that decomposes rather than
     // sweeps: the same size sweep `gemm-depth` runs, with one phase of the
     // item removed per rung and everything else held at the shipped kernel's.

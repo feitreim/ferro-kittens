@@ -30,6 +30,10 @@ Local usage:
     modal run modal_app.py::bench --case tile
                                       # gemm's pair tile and pipeline depth,
                                       # traversal held fixed (#87)
+    modal run modal_app.py::bench --case staged
+                                      # gemm's epilogue SHAPE: a register drain
+                                      # against one staged through shared
+                                      # memory by stmatrix (#15)
     modal run modal_app.py::profile   # one launch under Nsight Compute (see
                                       # the note there: no counters on Modal)
     modal run modal_app.py::doctor    # env / GPU sanity check
@@ -628,6 +632,74 @@ def _measure(arch: str) -> dict[tuple[str, str], dict[str, int]]:
     return measured
 
 
+# The opcode census (#114, #15). `ptxas -v` prices a kernel and never says what
+# is in it, and every ablation and epilogue rung in `examples/src/gemm.rs` is a
+# claim about exactly that: that a rung removes what it names, and that a
+# re-shaped epilogue issues the instructions its own doc counts. #114 ran this
+# by hand and reported it in prose; it is cheap, it is CPU-only, and a claim
+# nobody re-derives is a claim that goes stale, so it lives here now.
+#
+# Substrings of the PTX mnemonic, and deliberately disjoint — `st.global.b32`
+# is not a substring of `st.global.v4.b32`, so a plain count per pattern is a
+# partition and not a double count.
+CENSUS_OPCODES = (
+    ("mma", "tcgen05.mma"),
+    ("ldtm", "tcgen05.ld"),
+    ("tma", "cp.async.bulk.tensor"),
+    ("stmatrix", "stmatrix"),
+    ("ld.sh.v4", "ld.shared.v4"),
+    ("st.g.v4", "st.global.v4"),
+    ("st.g.b32", "st.global.b32"),
+    ("cvt.bf16x2", "cvt.rn.bf16x2"),
+    ("bar.sync", "bar.sync"),
+    ("bar.warp", "bar.warp.sync"),
+    ("mbar.arrive", "mbarrier.arrive"),
+)
+
+# Which entry functions the census prints. The whole table would be forty-odd
+# rows of probes with nothing in them; these are the kernels whose instruction
+# mix is an argument somebody made.
+CENSUS_PREFIX = "gemm_"
+
+
+def _census(directory: str) -> dict[str, dict[str, int]]:
+    """Opcodes per entry function, over the PTX a crate emitted.
+
+    Split on `.visible .entry` rather than parsed: the bodies contain inline
+    PTX from `ptx_asm!` verbatim, which is precisely the text worth counting
+    and precisely what a structural parser would have to be taught about."""
+    counted: dict[str, dict[str, int]] = {}
+    for ptx in sorted(Path(directory).rglob("*.ptx")):
+        chunks = ptx.read_text().split(".visible .entry ")
+        for chunk in chunks[1:]:
+            name = chunk.split("(", 1)[0].strip()
+            if not name.startswith(CENSUS_PREFIX):
+                continue
+            counted[name] = {
+                column: chunk.count(pattern) for column, pattern in CENSUS_OPCODES
+            }
+    return counted
+
+
+def _print_census() -> None:
+    counted = _census(EXAMPLES_DIR)
+    if not counted:
+        print(f"\nno `{CENSUS_PREFIX}*` entry functions in the examples' PTX to census.")
+        return
+    print(
+        f"\nopcode census, per entry function — every `{CENSUS_PREFIX}*` kernel the examples\n"
+        "emit, counted in the PTX. A rung that removes a phase must show zero in that\n"
+        "phase's column, and an epilogue that re-shapes the store must show the counts its\n"
+        "own doc predicts. Counts are static instructions inside one entry function, so a\n"
+        "loop the compiler did not unroll shows as one."
+    )
+    columns = [column for column, _ in CENSUS_OPCODES]
+    print("  " + f"{'kernel':<30}" + "".join(f"{column:>12}" for column in columns))
+    for name in sorted(counted):
+        row = "".join(f"{counted[name][column]:>12}" for column in columns)
+        print(f"  {name:<30}{row}")
+
+
 def _print_kernels(measured: dict[tuple[str, str], dict[str, int]]) -> None:
     for ptx in sorted({source for source, _ in measured}):
         kernels = {name: counts for (source, name), counts in measured.items() if source == ptx}
@@ -906,7 +978,14 @@ def _register_ceiling(ctas: int, threads: int) -> int:
 # is the residency the kernel's own grid is sized from — for `gemm_cg2`
 # measured twice, by #83 on a clock and by #84 by counting `%smid`, with the
 # argument in its doc comment. A kernel joins this table by declaring both.
-GATED_KERNELS = (("gemm_cg2", "examples/src/gemm.rs"),)
+GATED_KERNELS = (
+    ("gemm_cg2", "examples/src/gemm.rs"),
+    # #15's staged epilogue, on the same launch geometry and the same grid
+    # arithmetic. It reshapes the drained band from `[32, 128]` to `[32, 64]`,
+    # which moves peak liveness, so it is exactly the kind of change this gate
+    # exists for.
+    ("gemm_cg2_staged", "examples/src/gemm.rs"),
+)
 
 _CONTRACT_BLOCK = re.compile(r"block\s*=\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)")
 _CTAS_PER_SM = re.compile(r"\bconst\s+CTAS_PER_SM\s*:\s*u32\s*=\s*(\d+)\s*;")
@@ -1107,6 +1186,7 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     measured = _measure(arch)
     print(f"\nregisters per thread, {arch}" + (f" — {label}" if label else ""))
     _print_kernels(measured)
+    _print_census()
     _print_ladder(measured)
     _print_timed_twins(measured)
     _check_occupancy_step(measured)
