@@ -70,6 +70,7 @@ use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cluster, cluster_launch, cuda_module, debug, kernel, thread, warp};
 
+use kittens::epilogue::StoreRing;
 use kittens::global::{GlobalLayout, GlobalRows, encode_bf16_panels, load_rows, store_rows};
 use kittens::ldst::{load_fragment, load_tile, load_vec, store_fragment, store_tile};
 use kittens::mma::{self, MmaShape, mm_ab, mm_abt, mm_atb, mm_atbt, mma_abt};
@@ -107,6 +108,38 @@ const WIDE: usize = 128;
 /// so this is the only case that can tell them apart.
 const SHORT: usize = 4;
 
+/// Rows of the [`StoreRing`] probe's staging buffer. Capped at 64 because the
+/// band identities are [`cell`]s and a `cell`'s row field is six bits — the
+/// case distinguishes bands by rotating the *column* identity ([`ring_column`])
+/// rather than by widening the row, so nothing here needs a second encoding.
+const RING_ROWS: usize = 64;
+/// Rows one warp of that probe owns. Four warps write one staging buffer while
+/// a single thread issues its store, which is the arrangement the collective
+/// halves of [`StoreRing`] exist for — a one-warp probe would exercise neither
+/// the proxy fence's "every writer fences" clause nor the barrier that releases
+/// the other warps past thread 0's group wait.
+const RING_WARP_ROWS: usize = 16;
+/// Threads that probe launches with.
+const RING_THREADS: u32 = (RING_ROWS / RING_WARP_ROWS) as u32 * 32;
+/// Bands it pushes through the ring. Every buffer of the deepest ring under
+/// test is reused at least once at this count, which is the whole point: depth
+/// 1 cannot exercise the reuse hazard, and a ring that never wraps is a ring
+/// whose `acquire` has nothing to wait for.
+const RING_BANDS: usize = 8;
+/// How far band `b` rotates its column identities. Odd, so the rotation is a
+/// bijection on 64 and on 128 columns alike, and the eight bands' rotations are
+/// distinct at both widths — which is what makes a buffer that was recycled too
+/// early, or a band stored at another band's rows, decode to a *wrong column*
+/// naming the band it came from instead of a plausible right value.
+const RING_STRIDE: usize = 37;
+
+/// The column whose identity band `band` parks at column `column` of its
+/// staging buffer. The device fills registers with it and the host builds the
+/// expected destination from it, so the two cannot disagree about the pattern.
+const fn ring_column(column: usize, band: usize, columns: usize) -> usize {
+    (column + RING_STRIDE * band) % columns
+}
+
 /// Rows of the probe accumulator — one full `M128` MMA shape, and the four
 /// warps' 32 TMEM rows each.
 const ROWS: usize = 128;
@@ -123,6 +156,17 @@ type Tile<const R: usize, const C: usize> = SharedTile<Bf16, R, C, Swizzle128B>;
 type AOperand = Tile<ROWS, DEPTH>;
 type BOperand = Tile<TILE, DEPTH>;
 type Accumulator = TmemTile<ROWS, COLUMNS>;
+/// One warp's band of the [`StoreRing`] probe: the [`RING_WARP_ROWS`] rows it
+/// owns of the staging buffer, at the buffer's full width.
+type RingBand<const C: usize> = RegTile<RING_WARP_ROWS, C, BaseLdtm>;
+
+/// Shared bytes a [`StoreRing`] probe launches with — the ring and nothing
+/// else. A store ring needs no mbarrier: a bulk store completes on a group
+/// count and there is no barrier anywhere in this case's plan.
+const fn ring_shared<const C: usize, const IN_FLIGHT: u32>() -> u32 {
+    StoreRing::<Bf16, RING_ROWS, C, Swizzle128B, IN_FLIGHT>::BYTES as u32
+}
+
 /// The lane probe's staging tile: a warp's 32 rows by the one swizzle atom
 /// [`SharedTile::chunk_writer`] accepts, which is what `store_fragment`
 /// addresses into.
@@ -769,6 +813,99 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn stmatrix_roundtrip_wide(mut out: DisjointSlice<u32>) {
         unsafe { stmatrix_probe::<TILE, WIDE>(&mut out) }
+    }
+
+    /// Push [`RING_BANDS`] register bands out through a [`StoreRing`], one
+    /// acquire/commit pair each, landing band `b` at rows `RING_ROWS * b` of
+    /// the destination.
+    ///
+    /// The whole chain the library owns is in here and nothing else is: the
+    /// registers are filled from [`RingBand::coordinate`] and never loaded, so
+    /// no TMA load, no mbarrier and no MMA can be the cause of a mismatch.
+    /// What remains is `store_tile` into the acquired buffer, the proxy fence
+    /// and barrier `commit` takes before handing it to the engine, the group
+    /// wait `acquire` takes before the buffer comes round again, and the final
+    /// [`StoreRing::drain`].
+    ///
+    /// Four warps write each buffer and one thread issues each store, which is
+    /// the arrangement whose ordering is the point: a fence taken only by the
+    /// issuing thread, or a group wait not separated from the other warps'
+    /// writes by a barrier, both leave a band partly written and partly stale.
+    /// Launch with [`RING_THREADS`].
+    #[inline(always)]
+    unsafe fn store_ring_probe<const C: usize, const IN_FLIGHT: u32>(
+        destination: *const TmaDescriptor,
+    ) where
+        BaseLdtm: FragmentLayout<RING_WARP_ROWS, C>,
+    {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let mut ring = StoreRing::<Bf16, RING_ROWS, C, Swizzle128B, IN_FLIGHT>::attach(smem);
+            let lane = warp::lane_id();
+            let row_base = RING_WARP_ROWS as u32 * warp::warp_id();
+
+            let mut band = 0usize;
+            while band < RING_BANDS {
+                let staging = ring.acquire();
+
+                let mut values = RingBand::<C>::zero();
+                let mut slot = 0usize;
+                while slot < RingBand::<C>::SLOTS {
+                    let mut value = 0usize;
+                    while value < RingBand::<C>::VALUES {
+                        let (row, column) = RingBand::<C>::coordinate(lane, slot, value);
+                        values.set(
+                            slot,
+                            value,
+                            cell(
+                                (row_base + row) as usize,
+                                ring_column(column as usize, band, C),
+                            ),
+                        );
+                        value += 1;
+                    }
+                    slot += 1;
+                }
+                store_tile(staging.chunk_writer(), row_base, 0, lane, values);
+
+                ring.commit(destination, (RING_ROWS * band) as i32, 0);
+                band += 1;
+            }
+            // Nothing else makes the bytes visible to the host — not the
+            // barriers above and not the kernel ending.
+            ring.drain();
+        }
+    }
+
+    /// [`store_ring_probe`] at depth 1: one buffer, so every band's `stmatrix`
+    /// waits out the previous band's store reads. The degenerate ring, and the
+    /// shape `softmax` writes by hand.
+    #[kernel]
+    pub unsafe fn store_ring_depth_1(destination: *const TmaDescriptor) {
+        unsafe { store_ring_probe::<TILE, 0>(destination) }
+    }
+
+    /// [`store_ring_probe`] at depth 2 — the shallowest ring that can get the
+    /// reuse hazard wrong, since band `k + 2` writes the buffer band `k`'s
+    /// store is reading.
+    #[kernel]
+    pub unsafe fn store_ring_depth_2(destination: *const TmaDescriptor) {
+        unsafe { store_ring_probe::<TILE, 1>(destination) }
+    }
+
+    /// [`store_ring_probe`] at depth 4, where three stores are in flight across
+    /// a reuse and the wait is counting groups rather than draining them.
+    #[kernel]
+    pub unsafe fn store_ring_depth_4(destination: *const TmaDescriptor) {
+        unsafe { store_ring_probe::<TILE, 3>(destination) }
+    }
+
+    /// [`store_ring_probe`] at depth 2 over buffers of two stacked subtiles, so
+    /// each commit issues two boxes into one group — the case that says a
+    /// group is a *tile* and not an instruction.
+    #[kernel]
+    pub unsafe fn store_ring_depth_2_wide(destination: *const TmaDescriptor) {
+        unsafe { store_ring_probe::<WIDE, 1>(destination) }
     }
 
     /// TMA the same tile [`swizzle_probe`] stages, then read every `[16, 16]`
@@ -3744,6 +3881,59 @@ fn check_tma_store<const R: usize, const C: usize>(
         .map_err(|error| format!("pitched destination: {error}").into())
 }
 
+/// Does a band written into a [`StoreRing`] reach the global rows it was
+/// committed for, at every depth — including after the ring has wrapped?
+///
+/// The destination is [`RING_BANDS`] tall in staging buffers and seeded with
+/// [`POISON`], and band `b` is expected at rows `RING_ROWS * b` holding
+/// [`cell`]s whose columns are rotated by [`ring_column`]. Every way this can
+/// fail names itself:
+///
+/// - **A wrong row coordinate** puts a band at another band's rows, where its
+///   rotation is the wrong one for every element of the tile.
+/// - **A missed store** leaves `POISON`, which no identity can be.
+/// - **The reuse hazard** — a buffer written before the engine finished
+///   reading it — puts band `k + DEPTH`'s rotation into band `k`'s rows, and
+///   the difference of the two decoded columns is `RING_STRIDE * DEPTH`. That
+///   is the failure depth 1 cannot produce and depth ≥ 2 can, which is why the
+///   deeper cases exist at all.
+/// - **A missed final wait** leaves the tail of the destination unwritten when
+///   the host reads it back, again as `POISON`.
+///
+/// What it cannot claim: that a ring built *without* the waits would fail here.
+/// A dropped `wait_read` is a race, and a race that does not happen leaves no
+/// trace. The case is built so that a violation is a wrong value rather than a
+/// plausible one; it is not built to force the violation.
+fn check_store_ring<const C: usize>(
+    stream: &CudaStream,
+    shared: u32,
+    launch: impl Fn(LaunchConfig, *const TmaDescriptor) -> Result<(), cuda_core::DriverError>,
+) -> Result<String, Box<dyn Error>> {
+    let rows = RING_BANDS * RING_ROWS;
+    let destination = DeviceBuffer::from_host(stream, &vec![POISON; rows * C / 2])?;
+    let map =
+        unsafe { encode_bf16_panels::<RING_ROWS, C>(stream, destination.cu_deviceptr(), rows, 1)? };
+
+    launch(launch_config(RING_THREADS, shared), map.as_ptr())?;
+
+    let mut expected = Vec::with_capacity(rows * C / 2);
+    for band in 0..RING_BANDS {
+        for row in 0..RING_ROWS {
+            for pair in 0..C / 2 {
+                expected.push(pack(
+                    cell_bits(row, ring_column(2 * pair, band, C)),
+                    cell_bits(row, ring_column(2 * pair + 1, band, C)),
+                ));
+            }
+        }
+    }
+    let note = compare_tile(&destination.to_host_vec(stream)?, &expected, C / 2)?;
+    let columns = C;
+    Ok(format!(
+        "{RING_BANDS} bands of [{RING_ROWS}, {columns}] through {shared} B of ring, {note}"
+    ))
+}
+
 /// Does the cursor read back what the TMA engine wrote?
 ///
 /// The staged tile is position identities in logical order and the kernel
@@ -5249,6 +5439,42 @@ fn run() -> Result<usize, Box<dyn Error>> {
         Box::new(|| {
             check_tma_store::<TILE, TILE>(stream, |config, source, packed, pitched| unsafe {
                 module.tma_store_recycle(stream, config, source, packed, pitched)
+            })
+        }),
+    ));
+    // The epilogue's shared→global half as one primitive (#15): `stmatrix`
+    // into a staging ring and a bulk store out of it, with the proxy fence and
+    // the two group waits inside. Depth 1 is what `softmax` does by hand;
+    // everything above it is the reuse hazard, which depth 1 cannot exercise.
+    cases.push((
+        "store ring depth 1",
+        Box::new(|| {
+            check_store_ring::<TILE>(stream, ring_shared::<TILE, 0>(), |config, map| unsafe {
+                module.store_ring_depth_1(stream, config, map)
+            })
+        }),
+    ));
+    cases.push((
+        "store ring depth 2",
+        Box::new(|| {
+            check_store_ring::<TILE>(stream, ring_shared::<TILE, 1>(), |config, map| unsafe {
+                module.store_ring_depth_2(stream, config, map)
+            })
+        }),
+    ));
+    cases.push((
+        "store ring depth 4",
+        Box::new(|| {
+            check_store_ring::<TILE>(stream, ring_shared::<TILE, 3>(), |config, map| unsafe {
+                module.store_ring_depth_4(stream, config, map)
+            })
+        }),
+    ));
+    cases.push((
+        "store ring depth 2 wide",
+        Box::new(|| {
+            check_store_ring::<WIDE>(stream, ring_shared::<WIDE, 1>(), |config, map| unsafe {
+                module.store_ring_depth_2_wide(stream, config, map)
             })
         }),
     ));
