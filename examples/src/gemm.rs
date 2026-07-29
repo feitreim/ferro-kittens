@@ -615,9 +615,7 @@ struct Tile<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
 /// The split is [`Lcsf`]'s reason for existing and nothing else moves because
 /// of it: [`Job::work`] on [`Tile`] calls all three back to back and is the
 /// kernel that shipped through #87, instruction for instruction.
-impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize>
-    Tile<BLOCK_N, HALF_N, STAGES>
-{
+impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Tile<BLOCK_N, HALF_N, STAGES> {
     /// K blocks the producer can issue before any of them has to be recycled.
     ///
     /// [`SemaphoreRing::wait_recycled`] is a no-op below `STAGES`, so this
@@ -922,9 +920,7 @@ struct Lcsf<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
     pending: u32,
 }
 
-impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize>
-    Lcsf<BLOCK_N, HALF_N, STAGES>
-{
+impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Lcsf<BLOCK_N, HALF_N, STAGES> {
     /// No accumulator owed. `u32::MAX` is not a reachable item: the tile grid
     /// is `tiles_m * tiles_n` and both are `u32`, so a real item is strictly
     /// less than their product and cannot be this.
@@ -1976,7 +1972,10 @@ fn run<T>(
         check_c(&c.to_host_vec(&stream)?, m, n, k)?;
         format!("{m}x{n}x{k} exact")
     } else {
-        format!("{m}x{n}x{k} UNCHECKED ({} is not a GEMM)", plan.epilogue.name())
+        format!(
+            "{m}x{n}x{k} UNCHECKED ({} is not a GEMM)",
+            plan.epilogue.name()
+        )
     };
 
     let after = then(&stream, &mut || launch_once(&mut c))?;
@@ -2636,9 +2635,7 @@ pub fn epilogue_sweep(
          table and nothing has to be argued for out of a budget.",
         STAGES
     );
-    println!(
-        "\n1. the two epilogues, over sizes chosen so the gain has to fall with amortization"
-    );
+    println!("\n1. the two epilogues, over sizes chosen so the gain has to fall with amortization");
     println!(
         "{:<18}{:>8}{:>10}{:>12}{:>12}{:>12}{:>12}{:>10}",
         "shape", "tiles", "items/cl", "lcf ms", "lcf TF/s", "lcsf ms", "lcsf TF/s", "vs lcf"
