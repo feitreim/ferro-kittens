@@ -88,8 +88,18 @@ jobs:
 
       - run: pip install modal
 
+      # `scripts/modal-run`, not `modal run`. This is the tier the wrapper was
+      # written for: the wedge in #99 was a B200 container that printed the
+      # NVIDIA banner, never reached Python, and held the GPU for twenty-six
+      # minutes: `timeout=` was the only ceiling, and nothing inside
+      # `modal_app.py` could fire because `_run`'s first `print` never ran. The
+      # wrapper watches for that tell, stops the app, and exits 3. It exits 2
+      # on the workspace spend limit and 4 on a run that ended without printing
+      # its completion sentinel, because the client's exit code is not a
+      # completion signal (#115). Last command in the step, so all of those are
+      # this job's exit code and all of them are red.
       - name: device-tests on a B200
-        run: modal run modal_app.py::device_tests
+        run: scripts/modal-run device_tests
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}

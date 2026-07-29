@@ -1,8 +1,9 @@
 # Tier 2 — the host feature and a real device codegen, on CPU.
 #
-# This is `modal run modal_app.py::build`: clippy over all three crates with
-# `--features host`, the host tests, and a full `cargo oxide build --arch
-# sm_100a` of *both* kernel crates against the CUDA driver stub. That last part
+# This is `modal_app.py::build`, through `scripts/modal-run`: clippy over all
+# three crates with `--features host`, the host tests, and a full `cargo oxide
+# build --arch sm_100a` of *both* kernel crates against the CUDA driver stub.
+# That last part
 # is the reason this job exists. A post-monomorphization `const { assert!(..) }`
 # in a tile shape fires at codegen, not at type-check, so it is invisible to
 # `cargo check` and only a real device build finds it. Highest value per minute
@@ -83,13 +84,24 @@ jobs:
       # recipe changes.
       - run: pip install modal
 
+      # `scripts/modal-run`, not `modal run` — the same wrapper a laptop uses,
+      # for the same two reasons, both of which CI has more of rather than less.
+      # A container can wedge before it reaches Python (#99), where `timeout=`
+      # is the only thing that ever stops it and nothing inside `modal_app.py`
+      # runs to notice; and `modal run`'s exit code is not a completion signal
+      # (#115) — one stopped app gave 1, an indefinite hang, and a field report
+      # of 0. The wrapper returns 0 only on the sentinel, and 2/3/4 for the
+      # spend limit, a wedge it stopped, and a run that ended without
+      # finishing. It is the last command in the step, so its code is the
+      # step's code and every one of those is red; it annotates 2/3/4 itself so
+      # the diagnosis lands on the check rather than in a log nobody opens.
       - name: cargo clippy --features host, host tests, sm_100a device build
-        run: modal run modal_app.py::build
+        run: scripts/modal-run build
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
 
-  # `modal run modal_app.py::regcount` — the `ptxas -v` table, the shape ladder,
+  # `modal_app.py::regcount` — the `ptxas -v` table, the shape ladder,
   # #63's timed twins, and since #95 a **gate**: a kernel that crosses its
   # occupancy step fails this job. Until #95 that entry point existed and ran
   # nowhere, so the only thing between `gemm_cg2` and a silent third of its
@@ -128,8 +140,9 @@ jobs:
 
       - run: pip install modal
 
+      # Through the wrapper, as `build` is above.
       - name: ptxas register table, the ladder, and the occupancy-step gate
-        run: modal run modal_app.py::regcount
+        run: scripts/modal-run regcount
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}

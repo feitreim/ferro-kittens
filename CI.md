@@ -35,17 +35,16 @@ The `host`-gated links in `global`'s docs are allowed to dangle here (see the
 
 ## Tier 2 — the host feature, device codegen without a device, and the register gate
 
-`modal run modal_app.py::build`: clippy across all three crates with
-`--features host`, the host tests, `cargo doc --features host`, and a real
-`cargo oxide build --arch sm_100a` of both kernel crates against the CUDA driver
-stub.
+`scripts/modal-run build`: clippy across all three crates with `--features
+host`, the host tests, `cargo doc --features host`, and a real `cargo oxide
+build --arch sm_100a` of both kernel crates against the CUDA driver stub.
 
 That last part is why this tier is worth its money. A post-monomorphization
 `const { assert!(..) }` in a tile shape fires at *codegen*. `cargo check` cannot
 see it; only an actual device build can. This is the highest value-per-minute
 job here, and it needs no GPU.
 
-A second job runs `modal run modal_app.py::regcount`: the `ptxas -v` table, the
+A second job runs `scripts/modal-run regcount`: the `ptxas -v` table, the
 shape ladder, #63's timed twins, and #95's **occupancy-step gate**, which fails
 when a named kernel's register count would cost it a CTA per SM. That entry
 point predates this job by a long way and until #95 ran in no workflow at all,
@@ -54,6 +53,9 @@ separate job because it goes red for a different reason than `build` does — a
 register count rather than a compile — and that is worth seeing on the check
 list rather than in a log. It builds both kernel crates in its own container,
 so tier 2 now costs roughly twice what it did; still CPU-minutes.
+
+Both jobs go through **`scripts/modal-run`**, so the wedge watchdog and the
+completion sentinel cover this tier — see the wrapper's own section below.
 
 ### Why Modal rather than a CUDA container on a GitHub runner
 
@@ -76,9 +78,14 @@ target directory would cut most of that. Not done here.
 
 ## Tier 3 — the harness on a B200
 
-`modal run modal_app.py::device_tests`. The ~20 cases take about 1.5 minutes of
-GPU time, but the billed window is the whole container — image pull, harness
-build, run — so budget on the order of ten GPU-minutes per invocation.
+`scripts/modal-run device_tests`. The ~20 cases take about 1.5 minutes of GPU
+time, but the billed window is the whole container — image pull, harness build,
+run — so budget on the order of ten GPU-minutes per invocation.
+
+Through the wrapper for the reason the wrapper exists: the container that
+wedged for twenty-six minutes having printed nothing but a banner was a B200
+running this entry point. This is the tier where the watchdog is worth the most
+per firing, and until it was wired here it covered only runs started by hand.
 
 It runs on a PR only when the PR carries the **`gpu-ci`** label (and on every
 later push while the label is on; remove the label to stop the spend), and
@@ -99,9 +106,10 @@ gh workflow run gpu.yml -f ref=refs/pull/17/merge # a specific PR
 
 `cuda.yml` takes the same `ref` input.
 
-### Running Modal by hand, and the three ways it costs you money
+## `scripts/modal-run`, and the three ways a Modal run costs you money
 
-Use the wrapper rather than `modal run` directly:
+Every Modal invocation in this repo goes through the wrapper rather than calling
+`modal run` — tiers 2 and 3 above, and you:
 
 ```
 scripts/modal-run device_tests
@@ -158,10 +166,29 @@ If you do run `modal run` by hand, check `modal app list` afterwards and confirm
 your app is `stopped`. A live app you have stopped paying attention to is still
 a live app.
 
-**`cuda.yml` and `gpu.yml` still call `modal run` directly**, so neither guard
-covers them: a wedged CI container rides its `timeout=`, and a stopped one is
-whatever the client decides to return. Moving the workflows onto the wrapper is
-the obvious next step and is not done here.
+### In CI
+
+`cuda.yml`'s two jobs and `gpu.yml`'s call `scripts/modal-run`, and it is the
+only command in its step, so the wrapper's code is the step's code and the job
+is red on every one of 2, 3 and 4. Nothing catches, remaps, or `|| true`s them.
+
+2, 3 and 4 also arrive as **`::error::` annotations**, so the diagnosis is on
+the check rather than three hundred lines into a log. That is worth most for 2:
+the spend limit fails every entry point at once, in seconds, and a `build` check
+that goes red in fifteen seconds reads exactly like a broken diff — it has cost
+diagnosis time before. There is deliberately no retry on any of them; 2 in
+particular would spend the rest of the workspace's day retrying nothing.
+
+**The graces keep their defaults in CI (300 / 1200).** They are budgets for
+*silence*, not deadlines on the run: every line the client prints — `Created
+objects`, image-build progress, the NVIDIA banner — resets the clock, so a cold
+start costs wall time without consuming the grace, which is what makes one value
+work on a laptop and on a runner. The measurement they have to clear is #99's:
+`build` is 155–221 s warm end to end and ~7.5 min cold, and that whole cold
+build happens *after* Python is alive, where the 1200 s silence budget governs
+and cargo is printing `Compiling` throughout. What 300 s of startup silence is
+sized against is the failure itself — a container that said nothing at all for
+twenty-six minutes.
 
 ## Pull requests from forks
 
