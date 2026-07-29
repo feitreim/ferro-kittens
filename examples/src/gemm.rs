@@ -107,6 +107,39 @@
 //! a block whose shape the aspect ratio no longer controls. [`swizzle`] sweeps
 //! the width and keeps the losers, and `examples/README.md` §7 has both.
 //!
+//! ## `C` is bf16, and the accumulator is not
+//!
+//! `bf16` in, fp32 accumulate, `bf16` out is the signature a training GEMM has.
+//! This kernel accumulated in fp32 and *wrote* fp32 through #107, which is the
+//! unusual half, and #108 moved the output alone: [`Accumulator`] is still
+//! [`BLOCK_N`] fp32 columns of tensor memory, [`Band`] is still 128 fp32 a
+//! thread, and the single `cvt.rn.bf16x2.f32` is inside the store
+//! ([`kittens::global::store_rows`] over a [`kittens::global::GlobalRows`] of
+//! [`Bf16`]).
+//!
+//! **The cuBLASLt baseline moved in the same change and had to.** At 8192³ an
+//! fp32 `C` is 268 MB and a bf16 `C` is 134 MB, so a baseline left at
+//! `CUDA_R_32F` would write twice what this kernel writes and the difference
+//! would read as ours. Every ratio in `examples/README.md` §7 published before
+//! #108 is against the fp32 pair; the section #108 adds re-measures both
+//! columns in one session and says which of the older rows survive.
+//!
+//! What it changes in the epilogue is **not the instruction count**. Under
+//! [`BaseLdtm`] a thread's four values of a 16-column block sit at column
+//! offsets `{0, 1, 8, 9}` — two adjacent pairs, `CONTIGUOUS_VALUES = 2` — so a
+//! pair store is one instruction at either element and only its width moves,
+//! 8 bytes to 4. The `cvt` is new and the stores are not fewer, which is why
+//! the honest prediction here was neutral-to-slightly-negative on an epilogue
+//! #107 measured as issue-bound rather than write-bound.
+//!
+//! What it *does* change is what the epilogue could be. `stmatrix` is b16 and
+//! was unusable here for exactly one reason — `C` was fp32 — and #94 and #107
+//! both rejected the TMEM → shared → TMA route partly on that. That constraint
+//! is gone: [`kittens::ldst::store_tile`] already writes a
+//! `RegTile<M, N, BaseLdtm>` into a swizzled [`Bf16`] tile through `stmatrix`,
+//! and [`SharedTile::tma_store_2d`] already takes it out. §7 is where that is
+//! priced rather than assumed.
+//!
 //! ## What this kernel had to reach past the library for
 //!
 //! **Nothing.** There is no `GAP` block left in this file, and the last one to
@@ -591,8 +624,10 @@ struct Tile<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
     b_map: *const TmaDescriptor,
     accumulator: Accumulator<BLOCK_N>,
     /// `C` with `ldc` in it — built once, since a persistent CTA writes bands
-    /// of the same output through every item it runs.
-    c: GlobalRows,
+    /// of the same output through every item it runs. The cursor's element is
+    /// the output's, so the fp32 → bf16 rounding is the store instruction and
+    /// nothing else (#108).
+    c: GlobalRows<Bf16>,
     /// The tile grid, both axes. `tiles_m` is here only so the item map can
     /// short the last group of tile-rows when [`GROUP`] does not divide it —
     /// row-major never needed it, and a map that aliases the tail is a wrong
@@ -711,13 +746,23 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Tile<BLOCK_
         }
     }
 
-    /// The fp32 epilogue, straight out of registers (#11) — this warp's band of
-    /// the accumulator, LDTM'd and stored to the tile `item` names.
+    /// The epilogue, straight out of registers (#11) — this warp's band of the
+    /// accumulator, LDTM'd and stored to the tile `item` names.
     ///
     /// `ldc` is the destination's leading dimension and `C` is wider than this
     /// tile's columns, so the cursor carries the stride and each band lands at
-    /// its own `(row, column)` origin — no shared staging tile, no descriptor,
-    /// and no rounding to bf16 on the way out.
+    /// its own `(row, column)` origin — no shared staging tile and no
+    /// descriptor.
+    ///
+    /// **The band is fp32 and `C` is bf16** (#108), so the one rounding in this
+    /// kernel is the `cvt.rn.bf16x2.f32` inside [`kittens::global::store_rows`]'
+    /// pair store. The accumulator does not move: `bf16` in, fp32 accumulate,
+    /// `bf16` out is the signature a training GEMM has, and it is the *output*
+    /// that was the unusual choice here rather than the accumulator. What it
+    /// costs in instructions is one `cvt` per pair and no fewer stores — a pair
+    /// of adjacent columns is 4 bytes where it was 8, and `CONTIGUOUS_VALUES`
+    /// is 2 either way, so the store count is unchanged and only the width
+    /// halves.
     ///
     /// A band at a time rather than the whole accumulator at once, and
     /// [`DRAIN_N`] is why: 256 columns in one `RegTile` is 256 fp32 a thread.
@@ -874,6 +919,59 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
     }
 }
 
+/// [`Epilogue::DoubleDrain`]'s job: [`Tile`] with the epilogue run a **second
+/// time**, aimed at the cluster's own first tile.
+///
+/// **It computes a wrong `C` and is never checked.** See
+/// [`Epilogue::DoubleDrain`] for what the second drain is measuring and why the
+/// second one goes to the home tile rather than to the item's.
+#[derive(Clone, Copy)]
+struct DoubleDrain<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
+    tile: Tile<BLOCK_N, HALF_N, STAGES>,
+    /// As [`HotStore::home`], and here for a second reason: the extra epilogue's
+    /// bytes have to stay in L2 or this probe would price a doubled HBM stream
+    /// as well as a doubled instruction count.
+    home: u32,
+}
+
+impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
+    for DoubleDrain<BLOCK_N, HALF_N, STAGES>
+{
+    const RANKS: u32 = crate::gemm::RANKS;
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn init(&self, item: u32) {
+        unsafe { self.tile.init(item) }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn inval(&self) {
+        unsafe { self.tile.inval() }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s, and the extra drain's: both tiles are ones this cluster
+    /// owns, so both are in bounds, and the accumulator is read twice rather
+    /// than written — nothing between the two drains touches tensor memory.
+    #[inline(always)]
+    unsafe fn work(&mut self, item: u32) {
+        unsafe {
+            self.tile.work(item);
+            // The whole probe. `item` and `home` are runtime values a compiler
+            // cannot prove equal, so this is a second epilogue and not a dead
+            // store the first one subsumes.
+            self.tile.drain(self.home);
+        }
+    }
+}
+
 /// The same output tile with its store phase moved into the *next* item —
 /// ThunderKittens' `prototype::lcsf`, and #15.
 ///
@@ -883,6 +981,10 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
 /// priced it as a TMEM → shared → TMA store epilogue needing an fp32
 /// `TensorMapElement`, an fp32 `SharedTile` swizzle and a shared staging buffer
 /// nobody had the bytes for. **None of that is what the overlap needs here.**
+/// (Two of those three have since stopped existing as obstacles: #108 made `C`
+/// bf16, so the staging tile and the tensor map are both the element the
+/// library already has. What that changes is the *other* route's price, not
+/// this one's, and it is §7's question rather than this type's.)
 ///
 /// The thing `lcf` forbids is the epilogue of item `i` running while item
 /// `i + 1`'s first loads are in flight. What actually stands between them is
@@ -1055,7 +1157,7 @@ pub mod kernels {
         group: u32,
         k_blocks: u32,
         ldc: u32,
-        c: &mut DisjointSlice<f32>,
+        c: &mut DisjointSlice<u16>,
     ) -> (Tile<BLOCK_N, HALF_N, STAGES>, ClcQueue) {
         // Everything a rung has to be true about, fired at codegen — which is
         // the only place the ring byte counts are known, and the reason `cargo
@@ -1102,7 +1204,7 @@ pub mod kernels {
                     tmem_slot,
                     BLOCK_N as u32,
                 )),
-                c: GlobalRows::from_slice(c, ldc as usize),
+                c: GlobalRows::<Bf16>::from_slice(c, ldc as usize),
                 tiles_m,
                 tiles_n,
                 group,
@@ -1186,7 +1288,7 @@ pub mod kernels {
         group: u32,
         k_blocks: u32,
         ldc: u32,
-        mut c: DisjointSlice<f32>,
+        mut c: DisjointSlice<u16>,
     ) {
         unsafe {
             let (mut tile, _) = attach::<BLOCK_N, HALF_N, STAGES>(
@@ -1226,7 +1328,7 @@ pub mod kernels {
         group: u32,
         k_blocks: u32,
         ldc: u32,
-        mut c: DisjointSlice<f32>,
+        mut c: DisjointSlice<u16>,
     ) {
         unsafe {
             let (tile, _) = attach::<BLOCK_N, HALF_N, STAGES>(
@@ -1267,13 +1369,51 @@ pub mod kernels {
         group: u32,
         k_blocks: u32,
         ldc: u32,
-        mut c: DisjointSlice<f32>,
+        mut c: DisjointSlice<u16>,
     ) {
         unsafe {
             let (tile, _) = attach::<BLOCK_N, HALF_N, STAGES>(
                 a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
             );
             let mut job = HotStore {
+                tile,
+                home: cluster::cluster_idx().min(tiles_m * tiles_n - 1),
+            };
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            release(&job.tile);
+        }
+    }
+
+    /// **A deliberately wrong GEMM** — [`Epilogue::DoubleDrain`]'s probe, which
+    /// prices the epilogue by running it twice. Never checked, never shipped.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_cg2`]'s. Both tiles it writes are tiles this cluster owns.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 98_392,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_cg2_2x(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, _) = attach::<BLOCK_N, HALF_N, STAGES>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
+            let mut job = DoubleDrain {
                 tile,
                 home: cluster::cluster_idx().min(tiles_m * tiles_n - 1),
             };
@@ -1320,7 +1460,7 @@ pub mod kernels {
         group: u32,
         k_blocks: u32,
         ldc: u32,
-        mut c: DisjointSlice<f32>,
+        mut c: DisjointSlice<u16>,
     ) {
         unsafe {
             let (mut tile, queue) = attach::<BLOCK_N, HALF_N, STAGES>(
@@ -1368,7 +1508,7 @@ pub mod kernels {
         group: u32,
         k_blocks: u32,
         ldc: u32,
-        mut c: DisjointSlice<f32>,
+        mut c: DisjointSlice<u16>,
     ) {
         unsafe {
             let (mut tile, _) =
@@ -1407,7 +1547,7 @@ pub mod kernels {
         group: u32,
         k_blocks: u32,
         ldc: u32,
-        mut c: DisjointSlice<f32>,
+        mut c: DisjointSlice<u16>,
     ) {
         unsafe {
             let (mut tile, _) =
@@ -1448,7 +1588,7 @@ pub mod kernels {
         group: u32,
         k_blocks: u32,
         ldc: u32,
-        mut c: DisjointSlice<f32>,
+        mut c: DisjointSlice<u16>,
     ) {
         unsafe {
             let (mut tile, _) =
@@ -1493,7 +1633,7 @@ pub mod kernels {
         group: u32,
         k_blocks: u32,
         ldc: u32,
-        mut c: DisjointSlice<f32>,
+        mut c: DisjointSlice<u16>,
     ) {
         unsafe {
             let (mut tile, _) =
@@ -1577,9 +1717,19 @@ pub(crate) fn b_value(column: usize, depth: usize) -> f32 {
 
 /// Round-to-nearest-even fp32 → bf16. Exact for every value [`a_value`] and
 /// [`b_value`] produce, since their low 16 mantissa bits are already zero.
+///
+/// Since #108 it rounds the *output* too, and there it is not exact — see
+/// [`check_c`]. It is the same rounding `cvt.rn.bf16x2.f32` does, ties to even
+/// included, which is what lets the comparison stay `==`.
 fn to_bf16(value: f32) -> u16 {
     let bits = value.to_bits();
     (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+}
+
+/// bf16 → fp32, which is a shift and loses nothing: the way an observed `C`
+/// re-enters arithmetic the host can print and divide.
+fn from_bf16(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
 }
 
 /// A `[rows, k]` bf16 operand as the packed `u32` words a device buffer holds,
@@ -1708,10 +1858,13 @@ pub enum Epilogue {
     ///
     /// The fused epilogue with every item's store aimed at the *cluster's own
     /// first tile* instead of the item's. Identical in every instruction — same
-    /// LDTM, same count of `st.global.v2.f32`, same addresses within a tile —
-    /// and the only thing that moves is that 148 clusters rewrite 38 MB of `C`
-    /// over and over instead of streaming 268 MB or 1 GB of it, so the writes
-    /// stay in L2 and never press on HBM.
+    /// LDTM, same count of pair stores, same addresses within a tile — and the
+    /// only thing that moves is that 148 clusters rewrite 19 MB of `C` over and
+    /// over instead of streaming 134 MB or 512 MB of it, so the writes stay in
+    /// L2 and never press on HBM. Every one of those figures halved when #108
+    /// made `C` bf16, which is exactly the reason to re-run this probe rather
+    /// than carry #107's answer across: the bytes it deletes are half what they
+    /// were.
     ///
     /// It exists to split the epilogue's cost in two, which no exact
     /// intervention here can. If this is much faster than [`Epilogue::Fused`]
@@ -1725,6 +1878,36 @@ pub enum Epilogue {
     /// excluded from [`check`] deliberately: a probe that computed the right
     /// answer would not be measuring what this one is for.
     HotStore,
+    /// **Not a GEMM either. This computes a wrong `C` on purpose and is never
+    /// checked.**
+    ///
+    /// The fused epilogue run **twice** per item — the same LDTM and the same
+    /// stores a second time, the second aimed at the cluster's own first tile
+    /// so the extra bytes stay in L2 and what the extra pass costs is issue.
+    ///
+    /// It exists because nothing here has priced *the epilogue*. Every figure
+    /// this file quotes for it is a share of the **item boundary**, read off the
+    /// `gemm-depth` fit's intercept — and #104 says plainly that the intercept
+    /// is now "everything that does not scale with `K`", which since #102
+    /// includes a locality term, so the boundary reads 8.6 to 18.3 µs a tile
+    /// depending on which points the line is drawn through. A 2.1× spread is
+    /// not an instrument you can rank a lever with.
+    ///
+    /// This is the direct measurement instead: `2x - lcf`, over the items on the
+    /// critical path, is **one epilogue**, with the grid, the shared plan, the
+    /// tensor memory, the tile, the traversal, the schedule and the arithmetic
+    /// all held fixed and no fit involved. It caps the whole family of epilogue
+    /// changes at once — an epilogue that cost nothing could not save more than
+    /// this — which is what #108 needs to answer whether `stmatrix` is worth
+    /// reaching for now that a bf16 `C` has made it spellable.
+    ///
+    /// **What it does not separate is LDTM from stores.** [`Tile::drain`] is
+    /// both, and the obvious probe that keeps one and drops the other is a probe
+    /// whose result a dead-code pass decides: with nothing consuming the band,
+    /// the LDTM goes too and the measurement is of an empty loop. So this
+    /// number bounds the epilogue and does not decompose it, and it is quoted
+    /// that way.
+    DoubleDrain,
 }
 
 impl Epilogue {
@@ -1734,13 +1917,14 @@ impl Epilogue {
             Epilogue::Fused => "lcf",
             Epilogue::Deferred => "lcsf",
             Epilogue::HotStore => "hot",
+            Epilogue::DoubleDrain => "2x",
         }
     }
 
-    /// Whether a launch on this epilogue computes the GEMM. Only
-    /// [`Epilogue::HotStore`] does not, and it says so everywhere it appears.
+    /// Whether a launch on this epilogue computes the GEMM. The two probes do
+    /// not, and each says so everywhere it appears.
     fn exact(self) -> bool {
-        self != Epilogue::HotStore
+        !matches!(self, Epilogue::HotStore | Epilogue::DoubleDrain)
     }
 }
 
@@ -1881,7 +2065,7 @@ fn run<T>(
         columns => return Err(format!("no rung has {columns} pair columns").into()),
     };
 
-    let mut c = DeviceBuffer::<f32>::zeroed(&stream, m * n)?;
+    let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
     let cap = rung.max_clusters(shared_per_sm(context)?);
     let blocks = grid_for(plan.scheduler, m, n, rung, cap);
     let (tiles_m, tiles_n) = tile_grid(m, n, rung.block_n);
@@ -1907,7 +2091,7 @@ fn run<T>(
     macro_rules! launcher {
         ($prepare:ident, $launch:ident) => {{
             let prepared = module_ref.$prepare(config)?;
-            let launch = move |c: &mut DeviceBuffer<f32>| -> Result<(), Box<dyn Error>> {
+            let launch = move |c: &mut DeviceBuffer<u16>| -> Result<(), Box<dyn Error>> {
                 unsafe {
                     module_ref.$launch(
                         stream_ref, &prepared, a_ptr, b_ptr, tiles_m, tiles_n, plan.group,
@@ -1916,7 +2100,7 @@ fn run<T>(
                 };
                 Ok(())
             };
-            Box::new(launch) as Box<dyn Fn(&mut DeviceBuffer<f32>) -> Result<(), Box<dyn Error>>>
+            Box::new(launch) as Box<dyn Fn(&mut DeviceBuffer<u16>) -> Result<(), Box<dyn Error>>>
         }};
     }
     let launch_once = match (rung.entry, plan.scheduler, plan.epilogue) {
@@ -1928,6 +2112,9 @@ fn run<T>(
         }
         (Entry::Shipped, Scheduler::Static, Epilogue::HotStore) => {
             launcher!(prepare_gemm_cg2_hot, gemm_cg2_hot)
+        }
+        (Entry::Shipped, Scheduler::Static, Epilogue::DoubleDrain) => {
+            launcher!(prepare_gemm_cg2_2x, gemm_cg2_2x)
         }
         (Entry::Shipped, Scheduler::Stealing, Epilogue::Fused) => {
             launcher!(prepare_gemm_cg2_clc, gemm_cg2_clc)
@@ -1969,8 +2156,12 @@ fn run<T>(
     // epilogue — goes through the element-by-element `==` before a clock can
     // reach it.
     let label = if plan.epilogue.exact() {
-        check_c(&c.to_host_vec(&stream)?, m, n, k)?;
-        format!("{m}x{n}x{k} exact")
+        // Exact on the 16-bit words, and the number beside it is the rounding
+        // those words carry — the representation error of a bf16 `C`, which is
+        // a property of the output format and not of this launch. See
+        // `check_c` for why the comparison is still `==`.
+        let worst = check_c(&c.to_host_vec(&stream)?, m, n, k)?;
+        format!("{m}x{n}x{k} exact, worst |rel| {worst:.2e} against the fp32 reference")
     } else {
         format!(
             "{m}x{n}x{k} UNCHECKED ({} is not a GEMM)",
@@ -2011,8 +2202,8 @@ fn shared_per_sm(
     Ok(bytes as usize)
 }
 
-/// Compare an observed `[m, n]` row-major fp32 `C` against the CPU reference
-/// for `[m, k] · [n, k]ᵀ`, element by element and with `==`.
+/// Compare an observed `[m, n]` row-major **bf16** `C` against the CPU
+/// reference for `[m, k] · [n, k]ᵀ`, element by element and with `==`.
 ///
 /// `a_value` repeats every 7 rows and `b_value` every 21 columns, so the
 /// reference has 147 distinct dot products at any size and the naive
@@ -2022,43 +2213,87 @@ fn shared_per_sm(
 /// comparison is the one it always was. The sum stays over the *full* `k`,
 /// since both generators vary along it.
 ///
+/// # Where the rounding is, and what that makes this blind to
+///
+/// The output is bf16 since #108 and the accumulator is not, so exactly one
+/// rounding happens and this function has to agree with it. **It is put in the
+/// reference**: the exact fp32 dot product is rounded by [`to_bf16`] — the same
+/// round-to-nearest-even `cvt.rn.bf16x2.f32` performs — and the comparison
+/// stays `==` on the 16-bit words. **No tolerance was introduced and none was
+/// widened.** That is available because the sum itself is still exact: every
+/// operand is exact in bf16 and every partial sum stays under 2²⁴, so the fp32
+/// value reaching the `cvt` is the same integer whatever order it was summed
+/// in, and rounding it once is a deterministic function of that integer.
+///
+/// The alternative — widen the observed bf16 and compare to the fp32 reference
+/// within a tolerance — would have been strictly weaker, because a tolerance
+/// wide enough to admit correct rounding also admits everything smaller than
+/// it, and a wrong tile that happened to land close would pass.
+///
+/// What this *is* blind to is resolution, and it is worth being precise: two
+/// fp32 accumulators differing by less than half an ulp of bf16 round to the
+/// same word, so an error under about 0.2% of a value's magnitude is now
+/// invisible where it was not before. Every failure mode this gate exists for —
+/// a wrong coordinate, a wrong stride, a dropped or doubled tile, a wrong
+/// operand half, a mis-walked K — moves an element by far more than that or
+/// leaves it at zero, so none of them has become harder to see. A kernel that
+/// accumulated in bf16 instead of fp32 would be the case this cannot promise to
+/// catch at every element, and at these `K` it would still fail most of them.
+///
+/// The return value is the **worst relative error against the exact fp32
+/// reference** over the elements compared, which is the representation error
+/// and is reported rather than asserted: it is a property of bf16 and of the
+/// magnitudes this reference produces, not of the kernel.
+///
 /// It is a function rather than a block inside [`run`] because the **cuBLASLt
 /// baseline** (#92) is checked by it too. A denominator produced by a different
 /// GEMM is worth nothing, and the way that happens is a transposed operand or a
 /// wrong leading dimension — which computes the wrong matrix at full speed and
 /// looks like a plausible number. Sharing this function rather than copying it
 /// is what makes "checked against the same CPU reference" a property of the
-/// code instead of a claim in a comment.
+/// code instead of a claim in a comment. It also holds the library to the same
+/// rounding: cuBLASLt is asked for a `CUDA_R_16BF` output off a
+/// `CUBLAS_COMPUTE_32F` accumulator, so if it rounded any other way — or
+/// rounded a partial sum — its `C` would fail here rather than be timed.
 pub(crate) fn check_c(
-    observed: &[f32],
+    observed: &[u16],
     m: usize,
     n: usize,
     k: usize,
-) -> Result<(), Box<dyn Error>> {
-    let reference: Vec<f32> = (0..7 * 21)
+) -> Result<f64, Box<dyn Error>> {
+    let exact: Vec<f32> = (0..7 * 21)
         .map(|cell| {
             (0..k)
                 .map(|depth| a_value(cell / 21, depth) * b_value(cell % 21, depth))
                 .sum()
         })
         .collect();
-    let (mut wrong, mut sample) = (0usize, Vec::new());
+    let reference: Vec<u16> = exact.iter().copied().map(to_bf16).collect();
+    let (mut wrong, mut sample, mut worst) = (0usize, Vec::new(), 0.0f64);
     for row in 0..m {
         for column in 0..n {
-            let expected = reference[(row % 7) * 21 + column % 21];
+            let cell = (row % 7) * 21 + column % 21;
             let value = observed[row * n + column];
-            if value != expected {
+            if value != reference[cell] {
                 wrong += 1;
                 if sample.len() < 8 {
-                    sample.push(format!("C[{row}, {column}] = {value}, want {expected}"));
+                    sample.push(format!(
+                        "C[{row}, {column}] = {}, want {}",
+                        from_bf16(value),
+                        from_bf16(reference[cell])
+                    ));
                 }
+            }
+            if exact[cell] != 0.0 {
+                let error = (from_bf16(value) - exact[cell]) as f64 / exact[cell] as f64;
+                worst = worst.max(error.abs());
             }
         }
     }
     if wrong > 0 {
         return Err(format!("{wrong} of {} elements wrong: {}", m * n, sample.join("; ")).into());
     }
-    Ok(())
+    Ok(worst)
 }
 
 /// A scheduler's own failure modes, named so a passing line says what it
@@ -2115,6 +2350,12 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
     let per_sm = shared_per_sm(context)?;
     for (m, n, k) in [(M, N, K), (ITEMS_M, ITEMS_N, ITEMS_K)] {
         let (rows, _) = tile_grid(m, n, BLOCK_N);
+        // The rounding a bf16 `C` carries, reported once per size from the
+        // first checked launch of it (#108). It is measured against the exact
+        // fp32 reference rather than asserted, and it is the same number
+        // whichever plan produced the output, since every plan that reaches
+        // this line was `==` on the words.
+        let mut rounding = None;
         for scheduler in SCHEDULERS {
             for group in CHECK_GROUPS {
                 let plan = Plan {
@@ -2123,7 +2364,8 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
                     rung: SHIPPED,
                     epilogue: Epilogue::Fused,
                 };
-                run(context, m, n, k, plan, nothing_after)?;
+                let (label, _) = run(context, m, n, k, plan, nothing_after)?;
+                rounding.get_or_insert(label);
             }
             let clusters = grid_for(scheduler, m, n, SHIPPED, MAX_CLUSTERS) / RANKS;
             notes.push(format!(
@@ -2183,6 +2425,9 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
                 rung.shared(),
                 rung.ctas_per_sm(per_sm)
             ));
+        }
+        if let Some(label) = rounding {
+            notes.push(label);
         }
     }
     Ok(notes.join(", "))
@@ -2624,6 +2869,25 @@ const EPILOGUE_SIZES: [Shape; 5] = [
 /// unchanged and `regcount` should report **168 and no spill**. A band held
 /// across the boundary would be 128 fp32 a thread and would show up there
 /// instead of here.
+///
+/// # And the prediction for `2x`, written down before that ran (#108)
+///
+/// [`Epilogue::DoubleDrain`] is new and measures a quantity nothing here has:
+/// the epilogue itself, rather than its share of a fitted boundary. The
+/// pre-registered guess is **5–12 µs per tile at 8192³, so 5–12% of that
+/// launch** — the boundary fits at 8.6–18.3 µs and #91's evidence puts the
+/// store loop at roughly half of it, with the LDTM most of the rest, so an
+/// epilogue somewhat under the whole boundary is what the existing numbers
+/// imply. A `2x - lcf` at or above the boundary's own upper fit would mean the
+/// boundary is *mostly* epilogue and the fit has been mis-attributing it; well
+/// under 5 µs would mean the epilogue is already nearly free and no epilogue
+/// change — `stmatrix` included — is worth building.
+///
+/// It is not free of assumptions and the one it makes is worth naming: running
+/// the epilogue twice measures the *marginal* epilogue, and a marginal one can
+/// be cheaper than the first if the second finds its addresses in L2 and its
+/// issue slots idle. That biases this number **down**, which is the safe
+/// direction for a ceiling.
 pub fn epilogue_sweep(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     baseline: Option<crate::bench::Baseline>,
@@ -2636,7 +2900,10 @@ pub fn epilogue_sweep(
          the next item's first {} stages are in flight. Same grid, same {SHARED_BYTES} B\n\
          shared plan, same {BLOCK_N} accumulator columns, same {CTAS_PER_SM} CTAs an SM —\n\
          the store stage needs no staging buffer, so there is no occupancy step in this\n\
-         table and nothing has to be argued for out of a budget.",
+         table and nothing has to be argued for out of a budget.\n\
+         `C` is bf16 since #108, so every byte figure below is half what #107 measured\n\
+         and table 2c is new: it prices the epilogue directly instead of as a share of a\n\
+         fitted item boundary.",
         STAGES
     );
     println!("\n1. the two epilogues, over sizes chosen so the gain has to fall with amortization");
@@ -2650,6 +2917,7 @@ pub fn epilogue_sweep(
         let fused = timed(context, shape, plan)?;
         let deferred = timed(context, shape, plan.with(Epilogue::Deferred))?;
         let hot = timed(context, shape, plan.with(Epilogue::HotStore))?;
+        let twice = timed(context, shape, plan.with(Epilogue::DoubleDrain))?;
         let items = tiles(shape.m, shape.n, BLOCK_N);
         let clusters = grid_for(Scheduler::Static, shape.m, shape.n, SHIPPED, MAX_CLUSTERS) / RANKS;
         println!(
@@ -2663,7 +2931,7 @@ pub fn epilogue_sweep(
             tflops(shape, deferred),
             format!("{:+.1}%", 100.0 * (fused / deferred - 1.0))
         );
-        measured.push((shape, fused, deferred, hot));
+        measured.push((shape, fused, deferred, hot, twice));
     }
 
     println!(
@@ -2677,7 +2945,7 @@ pub fn epilogue_sweep(
         "{:<18}{:>12}{:>14}{:>16}{:>18}",
         "shape", "items/cl", "saved ms", "saved us/item", "hidden of boundary"
     );
-    for &(shape, fused, deferred, _) in &measured {
+    for &(shape, fused, deferred, _, _) in &measured {
         let items = tiles(shape.m, shape.n, BLOCK_N);
         let clusters = grid_for(Scheduler::Static, shape.m, shape.n, SHIPPED, MAX_CLUSTERS) / RANKS;
         // Items on the critical path, which is what #90 and #104 divide a
@@ -2702,8 +2970,8 @@ pub fn epilogue_sweep(
     println!(
         "\n2b. what the epilogue costs, split into issue and bandwidth. `hot` is the fused\n\
          kernel with every store aimed at the cluster's own first tile — same LDTM, same\n\
-         store count, same addresses within a tile, 38 MB of C rewritten instead of 268 MB\n\
-         or 1 GB streamed, so the writes stay in L2. IT COMPUTES A WRONG C AND IS NOT\n\
+         store count, same addresses within a tile, 19 MB of C rewritten instead of 134 MB\n\
+         or 512 MB streamed, so the writes stay in L2. IT COMPUTES A WRONG C AND IS NOT\n\
          CHECKED; the number is an upper bound on what decoupling the global write could\n\
          ever be worth, and that is exactly what #15's TMEM -> shared -> TMA route buys\n\
          over the deferred drain above.\n\
@@ -2715,7 +2983,7 @@ pub fn epilogue_sweep(
         "{:<18}{:>12}{:>12}{:>14}{:>18}",
         "shape", "lcf ms", "hot ms", "hot TF/s", "write-bound part"
     );
-    for &(shape, fused, _, hot) in &measured {
+    for &(shape, fused, _, hot, _) in &measured {
         println!(
             "{:<18}{:>12.4}{:>12.4}{:>14.1}{:>18}",
             shape,
@@ -2727,6 +2995,40 @@ pub fn epilogue_sweep(
     }
 
     println!(
+        "\n2c. what the epilogue costs *at all*, measured rather than fitted (#108). `2x` runs\n\
+         the fused epilogue TWICE per item — same LDTM, same stores, the second aimed at\n\
+         the cluster's home tile so the extra bytes stay in L2 and what the extra pass\n\
+         costs is issue. IT COMPUTES A WRONG C AND IS NOT CHECKED.\n\
+         `2x - lcf` over the items on the critical path is one epilogue, with the grid,\n\
+         the plan, the tile, the traversal, the schedule and the arithmetic all fixed and\n\
+         no fit involved — where every figure this file has quoted for the epilogue is a\n\
+         share of the item boundary read off an intercept whose own spread is 2.1x.\n\
+         It is the CEILING on every epilogue change at once, `stmatrix` included: an\n\
+         epilogue that cost nothing could not save more than this. It does not split LDTM\n\
+         from stores, because the probe that would — drop the stores, keep the load — is\n\
+         one a dead-code pass decides the answer to."
+    );
+    println!(
+        "{:<18}{:>12}{:>12}{:>16}{:>18}{:>16}",
+        "shape", "lcf ms", "2x ms", "one epilogue", "us/item", "of the launch"
+    );
+    for &(shape, fused, _, _, twice) in &measured {
+        let items = tiles(shape.m, shape.n, BLOCK_N);
+        let clusters = grid_for(Scheduler::Static, shape.m, shape.n, SHIPPED, MAX_CLUSTERS) / RANKS;
+        let critical = items.div_ceil(clusters) as f64;
+        let epilogue = twice - fused;
+        println!(
+            "{:<18}{:>12.4}{:>12.4}{:>16.4}{:>18.2}{:>16}",
+            shape,
+            fused,
+            twice,
+            epilogue,
+            epilogue * 1e3 / critical,
+            format!("{:.1}%", 100.0 * epilogue / fused)
+        );
+    }
+
+    println!(
         "\n3. against cuBLASLt on the same device in the same container — the denominator,\n\
          and the drift control that says how much of the delta above is the session."
     );
@@ -2734,7 +3036,7 @@ pub fn epilogue_sweep(
         "{:<18}{:>14}{:>14}{:>14}{:>16}",
         "shape", "cuBLASLt ms", "theirs TF/s", "lcf/theirs", "lcsf/theirs"
     );
-    for &(shape, fused, deferred, _) in &measured {
+    for &(shape, fused, deferred, _, _) in &measured {
         if shape.m < 8192 {
             continue;
         }

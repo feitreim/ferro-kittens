@@ -961,7 +961,7 @@ pub mod kernels {
             // SAFETY: read-only — `load_rows` is the only thing issued on this
             // cursor, which is what `GlobalRows::from_raw` asks of a caller
             // that reached it by casting away a shared reference.
-            let rows = GlobalRows::from_raw(source.as_ptr().cast_mut(), GLOBAL_PITCH);
+            let rows = GlobalRows::<F32>::from_raw(source.as_ptr().cast_mut().cast(), GLOBAL_PITCH);
             let band: RegTile<32, WIDE, BaseLdtm> =
                 load_rows(rows, GLOBAL_ROW, GLOBAL_COLUMN, lane);
             dump_band(band, 0, lane, &mut out);
@@ -1000,7 +1000,7 @@ pub mod kernels {
                 let column = N as u32 * step;
                 let band = if FORM == MOVERS {
                     load_rows(
-                        GlobalRows::from_raw(source.as_ptr().cast_mut(), pitch as usize),
+                        GlobalRows::<F32>::from_raw(source.as_ptr().cast_mut().cast(), pitch as usize),
                         0,
                         column,
                         lane,
@@ -1024,7 +1024,7 @@ pub mod kernels {
 
                 if FORM == MOVERS {
                     store_rows(
-                        GlobalRows::from_slice(out, pitch as usize),
+                        GlobalRows::<F32>::from_slice(out, pitch as usize),
                         0,
                         column,
                         lane,

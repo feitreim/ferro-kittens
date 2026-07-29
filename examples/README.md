@@ -2806,6 +2806,75 @@ What is now established is the method: the store stage costs one reordering to
 try, so the next kernel that wants one should measure it before anyone scopes a
 tensor map.
 
+##### and `C` is bf16 now, on both sides of the ratio — #108
+
+`gemm_cg2` accumulated in fp32 and *wrote* fp32 through #107. `bf16` in, fp32
+accumulate, `bf16` out is the ordinary training-GEMM signature, so it was the
+output that was the unusual half here, and this is the change that moves it.
+**The accumulator does not move**: the accumulator is still 256 fp32 columns of
+tensor memory, the drained band is still 128 fp32 a thread, and the single
+`cvt.rn.bf16x2.f32` lives inside the store.
+
+**The cuBLASLt baseline moved in the same commit and had to.** At 8192³ an fp32
+`C` is 268 MB and a bf16 `C` is 134 MB. Timing our kernel writing half as much
+against a baseline still writing twice as much, and reporting the difference as
+ours, is the way this change goes wrong — so `cublaslt.rs`'s output layout is
+`CUDA_R_16BF` and both columns below were re-measured in one container.
+`CUBLAS_COMPUTE_32F` and the `CUDA_R_16BF` operands are untouched; the library
+accumulates in fp32 exactly as we do. That module's own doc used to say
+upstream's C file "uses a 2-byte output and is not the same measurement", which
+had the asymmetry backwards — the baseline had been bent to match *us*.
+
+**Which earlier rows survive this, because most do not.** Every `ours/theirs`
+ratio in §7 above — #92's 0.573–0.694, #102's 0.742/0.793, #87's 0.826/0.886,
+#107's 0.824–0.881 — is a *pair* of fp32-output measurements, as is every
+absolute millisecond and every TFLOP/s figure. None is comparable to a number
+below, and rescaling one is not available either, since the two sides did not
+have to lose the same amount. What survives, being a property of the tile rather
+than of the output: the counted residency, the register count and its zero
+spill, `GROUP = 8`, the 98392 B shared plan, wave efficiency, `wave_reuse`, and
+the whole structural argument about the item boundary. #87's rungs stay
+comparable to *each other* across this change and not to their published
+figures.
+
+**The predictions, written into this file before the run.** They are in the
+commit that added the section with these tables empty, which is the only way a
+pre-registration in a repo is worth anything.
+
+1. **bf16 `C` is worth roughly nothing, and might cost.** #107's `HotStore`
+   deleted a gigabyte of streaming writes for 0–1.2%, so the epilogue is
+   issue-bound and halving its bytes cannot buy more than that. And it does not
+   reduce the instruction count: under `BaseLdtm` the contiguous run is 2 (#94's
+   `CONTIGUOUS_VALUES`; the columns are `{0,1}` then `{8,9}`, eight apart), so a
+   bf16 pair is a **4-byte store where an fp32 pair was 8 — the same number of
+   stores, half as wide** — plus a `cvt` that was not there before. Predicted
+   **−1% to +1.5%** at 8192³ and 16384³.
+2. **The ratio moves against us, slightly.** cuBLASLt gets the cheaper output
+   too and sits closer to the machine, so if the write is worth anything it is
+   worth at least as much to them. Predicted **0 to −3 points** off #107's 0.828
+   and 0.881.
+3. **168 registers, 0 spill, 528 B frame, unchanged.** The `cvt` takes two fp32
+   and yields one packed word, so peak liveness cannot rise.
+4. **2 CTAs an SM, unchanged, and not for a shared-memory reason.** Since #87
+   the binding half of `min(512 / columns, shared per SM / plan)` is tensor
+   memory — `512 / 256 = 2` — and a narrower `C` moves neither term. To be
+   *counted* rather than assumed.
+5. **Exactness survives with no tolerance at all**, and the worst relative error
+   of the output against the exact fp32 reference is **2⁻⁸ ≈ 3.9e-3**.
+
+And a sixth, for a probe this change adds rather than for the change itself:
+`Epilogue::DoubleDrain` runs the epilogue twice per item and prices it directly
+instead of as a share of a fitted boundary. Predicted **5–12 µs a tile at
+8192³**, so 5–12% of that launch.
+
+<!-- TABLE 1: the headline pair, both columns re-measured -->
+
+<!-- TABLE 2: accuracy -->
+
+<!-- TABLE 3: the epilogue, priced -->
+
+<!-- TABLE 4: is stmatrix reachable, and what would it be worth -->
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all

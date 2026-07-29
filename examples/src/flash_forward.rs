@@ -141,7 +141,7 @@ use kittens::global::{GlobalRows, store_rows};
 use kittens::ldst::store_tile;
 use kittens::mma::{MmaShape, commit, mm_ab, mm_abt};
 use kittens::reg::{BaseLdtm, RegTile, RegVec, online_rescale};
-use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
+use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
 
@@ -368,7 +368,7 @@ pub mod kernels {
             // is zero — the degenerate case of the stride the GEMM's epilogue
             // needs, spelled the same way.
             store_rows(
-                GlobalRows::from_slice(&mut out, HEAD),
+                GlobalRows::<F32>::from_slice(&mut out, HEAD),
                 query_base + 32 * warp_id,
                 0,
                 lane,

@@ -29,11 +29,16 @@
 //!
 //! [`GlobalRows`], [`load_rows`] and [`store_rows`] are the other path —
 //! ThunderKittens' `global_to_register.cuh`, and the reason a descriptor is
-//! not the only way out of a kernel. An epilogue holding fp32 in registers has
-//! no fp32 tile to stage it in ([`crate::shared::Element`] is bf16-only), so
-//! through shared memory its choices are to round or to widen; and a small
-//! irregular operand — a bias row, a lookup table, a ragged tail — is not
-//! worth a descriptor built on the host in the first place.
+//! not the only way out of a kernel. An epilogue that must reach global memory
+//! **as fp32** has no descriptor route at all: `TensorMapElement` is
+//! `Bf16`-only and `stmatrix` is b16, so the staging half of the round trip
+//! cannot be spelled and the choice through shared memory is to round or to
+//! widen. And a small irregular operand — a bias row, a lookup table, a ragged
+//! tail — is not worth a descriptor built on the host in the first place.
+//!
+//! An epilogue whose output *is* bf16 (#108) has both routes open, and this one
+//! is still the shorter: the cursor's element is where the rounding happens,
+//! and nothing is staged.
 //!
 //! There is no engine here and nothing asynchronous: a thread computes the
 //! address of each value it owns from the fragment layout's own
@@ -47,9 +52,8 @@
 //!
 //! A map that gives a thread *adjacent* columns has told the mover something:
 //! those two accesses are one. [`crate::reg::ColLayout::CONTIGUOUS_VALUES`] is
-//! that claim,
-//! and [`store_rows`]/[`load_rows`] spend it on `st.global.v2.f32` and
-//! `ld.global.v2.f32` — half the memory instructions, and, because the two
+//! that claim, and [`store_rows`]/[`load_rows`] spend it through
+//! [`Element::write_pair`] — half the memory instructions, and, because the two
 //! words of a pair sat in the same 32-byte sector either way, the same
 //! transactions carrying twice the useful bytes (#91).
 //!
@@ -61,12 +65,20 @@
 //! stride and column origin are runtime numbers. So the pairing is checked
 //! once per call ([`GlobalRows::runs_aligned`]) rather than promised in a
 //! safety contract that an odd leading dimension would quietly break.
+//!
+//! What the *element* decides is only the instruction: fp32 needs a
+//! `st.global.v2.f32` to carry two values and bf16 needs a plain 4-byte word,
+//! because two bf16 already are one. Same count, half the bytes — see
+//! [`Element::write_pair`].
+
+use core::marker::PhantomData;
 
 use crate::reg::{FragmentLayout, RegTile};
-use cuda_device::{DisjointSlice, ptx_asm};
+use crate::shared::Element;
+use cuda_device::DisjointSlice;
 
-/// A row-major window of global memory: a base address and the elements per
-/// row that separate one row from the next.
+/// A row-major window of global memory: a base address, the elements per row
+/// that separate one row from the next, and the element those are.
 ///
 /// The device-side counterpart of [`GlobalLayout`], and deliberately much less
 /// than one. A descriptor describes a whole tensor because the TMA engine
@@ -75,43 +87,58 @@ use cuda_device::{DisjointSlice, ptx_asm};
 /// it. Extents are therefore absent rather than forgotten — see
 /// [`store_rows`]' safety contract for what the caller owes instead.
 ///
-/// **fp32 only**, and since #3 that is a choice rather than a constraint. The
-/// argument used to be that [`crate::shared::Element`] was implemented for
-/// `Bf16` alone, so `GlobalRows<E>` would have had exactly one instantiation
-/// and it would have been the wrong one — a register tile *is* fp32, and this
-/// path exists to move it without rounding. [`crate::shared::F32`] is that
-/// impl now, so what remains is the parameter, a bound, and two
-/// `E::read`/`E::write` calls here and in [`load_rows`]/[`store_rows`]. Nobody
-/// has asked for a narrow one yet, and a mover with one caller and two element
-/// types is generality bought before it is wanted.
-#[derive(Clone, Copy)]
-pub struct GlobalRows {
-    base: *mut f32,
+/// **The element used to be fp32 and nothing else**, on the argument that a
+/// register tile *is* fp32 and this path exists to move one without rounding.
+/// #108 is what asked for the other direction: a training GEMM's `C` is bf16,
+/// so the rounding is the point rather than the loss, and it belongs in the
+/// store instruction rather than in a round trip through a shared tile. What
+/// the parameter costs is what the doc that predicted it said — a bound, and
+/// `E::read`/`E::write` where a raw `f32` used to be.
+pub struct GlobalRows<E: Element> {
+    base: *mut u8,
     stride: usize,
+    _element: PhantomData<E>,
 }
 
-impl GlobalRows {
+impl<E: Element> Clone for GlobalRows<E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<E: Element> Copy for GlobalRows<E> {}
+
+impl<E: Element> GlobalRows<E> {
     /// Wrap a base address and a row stride in elements — a matrix's leading
     /// dimension, which is `columns` for a packed buffer and larger for a
     /// window into one.
     ///
     /// # Safety
     ///
-    /// `base` must be a device address, aligned for `f32`, of a live buffer
-    /// that outlives every use of the cursor. Nothing here dereferences it;
-    /// the movers' contracts say which elements they touch.
+    /// `base` must be a device address, aligned for `E`, of a live buffer that
+    /// outlives every use of the cursor. Nothing here dereferences it; the
+    /// movers' contracts say which elements they touch.
     ///
     /// A read-only source — a `&[f32]` kernel parameter — may be wrapped by
     /// casting its pointer, provided [`load_rows`] is the only thing issued on
     /// the cursor: a write through a pointer derived from a shared reference
     /// is undefined however this type spells it.
     #[inline(always)]
-    pub const unsafe fn from_raw(base: *mut f32, stride: usize) -> Self {
-        Self { base, stride }
+    pub const unsafe fn from_raw(base: *mut u8, stride: usize) -> Self {
+        Self {
+            base,
+            stride,
+            _element: PhantomData,
+        }
     }
 
     /// The same, from the [`DisjointSlice`] a kernel's output parameter
     /// arrives as.
+    ///
+    /// The slice's element is whatever storage word the launch declared — `f32`
+    /// for an fp32 output, `u16` for a bf16 one, since the device crate has no
+    /// bf16 scalar and a tile is bytes either way. Only the *width* has to
+    /// agree with `E`, and that is asserted at codegen rather than carried as a
+    /// type equality nobody could spell for the narrow case.
     ///
     /// # Safety
     ///
@@ -120,11 +147,17 @@ impl GlobalRows {
     /// the disjointness of what the threads write is the mover's contract to
     /// keep and no longer the slice's.
     #[inline(always)]
-    pub unsafe fn from_slice<Space>(
-        slice: &mut DisjointSlice<'_, f32, Space>,
+    pub unsafe fn from_slice<T, Space>(
+        slice: &mut DisjointSlice<'_, T, Space>,
         stride: usize,
     ) -> Self {
-        unsafe { Self::from_raw(slice.as_mut_ptr(), stride) }
+        const {
+            assert!(
+                size_of::<T>() == E::BYTES,
+                "a cursor's element must be as wide as the slice's storage word"
+            )
+        };
+        unsafe { Self::from_raw(slice.as_mut_ptr().cast(), stride) }
     }
 
     /// Elements per row — the leading dimension the cursor was built with.
@@ -150,8 +183,8 @@ impl GlobalRows {
     ///
     /// `(row, column)` must be inside the buffer `base` names.
     #[inline(always)]
-    pub const unsafe fn at(self, row: u32, column: u32) -> *mut f32 {
-        unsafe { self.base.add(self.index(row, column)) }
+    pub const unsafe fn at(self, row: u32, column: u32) -> *mut u8 {
+        unsafe { self.base.add(E::BYTES * self.index(row, column)) }
     }
 
     /// Whether a `run`-wide fp32 vector access is legally aligned at *every*
@@ -170,73 +203,37 @@ impl GlobalRows {
     /// A cursor over a packed buffer at an even leading dimension passes for
     /// pairs; one at an odd `ldc` does not, and gets scalar accesses instead
     /// of a misaligned-address fault.
+    ///
+    /// The width is the *element's* — 4 bytes for a bf16 pair where an fp32
+    /// pair needs 8 — and that turns out to leave the answer unchanged, which
+    /// is not the obvious result. A narrower element halves the byte offset a
+    /// column costs as well as the width it must be aligned to, so both sides
+    /// scale together and what survives is an even stride and an even column
+    /// origin at either element
+    /// (`the_pairing_test_is_the_same_at_either_element`).
     #[inline(always)]
     pub fn runs_aligned(self, column: u32, run: usize) -> bool {
-        let width = run * size_of::<f32>();
-        (self.base as usize + size_of::<f32>() * column as usize).is_multiple_of(width)
-            && (size_of::<f32>() * self.stride).is_multiple_of(width)
-    }
-}
-
-/// `st.global.v2.f32` — the two fp32 at `dest` and `dest + 1` in one
-/// instruction.
-///
-/// Inline PTX for the reason [`crate::ldst::stmatrix_m8n8_x2`] is: the
-/// instruction has to be *asked for*. Widening a pair of adjacent stores is a
-/// transformation ptxas may only make when the address is provably aligned,
-/// and an address built from a runtime leading dimension never is — so the
-/// caller that has actually checked ([`GlobalRows::runs_aligned`]) is the only
-/// one in a position to spell it.
-///
-/// # Safety
-///
-/// `dest` must be 8-byte aligned and name two writable fp32 of a global
-/// buffer.
-#[inline(always)]
-unsafe fn store_pair(dest: *mut f32, first: f32, second: f32) {
-    unsafe {
-        ptx_asm!(
-            "st.global.v2.f32 [%0], {%1, %2};",
-            in("l") dest as u64,
-            in("f") first,
-            in("f") second,
-            clobber("memory"),
-        );
-    }
-}
-
-/// `ld.global.v2.f32` — the read direction of [`store_pair`], under the same
-/// contract.
-///
-/// # Safety
-///
-/// `src` must be 8-byte aligned and name two readable fp32 of a global buffer.
-#[inline(always)]
-unsafe fn load_pair(src: *const f32) -> (f32, f32) {
-    unsafe {
-        let first: f32;
-        let second: f32;
-        ptx_asm!(
-            "ld.global.v2.f32 {%0, %1}, [%2];",
-            out("=f") first,
-            out("=f") second,
-            in("l") src as u64,
-            clobber("memory"),
-        );
-        (first, second)
+        let width = run * E::BYTES;
+        (self.base as usize + E::BYTES * column as usize).is_multiple_of(width)
+            && (E::BYTES * self.stride).is_multiple_of(width)
     }
 }
 
 /// Write a whole `[M, N]` register tile to `(row, column)` of a row-major
 /// global buffer, each thread storing the values its fragment layout gives it.
 ///
-/// The global twin of [`crate::ldst::store_tile`], and the direct answer to an
-/// fp32 epilogue: no shared tile, no descriptor, no packing step, and the
-/// destination's leading dimension is a runtime number the cursor carries. One
-/// `st.global.f32` per owned value, addressed by
-/// `L::row_of`/`L::col_of` — the same coordinates
+/// The global twin of [`crate::ldst::store_tile`], and the direct answer to a
+/// register epilogue: no shared tile, no descriptor, and the destination's
+/// leading dimension is a runtime number the cursor carries. One store per
+/// owned value, addressed by `L::row_of`/`L::col_of` — the same coordinates
 /// [`RegTile::coordinate`] reports, so a kernel that used to open-code this
 /// loop against them gets the identical stores.
+///
+/// The tile is fp32 whatever `E` is, because a register tile is: an `E`
+/// narrower than fp32 rounds here, in [`Element::write`] or
+/// [`Element::write_pair`], and that is the only place it does. Rounding once
+/// at the store is what a bf16 output wants (#108) and what an fp32 one must
+/// not have, which is why the element is the cursor's and not the tile's.
 ///
 /// A thread's row address is formed once per slot and its values indexed off
 /// it, which is what makes the inner loop a run of offsets from one register
@@ -272,18 +269,18 @@ unsafe fn load_pair(src: *const f32) -> (f32, f32) {
 /// stays idempotent, as [`crate::ldst::store_vec`]'s does; what it would not
 /// be is a single writer per element.
 #[inline(always)]
-pub unsafe fn store_rows<const M: usize, const N: usize, L: FragmentLayout<M, N>>(
-    dest: GlobalRows,
+pub unsafe fn store_rows<E: Element, const M: usize, const N: usize, L: FragmentLayout<M, N>>(
+    dest: GlobalRows<E>,
     row: u32,
     column: u32,
     lane: u32,
     tile: RegTile<M, N, L>,
 ) {
     unsafe {
-        if pairs_are_one_access::<M, N, L>(dest, column) {
-            store_rows_in_runs::<2, M, N, L>(dest, row, column, lane, tile)
+        if pairs_are_one_access::<E, M, N, L>(dest, column) {
+            store_rows_in_runs::<2, E, M, N, L>(dest, row, column, lane, tile)
         } else {
-            store_rows_in_runs::<1, M, N, L>(dest, row, column, lane, tile)
+            store_rows_in_runs::<1, E, M, N, L>(dest, row, column, lane, tile)
         }
     }
 }
@@ -295,8 +292,8 @@ pub unsafe fn store_rows<const M: usize, const N: usize, L: FragmentLayout<M, N>
 /// `2` divides the run rather than equalling it: a layout claiming runs of
 /// four contains two aligned pairs, and one claiming three contains none.
 #[inline(always)]
-fn pairs_are_one_access<const M: usize, const N: usize, L: FragmentLayout<M, N>>(
-    rows: GlobalRows,
+fn pairs_are_one_access<E: Element, const M: usize, const N: usize, L: FragmentLayout<M, N>>(
+    rows: GlobalRows<E>,
     column: u32,
 ) -> bool {
     const {
@@ -320,11 +317,12 @@ fn pairs_are_one_access<const M: usize, const N: usize, L: FragmentLayout<M, N>>
 #[inline(always)]
 unsafe fn store_rows_in_runs<
     const RUN: usize,
+    E: Element,
     const M: usize,
     const N: usize,
     L: FragmentLayout<M, N>,
 >(
-    dest: GlobalRows,
+    dest: GlobalRows<E>,
     row: u32,
     column: u32,
     lane: u32,
@@ -336,10 +334,10 @@ unsafe fn store_rows_in_runs<
             let start = dest.at(row + L::row_of(lane, slot), column);
             let mut value = 0usize;
             while value < L::VALUES {
-                let at = start.add(L::col_of(lane, value) as usize);
+                let at = start.add(E::BYTES * L::col_of(lane, value) as usize);
                 match RUN {
-                    2 => store_pair(at, tile.get(slot, value), tile.get(slot, value + 1)),
-                    _ => at.write(tile.get(slot, value)),
+                    2 => E::write_pair(at, tile.get(slot, value), tile.get(slot, value + 1)),
+                    _ => E::write(at, tile.get(slot, value)),
                 }
                 value += RUN;
             }
@@ -358,25 +356,25 @@ unsafe fn store_rows_in_runs<
 /// or a [`crate::ldst::store_tile`].
 ///
 /// The pairing is the same: the addresses are the same addresses, so a layout
-/// whose values are adjacent reads them with one `ld.global.v2.f32` under the
-/// same alignment test [`store_rows`] applies (#91).
+/// whose values are adjacent reads them in one access under the same alignment
+/// test [`store_rows`] applies (#91).
 ///
 /// # Safety
 ///
 /// As [`store_rows`], reading instead of writing: the rectangle must lie
 /// inside the buffer, and no other thread may be writing it.
 #[inline(always)]
-pub unsafe fn load_rows<const M: usize, const N: usize, L: FragmentLayout<M, N>>(
-    src: GlobalRows,
+pub unsafe fn load_rows<E: Element, const M: usize, const N: usize, L: FragmentLayout<M, N>>(
+    src: GlobalRows<E>,
     row: u32,
     column: u32,
     lane: u32,
 ) -> RegTile<M, N, L> {
     unsafe {
-        if pairs_are_one_access::<M, N, L>(src, column) {
-            load_rows_in_runs::<2, M, N, L>(src, row, column, lane)
+        if pairs_are_one_access::<E, M, N, L>(src, column) {
+            load_rows_in_runs::<2, E, M, N, L>(src, row, column, lane)
         } else {
-            load_rows_in_runs::<1, M, N, L>(src, row, column, lane)
+            load_rows_in_runs::<1, E, M, N, L>(src, row, column, lane)
         }
     }
 }
@@ -390,11 +388,12 @@ pub unsafe fn load_rows<const M: usize, const N: usize, L: FragmentLayout<M, N>>
 #[inline(always)]
 unsafe fn load_rows_in_runs<
     const RUN: usize,
+    E: Element,
     const M: usize,
     const N: usize,
     L: FragmentLayout<M, N>,
 >(
-    src: GlobalRows,
+    src: GlobalRows<E>,
     row: u32,
     column: u32,
     lane: u32,
@@ -406,14 +405,14 @@ unsafe fn load_rows_in_runs<
             let start = src.at(row + L::row_of(lane, slot), column);
             let mut value = 0usize;
             while value < L::VALUES {
-                let at = start.add(L::col_of(lane, value) as usize);
+                let at = start.add(E::BYTES * L::col_of(lane, value) as usize);
                 match RUN {
                     2 => {
-                        let (first, second) = load_pair(at);
+                        let (first, second) = E::read_pair(at);
                         tile.set(slot, value, first);
                         tile.set(slot, value + 1, second);
                     }
-                    _ => tile.set(slot, value, at.read()),
+                    _ => tile.set(slot, value, E::read(at)),
                 }
                 value += RUN;
             }
@@ -427,18 +426,19 @@ unsafe fn load_rows_in_runs<
 mod rows_tests {
     use super::*;
     use crate::reg::{BaseLdtm, ColLayout, RowLayout};
+    use crate::shared::{Bf16, F32};
 
     /// A device address is never dereferenced host-side; `index` is pure
     /// arithmetic on it, which is the whole of the map.
-    const BASE: *mut f32 = 0x7f00_0000 as *mut f32;
+    const BASE: *mut u8 = 0x7f00_0000 as *mut u8;
 
-    fn cursor(stride: usize) -> GlobalRows {
+    fn cursor(stride: usize) -> GlobalRows<F32> {
         unsafe { GlobalRows::from_raw(BASE, stride) }
     }
 
     /// Every index a `[M, N]` band's threads form, in dump order.
     fn band_indices<const M: usize, const N: usize>(
-        rows: GlobalRows,
+        rows: GlobalRows<F32>,
         row: u32,
         column: u32,
     ) -> Vec<usize>
@@ -519,12 +519,41 @@ mod rows_tests {
         assert!(!cursor(1024).runs_aligned(129, 2));
         // A window starting mid-pair, which is what a `from_raw` on an
         // interior address gives.
-        let odd_base = unsafe { GlobalRows::from_raw(BASE.add(1), 1024) };
+        let odd_base = unsafe { GlobalRows::<F32>::from_raw(BASE.add(4), 1024) };
         assert!(!odd_base.runs_aligned(0, 2));
         assert!(odd_base.runs_aligned(1, 2));
         // A run of one is every address, and is what a layout that claims
         // nothing gets.
         assert!(cursor(1023).runs_aligned(129, 1));
+    }
+
+    /// **The element does not move this test**, which is worth a case of its
+    /// own because the obvious expectation is that it does (#108). A narrower
+    /// element halves the offset a column costs *and* halves the width a pair
+    /// must be aligned to, so the two cancel and what is left is the same
+    /// question at either element: an even stride and an even column origin,
+    /// off a base aligned for the element it is.
+    ///
+    /// So a bf16 `C` does not buy the pairing anywhere an fp32 `C` was denied
+    /// it, and cannot lose it anywhere an fp32 `C` had it. Every row below is
+    /// the fp32 case above with the element swapped and the same answer.
+    #[test]
+    fn the_pairing_test_is_the_same_at_either_element() {
+        let bf16 = |stride| unsafe { GlobalRows::<Bf16>::from_raw(BASE, stride) };
+        for stride in [1024usize, 1023] {
+            for column in [0u32, 128, 129] {
+                assert_eq!(
+                    bf16(stride).runs_aligned(column, 2),
+                    cursor(stride).runs_aligned(column, 2),
+                    "stride {stride} column {column}"
+                );
+            }
+        }
+        // A base one element into a pair, which is the interior address above
+        // at each element's own width.
+        let interior = |offset| unsafe { GlobalRows::<Bf16>::from_raw(BASE.add(offset), 1024) };
+        assert!(!interior(2).runs_aligned(0, 2));
+        assert!(interior(2).runs_aligned(1, 2));
     }
 
     /// Each thread's values within a slot are a run of offsets from one row
