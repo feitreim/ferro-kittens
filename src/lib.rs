@@ -12,7 +12,7 @@
 //! for the abstraction unless ptxas says otherwise.
 //!
 //! Libdevice math is legal beside tcgen05 in the same pure-PTX artifact at
-//! cuda-oxide b099f64. Software approximations remain where their lowering is
+//! cuda-oxide 20a5616. Software approximations remain where their lowering is
 //! a measured kernel optimization rather than an artifact-path workaround.
 //!
 // `global`'s types are all `feature = "host"`, and docs across the crate link

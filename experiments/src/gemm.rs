@@ -7102,7 +7102,7 @@ const WIDTH_RUNGS: [Epilogue; 4] = [
 /// **`.pack::16b` is not a lever and the pin says so before any device time is
 /// spent on it.** The scoping read it as folding the fp32→bf16 convert into
 /// the load, halving the registers reaching `stmatrix`. At
-/// `b099f64c1a32869b74be99f4f88242fb68655b51`,
+/// `20a56163f258e09f2c51e4c27ae4e4ff17582443`,
 /// `intrinsics/abi-v1.toml` gives `tcgen05_ld_16x256b_x8_pack16` the result
 /// type `[u32; 32]` — **the same 32 registers as `_x8_raw`** — and
 /// `intrinsics/generated-reference.md` validates it as

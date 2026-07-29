@@ -1922,7 +1922,7 @@ example inverted against the function's own doc. That was true of a revision and
 is not true of ours. Upstream fixed it in `61f4a563` on 2026-06-29 — along with
 the flow diagram and all three `clc_query_get_first_ctaid_*` docs, which were
 wrong the same way — and then replaced the hand-written module doc with a
-generated one, so the pinned `b099f64c` ships a thirteen-line `clc.rs` with no
+generated one, so the pinned `20a56163` ships a thirteen-line `clc.rs` with no
 usage example to be wrong. The claim traced to a **stale sibling cargo
 checkout**: `~/.cargo/git/checkouts/cuda-oxide-…/4514af2` is v0.2.1 from
 2026-06-10, and of the six checkouts in that directory it is the only one still
@@ -3680,7 +3680,7 @@ in this file since the port.**
 **`.pack::16b` is not a lever, and the pin says so before any device time is
 spent on it.** The scoping read it as folding the fp32→bf16 convert into the
 load — eliminating the `cvt` and halving the registers reaching `stmatrix`. At
-`b099f64c1a32869b74be99f4f88242fb68655b51`, `intrinsics/abi-v1.toml` gives
+`20a56163f258e09f2c51e4c27ae4e4ff17582443`, `intrinsics/abi-v1.toml` gives
 `tcgen05_ld_16x256b_x8_pack16` the result type `[u32; 32]`, **the same 32
 registers as `_x8_raw`**, and `intrinsics/generated-reference.md` validates it
 as `tcgen05.ld.sync.aligned.16x256b.x8.pack::16b.b32 <register-list:32>`. The
@@ -3701,7 +3701,7 @@ every shape. The removed intrinsics took a shared-memory *pointer*; every
 generated variant at this pin is `status = "active"` with an array **result**,
 and `_x8_pure` and `_x8_raw` share one LLVM intrinsic
 (`llvm.nvvm.tcgen05.ld.16x256b.x8`) and one validated encoding. Checked against
-the checkout at `b099f64`, `git rev-parse HEAD` confirmed — not against the
+the checkout at `20a5616`, `git rev-parse HEAD` confirmed — not against the
 stale `4514af2` in the same cargo directory.
 
 **What no document settles is the register *order*, and that got a case.**

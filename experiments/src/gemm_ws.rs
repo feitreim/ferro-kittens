@@ -56,7 +56,7 @@
 //!
 //! This kernel gets it **inside one CTA**, from warp specialization plus a
 //! double-buffered accumulator — which is NVIDIA's `gemm_sol_final`
-//! (cuda-oxide `b099f64`,
+//! (cuda-oxide `20a5616`,
 //! `crates/rustc-codegen-cuda/examples/gemm_sol_final/`), reproduced in this
 //! repo's idiom. Six warps per CTA:
 //!

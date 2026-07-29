@@ -88,7 +88,7 @@
 //! data to buy back *both* halves of that: the accesses widen to 16 bytes and
 //! the addresses of a warp become one contiguous run. NVIDIA's own reference
 //! kernel takes exactly this route (`gemm_sol_final` in cuda-oxide at the
-//! pinned revision `b099f64`), and it is the shared→global half of an epilogue
+//! pinned revision `20a5616`), and it is the shared→global half of an epilogue
 //! that [`crate::epilogue::StoreRing`] does with the TMA engine instead.
 //!
 //! Neither is a strictly better answer. The engine costs a host-built

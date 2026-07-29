@@ -316,14 +316,13 @@ Group scope is 1.1.
 `SharedVec` carries its own `tma_load`/`tma_load_2d`/`tma_store`/`tma_store_2d`
 beside these (1.4), at rank 1 and 2 and one instruction each.
 
-What is left of this entry is the *reduction* stores, and they are a different
-kind of missing: `cp.reduce.async.bulk.tensor` is absent from cuda-oxide at the
-pinned revision in every form — not in the generated crate and not in
-`intrinsics/imported.json` either — so unlike the plain stores they are not a
-transcription. `store_add_async` is what makes split-K and multi-CTA reduction
-epilogues cheap, and getting it means a local `ptx_asm!` intrinsic (`ldst.rs`
-sets the precedent) or an upstream contribution — filed as **#42**, which argues
-for the upstream half.
+What is left of this entry is the *reduction* stores. The
+`cp.reduce.async.bulk.tensor` records are present in cuda-oxide's
+`intrinsics/imported.json`, but are not admitted to the generated `cuda-device`
+crate. So, like prefetch below, this is a generation-list change upstream or a
+local `ptx_asm!` intrinsic (`ldst.rs` sets the precedent). `store_add_async` is
+what makes split-K and multi-CTA reduction epilogues cheap; the upstream route
+is filed as **#42**.
 
 **Prefetch is not absent for the same reason, and this file said it was.**
 `int_nvvm_cp_async_bulk_prefetch_L2` and the tensor prefetch forms *are* in
@@ -874,11 +873,11 @@ instantiations on shared **tiles** (3.1, 3.2 — the vector half is #130), an fp
 descriptor (2.6). TMA prefetch is no longer on this list in the form it was:
 see 2.3 and the note on #42.
 
-## cuda-oxide support at the pinned rev (`b099f64`)
+## cuda-oxide support at the pinned rev (`20a5616`)
 
 Checked against the source, since several gaps turn on it. **Re-checked on
 2026-07-29 against a checkout whose `HEAD` was confirmed to be
-`b099f64c1a32869b74be99f4f88242fb68655b51` before anything was read from it** —
+`20a56163f258e09f2c51e4c27ae4e4ff17582443` before anything was read from it** —
 which is #106's rule, written after a `~/.cargo` checkout at `4514af2` was cited
 for a `clc` doc that our pin does not have. There are six cuda-oxide checkouts
 on this machine; five of them are not our pin.
@@ -894,7 +893,7 @@ the prefetch row.
 | Sparse MMA | ✅ `tcgen05_mma_sp_*` (unused) |
 | Register → TMEM (STTM) | ✅ full `tcgen05_st_*` family + `tcgen05_store_wait` |
 | TMA store | ✅ `cp_async_bulk_tensor_{1..5}d_s2g` + commit/wait groups |
-| TMA reduction store (add/min/max) | ❌ absent from the crate **and** from `intrinsics/imported.json` — needs a new record and a lowering, or `ptx_asm!` (#42) |
+| TMA reduction store (add/min/max) | ❌ absent from the crate, ✅ **present in `intrinsics/imported.json`** — a generation-list change or `ptx_asm!` (#42) |
 | TMA prefetch | ❌ absent from the crate, ✅ **present in `intrinsics/imported.json`** (`int_nvvm_cp_async_bulk_prefetch_L2`, plain and `.L2::cache_hint`, plus the tensor forms) — a generation-list change, not a lowering (#42's thread) |
 | f32 → fp8 | ✅ `cvt_rn_satfinite_{e4m3,e5m2}x2_f32` (+ `relu`) |
 | f32 → fp4/fp6/e8m0 | ❌ absent — hand bit-packing |
