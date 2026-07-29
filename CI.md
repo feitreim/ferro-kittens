@@ -99,7 +99,7 @@ gh workflow run gpu.yml -f ref=refs/pull/17/merge # a specific PR
 
 `cuda.yml` takes the same `ref` input.
 
-### Running Modal by hand, and the two ways it costs you money
+### Running Modal by hand, and the three ways it costs you money
 
 Use the wrapper rather than `modal run` directly:
 
@@ -125,9 +125,43 @@ stops the app when it does not arrive, and exits 3. It exits 2 on the workspace
 spend limit, which fails every entry point at once and reads exactly like a
 broken diff.
 
+The third way is the cheapest to pay and the most expensive to believe: **a run
+that was killed and read as a passing one**. A concurrent agent stopping an app,
+a Modal-side eviction, a spend limit tripping mid-run, the dashboard's stop
+button — none of those are your entry point failing, and what the client reports
+for them is not one thing. Measured on client 1.5.1 (#103): stopping an app
+while the function is running raises `RemoteError` and exits **1**, stopping one
+between app creation and the function call makes the client **hang on
+`AppHeartbeat` indefinitely**, and the field report that opened #103 saw **0**.
+
+So `scripts/modal-run` does not decide from the exit code. `modal_app.py` prints
+a completion sentinel after each entry point's last line — `completes`, one
+`print` — and the wrapper returns 0 only having seen it, and **4** otherwise.
+Absence of failure is not evidence of completion; the sentinel is. The exit
+codes in full:
+
+| code | meaning |
+| ---: | --- |
+| 0 | the entry point ran to its last line — the sentinel was seen |
+| the run's own | the entry point itself failed |
+| 2 | the workspace spend limit |
+| 3 | a wedge this wrapper detected and stopped |
+| 4 | the run ended, without failing and without finishing |
+
+`modal run modal_app.py::stall` is the control: it prints one `$ ` line and then
+sleeps, so `modal app stop`ping it from a second shell reproduces exactly this
+for a fractional CPU and a minute. Both graces are env-overridable
+(`MODAL_RUN_STARTUP_GRACE`, `MODAL_RUN_SILENCE_GRACE`) for the same reason — a
+check nobody has watched fail is not a check.
+
 If you do run `modal run` by hand, check `modal app list` afterwards and confirm
 your app is `stopped`. A live app you have stopped paying attention to is still
 a live app.
+
+**`cuda.yml` and `gpu.yml` still call `modal run` directly**, so neither guard
+covers them: a wedged CI container rides its `timeout=`, and a stopped one is
+whatever the client decides to return. Moving the workflows onto the wrapper is
+the obvious next step and is not done here.
 
 ## Pull requests from forks
 

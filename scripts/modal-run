@@ -17,8 +17,14 @@ ride the timeout.
     scripts/modal-run device_tests
     scripts/modal-run bench --case gemm-depth
 
-Exit codes: the run's own on a clean finish, 2 on the workspace spend limit,
-3 on a wedge this script stopped.
+The other thing it will not do is call a run that did not finish a passing one.
+`modal run`'s exit code is not a completion signal (see `COMPLETED` below), so
+returning 0 takes positive evidence: the sentinel `modal_app.py` prints after
+the entry point's last line.
+
+Exit codes: the run's own when the run itself failed, 2 on the workspace spend
+limit, 3 on a wedge this script stopped, 4 on a run that ended without
+finishing, and 0 only for a run seen to finish.
 """
 
 import os
@@ -47,6 +53,17 @@ APP_ID = re.compile(r"\bap-[A-Za-z0-9]{18,}\b")
 OURS = re.compile(r"^\$ |^Compiling |^\s+Compiling ")
 SPEND_LIMIT = "exceeded its spend limit"
 
+# `modal_app.COMPLETED`, spelled again because the client ships as its own venv
+# and this script runs under whatever `python3` is on PATH -- there is no import
+# that reaches it. The copy is safe because it fails *closed*: change one and
+# not the other and every run exits 4 with the message below naming both files,
+# rather than quietly passing. `modal run`'s own exit code cannot be that check.
+# Measured (#103, client 1.5.1): stopping an app mid-function makes the client
+# raise RemoteError and exit 1, but stopping one between app creation and the
+# function call makes it hang on `AppHeartbeat` forever, and the field report
+# this issue came from saw 0. Three answers to one question is not a signal.
+COMPLETED = "== modal_app: entry point completed =="
+
 
 def stream(pipe, into):
     for line in pipe:
@@ -67,7 +84,7 @@ def main(argv):
     lines = queue.Queue()
     threading.Thread(target=stream, args=(proc.stdout, lines), daemon=True).start()
 
-    app, alive, spent = None, False, False
+    app, alive, spent, done = None, False, False, False
     last = time.monotonic()
     while True:
         # The deadline is the startup one until our own output proves the
@@ -83,6 +100,7 @@ def main(argv):
         last = time.monotonic()
         alive = alive or bool(OURS.match(line))
         spent = spent or SPEND_LIMIT in line
+        done = done or COMPLETED in line
         app = app or next(iter(APP_ID.findall(line)), None)
 
     code = proc.wait()
@@ -94,7 +112,22 @@ def main(argv):
             file=sys.stderr,
         )
         return 2
-    return code
+    if code:
+        # The run's own code says more than "incomplete" does, and a failed run
+        # is incomplete by definition. Nothing to add.
+        return code
+    if not done:
+        print(
+            f"\n!! the run ended without printing `{COMPLETED}`, so it did not\n"
+            "   reach the end of its entry point -- the app was stopped, evicted,\n"
+            "   or the client returned on something other than a result. This is\n"
+            "   NOT a pass. Check `modal app list` and the run's log.\n"
+            "   (If you just renamed `COMPLETED` in modal_app.py, rename it in\n"
+            "   scripts/modal-run too -- they are two copies of one string.)",
+            file=sys.stderr,
+        )
+        return 4
+    return 0
 
 
 def wedged(proc, app, alive, grace):
