@@ -1128,14 +1128,21 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAG
     /// called twice per `stmatrix` where `Element::write_pair` was called once
     /// per pair store.
     ///
-    /// # The LDTM half is untouched, and is 39% of the cost
+    /// # The LDTM half was untouched, was 54% of the cost, and `WIDE` is it
     ///
     /// #109 split the epilogue into 13.1 µs of stores and 8.3 µs of LDTM at
-    /// 8192³. Every column above is the store half. What does change on the
-    /// load side is the *band*: [`StagedBand`] is 64 fp32 a thread where
+    /// 8192³. Every column above is the store half. What changed on the load
+    /// side was only the *band*: [`StagedBand`] is 64 fp32 a thread where
     /// [`Band`] is 128, because the pass is as wide as the staging tile — the
     /// same TMEM reads in twice as many passes, and `regcount` is what says
     /// where peak liveness went.
+    ///
+    /// `WIDE` is what removes it (#117), and the measurement closed #109's
+    /// split from the other end: at 8192³ this epilogue costs 14.96 µs a tile
+    /// and `WIDE` takes it to 6.89, so **8.07 µs of it was LDTM** against
+    /// #109's 8.3 — two instruments, two containers, four issues apart. The
+    /// mechanism is the *wait* rather than the issue, which is why `X4` halves
+    /// an instruction count and is worth −0.6% to −1.1% on its own.
     ///
     /// # There is no proxy fence here and its absence is not a bug
     ///
