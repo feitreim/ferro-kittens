@@ -388,6 +388,36 @@ def clc_bench() -> None:
     _run(["cargo", "oxide", "run", "kittens-examples", "--", "clc"], cwd=EXAMPLES_DIR)
 
 
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
+def ws_bench() -> None:
+    """The warp-specialized GEMM against the one it is a variant of.
+
+    `examples/src/gemm.rs` gets its overlap across CTAs -- two per SM, so one
+    CTA's epilogue runs against another's MMA. `examples/src/gemm_ws.rs` gets it
+    inside one CTA, from six warps and a double-buffered TMEM accumulator, which
+    is 512 accumulator columns and therefore one CTA per SM. The epilogue is
+    identical in both, deliberately, so a delta is the occupancy/specialization
+    structure and not a store path.
+
+    Both kernels and cuBLASLt are measured in the *same container*, because a
+    control quoted from another one is not a control: #98 found 2.9% of drift
+    between runs of the same tree.
+
+    `--features cublas` for the same reason `bench` has it -- a GEMM number with
+    no denominator is the thing that feature exists to stop shipping. Same
+    5400 s as `bench`: 16384^3 stages a gigabyte of operands and checks every
+    one of 268 million output elements, and this entry point does it for three
+    plans plus the control.
+    """
+    _run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
+          "--format=csv"], cwd="/")
+    _run(
+        ["cargo", "oxide", "run", "kittens-examples", "--features", "cublas",
+         "--", "ws"],
+        cwd=EXAMPLES_DIR,
+    )
+
+
 # `cpu=8` because on a cold container the *build* is a long pole in its own
 # right — the harness' dependency tree is ten-odd minutes of compilation and
 # the B200 is billed through all of it. The timeout covers that plus the sweep:

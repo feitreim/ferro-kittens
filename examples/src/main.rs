@@ -47,6 +47,7 @@ pub mod bench;
 pub mod cublaslt;
 pub mod flash_forward;
 pub mod gemm;
+pub mod gemm_ws;
 pub mod layernorm;
 pub mod softmax;
 
@@ -79,6 +80,16 @@ fn examples() -> Vec<Example> {
             status: "runs",
             threads: gemm::THREADS,
             shared_bytes: gemm::SHARED_BYTES,
+            entry: None,
+        },
+        Example {
+            name: "gemm_ws",
+            status: "runs (warp-specialized gemm)",
+            threads: gemm_ws::THREADS,
+            shared_bytes: gemm_ws::SHARED_BYTES,
+            // `#[cluster_launch]` too, so the same absence for the same reason
+            // — and here the counted figure is `device-tests`' `cg2 512` rung,
+            // which holds exactly this kernel's 512 accumulator columns.
             entry: None,
         },
         Example {
@@ -228,6 +239,10 @@ fn checks(
             gemm::check(context).map_err(|error| error.to_string()),
         ),
         (
+            "gemm_ws",
+            gemm_ws::check(context).map_err(|error| error.to_string()),
+        ),
+        (
             "softmax",
             softmax::check(context).map_err(|error| error.to_string()),
         ),
@@ -257,6 +272,25 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         };
         return match gemm::compare(&context) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // `cargo oxide run kittens-examples -- ws`: the warp-specialized GEMM and
+    // the one it is a variant of, on one clock, in one container, with cuBLASLt
+    // beside them. Its own argument for the same reason `clc` has one — it
+    // times two *kernels* against each other rather than sweeping one kernel's
+    // sizes, and `bench`'s `Case` is the wrong shape for that.
+    if std::env::args().nth(1).as_deref() == Some("ws") {
+        let Ok(context) = cuda_core::CudaContext::new(0) else {
+            println!("ws needs a CUDA device");
+            return ExitCode::FAILURE;
+        };
+        return match gemm_ws::compare(&context, bench::CUBLASLT) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 println!("FAIL  {error}");
