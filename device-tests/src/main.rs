@@ -1000,7 +1000,10 @@ pub mod kernels {
                 let column = N as u32 * step;
                 let band = if FORM == MOVERS {
                     load_rows(
-                        GlobalRows::<F32>::from_raw(source.as_ptr().cast_mut().cast(), pitch as usize),
+                        GlobalRows::<F32>::from_raw(
+                            source.as_ptr().cast_mut().cast(),
+                            pitch as usize,
+                        ),
                         0,
                         column,
                         lane,
