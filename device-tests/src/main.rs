@@ -72,7 +72,7 @@ use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cluster, cluster_launch, cuda_module, debug, kernel, thread, warp};
 
-use kittens::epilogue::StoreRing;
+use kittens::epilogue::{StoreRing, Warp};
 use kittens::global::{
     GlobalLayout, GlobalRows, encode_bf16_panels, load_rows, store_rows, store_shared_rows,
 };
@@ -209,6 +209,21 @@ type RingBand<const C: usize> = RegTile<RING_WARP_ROWS, C, BaseLdtm>;
 /// count and there is no barrier anywhere in this case's plan.
 const fn ring_shared<const C: usize, const IN_FLIGHT: u32>() -> u32 {
     StoreRing::<Bf16, RING_ROWS, C, Swizzle128B, IN_FLIGHT>::BYTES as u32
+}
+
+/// One warp's own store ring: [`RING_WARP_ROWS`] rows, one buffer, and
+/// `bar.warp.sync` where the block-scope ring has `bar.sync`.
+///
+/// The shape `examples/src/gemm.rs`'s TMA epilogue stages at (#122). Four of
+/// these side by side is the same memory as one [`StoreRing`] over
+/// [`RING_ROWS`], and the case below is that arrangement against the one the
+/// four cases above run.
+type WarpRing<const C: usize> = StoreRing<Bf16, RING_WARP_ROWS, C, Swizzle128B, 0, Warp>;
+
+/// Shared bytes a [`WarpRing`] probe launches with: one ring per warp, plus the
+/// 128-byte units `PHASE` pushes them all along by.
+const fn warp_ring_shared<const C: usize, const PHASE: usize>() -> u32 {
+    (PHASE * 128 + (RING_THREADS as usize / 32) * WarpRing::<C>::BYTES) as u32
 }
 
 /// The lane probe's staging tile: a warp's 32 rows by the one swizzle atom
@@ -950,6 +965,99 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn store_ring_depth_2_wide(destination: *const TmaDescriptor) {
         unsafe { store_ring_probe::<WIDE, 1>(destination) }
+    }
+
+    /// The same bands through **four warp-scope rings** instead of one
+    /// block-scope one: each warp owns a [`WarpRing`], fills it alone, and
+    /// commits its own [`RING_WARP_ROWS`] rows of every band.
+    ///
+    /// Two claims live here that [`store_ring_probe`] cannot make.
+    ///
+    /// **`bar.warp.sync` carries a proxy fence.** The TMA engine reads through
+    /// the async proxy and `stmatrix` writes through the generic one, so the
+    /// fence every lane takes has to reach lane 0 before it issues. At block
+    /// scope a `bar.sync` does that and nobody doubts it; at warp scope the
+    /// claim is that `bar.warp.sync` orders memory among a warp's lanes the same
+    /// way. If it does not, lane 0 hands the engine a buffer some lane has not
+    /// published and the case reports a stale or half-written band.
+    ///
+    /// **The swizzle phase is the buffer's absolute one.** `PHASE` pushes the
+    /// whole run along by that many 128-byte rows, so at `PHASE = 1` every
+    /// buffer starts mid-swizzle-period — which is where `gemm`'s staging run
+    /// sits, since its offset is a shared plan rounded to 128 and not to 1024.
+    /// [`SharedTile::chunk_writer`] folds that phase in; whether the *engine*
+    /// derives the same one from the same address is a hardware fact this repo
+    /// has only ever checked on the load side (`swizzle roundtrip short`). A
+    /// disagreement comes back as chunks permuted within their rows, which
+    /// decodes to wrong columns rather than to poison.
+    ///
+    /// Launch with [`RING_THREADS`].
+    #[inline(always)]
+    unsafe fn store_ring_warp_probe<const C: usize, const PHASE: usize>(
+        destination: *const TmaDescriptor,
+    ) where
+        BaseLdtm: FragmentLayout<RING_WARP_ROWS, C>,
+    {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let warp_id = warp::warp_id();
+            let mut ring = WarpRing::<C>::attach(
+                smem.add(PHASE * 128 + warp_id as usize * WarpRing::<C>::BYTES),
+            );
+            let lane = warp::lane_id();
+            let row_base = RING_WARP_ROWS as u32 * warp_id;
+
+            let mut band = 0usize;
+            while band < RING_BANDS {
+                let staging = ring.acquire();
+
+                let mut values = RingBand::<C>::zero();
+                let mut slot = 0usize;
+                while slot < RingBand::<C>::SLOTS {
+                    let mut value = 0usize;
+                    while value < RingBand::<C>::VALUES {
+                        let (row, column) = RingBand::<C>::coordinate(lane, slot, value);
+                        values.set(
+                            slot,
+                            value,
+                            cell(
+                                (row_base + row) as usize,
+                                ring_column(column as usize, band, C),
+                            ),
+                        );
+                        value += 1;
+                    }
+                    slot += 1;
+                }
+                // Row 0 of the buffer, not `row_base`: a warp-scope ring's
+                // buffer is only this warp's rows, where the block-scope one
+                // holds all four warps' and each warp writes its own slice.
+                store_tile(staging.chunk_writer(), 0, 0, lane, values);
+
+                ring.commit(
+                    destination,
+                    (RING_ROWS * band + RING_WARP_ROWS * warp_id as usize) as i32,
+                    0,
+                );
+                band += 1;
+            }
+            ring.drain();
+        }
+    }
+
+    /// [`store_ring_warp_probe`] with the rings 1024-byte aligned — the warp
+    /// scope on its own.
+    #[kernel]
+    pub unsafe fn store_ring_warp(destination: *const TmaDescriptor) {
+        unsafe { store_ring_warp_probe::<TILE, 0>(destination) }
+    }
+
+    /// [`store_ring_warp_probe`] with the whole run pushed one 128-byte row
+    /// along, so every buffer starts mid-swizzle-period — `gemm`'s own offset,
+    /// and the case that says the engine reads the phase off the address.
+    #[kernel]
+    pub unsafe fn store_ring_warp_phased(destination: *const TmaDescriptor) {
+        unsafe { store_ring_warp_probe::<TILE, 1>(destination) }
     }
 
     /// Fill a `[DRAIN_ROWS, C]` staging tile with position identities through
@@ -4092,7 +4200,13 @@ fn check_tma_store<const R: usize, const C: usize>(
 /// A dropped `wait_read` is a race, and a race that does not happen leaves no
 /// trace. The case is built so that a violation is a wrong value rather than a
 /// plausible one; it is not built to force the violation.
-fn check_store_ring<const C: usize>(
+/// `BOX_ROWS` is the descriptor's row count and therefore the *scope* of a commit:
+/// [`RING_ROWS`] when the block fills one buffer, [`RING_WARP_ROWS`] when each
+/// warp fills its own. The expectation does not move with it — a band is the
+/// same [`RING_ROWS`] rows of the same identities either way, assembled by four
+/// commits instead of one — which is the whole reason the two arrangements can
+/// share this function.
+fn check_store_ring<const BOX_ROWS: usize, const C: usize>(
     stream: &CudaStream,
     shared: u32,
     launch: impl Fn(LaunchConfig, *const TmaDescriptor) -> Result<(), cuda_core::DriverError>,
@@ -4100,7 +4214,7 @@ fn check_store_ring<const C: usize>(
     let rows = RING_BANDS * RING_ROWS;
     let destination = DeviceBuffer::from_host(stream, &vec![POISON; rows * C / 2])?;
     let map =
-        unsafe { encode_bf16_panels::<RING_ROWS, C>(stream, destination.cu_deviceptr(), rows, 1)? };
+        unsafe { encode_bf16_panels::<BOX_ROWS, C>(stream, destination.cu_deviceptr(), rows, 1)? };
 
     launch(launch_config(RING_THREADS, shared), map.as_ptr())?;
 
@@ -4116,9 +4230,10 @@ fn check_store_ring<const C: usize>(
         }
     }
     let note = compare_tile(&destination.to_host_vec(stream)?, &expected, C / 2)?;
-    let columns = C;
+    let (box_rows, columns) = (BOX_ROWS, C);
     Ok(format!(
-        "{RING_BANDS} bands of [{RING_ROWS}, {columns}] through {shared} B of ring, {note}"
+        "{RING_BANDS} bands of [{RING_ROWS}, {columns}] in [{box_rows}, {columns}] boxes \
+         through {shared} B of ring, {note}"
     ))
 }
 
@@ -5750,33 +5865,67 @@ fn run() -> Result<usize, Box<dyn Error>> {
     cases.push((
         "store ring depth 1",
         Box::new(|| {
-            check_store_ring::<TILE>(stream, ring_shared::<TILE, 0>(), |config, map| unsafe {
-                module.store_ring_depth_1(stream, config, map)
-            })
+            check_store_ring::<RING_ROWS, TILE>(
+                stream,
+                ring_shared::<TILE, 0>(),
+                |config, map| unsafe { module.store_ring_depth_1(stream, config, map) },
+            )
         }),
     ));
     cases.push((
         "store ring depth 2",
         Box::new(|| {
-            check_store_ring::<TILE>(stream, ring_shared::<TILE, 1>(), |config, map| unsafe {
-                module.store_ring_depth_2(stream, config, map)
-            })
+            check_store_ring::<RING_ROWS, TILE>(
+                stream,
+                ring_shared::<TILE, 1>(),
+                |config, map| unsafe { module.store_ring_depth_2(stream, config, map) },
+            )
         }),
     ));
     cases.push((
         "store ring depth 4",
         Box::new(|| {
-            check_store_ring::<TILE>(stream, ring_shared::<TILE, 3>(), |config, map| unsafe {
-                module.store_ring_depth_4(stream, config, map)
-            })
+            check_store_ring::<RING_ROWS, TILE>(
+                stream,
+                ring_shared::<TILE, 3>(),
+                |config, map| unsafe { module.store_ring_depth_4(stream, config, map) },
+            )
         }),
     ));
     cases.push((
         "store ring depth 2 wide",
         Box::new(|| {
-            check_store_ring::<WIDE>(stream, ring_shared::<WIDE, 1>(), |config, map| unsafe {
-                module.store_ring_depth_2_wide(stream, config, map)
-            })
+            check_store_ring::<RING_ROWS, WIDE>(
+                stream,
+                ring_shared::<WIDE, 1>(),
+                |config, map| unsafe { module.store_ring_depth_2_wide(stream, config, map) },
+            )
+        }),
+    ));
+    // The same ring at **warp scope** (#122): four warps, four buffers, four
+    // commits a band, and `bar.warp.sync` carrying the proxy fence to the lane
+    // that issues. `gemm`'s TMA epilogue stages this way because its staging
+    // tiles are per warp, and the phased rung is that kernel's own offset — a
+    // shared plan rounded to 128 and not to 1024, so every buffer starts
+    // mid-swizzle-period and the engine has to read the phase off the address.
+    cases.push((
+        "store ring warp",
+        Box::new(|| {
+            check_store_ring::<RING_WARP_ROWS, TILE>(
+                stream,
+                warp_ring_shared::<TILE, 0>(),
+                |config, map| unsafe { module.store_ring_warp(stream, config, map) },
+            )
+        }),
+    ));
+    cases.push((
+        "store ring warp phased",
+        Box::new(|| {
+            check_store_ring::<RING_WARP_ROWS, TILE>(
+                stream,
+                warp_ring_shared::<TILE, 1>(),
+                |config, map| unsafe { module.store_ring_warp_phased(stream, config, map) },
+            )
         }),
     ));
     // The same half of an epilogue without the engine: `stmatrix` into a

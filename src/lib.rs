@@ -32,7 +32,7 @@ pub mod shared;
 pub mod sync;
 pub mod tmem;
 
-pub use epilogue::StoreRing;
+pub use epilogue::{Cta, Scope, StoreRing, Warp};
 pub use reg::{
     BaseLdtm, BinaryOp, ColLayout, ColVec, Fragment, FragmentLayout, ReduceOp, RegTile, RegVec,
     RowLayout, TernaryOp, UnaryOp,
