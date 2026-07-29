@@ -1,6 +1,6 @@
 //! Timed runs of the examples that run, at sizes chosen to cross a regime.
 //!
-//! Three rules this file exists to enforce, in the order they matter:
+//! Five rules this file exists to enforce, in the order they matter:
 //!
 //! 1. **A number only ever comes out of a checked run.** An example's timing
 //!    entry point is not reachable except through its own CPU reference — see
@@ -25,6 +25,15 @@
 //!    Rule 1 has no exception for it: the baseline is checked before it is
 //!    timed, exactly as ours is, because the way a baseline goes wrong is by
 //!    computing a *different* GEMM quickly.
+//! 5. **A difference between two launches carries their error divided by its
+//!    own share of them.** Most of what this harness is asked for is a
+//!    difference — an epilogue against a launch with no epilogue, one rung
+//!    against another — and a difference that is 2% of either arm inherits
+//!    fifty times whatever the arms repeat to. That is arithmetic, so no
+//!    estimator, sample count or interleave fixes it and the only lever is to
+//!    take the difference where its share is large. [`repro`] is where that
+//!    share is printed beside every number it multiplies, and #122 is the
+//!    three published figures that did not carry it.
 //!
 //! Every example that is *not* in [`cases`] is in [`SKIPPED`] with the reason,
 //! so a missing row never leaves a reader guessing whether a kernel is slow or
@@ -107,7 +116,8 @@ impl std::fmt::Display for Shape {
     }
 }
 
-/// Per-launch kernel times in milliseconds, sorted.
+/// Per-launch kernel times in milliseconds, kept both sorted and in the order
+/// they were launched.
 ///
 /// The headline is the minimum: it is the least noise-contaminated estimate of
 /// what the kernel can do, since every source of error on a quiet device adds
@@ -115,25 +125,67 @@ impl std::fmt::Display for Shape {
 /// because a gap between them is a finding — a device sharing work, a clock
 /// dropping, a first-touch cost that never amortizes — and the table's job is
 /// to surface that, not to hide it behind one number.
-pub struct Timings(Vec<f64>);
+///
+/// **The launch order is kept because sorting answers only half the question**
+/// (#122). A row whose minimum will not repeat has two possible causes with
+/// opposite fixes: the distribution is wide and `min` of [`ITERATIONS`] is
+/// sampling its left tail, which more samples fix, or the device is slowing
+/// down inside the call, which no number of samples fixes. [`Timings::spread`]
+/// sees the first and [`Timings::drift`] sees the second, and neither is
+/// visible once the samples are sorted.
+pub struct Timings {
+    sorted: Vec<f64>,
+    launched: Vec<f64>,
+}
 
 impl Timings {
+    fn new(launched: Vec<f64>) -> Timings {
+        let mut sorted = launched.clone();
+        sorted.sort_by(f64::total_cmp);
+        Timings { sorted, launched }
+    }
+
     /// The headline. `pub` because [`gemm::compare`](crate::gemm::compare)
     /// puts both schedulers' headlines in one row of its own table.
     pub fn min(&self) -> f64 {
-        self.0[0]
+        self.sorted[0]
     }
 
     /// `pub` for the same reason [`Timings::min`] is, one table further on:
     /// `gemm::residual_sweep` quotes the baseline's own spread rather than its
     /// headline, because a ratio is only as stable as its denominator.
     pub fn median(&self) -> f64 {
-        self.0[self.0.len() / 2]
+        self.sorted[self.sorted.len() / 2]
     }
 
     /// As [`Timings::median`].
     pub fn max(&self) -> f64 {
-        self.0[self.0.len() - 1]
+        self.sorted[self.sorted.len() - 1]
+    }
+
+    /// How wide this call's own distribution is, as `max/min - 1`.
+    ///
+    /// It bounds what `min` of [`ITERATIONS`] can be asked to do. A call whose
+    /// launches all land within 1% of each other has a minimum that is the
+    /// floor; a call spread over 15% has one that is wherever the luckiest of
+    /// thirty draws fell, and two such calls will not agree.
+    pub fn spread(&self) -> f64 {
+        self.max() / self.min() - 1.0
+    }
+
+    /// The same call's second half against its first, **in launch order** — the
+    /// separator between a wide distribution and a moving device.
+    ///
+    /// Noise that is stationary leaves this at zero however wide
+    /// [`Timings::spread`] is. A clock stepping down under sustained load does
+    /// not: it puts the fast launches at the start and the slow ones at the
+    /// end, so the sign and the size of this are the thermal question asked
+    /// directly rather than inferred from a spread that cannot tell the two
+    /// apart.
+    pub fn drift(&self) -> f64 {
+        let half = self.launched.len() / 2;
+        let mean = |over: &[f64]| over.iter().sum::<f64>() / over.len() as f64;
+        mean(&self.launched[half..]) / mean(&self.launched[..half]) - 1.0
     }
 }
 
@@ -170,8 +222,7 @@ pub fn time(
         stop.record(stream)?;
         milliseconds.push(start.elapsed_ms(&stop)? as f64);
     }
-    milliseconds.sort_by(f64::total_cmp);
-    Ok(Timings(milliseconds))
+    Ok(Timings::new(milliseconds))
 }
 
 /// An example's verify-then-time entry point: check at a size against that
@@ -751,6 +802,287 @@ fn report(context: &Arc<CudaContext>, case: &Case, sizes: &[Shape]) -> usize {
     failures
 }
 
+/// Shapes `bench repro` takes, in two groups that differ **only in `K`**.
+///
+/// The epilogue is a per-output-tile cost and the rest of the launch is not:
+/// `M` and `N` set how many tiles there are, `K` sets how much arithmetic sits
+/// between one tile's epilogue and the next one's. So holding `M` and `N` and
+/// moving `K` holds the tile grid, the waves, the items a critical-path cluster
+/// walks, the `C` traffic and the epilogue's total cost all fixed, and moves
+/// only the number the epilogue is a *fraction of*.
+///
+/// That fraction is the whole subject. Every epilogue figure in
+/// `examples/README.md` §7 is a difference between two whole launches, and a
+/// difference's relative error is the arms' relative error divided by that
+/// fraction — so a row where the epilogue is 4% of the launch multiplies the
+/// noise by twenty-five before anyone reads it. The two `1024`-deep rows are
+/// the same output geometries as the two full cubes with the fraction put back
+/// up where a difference survives it, and the three depths at 8192² are what
+/// says whether the µs/tile they measure is the same quantity: if the epilogue
+/// really is per tile, those three rows read the same and the shallow ones are
+/// the deep one measured better. If they do not, `K` is a variable for the
+/// epilogue and nothing here transfers, which is a finding and not a failure.
+const REPRO_SIZES: &[Shape] = &[
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 1024,
+    },
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 2048,
+    },
+    // The anchor: the one size §7 trusts, so the shallow rows above it are
+    // judged against a number this file already carries rather than against
+    // themselves.
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 8192,
+    },
+    Shape {
+        m: 16384,
+        n: 16384,
+        k: 1024,
+    },
+    // The size under investigation. It is here to be *shown* unmeasurable by
+    // the same instrument that measures the row above it, which is a stronger
+    // statement than leaving it out.
+    Shape {
+        m: 16384,
+        n: 16384,
+        k: 16384,
+    },
+];
+
+/// The three arms `bench repro` interleaves.
+///
+/// `staged84` is the shipped rung and the baseline of both comparisons.
+/// `staged8` is the rung #121 calls a tie with it and #120 shipped against on a
+/// 16384³ row. `s84 2g` is [`Epilogue::StagedTwiceGlobal`] — `staged84` with a
+/// second `store_shared_rows` per band and nothing else — so `2g − staged84` is
+/// one added link of the epilogue chain, priced by **addition**: no pass is
+/// deleted, so no dead-code pass gets a vote, which is why #121 built the
+/// ladder this way. It is not a GEMM and is never checked; the two rungs it is
+/// compared against are, and both go through the same element-by-element `==`
+/// before any clock reaches them.
+///
+/// [`Epilogue::StagedTwiceGlobal`]: crate::gemm::Epilogue::StagedTwiceGlobal
+const REPRO_ARMS: [gemm::Epilogue; 3] = [
+    gemm::Epilogue::StagedWideX4,
+    gemm::Epilogue::StagedWide,
+    gemm::Epilogue::StagedTwiceGlobal,
+];
+
+/// Whole measurements each arm gets, taken round-robin over the arms.
+///
+/// Round-robin rather than arm-by-arm is the control #121 could not take. A
+/// device whose clocks step down over a sweep slows whichever arm ran last, and
+/// `A,A,A,A,B,B,B,B` cannot tell that from a difference between `A` and `B`;
+/// `A,B,A,B,…` puts each pair adjacent in time, so the four paired differences
+/// carry the drift as a *common* term and the spread over them is what is left.
+///
+/// Four rather than two because the deliverable is a spread, and two points
+/// give a range with no interior — the house rule since #67 is that an
+/// instrument nobody has watched repeat itself is not an instrument, and #121
+/// is the reason it now applies to this file.
+const REPEATS: usize = 4;
+
+/// `bench repro` — the instrument measured with the same rigour it measures
+/// kernels with (#122).
+///
+/// #121 took the first reproducibility control on `whole − no drain` and it came
+/// back 39–46% at 16384³ against 1–5% at 8192³. Three published epilogue
+/// figures at that size sit inside that band. This is what replaces it.
+///
+/// # Three tables
+///
+/// 1. **What one measurement repeats to**, per arm and per shape, with the
+///    call's own [`Timings::spread`] and [`Timings::drift`] beside it. Those
+///    two columns separate the two things a bad row can be — a distribution too
+///    wide for `min` of [`ITERATIONS`], or a device slowing down while it is
+///    being timed — and only the first is fixed by taking more samples.
+/// 2. **One added link of the epilogue chain**, in µs a tile, with the
+///    amplification printed next to it: the added pass as a share of the
+///    launch, its reciprocal, the spread the four paired differences actually
+///    came out at, and the spread that share *predicts* from the arms' own
+///    repeatability. Those last two agreeing is the diagnosis. A difference
+///    between two large runs cannot be more precise than the runs divided by
+///    the difference, and no estimator, sample count or interleave changes
+///    that — it is arithmetic, so the only fix is to measure where the share is
+///    large.
+/// 3. **`staged8` against `staged84`**, which is the same arithmetic pointed at
+///    a standing decision: they differ by ~1.5 points at 16384³, #120 set the
+///    shipped default on that row, and a 1.5-point difference between two 5 ms
+///    launches is a share of 1.5% and an amplification of 67.
+pub fn repro(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
+    println!(
+        "gemm: what the epilogue instrument reproduces to, and where it can be pointed —\n\
+         {REPEATS} whole measurements of each arm, taken round-robin so every pair is\n\
+         adjacent in time, each one min ms over {ITERATIONS} timed launches after {WARMUP}\n\
+         warm-up, static schedule, the shipped [256,256] rung. Every row is one container."
+    );
+    println!(
+        "the two `k1024` shapes are the two cubes' own output geometries with the reduction\n\
+         shortened: same tiles, same waves, same items a cluster walks, same C, same total\n\
+         epilogue — and a launch the epilogue is a large fraction of instead of a small one."
+    );
+
+    let mut sweep = Vec::new();
+
+    println!("\n1. what one measurement repeats to. `call/call` is the worst of the four");
+    println!(
+        "   against the best of them; `in-call` and `drift` are the worst call's own max/min\n\
+         and its second fifteen launches against its first, in launch order — a wide but\n\
+         stationary call is a sampling problem and a drifting one is a clock."
+    );
+    println!(
+        "{:<20}{:<12}{:>11}{:>11}{:>11}{:>10}{:>10}",
+        "shape", "arm", "best ms", "worst ms", "call/call", "in-call", "drift"
+    );
+    for &shape in REPRO_SIZES {
+        let mut taken: Vec<Vec<Timings>> = REPRO_ARMS.iter().map(|_| Vec::new()).collect();
+        for pass in 1..=REPEATS {
+            for (arm, into) in REPRO_ARMS.iter().zip(taken.iter_mut()) {
+                eprintln!("{shape} {} pass {pass}: staging and checking", arm.name());
+                into.push(gemm::bench_with(context, shape, *arm)?);
+            }
+        }
+        for (arm, calls) in REPRO_ARMS.iter().zip(taken.iter()) {
+            let (best, worst) = extremes(&mins(calls));
+            let widest = calls
+                .iter()
+                .max_by(|left, right| left.spread().total_cmp(&right.spread()))
+                .expect("REPEATS is not zero");
+            let drifted = calls
+                .iter()
+                .max_by(|left, right| left.drift().abs().total_cmp(&right.drift().abs()))
+                .expect("REPEATS is not zero");
+            println!(
+                "{:<20}{:<12}{:>11.4}{:>11.4}{:>10.2}%{:>9.2}%{:>9.2}%",
+                shape,
+                arm.name(),
+                best,
+                worst,
+                100.0 * (worst / best - 1.0),
+                100.0 * widest.spread(),
+                100.0 * drifted.drift(),
+            );
+        }
+        sweep.push((shape, taken));
+    }
+
+    println!(
+        "\n2. one added link, by doubling. `s84 2g` is `staged84` with a second\n\
+         `store_shared_rows` per band and nothing else deleted, so `2g − staged84` is what\n\
+         one `ld.shared` + `st.global.v4` pass costs serially. `share` is that difference as\n\
+         a fraction of the launch and `1/share` is what the subtraction multiplies the arms'\n\
+         error by; `predicted` is that product, and `observed` is the spread the four paired\n\
+         differences came out at. The two agreeing is the whole diagnosis."
+    );
+    println!(
+        "{:<20}{:>7}{:>10}{:>10}{:>10}{:>9}{:>9}{:>11}{:>11}",
+        "shape", "items", "s84 ms", "2g ms", "µs/tile", "share", "1/share", "observed", "predicted"
+    );
+    for (shape, taken) in &sweep {
+        let items = gemm::wave_efficiency(shape.m, shape.n).0;
+        let (base, doubled) = (&taken[0], &taken[2]);
+        let paired: Vec<f64> = base
+            .iter()
+            .zip(doubled)
+            .map(|(one, two)| two.min() - one.min())
+            .collect();
+        let difference = middle(&paired);
+        let (narrow, wide) = extremes(&paired);
+        let share = difference / middle(&mins(base));
+        let predicted = (relative_range(&mins(base)) + relative_range(&mins(doubled))) / share;
+        println!(
+            "{:<20}{:>7}{:>10.4}{:>10.4}{:>10.2}{:>8.1}%{:>9.1}{:>10.0}%{:>10.0}%",
+            shape,
+            items,
+            middle(&mins(base)),
+            middle(&mins(doubled)),
+            1e3 * difference / items as f64,
+            100.0 * share,
+            1.0 / share,
+            100.0 * (wide - narrow) / difference,
+            100.0 * predicted,
+        );
+    }
+    println!(
+        "\n   µs/tile is over the items a critical-path cluster walks, which is §7's\n\
+         denominator throughout. A row whose `observed` and `predicted` both exceed its own\n\
+         µs/tile has measured nothing, however many launches went into it."
+    );
+
+    println!(
+        "\n3. `staged8` against `staged84` — the same arithmetic, pointed at a shipped\n\
+         default. Four paired ratios, each pair adjacent in time. `share` is how much of a\n\
+         launch the difference between the two rungs is, so `1/share` is again what any\n\
+         conclusion drawn from this row multiplies the arms' repeatability by."
+    );
+    println!(
+        "{:<20}{:>10}{:>10}{:>11}{:>11}{:>11}{:>9}{:>9}",
+        "shape", "s84 ms", "s8 ms", "s8/s84", "lowest", "highest", "share", "1/share"
+    );
+    for (shape, taken) in &sweep {
+        let (wide_x4, wide) = (&taken[0], &taken[1]);
+        let paired: Vec<f64> = wide_x4
+            .iter()
+            .zip(wide)
+            .map(|(shipped, other)| other.min() / shipped.min())
+            .collect();
+        let ratio = middle(&paired);
+        let (narrow, widest) = extremes(&paired);
+        let share = (ratio - 1.0).abs();
+        println!(
+            "{:<20}{:>10.4}{:>10.4}{:>11.4}{:>11.4}{:>11.4}{:>8.1}%{:>9.0}",
+            shape,
+            middle(&mins(wide_x4)),
+            middle(&mins(wide)),
+            ratio,
+            narrow,
+            widest,
+            100.0 * share,
+            1.0 / share,
+        );
+    }
+    println!(
+        "\n   above 1.000 is `staged84` ahead. A row whose lowest and highest straddle 1.000\n\
+         has not ordered the two rungs, and one whose `1/share` is in the tens could not\n\
+         have ordered them at this sample count whichever side it landed on."
+    );
+
+    Ok(())
+}
+
+/// Each call's headline, which is the only number the tables above compare.
+fn mins(calls: &[Timings]) -> Vec<f64> {
+    calls.iter().map(Timings::min).collect()
+}
+
+fn extremes(over: &[f64]) -> (f64, f64) {
+    let fold = |start: f64, pick: fn(f64, f64) -> f64| over.iter().copied().fold(start, pick);
+    (
+        fold(f64::INFINITY, f64::min),
+        fold(f64::NEG_INFINITY, f64::max),
+    )
+}
+
+fn middle(of: &[f64]) -> f64 {
+    let mut sorted = of.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[sorted.len() / 2]
+}
+
+/// A set of repeats as a fraction of its own best — the arm's contribution to
+/// any difference taken against it.
+fn relative_range(over: &[f64]) -> f64 {
+    let (best, worst) = extremes(over);
+    worst / best - 1.0
+}
+
 /// What a `bench <name> [<m> <n> <k>]` argument list selects: one case, and
 /// optionally one size of it instead of that case's whole sweep.
 ///
@@ -901,6 +1233,24 @@ pub fn main() -> ExitCode {
         && name == "residual"
     {
         return match gemm::residual_sweep(&context, CUBLASLT) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // `bench repro` is the eighth and the only one that is about this file
+    // rather than about the kernel: #121's control found `whole − no drain`
+    // reproducing to 39–46% at 16384³, and three published figures at that size
+    // are inside the band. It lives here rather than in `gemm.rs` because what
+    // it varies is the *measurement* — the repeat count, the interleave, and
+    // the shape the difference is taken at — and none of those are a kernel.
+    if let Some((name, _)) = &selected
+        && name == "repro"
+    {
+        return match repro(&context) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 println!("FAIL  {error}");

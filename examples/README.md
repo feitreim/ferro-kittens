@@ -4368,6 +4368,184 @@ zero spill everywhere, every one of them inside the step that
 eleventh occasion in this file the register column has been unable to order the
 times.
 
+##### and the 16384³ instrument was never valid, for a reason that is arithmetic — #122
+
+#121's reproducibility control is the first thing in this file to measure the
+*measurement*, and it came back 39–46% at 16384³ against 1–5% at 8192³. Three
+published figures at that size — #116's 16.34 µs a tile, #117's 5.81, #118's
+2.91 — are inside that band. This is what that band is, and it is not a
+degradation: the same arithmetic that produces it at 16384³ produces the 1% at
+8192³, so the instrument did not stop working there. **It never worked there.**
+
+**Every epilogue figure in the sections above is a difference between two whole
+launches**, and a difference is only as precise as its arms divided by its own
+share of them. Call that share `s`; the amplification is `1/s`, and the
+difference's relative error is the arms' relative error over `s` whatever the
+estimator, the sample count or the interleave. #121's own table 6 is a
+three-point instance of it, reconstructed here from its own printed numbers with
+nothing measured:
+
+| shape | epilogue / launch | `1/s` | the two arms repeat to | predicted | #121 observed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4096³ | 17.9% | 5.6 | 0.86% + 0.58% | 8.1% | 7% |
+| 8192³ | 7.8% | 12.9 | 0.15% + 0.10% | 3.2% | 1% |
+| **16384³** | **5.3%** | **19.0** | **0.45% + 2.11%** | **49%** | **46%** |
+
+**The launches were never the problem.** They repeat to 0.1–2.1% at every size
+in that table, which is a *better* instrument than most of this file assumes.
+What fails is the quotient: the epilogue is a per-output-tile cost and the
+launch is per tile times `K`, so `s` falls as `1/K` by construction, and at
+16384³ a 2% arm error is a 40% epilogue error before anybody reads it. That is
+the whole finding, it is the cheapest of the four candidates, and it means the
+16384³ rows were arithmetic rather than a hardware effect.
+
+**Three things it is not, each checked rather than assumed.** *Sampling* is not
+it: `min` of 30 is the same estimator at every size and the arms' own
+reproducibility is 0.10% at 8192³, so more samples have nothing to fix at the
+size where the quotient works. *The wave* is not it: 8192² and 16384² are both
+98.8% full over 148 clusters (#87), and in any case every comparison in this
+file holds the grid, the tile and the traversal fixed between its arms, so wave
+quantization is common to both and cancels. And **adding rather than deleting
+does not fix it either** — `Tile::drain_staged_twice` retires the dead-code
+hazard, which is a real and different hazard, but one added link is a *smaller*
+share of the launch than the whole epilogue is, so the ladder is more amplified
+and not less. #121's own 16384³ ladder row says so: +4.01 and −2.69 µs a tile
+for the same quantity in two sessions.
+
+**But there is a second term, and keeping the launch order is what shows it.**
+`bench` sorted its thirty samples and threw the order away, so a wide
+distribution and a device slowing down inside the call looked identical.
+[`Timings::drift`] is the second fifteen launches over the first fifteen, in
+launch order, and [`Timings::spread`] is the same call's `max/min`. Six arms
+over two containers:
+
+| shape | call to call | in-call `max/min` | **drift** |
+| --- | ---: | ---: | ---: |
+| 8192² × k1024 | 0.39–1.46% | 4.0–7.5% | −1.90 … −0.25% |
+| 8192² × k2048 | 0.15–1.04% | 4.1–9.4% | −3.40 … −0.61% |
+| 8192³ | 0.26–0.58% | 1.3–2.5% | −0.40 … −0.18% |
+| 16384² × k1024 | 0.24–1.15% | 0.9–7.2% | −1.01 … +0.56% |
+| **16384³** | **0.99–3.12%** | **18.4–22.6%** | **+6.85 … +11.33%** |
+
+**At 16384³ and nowhere else, the device is 7–11% slower by the end of the call
+than at the start**, in all six arms and both containers, and that drift is
+essentially the whole of the 18–23% in-call spread — everywhere else the drift
+is *negative*, which is a warm-up finishing rather than a clock dropping. It is
+not the problem size: `16384² × k1024` has the same 4096 tiles, the same 28
+items a critical-path cluster walks, the same 512 MiB of `C` and the same wave,
+and drifts −1.0 to +0.6%. It is the *duration* — thirty launches of 5.1 ms is
+154 ms of continuous 1.1 PFLOP/s against 16 ms at the shortened depth. So a
+16384³ `min` is a boost-clock number taken from the first launch or two of a
+call whose last launches run 10% slower, and how far into the boost corner it
+lands is what moves it 1–3% between calls where 8192³ moves 0.3%. This is the
+mechanism under #121's table 2 as well: cuBLASLt's own `max/min` is 1.15–1.19 at
+16384³ and 1.01 at 8192³, measured through this same harness.
+
+##### so measure the same geometry at a shorter reduction — `bench repro`
+
+`K` is the one axis the epilogue's cost does not sit on. Holding `M` and `N`
+holds the tile grid, the waves, the items a cluster walks, the `C` traffic and
+the epilogue's *total* cost; moving `K` moves only the launch it is a fraction
+of. So the fix is not a better estimator — no estimator survives a 60×
+amplifier — it is to take the difference where `s` is 11% instead of 2%. The
+arms are interleaved round-robin rather than run arm-by-arm, so each pair is
+adjacent in time and a drift enters both sides of it; four whole measurements
+of each arm give a spread rather than a point, and the table prints the spread
+the amplification *predicts* beside the one it got.
+
+The probe is `s84 2g` — `staged84` with a second `store_shared_rows` per band
+and nothing deleted, so the difference is one `ld.shared` + `st.global.v4` pass,
+priced by addition. Two containers, `session 1 / session 2`, µs a tile over the
+items a critical-path cluster walks:
+
+| shape | items | µs/tile | `s` | `1/s` | observed | predicted | **session to session** |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8192² × k1024 | 7 | **2.34 / 2.34** | 10.8 / 11.0% | 9.2 | 17 / 17% | 16 / 18% | **0.0%** |
+| 8192² × k2048 | 7 | 2.42 / 2.61 | 7.8 / 8.6% | 12.2 | 13 / 4% | 19 / 9% | 7.9% |
+| 8192³ | 7 | 2.07 / 2.29 | 2.2 / 2.5% | 42.8 | 33 / 18% | 41 / 30% | 10.6% |
+| 16384² × k1024 | 28 | **2.11 / 2.12** | 10.8 / 10.8% | 9.3 | 5 / 8% | 12 / 13% | **0.5%** |
+| **16384³** | 28 | 3.01 / 3.82 | 1.6 / 2.1% | **54.1** | **167 / 111%** | 235 / 177% | **26.9%** |
+
+**`predicted` tracks `observed` across a twenty-fold range and bounds it from
+above in nine rows of ten**, which is the diagnosis stated as a prediction
+rather than as an explanation: the error on these differences is the arms'
+error over `s`, and the residual — predicted running above observed — is the
+round-robin pairing cancelling the drift the propagation assumed was adverse.
+
+**And the two shortened rows reproduce to 0.0% and 0.5% across two
+containers**, against 10.6% and 26.9% for the same quantity at full depth. The
+16384² number nobody could measure is **2.11 µs a tile**; #121's ladder put it
+at 0.45 and 4.22 in two sessions, and 2.11 is inside neither and between both.
+The instrument is calibrated by the 8192² column: 2.34 µs a tile lands at the
+top of the 2.0–2.3 that #121's `ld.shared` + `st.global` row already carries.
+
+**The µs/tile is flat in `K`, which is what makes the substitution legal** —
+2.34 / 2.42 / 2.07 and 2.34 / 2.61 / 2.29 across an eightfold range of depth,
+with the two deep readings carrying ±18–33% of their own. That is the check
+this design has to pass and it is also its residual risk: shortening `K` puts
+`A` and `B` inside L2 where they were 128 MiB each, and the K sweep bounds that
+confound to the deep rows' own error bar rather than to 1%. The flatness is
+real to about a tenth; it is not established to a hundredth.
+
+##### which orders `staged8` and `staged84` for the first time, and the sign is the geometry's
+
+#120 set `gemm`'s default to `staged84` on a 16384³ row where it led by ~1.5
+points, and #121 called that row a tie because ~1.5 points is inside its noise.
+Both are right about the row. The shortened rows can see it. Four paired ratios
+per cell, `session 1 / session 2`, above 1.000 being `staged84` ahead:
+
+| shape | `s8`/`s84` | lowest–highest, both sessions | `1/s` | µs/tile | orders them |
+| --- | ---: | --- | ---: | ---: | --- |
+| 8192² × k1024 | 0.9852 / 0.9758 | 0.9724 – 0.9902 | 41–67 | −0.32 / −0.51 | **`staged8`, 1.5–2.4%** |
+| 8192² × k2048 | 0.9827 / 0.9864 | 0.9813 – 0.9882 | 58–74 | −0.54 / −0.41 | **`staged8`, 1.4–1.7%** |
+| 8192³ | 0.9965 / 1.0002 | 0.9944 – 1.0033 | 284–5041 | −0.33 / +0.02 | no — straddles 1.000 |
+| 16384² × k1024 | 1.0104 / 1.0038 | 0.9971 – 1.0116 | 96–263 | **+0.20 / +0.07** | **`staged84`, 0.4–1.0%** |
+| **16384³** | 0.9926 / 0.9874 | 0.9796 – 1.0207 | 80–135 | −1.36 / −2.26 | no — both ranges straddle |
+
+**They are not tied, and which one wins is a property of the output geometry.**
+At 8192² `staged8` is ahead by 1.4–2.4% of the launch in four independent cells,
+none of whose ranges reach 1.000; at 16384² `staged84` is ahead by 0.4–1.0%,
+same sign in both containers, though session 2's range does touch it.
+
+**The full-depth rows do not merely fail to order them — they point the wrong
+way by an order of magnitude.** 16384³ centres on `staged8` ahead by 1.4–2.3 µs
+a tile where the same geometry shortened says `staged84` ahead by 0.07–0.20,
+and both of its ranges straddle 1.000 so neither reading is a result. That is
+`1/s` of 80–135 doing exactly what it is advertised to do: this comparison is a
+0.7–1.3% difference between two 5 ms launches, which is a harder measurement
+than the epilogue subtraction and not an easier one, and it is the row #120's
+default was set on.
+
+**So #120's default is right, for a reason its own row could not carry**, and
+#121's advice — break the tie at 8192³ where the instrument works — would have
+broken it the *other way* and shipped the rung that loses at the size the
+default was chosen for. The correction is not "use 8192³"; it is **use the
+geometry the decision is about, at a depth where the difference is a tenth of
+the launch and not a hundredth.** Nothing here asks for the default to move: a
+rung that wins at 16384² and loses at 8192² is a shape question, and `gemm_ws`
+shipping `staged8` (#118) beside `gemm` shipping `staged84` is now two answers
+to two questions rather than the same coin landing twice.
+
+**What this does not do.** It never measures `whole − no drain`, because the
+epilogue-free entry points are not on `bench`'s side of the wall and the
+subtraction is what is under investigation. But the same substitution applies to
+it and is worth stating with a number: the whole epilogue is ~7.3 µs a tile, so
+at `16384² × k1024` it is ~0.20 ms of a 0.55 ms launch — `s` of 37% and `1/s` of
+2.7, which against arms that repeat to 0.5–1.2% is **±5% where the full-depth
+version is ±46%**. That is the row that would replace #116's 16.34, #117's 5.81
+and #118's 2.91 rather than merely retire them, and it is a change in
+`gemm.rs`'s sweeps and not in the harness. Until it is taken, the honest status
+of every 16384³ epilogue total in this file is *unmeasured*, which is a weaker
+claim than wrong and a much weaker one than the numbers currently read as.
+
+**And one thing every 16384³ absolute in this file now carries.** The drift
+table says a `min` at that size is a boost-clock reading from the first launches
+of a call whose last launches are 7–11% slower. The TFLOP/s, the ratios against
+cuBLASLt and the ms are all still comparable *to each other* — both sides of
+every ratio are timed the same way in the same call — but none of them is a
+sustained-clock number, and the 1178.5 / 1117.3 TFLOP/s [`GEMM_SIZES`] reports
+for two runs of this tree is that 5.5% seen from the other end.
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all
