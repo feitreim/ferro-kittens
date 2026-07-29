@@ -25,6 +25,9 @@ the entry point's last line.
 Exit codes: the run's own when the run itself failed, 2 on the workspace spend
 limit, 3 on a wedge this script stopped, 4 on a run that ended without
 finishing, and 0 only for a run seen to finish.
+
+CI calls this script too (`cuda.yml`, `gpu.yml`), so 2, 3 and 4 also arrive as
+GitHub annotations -- see `annotate`.
 """
 
 import os
@@ -65,6 +68,20 @@ SPEND_LIMIT = "exceeded its spend limit"
 COMPLETED = "== modal_app: entry point completed =="
 
 
+def annotate(title, message):
+    """Put a diagnosis on the check itself, not only in the log.
+
+    2, 3 and 4 all mean "the entry point did not fail" -- the workspace is out
+    of money, a container wedged, a run was stopped -- and all three read from
+    the check list exactly like a broken diff. A reader who never opens the log
+    is the one who most needs to be told otherwise, and `::error::` is where
+    GitHub shows them. Titles carry no commas: GitHub parses those as the
+    separator between annotation properties.
+    """
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::error title={title}::{message}", flush=True)
+
+
 def stream(pipe, into):
     for line in pipe:
         into.put(line)
@@ -93,7 +110,7 @@ def main(argv):
         try:
             line = lines.get(timeout=max(1.0, grace - (time.monotonic() - last)))
         except queue.Empty:
-            return wedged(proc, app, alive, grace)
+            return wedged(entry, proc, app, alive, grace)
         if line is None:
             break
         print(line, end="", flush=True)
@@ -111,6 +128,12 @@ def main(argv):
             "   in seconds. Raise the limit, then re-run; do not retry in a loop.",
             file=sys.stderr,
         )
+        annotate(
+            "Modal spend limit -- this is not your diff",
+            f"`{entry}` did not run: the workspace spend limit is exhausted. "
+            "Every Modal entry point fails at once and in seconds when it is. "
+            "Raise the limit and re-run the job; do not retry in a loop.",
+        )
         return 2
     if code:
         # The run's own code says more than "incomplete" does, and a failed run
@@ -126,12 +149,25 @@ def main(argv):
             "   scripts/modal-run too -- they are two copies of one string.)",
             file=sys.stderr,
         )
+        annotate(
+            "The run did not complete -- this is not a pass",
+            f"`{entry}` ended without printing its completion sentinel, so it "
+            "never reached the end of its entry point: the app was stopped, "
+            "evicted, or the client returned on something other than a result. "
+            "The client's own exit code does not say which. See CI.md.",
+        )
         return 4
     return 0
 
 
-def wedged(proc, app, alive, grace):
+def wedged(entry, proc, app, alive, grace):
     stage = "said nothing for" if alive else "never reached Python in"
+    annotate(
+        "Container wedged -- stopped rather than billed out",
+        f"`{entry}` {stage} {grace}s, which is a wedge and not a slow start. "
+        "This wrapper stopped the app instead of paying out its `timeout=`. "
+        "Infrastructure rather than the diff: re-run the job once.",
+    )
     print(
         f"\n!! wedged: the run {stage} {grace}s. Stopping it rather than paying\n"
         f"   out the function timeout.",
