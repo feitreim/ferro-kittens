@@ -4833,6 +4833,95 @@ either table and was not chased; `4096x4096x2048` runs and is (1181.9 wide,
 1004.4 narrow). A `k` shorter than `m` is otherwise unexercised by this kernel,
 so whether that is a shape contract this port does not hold or a one-off is open.
 
+##### the kernel the port is a port of, unported, on the same clock — and it does not reach cuBLASLt either
+
+`gemm_sol` (#138) is a port of NVLabs' canonical `gemm_sol_final`, and it
+measured **0.806 / 0.873 / 0.946** of cuBLASLt at 4096³ / 8192³ / 16384³ with no
+way to read that: either the port dropped something the original has, or the
+original stands there too. Nobody had timed the original on a B200. This is that
+number, and **most of the gap is not the port's**.
+
+The control arm is `experiments/src/gemm_sol_upstream.rs`: upstream's
+`kernels.rs` at `b099f64c1a32869b74be99f4f88242fb68655b51`, copied without a
+character changed and `include!`d as upstream `include!`s it, launched on
+upstream's own grid through upstream's own `cuTensorMapEncodeTiled` descriptors,
+under upstream's own variant selector. What is *not* upstream's is everything
+outside the two CUDA events: `bench::time`'s five warm-ups and minimum of
+thirty, and `gemm_sol`'s own `stage_f16` and `check_output` — the same functions,
+not copies — so both kernels read byte-identical operands and both pass the same
+exact-BF16 comparison before either is timed. `modal_app.py::upstream_bench` is
+one container, so one device, one cuBLASLt, one day.
+
+`gemm_sol_final` is identical at `20a5616`, so none of this turns on the pin.
+
+**Each arm at the variant it should be judged at.** cuBLASLt is the mean of its
+four readings per shape; it repeats to 0.03% at 16384³, 0.15% at 8192³ and
+**1.3% at 4096³**, which is the error bar the 4096³ row carries.
+
+| | 4096³ M256xN256 | 8192³ M512xN256 | 16384³ M512xN256 |
+| --- | ---: | ---: | ---: |
+| cuBLASLt FP16 | 1635.9 | 2146.0 | 2158.8 |
+| **upstream, unported** | 1435.0 | 1955.7 | 2086.2 |
+| **our port** | 1322.7 | 1871.5 | 2041.4 |
+| upstream / cuBLASLt | 0.877 | 0.911 | 0.966 |
+| port / cuBLASLt | 0.809 | 0.872 | 0.946 |
+| port / upstream | 0.922 | 0.957 | 0.979 |
+
+**So the attribution, in TFLOP/s of shortfall against cuBLASLt:**
+
+| | 4096³ | 8192³ | 16384³ |
+| --- | ---: | ---: | ---: |
+| total shortfall | 313.2 | 274.5 | 117.4 |
+| upstream's own | 200.9 — **64%** | 190.3 — **69%** | 72.6 — **62%** |
+| the port's | 112.3 — 36% | 84.2 — 31% | 44.8 — 38% |
+
+Two thirds of it is where `gemm_sol_final` itself lands on this B200, and it
+lands short of cuBLASLt at every one of the three sizes — furthest at the small
+end, exactly as the port does. Whatever closes 4096³ is not a port defect and
+was never going to be found by reading the port against the paper.
+
+**And the row that does not flatter the port's control arm.** Upstream's shipped
+selector takes M256xN256 up to 8192³; #138 moved that crossover to M512xN256
+and this is the price of not having:
+
+| 8192³, upstream's own policy | TFLOP/s | of cuBLASLt |
+| --- | ---: | ---: |
+| upstream, M256xN256 as shipped | 1800.1 | 0.839 |
+| upstream, M512xN256 forced | 1955.7 | 0.911 |
+| our port, M512xN256 | 1871.5 | 0.872 |
+
+At 8192³ **the port beats the kernel it is a port of**, by 4.0%, entirely on the
+crossover. At 4096³ upstream's policy is the better one — M256 1435.0 against
+M512 1407.7 — and both agree at 16384³ to 0.01%, which is the auto selector and
+the forced entry landing on the same kernel.
+
+**Getting there needed two toolchain workarounds, and neither is the
+vendoring's.** `modal_app.py::upstream_ptx` builds upstream's crate from a clean
+clone, in its own workspace, at its own profile, and it does not assemble:
+
+1. `cuda_device::tcgen05::stmatrix_m8n8_x2` reaches the NVPTX back end as
+   `llvm.nvvm.stmatrix.sync.aligned.m8n8.x2.b16.p3`, is selected by nothing, and
+   comes out as a call to an `.extern .func` that does not exist — *"line 10;
+   fatal: Parsing error near '.nvvm'"*. `kittens::ldst` had already written this
+   workaround for itself at `b099f64`, and the vendored copy binds the name to
+   it: same signature, same instruction, upstream's file untouched.
+2. `opt -O2` turns upstream's four-way stage selects into **sixteen** lookup
+   tables emitted as `.global` arrays of `.shared` addresses, which PTX forbids
+   outright. `CUDA_OXIDE_OPT` pointed at an `opt` wrapper carrying
+   `-switch-to-lookup=false` removes all sixteen and the whole bundle assembles.
+
+Sixteen in upstream's own build and sixteen in ours, so this is the toolchain and
+not the copy — and it is worth knowing that **`cargo oxide build` passes on both
+of them**: it emits the PTX and never assembles it, so `build` gained a `ptxas`
+step for this crate rather than trusting the one it had.
+
+The second workaround is global to the compilation, so it is measured rather than
+assumed: the port is timed in the same container without the flag and with it,
+and reads **1320.7 / 1871.4 / 2041.0** against **1322.7 / 1871.5 / 2041.4** —
+0.15%, 0.006% and 0.02% apart. The flag does not move the port, and the port's
+own rows reproduce #138's published 1289.0 / 1867.7 / 2045.5 to 2.5% / 0.2% /
+0.2% across two sessions and two days.
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all

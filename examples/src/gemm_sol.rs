@@ -972,15 +972,25 @@ fn validate_shape(m: usize, n: usize, k: usize, variant: Variant) -> Result<(), 
     Ok(())
 }
 
-fn a_value(row: usize, depth: usize) -> f32 {
+/// `A`'s generator. Small integers, so every product and every partial sum is
+/// exact in fp32 and [`check_output`] is `==` rather than a tolerance.
+///
+/// `pub` because `experiments/`' copy of the *unported* upstream kernel is
+/// staged and checked by these four functions rather than by re-derivations of
+/// them (#138). Two kernels compared on one clock have to read byte-identical
+/// operands, and the way to guarantee that is to call the same code.
+pub fn a_value(row: usize, depth: usize) -> f32 {
     ((row * 5 + depth * 3) % 7) as f32 - 3.0
 }
 
-fn b_value(column: usize, depth: usize) -> f32 {
+/// `B`'s generator, per [`a_value`].
+pub fn b_value(column: usize, depth: usize) -> f32 {
     ((column * 4 + depth * 5) % 21) as f32 - 10.0
 }
 
-fn stage_f16(rows: usize, k: usize, value: impl Fn(usize, usize) -> f32) -> Vec<u16> {
+/// One operand, packed f16 row-major with K contiguous — the layout both this
+/// kernel and upstream's take.
+pub fn stage_f16(rows: usize, k: usize, value: impl Fn(usize, usize) -> f32) -> Vec<u16> {
     let mut staged = Vec::with_capacity(rows * k);
     for row in 0..rows {
         for depth in 0..k {
@@ -990,7 +1000,10 @@ fn stage_f16(rows: usize, k: usize, value: impl Fn(usize, usize) -> f32) -> Vec<
     staged
 }
 
-fn check_output(observed: &[u16], m: usize, n: usize, k: usize) -> Result<f64, Box<dyn Error>> {
+/// Every one of `m * n` BF16 outputs against the exact reference, per
+/// [`a_value`]. Returns the worst relative error, which is bf16's own and not
+/// a tolerance the comparison was given.
+pub fn check_output(observed: &[u16], m: usize, n: usize, k: usize) -> Result<f64, Box<dyn Error>> {
     let exact: Vec<f32> = (0..7 * 21)
         .map(|cell| {
             (0..k)

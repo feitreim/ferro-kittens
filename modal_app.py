@@ -31,6 +31,16 @@ Local usage:
     modal run modal_app.py::bench --case sol-small
                                       # the same two rungs below 4096^3, taken
                                       # twice, where the clock is the limit
+    modal run modal_app.py::upstream_bench
+                                      # the port, the kernel it is a port of
+                                      # unported, and cuBLASLt beside both --
+                                      # one container, so one device and one
+                                      # day. `--case` takes a comma-separated
+                                      # list for exactly this reason
+    modal run modal_app.py::upstream_ptx
+                                      # why that entry point needs an `opt`
+                                      # wrapper: upstream's own crate does not
+                                      # assemble in this image. No GPU
     modal run modal_app.py::bench --case swizzle
                                       # gemm's item traversal, tile held fixed
     modal run modal_app.py::bench --case tile
@@ -367,6 +377,23 @@ def build() -> None:
           "--features", "cublas"],
          cwd=EXPERIMENTS_DIR)
 
+    # The vendored upstream `gemm_sol_final`, which is 1300 lines of device code
+    # nothing else in this repository compiles. It is the only kernel here whose
+    # gate has to include `ptxas`: `cargo oxide build` emits its PTX happily and
+    # `opt -O2` has put sixteen illegal lookup tables in it, so a build alone
+    # would pass on a bundle that cannot load. So this step asserts both halves
+    # of the workaround at once -- that upstream's code still compiles, and that
+    # `-switch-to-lookup=false` still makes what it compiles to assemble.
+    # `upstream_ptx` is the diagnosis if this goes red; `OPT_NO_LOOKUP_TABLE` is
+    # where the reasoning lives.
+    _run(["sh", "-c", WRITE_OPT_WRAPPER], cwd="/")
+    _run([*STUB_ENV, "env", f"CUDA_OXIDE_OPT={OPT_NO_LOOKUP_TABLE}",
+          "cargo", "oxide", "build", "kittens-experiments", "--arch", "sm_100a",
+          "--features", "cublas,gemm-sol-upstream"],
+         cwd=EXPERIMENTS_DIR)
+    _run(["ptxas", "-arch=sm_100a", "-o", "/dev/null", "kittens_experiments.ptx"],
+         cwd=EXPERIMENTS_DIR)
+
 
 # `gaps` lived here until #3, and printed each aspirational kernel's remaining
 # errors by turning its cargo feature on: the missing API surface *was* the
@@ -669,6 +696,109 @@ def profile(kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192) -
 def doctor() -> None:
     _run(["nvidia-smi"], cwd="/")
     _run(["cargo", "oxide", "doctor"], cwd="/opt/warmup")
+
+
+# The `opt` the vendored upstream kernels need, and why they need one.
+#
+# `opt -O2` turns each of upstream's four-way stage selects -- `SMEM_A0..3`,
+# `TMA_BAR0..3`, and six more -- into a lookup table, and emits that table as a
+# `.global` array initialized with the addresses of `.shared` variables. PTX
+# forbids exactly that: *"Variable used as initial value not in .global or
+# .const state space"*, `ptxas` fatal, no code. Sixteen tables in our build of
+# it and sixteen in **upstream's own**, which `upstream_ptx` demonstrates from a
+# clean clone -- so this is a defect of the toolchain and not of the vendoring.
+#
+# `-switch-to-lookup=false` is LLVM's own switch for the transform that makes
+# them, and `CUDA_OXIDE_OPT` is cuda-oxide's own hook for supplying the `opt`
+# binary. Composing the two is a build-environment change and touches no source:
+# with the wrapper, all sixteen tables are gone and every one of the 46 entries
+# assembles for `sm_100a`.
+#
+# It is not free of consequence and is not assumed to be: the flag is global to
+# the compilation, so `upstream_bench` measures the port with it and without it
+# in one container and prints both. A difference there is the flag's, not the
+# kernel's, and belongs in the report.
+OPT_NO_LOOKUP_TABLE = "/tmp/opt-no-lookup-table"
+WRITE_OPT_WRAPPER = (
+    f"printf '#!/bin/sh\\nexec %s -switch-to-lookup=false \"$@\"\\n'"
+    f" \"$(which opt)\" > {OPT_NO_LOOKUP_TABLE}; chmod +x {OPT_NO_LOOKUP_TABLE};"
+    f" {OPT_NO_LOOKUP_TABLE} --version | head -2"
+)
+
+
+@app.function(cpu=8, timeout=CHECKING)
+@completes
+def upstream_ptx() -> None:
+    """Build NVLabs' own `gemm_sol_final`, from a clean clone of the pinned
+    cuda-oxide, and assemble its PTX. No GPU: `ptxas` is the whole question.
+
+    This exists because the first attempt to time upstream's kernel against ours
+    found it does not run, and the obvious suspicion -- that vendoring it into
+    `experiments/` broke it -- had to be ruled out before the finding could be
+    published. It is ruled out here, from upstream's crate, upstream's
+    workspace, upstream's profile, in this image:
+
+        .extern .func llvm.nvvm.stmatrix.sync.aligned.m8n8.x2.b16.p3
+        ptxas gemm_sol_final.ptx, line 10; fatal : Parsing error near '.nvvm'
+
+    and behind that one, sixteen `switch_$_table` arrays of `.shared` addresses.
+    Two independent lowering defects, both fatal, both upstream's own. Ours are
+    the same two, and `kittens::ldst` had already written the workaround for the
+    first one at `b099f64`.
+
+    Run it after a pin bump: if this comes back clean, the two workarounds
+    `gemm_sol_upstream.rs` and `OPT_NO_LOOKUP_TABLE` carry can both be dropped.
+    """
+    _run(["git", "clone", "--filter=blob:none", GIT_REPO, "/tmp/oxide"], cwd="/")
+    _run(["git", "checkout", CUDA_OXIDE_REF], cwd="/tmp/oxide")
+    # The clone's own `.cargo/config.toml` aliases `oxide` to a workspace
+    # member, which shadows the installed subcommand.
+    _run(["rm", "-f", "/tmp/oxide/.cargo/config.toml"], cwd="/")
+    upstream = "/tmp/oxide/crates/rustc-codegen-cuda/examples/gemm_sol_final"
+    _run([*STUB_ENV, "cargo", "oxide", "build", "gemm_sol_final", "--arch", "sm_100a"],
+         cwd=upstream)
+    _run(["sh", "-c",
+          "echo '--- unresolved externs ---'; grep -n '^\\.extern \\.func' gemm_sol_final.ptx;"
+          " echo '--- lookup tables of shared addresses ---';"
+          " grep -c 'switch_\\$_table' gemm_sol_final.ptx || true;"
+          " echo '--- ptxas ---';"
+          " ptxas -arch=sm_100a -o /dev/null gemm_sol_final.ptx 2>&1 | tail -10"],
+         cwd=upstream)
+
+
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
+@completes
+def upstream_bench() -> None:
+    """The port, the kernel it is a port of, and cuBLASLt -- one container, one
+    device, one clock.
+
+    `bench --case gemm-sol` published 0.795 / 0.873 / 0.946 of cuBLASLt at
+    4096³ / 8192³ / 16384³ with nothing to say whether that gap is the port's or
+    the design's. This runs the design too, from upstream's device code
+    unmodified (`experiments/src/gemm_sol_upstream.rs`), staged from the same
+    generators, checked by the same exact-BF16 reference and timed by the same
+    five-warm-up minimum-of-thirty clock, so the only thing left different is
+    the code between the events.
+
+    Two invocations, and the first one is the control. `OPT_NO_LOOKUP_TABLE` is
+    what makes upstream's kernels assemble at all, and it is global to the
+    compilation -- so the port is measured *without* it first, which is exactly
+    what `bench --case gemm-sol` measures on any other day, and then again
+    *with* it beside upstream. If those two port rows disagree, the flag moved
+    the port and every ratio in the second table has to be read against the
+    second port row rather than the published one.
+    """
+    _run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
+          "--format=csv"], cwd="/")
+    _run(["cargo", "oxide", "run", "kittens-experiments", "--features", "cublas",
+          "--", "bench", "gemm-sol"],
+         cwd=EXPERIMENTS_DIR)
+    _run(["sh", "-c", WRITE_OPT_WRAPPER], cwd="/")
+    _run(["env", f"CUDA_OXIDE_OPT={OPT_NO_LOOKUP_TABLE}",
+          "cargo", "oxide", "run", "kittens-experiments",
+          "--features", "cublas,gemm-sol-upstream",
+          "--", "bench", "gemm-sol,gemm-sol-upstream,gemm-sol-upstream-m512"],
+         cwd=EXPERIMENTS_DIR)
 
 
 @app.function(timeout=ASKING)
