@@ -1,17 +1,21 @@
 #!/bin/sh
-# rustfmt every manifest CI checks, which is three and not one.
+# rustfmt every manifest CI checks, which is four and not one.
 #
-# `cargo fmt` at the root reaches the library and nothing else: `device-tests/`
-# and `examples/` are separate workspaces, so their formatting is invisible from
-# here. Tier 1 checks all three (see `.github/workflows/ci.yml`), so a root-only
-# `cargo fmt` passes locally and fails in CI -- which it has done three times,
-# on #97, #104 and #109, each costing a round trip on a gate that takes 20
-# seconds to run.
+# `cargo fmt` at the root reaches the library and nothing else: `device-tests/`,
+# `examples/` and `experiments/` are separate workspaces, so their formatting is
+# invisible from here. Tier 1 checks all four (see `.github/workflows/ci.yml`),
+# so a root-only `cargo fmt` passes locally and fails in CI -- which it has done
+# three times, on #97, #104 and #109, each costing a round trip on a gate that
+# takes 20 seconds to run.
 #
-#     scripts/fmt          # format all three
+#     scripts/fmt          # format all four
 #     scripts/fmt --check  # what CI runs
+#
+# `experiments/` reaches into `examples/src` for two kernels and the clock
+# (`#[path]`), so rustfmt visits those files twice. That is idempotent and is
+# the reason the loop cannot be reordered into anything cleverer.
 set -e
 cd "$(dirname "$0")/.."
-for manifest in Cargo.toml device-tests/Cargo.toml examples/Cargo.toml; do
+for manifest in Cargo.toml device-tests/Cargo.toml examples/Cargo.toml experiments/Cargo.toml; do
     cargo fmt --manifest-path "$manifest" "$@"
 done

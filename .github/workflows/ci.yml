@@ -8,11 +8,12 @@
 #
 # Cost: a few minutes of `ubuntu-latest`. Free on a public repo.
 #
-# What is deliberately absent: `--features host`, `device-tests/`, and
-# `examples/`. All three reach `cuda-core` -> `cuda-bindings`, whose build
-# script wants `cuda.h` and fails without a toolkit. Their compilation lives in
-# cuda.yml (tier 2); what *can* be checked of them without a toolkit — their
-# formatting and their lockfiles — is checked here, because it is free.
+# What is deliberately absent: `--features host`, `device-tests/`, `examples/`
+# and `experiments/`. All three kernel crates reach `cuda-core` ->
+# `cuda-bindings`, whose build script wants `cuda.h` and fails without a
+# toolkit. Their compilation lives in cuda.yml (tier 2); what *can* be checked
+# of them without a toolkit — their formatting and their lockfiles — is checked
+# here, because it is free.
 #
 # See CI.md for the tier-by-tier policy.
 
@@ -50,23 +51,27 @@ jobs:
       # restored until the pin moves.
       - uses: Swatinem/rust-cache@v2
 
-      # Parsing needs no dependencies, so the two kernel crates get this one
-      # for free even though nothing else here can touch them.
-      - name: Formatting, all three crates
+      # Parsing needs no dependencies, so the three kernel crates get this one
+      # for free even though nothing else here can touch them. This is
+      # `scripts/fmt --check`, spelled out so the job's log names the crate that
+      # failed; keep the two lists in step.
+      - name: Formatting, all four crates
         run: |
           cargo fmt --check
           cargo fmt --check --manifest-path device-tests/Cargo.toml
           cargo fmt --check --manifest-path examples/Cargo.toml
+          cargo fmt --check --manifest-path experiments/Cargo.toml
 
       # Resolution needs no `cuda.h` either — only compilation does. This
-      # catches a lockfile left behind by a manifest edit in any of the three
+      # catches a lockfile left behind by a manifest edit in any of the four
       # crates, which would otherwise surface as a surprise dependency bump in
       # a Modal job that costs real money.
-      - name: Lockfiles are current, all three crates
+      - name: Lockfiles are current, all four crates
         run: |
           cargo metadata --locked --format-version 1 > /dev/null
           cargo metadata --locked --format-version 1 --manifest-path device-tests/Cargo.toml > /dev/null
           cargo metadata --locked --format-version 1 --manifest-path examples/Cargo.toml > /dev/null
+          cargo metadata --locked --format-version 1 --manifest-path experiments/Cargo.toml > /dev/null
 
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings

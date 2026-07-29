@@ -69,7 +69,7 @@
 //! request: `softmax`'s own header argues for 32 at length and rewriting it
 //! belongs to its own issue, with its own controls.
 //!
-//! Note also what the ladder in `examples/README.md` says about `[32, 32]` — a
+//! Note also what the ladder in `experiments/README.md` says about `[32, 32]` — a
 //! **zero** frame, in all five spellings. This kernel gets 128 bytes at that
 //! shape. The probe is not the kernel: it carries no `ColVec` parameters and no
 //! statistics across chunks, and this kernel's extra live state moves its cliff
@@ -127,7 +127,7 @@
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
-use cuda_device::{cuda_module, kernel, thread, warp};
+use cuda_device::{cuda_module, kernel, launch_bounds, thread, warp};
 
 // Host side: the launcher's error type, and the benchmark's size and clock.
 use crate::bench::{Shape, Timings, time};
@@ -185,6 +185,14 @@ type Partials = SharedVec<F32, WARPS>;
 
 pub const SHARED_BYTES: usize = Tile::BYTES + 2 * Parameters::BYTES + 64;
 pub const THREADS: u32 = (WARPS * 32) as u32;
+/// `groupnorm_tile`'s `#[launch_bounds]` spells this count as a literal — the
+/// attribute takes one, and `modal_app.py`'s occupancy gate reads it back out
+/// of the source with a digit regex. So [`THREADS`] derives from [`ROWS`] and
+/// the attribute does not, and a tile that changed shape would move one and
+/// leave the other: `ptxas` would be told a residency for a launch that no
+/// longer exists, and the gate would check the step at the wrong width. This
+/// is the two of them saying the same number out loud.
+const _: () = assert!(THREADS == 128);
 
 #[cuda_module]
 pub mod kernels {
@@ -311,12 +319,32 @@ pub mod kernels {
     /// The same normalization over the whole tile instead of per row — group
     /// norm's statistic, and the one that needs the four warps to agree.
     ///
+    /// # The residency is declared, because it used to be luck
+    ///
+    /// `#[launch_bounds(128, 3)]` is `__launch_bounds__`: it puts
+    /// `.maxntid 128, 1, 1` and `.minnctapersm 3` on the entry, so **`ptxas` is
+    /// told the residency this kernel is written for** and caps registers to
+    /// reach it. Three CTAs an SM at 128 threads is 168 registers a thread,
+    /// which is exactly the step — `_register_ceiling(3, 128)` in
+    /// `modal_app.py` derives the same 168 — and shared memory permits six at
+    /// [`SHARED_BYTES`], so **registers are this kernel's binding term** and
+    /// nothing else was going to hold the line.
+    ///
+    /// It sat on 168 without saying so until this file was compiled into a
+    /// smaller crate, at which point the same source came out at 236 and the
+    /// step was crossed with nothing in the tree to notice. A count that lands
+    /// on its ceiling by luck is not a residency, and #95's gate can only watch
+    /// a kernel that states one — this is that statement, in the one place the
+    /// compiler reads it too, so the gate and `ptxas` cannot be told different
+    /// numbers.
+    ///
     /// # Safety
     ///
     /// As [`layernorm_rows`], minus the parameter vectors. The block is 1-D and
     /// exactly [`THREADS`] threads, which is what makes each warp's slot in
-    /// `partials` its own.
+    /// `partials` its own — and what `#[launch_bounds]` above now also declares.
     #[kernel]
+    #[launch_bounds(128, 3)]
     pub unsafe fn groupnorm_tile(
         source: *const TmaDescriptor,
         destination: *const TmaDescriptor,

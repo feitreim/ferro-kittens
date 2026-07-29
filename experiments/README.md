@@ -1,28 +1,40 @@
-# examples
+# experiments
 
-Four kernels written the way we want them to read, and a header on each saying
-whether it runs or whether it only compiles. All four compile as of #3; two run.
+**The measurement record.** Every sweep, every ablation, every rung that lost,
+and the reasoning that picked the one `examples/` ships. It was written as
+`examples/README.md` while `examples/` was doing three jobs at once; it moved
+here with the sweeps it describes, unedited apart from the paths in this header
+and the six links that had to follow the two crates apart.
 
-The value of this crate was the **diff** between what the kernels wanted to say
+Read it as a notebook and not as documentation. The sections are in the order
+they were measured, later ones correct earlier ones by name, and a figure with
+an issue number beside it belongs to the kernel that existed at that issue —
+several of which no longer do. §7 says so at each point where it matters.
+
+Four kernels were written the way we want them to read, and a header on each
+said whether it runs or whether it only compiles. All four compile as of #3;
+two run.
+
+The value of that crate was the **diff** between what the kernels wanted to say
 and what `kittens` could express. An aspirational example — one naming API that
 did not exist yet — is not a placeholder but a statement of a missing API in the
 only terms that matter, which is what a kernel author has to type. That diff is
 now empty, and this file is the record of what it produced while it was not.
 
-Its own workspace, like `device-tests`, so `cargo` at the repo root never sees
-it. (The root `Cargo.toml` also needs `autoexamples = false`: `examples/` is one
-of cargo's own target directory names, and `exclude` does not stop target
-auto-discovery, so without it `examples/src/main.rs` gets compiled as an example
-target *of the library*.)
+Its own workspace, like `device-tests` and `examples`, so `cargo` at the repo
+root never sees it. (The root `Cargo.toml` also needs `autoexamples = false`:
+`examples/` is one of cargo's own target directory names, and `exclude` does not
+stop target auto-discovery, so without it `examples/src/main.rs` gets compiled
+as an example target *of the library*.)
 
 ## Status
 
 | Kernel | Status | Blocked on |
 | --- | --- | --- |
 | [`gemm`](src/gemm.rs) | **runs** — exact against a CPU reference, `==` on a bf16 `C` against a reference rounded the same way (#108) | — (and no gap worked around in-file any more) |
-| [`softmax`](src/softmax.rs) | **runs** — within 2⁻⁸ of a CPU reference | — |
-| [`layernorm`](src/layernorm.rs) | **runs** — `layernorm_rows` within 2⁻⁷ of a CPU reference; `groupnorm_tile` compiles, no launcher | — |
-| [`flash_forward`](src/flash_forward.rs) | **compiles** — no launcher yet | — |
+| [`softmax`](../examples/src/softmax.rs) | **runs** — within 2⁻⁸ of a CPU reference | — |
+| [`layernorm`](../examples/src/layernorm.rs) | **runs** — `layernorm_rows` within 2⁻⁷ of a CPU reference; `groupnorm_tile` compiles, no launcher | — |
+| [`flash_forward`](../examples/src/flash_forward.rs) | **compiles** — no launcher yet | — |
 
 All four are in the default build and this crate has **no cargo features left**.
 That is not tidying: `cargo oxide build kittens-examples --arch sm_100a` — which
@@ -99,12 +111,15 @@ the API it shipped, and § "in-place versus by-value" below is rewritten around
 it.
 
 ```sh
-cargo oxide build kittens-examples --arch sm_100a   # all four kernels
-cargo oxide run kittens-examples                    # and run the ones with launchers, on a B200
+cargo oxide build kittens-examples --arch sm_100a      # all four kernels
+cargo oxide run kittens-examples                       # and run the ones with launchers, on a B200
+cargo oxide build kittens-experiments --arch sm_100a   # every rung and probe below
+cargo oxide run kittens-experiments -- check           # and check the ones that compute a GEMM
 ```
 
-From the repo root: `modal run modal_app.py::build` for the first and
-`modal run modal_app.py::examples` for the second.
+From the repo root: `scripts/modal-run build` for the two builds and
+`scripts/modal-run examples` for the two runs — that entry point invokes both
+binaries, so the correctness gate is the one it always was.
 
 ## The gap lists, and why there is no longer a command for them
 
@@ -167,7 +182,7 @@ band and stored another. No choice of row multiplier fixes that: the affine
 maps mod 128 are a 2-group of exponent 128, so every row-affine seed repeats
 inside a band. The band therefore picks the *column stride* instead, from a
 cycle of 63, and 63 divides no power of two — so no band displacement this
-grid's arithmetic can produce is invisible. [`softmax::permutation`](src/softmax.rs)
+grid's arithmetic can produce is invisible. [`softmax::permutation`](../examples/src/softmax.rs)
 argues it and states what is left over.
 
 `gemm` **runs**, and is the first numerical result this library has produced.
@@ -451,7 +466,7 @@ short — at `[48, 64]` `assign` runs 32 warps an SM against `fused`'s 16 and is
 still 5% *slower* across the device. Twice the warps did not quite cover it.
 
 **So the advice.** Do not read a register count as a speed. Read it with the
-occupancy beside it — `regcount` prices both kernel crates now, and
+occupancy beside it — `regcount` prices all three kernel crates now, and
 `kittens-examples`' own status table prints
 `cuOccupancyMaxActiveBlocksPerMultiprocessor` per kernel (#47) — and ask the one
 question that matters: *does this kernel get more warps if the band leaves the
@@ -868,7 +883,7 @@ would have missed: the third pass reads and writes the *same* tile, so chunk 0
 is overwritten before chunks 1..7 re-read it (worth 384 cells), and the
 device's bf16 intermediate moves cells across a tolerance an `f64` host model
 keeps inside it (the last 64). The second was picked as the *weakest* error a
-chunk walk can commit and is not weak: [`softmax::permutation`](src/softmax.rs)
+chunk walk can commit and is not weak: [`softmax::permutation`](../examples/src/softmax.rs)
 spreads a chunk across the whole ladder at an odd stride rather than giving it
 16 adjacent values, so the smallest denominator shift over the check's 512 rows
 is 4.3% — eleven times the tolerance.

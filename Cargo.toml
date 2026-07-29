@@ -5,11 +5,11 @@ edition = "2024"
 description = "A ThunderKittens-style tile library for cuda-oxide, targeting Blackwell tcgen05."
 repository = "https://github.com/feitreim/ferro-kittens"
 license = "MIT"
-# `device-tests` and `examples` are separate kernel crates with their own
-# workspaces: this library deliberately ships no `#[cuda_module]`, so anything
-# that needs one lives outside the package. Excluded so `cargo` at the root
-# never sees them.
-exclude = ["device-tests", "examples", "modal_app.py"]
+# `device-tests`, `examples` and `experiments` are separate kernel crates with
+# their own workspaces: this library deliberately ships no `#[cuda_module]`, so
+# anything that needs one lives outside the package. Excluded so `cargo` at the
+# root never sees them.
+exclude = ["device-tests", "examples", "experiments", "modal_app.py"]
 # `examples/` is cargo's own target directory name, and `exclude` does not stop
 # target auto-discovery: without this, `examples/src/main.rs` is compiled as an
 # example target *of this package*, against this package's dependencies. It is

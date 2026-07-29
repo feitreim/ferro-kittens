@@ -5,7 +5,7 @@
 //! that did not exist yet — and an example in it was not a placeholder but a
 //! precise statement of a missing surface, in the only terms that matter, which
 //! is what a kernel author has to type. The diff between these files and the
-//! library *was* the backlog; `examples/README.md` collects what it produced.
+//! library *was* the backlog; `experiments/README.md` collects what it produced.
 //!
 //! | Kernel | Status |
 //! | --- | --- |
@@ -15,7 +15,7 @@
 //! | [`flash_forward`] | compiles — no launcher yet |
 //!
 //! **Every kernel here is in the default build**, and there are no cargo
-//! features left. That is what makes `modal run modal_app.py::build` — a real
+//! features left. That is what makes `scripts/modal-run build` — a real
 //! `sm_100a` codegen of this crate — a regression gate on all four: a gated
 //! kernel is not in the default feature set, so it was never compiled by the
 //! thing that compiles this crate, and the example exercising the most of the
@@ -28,26 +28,31 @@
 //! [`softmax::permutation`] and [`layernorm::value`], which had to answer
 //! different questions — and not a status to be assigned.
 //!
-//! Until #8 there was no launcher here at all, because `global.rs` built one
-//! shape of tensor map (3-D bf16 panels) and the GEMM's operands are 2-D.
-//! `main` now prints the table and then runs every kernel that has one, so on
-//! a B200 this binary reports numbers and exits non-zero when they are wrong;
-//! off a GPU it degrades to the table it always printed.
+//! `main` prints the table and then runs every kernel that has one, so on a
+//! B200 this binary reports numbers and exits non-zero when they are wrong; off
+//! a GPU it degrades to the table.
 //!
-//! Pass `bench` and it says how *fast* the ones that run are instead — see
-//! [`bench`], which checks each size before it times it.
+//! # What is *not* here, and where it went
+//!
+//! One GEMM: the kernel the library ships, at the epilogue and the two
+//! instruction widths it ships with. The seven tile rungs it was chosen over,
+//! the two schedulers, the ablation cube, the four epilogue families, the
+//! doubling probes that compute a deliberately wrong `C` on purpose to price
+//! one term, the warp-specialized variant, the benchmark sweeps and the
+//! cuBLASLt denominator are all in **`experiments/`**, which is where the
+//! numbers quoted in these files' docs were measured. Nothing was deleted;
+//! this crate is the third of it that was ever about teaching.
+//!
+//! `bench.rs` here is the clock and nothing else — [`bench::time`] and the
+//! [`bench::Shape`] it is taken at — because [`softmax::bench`] and
+//! [`layernorm::bench`] are written against it, and `experiments/src/bench.rs`
+//! includes this file rather than carrying a second copy of it.
 
 use std::process::ExitCode;
 
 pub mod bench;
-/// The GEMM's denominator, behind the off-by-default `cublas` feature (#92).
-/// Absent from a default build, which is what keeps a crate that anyone can
-/// compile from needing a CUDA toolkit to link against.
-#[cfg(feature = "cublas")]
-pub mod cublaslt;
 pub mod flash_forward;
 pub mod gemm;
-pub mod gemm_ws;
 pub mod layernorm;
 pub mod softmax;
 
@@ -69,7 +74,7 @@ struct Example {
     /// calls it, and on a cluster launch with no allocator in it the answer
     /// matches a counted census exactly. So `None` here marks a query nobody
     /// has wired into this table, not a residency nothing can reach — and the
-    /// counted figure for `gemm` is on `gemm::CTAS_PER_SM`.
+    /// counted figure for `gemm` is in [`gemm::check`]'s pass line.
     entry: Option<&'static str>,
 }
 
@@ -79,23 +84,9 @@ fn examples() -> Vec<Example> {
             name: "gemm",
             status: "runs",
             threads: gemm::THREADS,
-            // The envelope `gemm::SHIPPED_EPILOGUE` declares, which since #119
-            // is the staged one. `gemm::SHARED_BYTES` is the register drain's
-            // and 16 424 B smaller; reporting it here would describe a launch
-            // this crate no longer makes by default.
+            // The envelope the shipped epilogue declares: the operand rings and
+            // the four per-warp staging tiles on the end of them.
             shared_bytes: gemm::STAGED_SHARED_BYTES,
-            entry: None,
-        },
-        Example {
-            name: "gemm_ws",
-            status: "runs (warp-specialized gemm)",
-            threads: gemm_ws::THREADS,
-            // As above: `gemm_ws::SHIPPED_ENTRY`'s envelope, not `Entry::S4`'s.
-            shared_bytes: gemm_ws::SHIPPED_ENTRY.shared(),
-            // `#[cluster_launch]` too, so the same absence for the same reason
-            // — and here the counted figure is `device-tests`' `ws envelope`
-            // rungs, which hold this kernel's 512 accumulator columns at this
-            // kernel's own two shared plans and count 1 CTA an SM at both.
             entry: None,
         },
         Example {
@@ -245,10 +236,6 @@ fn checks(
             gemm::check(context).map_err(|error| error.to_string()),
         ),
         (
-            "gemm_ws",
-            gemm_ws::check(context).map_err(|error| error.to_string()),
-        ),
-        (
             "softmax",
             softmax::check(context).map_err(|error| error.to_string()),
         ),
@@ -260,51 +247,6 @@ fn checks(
 }
 
 fn main() -> ExitCode {
-    // `cargo oxide run kittens-examples -- bench` (#40): the same kernels at
-    // several sizes, checked and then timed. It lives behind an argument rather
-    // than in the default path so the correctness run stays a few seconds.
-    if std::env::args().nth(1).as_deref() == Some("bench") {
-        return bench::main();
-    }
-
-    // `cargo oxide run kittens-examples -- clc` (#88): the GEMM's three item
-    // sources on one clock, with the ragged-wave prediction beside them. Its
-    // own argument rather than a row of `bench`, because it times one kernel
-    // three ways and its sizes are chosen by what the prediction does across
-    // them rather than by what crosses a regime.
-    if std::env::args().nth(1).as_deref() == Some("clc") {
-        let Ok(context) = cuda_core::CudaContext::new(0) else {
-            println!("clc needs a CUDA device");
-            return ExitCode::FAILURE;
-        };
-        return match gemm::compare(&context) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                println!("FAIL  {error}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-
-    // `cargo oxide run kittens-examples -- ws`: the warp-specialized GEMM and
-    // the one it is a variant of, on one clock, in one container, with cuBLASLt
-    // beside them. Its own argument for the same reason `clc` has one — it
-    // times two *kernels* against each other rather than sweeping one kernel's
-    // sizes, and `bench`'s `Case` is the wrong shape for that.
-    if std::env::args().nth(1).as_deref() == Some("ws") {
-        let Ok(context) = cuda_core::CudaContext::new(0) else {
-            println!("ws needs a CUDA device");
-            return ExitCode::FAILURE;
-        };
-        return match gemm_ws::compare(&context, bench::CUBLASLT) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                println!("FAIL  {error}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-
     println!(
         "{:<16}{:<38}{:>8}{:>14}",
         "kernel", "status", "threads", "shared"

@@ -69,7 +69,7 @@
 //! needs the residency, which
 //! `cuOccupancyMaxActiveBlocksPerMultiprocessor` cannot supply for a
 //! `#[cluster_launch]` kernel — it takes a block shape and no cluster — so the
-//! GEMM's came off a clock by bisection. `examples/README.md` §7 has the sweep
+//! GEMM's came off a clock by bisection. `experiments/README.md` §7 has the sweep
 //! and what it says about #78.
 //!
 //! # The schedule the hardware picks, and what it is actually worth
@@ -97,7 +97,7 @@
 //! term, and the term is small. #90 and #94 already measured the one that is
 //! not — the *item boundary*, a fifth to a third of the launch — and a dynamic
 //! schedule removes no item boundary at all; it only moves which cluster pays
-//! them. `examples/README.md` §7 carries the table.
+//! them. `experiments/README.md` §7 carries the table.
 //!
 //! **The reason to want it anyway is that it deletes the constants.** Picking a
 //! persistent grid needs `SMS` and `CTAS_PER_SM`, and #84 established that the
@@ -129,7 +129,7 @@
 //!
 //! **It was the other way round at every size measured, by 8.5% at 16384³
 //! against numbers that repeat to 0.6%.** Both forms were built and timed;
-//! `examples/README.md` §7 has the table. The prefetched one is **deleted**,
+//! `experiments/README.md` §7 has the table. The prefetched one is **deleted**,
 //! and [`run_stealing`] is the form that issues the request after the item it
 //! will replace.
 //!
@@ -178,7 +178,7 @@
 //! returns, which is a whole output tile computed by nobody if it is forgotten.
 //!
 //! What that buys is a separate question from whether it can be expressed, and
-//! for the GEMM the answer is nothing — `examples/README.md` §7 has the two
+//! for the GEMM the answer is nothing — `experiments/README.md` §7 has the two
 //! sessions and the probe that says why. The fact worth carrying here is that
 //! the experiment cost a reordering, so the next job with a store phase should
 //! measure one before anyone scopes a second scaffold.
@@ -266,7 +266,7 @@ pub trait Job {
 /// `group` tile-rows instead of one long row-major run, and the operand bytes
 /// they collectively touch — the working set an L2 has to hold for the reuse to
 /// land — is minimized where those two are balanced against the tile's own
-/// aspect. `examples/README.md` §7 carries the sweep and the shape it was found
+/// aspect. `experiments/README.md` §7 carries the sweep and the shape it was found
 /// at; a caller should take the width as a parameter and measure, not inherit
 /// one.
 ///

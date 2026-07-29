@@ -6,30 +6,23 @@ name = "kittens-examples"
 version = "0.1.0"
 edition = "2024"
 
-# Standalone workspace, like `device-tests`: `cargo` at the repo root never sees
-# this crate, so an aspirational kernel that names API we have not written yet
-# cannot break the library's build or its CI.
+# Standalone workspace, like `device-tests` and `experiments`: `cargo` at the
+# repo root never sees this crate, so an aspirational kernel that names API we
+# have not written yet cannot break the library's build or its CI.
 [workspace]
 
-[features]
-# The cuBLASLt baseline `bench` divides by (#92). Off by default, and it is the
-# link step rather than the code that makes that necessary: turning it on makes
-# the binary need `libcublasLt.so` from a *devel* CUDA toolkit, which tier 1 CI
-# does not have and which nobody should need in order to build this crate.
-#
-# It is not a gated *kernel* — see the note below for why those are all gone.
-# Nothing device-side is behind it. What it gates is host code that calls a
-# vendor library, which is the one thing a feature is genuinely for here.
-cublas = []
-
-# No kernel features. Each aspirational kernel used to sit behind one and be off by
-# default, so that everything in the default build genuinely compiled and
+# No features at all. Each aspirational kernel used to sit behind one and be off
+# by default, so that everything in the default build genuinely compiled and
 # turning a feature on printed that kernel's gap list as compiler errors. Every
 # gap list is empty now (#3 closed the last one), so the features held nothing
 # back — and worse, a gated kernel is absent from the default set that
 # `cargo oxide build kittens-examples --arch sm_100a` compiles, which made the
 # examples with the most library surface in them the ones CI never codegened.
 # All four kernels are in the default build.
+#
+# The one feature that survived that, `cublas`, went to `experiments/` with the
+# benchmark it gates: nothing here divides by a vendor library, so nothing here
+# needs a *devel* CUDA toolkit to link against.
 
 [dependencies]
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }

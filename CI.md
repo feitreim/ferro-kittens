@@ -17,27 +17,38 @@ buys something the one below genuinely cannot see.
 `fmt`, lockfile freshness, `clippy --all-targets -- -D warnings`, `test`, and
 `doc --no-deps` with `RUSTDOCFLAGS=-D warnings`.
 
-**Format with `scripts/fmt`, not `cargo fmt`.** This tier checks three
-manifests; a root `cargo fmt` reaches only the library, because `device-tests/`
-and `examples/` are separate workspaces. That gap has turned this gate red three
-times (#97, #104, #109) on changes that were otherwise correct — the code was
-fine and a signature wanted to be on one line. `scripts/fmt --check` is what CI
-runs; `scripts/fmt` fixes it.
+**Format with `scripts/fmt`, not `cargo fmt`.** This tier checks four
+manifests; a root `cargo fmt` reaches only the library, because `device-tests/`,
+`examples/` and `experiments/` are separate workspaces. That gap has turned this
+gate red three times (#97, #104, #109) on changes that were otherwise correct —
+the code was fine and a signature wanted to be on one line.
+`scripts/fmt --check` is what CI runs; `scripts/fmt` fixes it.
 
 The library's default feature set is device-only and `cuda-device` is ordinary
-Rust, so all of that runs on a stock runner with no toolkit. `device-tests/` and
-`examples/` cannot be compiled here — both pull `cuda-core` -> `cuda-bindings`,
-whose build script wants `cuda.h` — but formatting and dependency resolution
-need neither, so both crates get those two checks for free.
+Rust, so all of that runs on a stock runner with no toolkit. The three kernel
+crates cannot be compiled here — all pull `cuda-core` -> `cuda-bindings`, whose
+build script wants `cuda.h` — but formatting and dependency resolution need
+neither, so each gets those two checks for free.
+
+`experiments/` compiles two of `examples/`' kernel files and its clock through
+`#[path]`, so rustfmt visits those files twice. That is idempotent, and it is
+why `scripts/fmt` is a loop over manifests rather than anything cleverer.
 
 The `host`-gated links in `global`'s docs are allowed to dangle here (see the
 `cfg_attr` at the top of `src/lib.rs`); tier 2 is where they must resolve.
 
 ## Tier 2 — the host feature, device codegen without a device, and the register gate
 
-`scripts/modal-run build`: clippy across all three crates with `--features
-host`, the host tests, `cargo doc --features host`, and a real `cargo oxide
-build --arch sm_100a` of both kernel crates against the CUDA driver stub.
+`scripts/modal-run build`: clippy across all four crates, the library's host
+tests, `cargo doc --features host`, and a real `cargo oxide build --arch
+sm_100a` of all three kernel crates against the CUDA driver stub — plus a second
+build of `experiments/` with `--features cublas`, which is the step that proves
+FFI through cargo-oxide links at all.
+
+`experiments/` is the expensive half of that and the half most worth having:
+about a third of its GEMM entry points compute a deliberately wrong `C` to
+isolate one term, so they are on no correctness gate and this codegen is the
+only gate they have.
 
 That last part is why this tier is worth its money. A post-monomorphization
 `const { assert!(..) }` in a tile shape fires at *codegen*. `cargo check` cannot
@@ -51,8 +62,14 @@ point predates this job by a long way and until #95 ran in no workflow at all,
 so a kernel could cross the step on any PR and nothing would say so. It is a
 separate job because it goes red for a different reason than `build` does — a
 register count rather than a compile — and that is worth seeing on the check
-list rather than in a log. It builds both kernel crates in its own container,
-so tier 2 now costs roughly twice what it did; still CPU-minutes.
+list rather than in a log. It builds all three kernel crates in its own
+container, so tier 2 now costs roughly twice what it did; still CPU-minutes.
+
+`examples/` and `experiments/` both emit `gemm_cg2_staged_x8x4` — it is the same
+kernel, shipped by one and kept as every A/B's control arm by the other — and
+`_measure` keys on `(ptx file, kernel)`, so the table carries both rows. Two
+identical rows is the claim that the teaching copy moved no instruction; a
+difference between them is a finding.
 
 Both jobs go through **`scripts/modal-run`**, so the wedge watchdog and the
 completion sentinel cover this tier — see the wrapper's own section below.
@@ -81,6 +98,14 @@ target directory would cut most of that. Not done here.
 `scripts/modal-run device_tests`. The ~20 cases take about 1.5 minutes of GPU
 time, but the billed window is the whole container — image pull, harness build,
 run — so budget on the order of ten GPU-minutes per invocation.
+
+`scripts/modal-run examples` is the other correctness gate here, and it runs
+**two** binaries since the crates split: `kittens-examples` for the four
+teaching kernels and `kittens-experiments -- check` for every rung and probe
+that computes a GEMM. The gate is what it always was — both check sizes, all
+three traversal widths, both schedulers where a rung has both — and naming both
+binaries in `modal_app.py` rather than in one of them is what keeps it that
+way.
 
 Through the wrapper for the reason the wrapper exists: the container that
 wedged for twenty-six minutes having printed nothing but a banner was a B200
