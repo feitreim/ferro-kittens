@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use cuda_core::CudaContext;
 
-use crate::{gemm, gemm_sol, layernorm, softmax};
+use crate::{gemm, gemm_sol, gemm_sol_upstream, layernorm, softmax};
 
 #[path = "../../examples/src/bench.rs"]
 mod harness;
@@ -493,6 +493,38 @@ fn cases() -> Vec<Case> {
             work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
             blocks: gemm_sol::grid,
             bench: gemm_sol::bench,
+            baseline: CUBLASLT_F16,
+        },
+        // The two rows above's denominator was cuBLASLt and its *numerator* had
+        // no control arm: a port that reaches 0.795 of the library at 4096³ is
+        // either carrying port overhead or standing where the kernel it ports
+        // stands, and no measurement in this tree could tell those apart. These
+        // two cases are that control arm — upstream's device code unmodified,
+        // through this clock, staged from the same generators and held to the
+        // same exact check. See [`crate::gemm_sol_upstream`].
+        //
+        // Two cases and not one because the variant policies differ. Upstream
+        // takes M256xN256 up to 8192³ and the port crosses over to M512xN256
+        // there, so `gemm-sol-upstream` is upstream's own selector and
+        // `gemm-sol-upstream-m512` forces the large entry at every size. The
+        // 8192³ rows of the three tables are only comparable through the
+        // second.
+        Case {
+            name: "gemm-sol-upstream",
+            bound: Bound::Compute,
+            sizes: GEMM_SOL_SIZES,
+            work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
+            blocks: gemm_sol_upstream::grid,
+            bench: gemm_sol_upstream::bench,
+            baseline: CUBLASLT_F16,
+        },
+        Case {
+            name: "gemm-sol-upstream-m512",
+            bound: Bound::Compute,
+            sizes: GEMM_SOL_SIZES,
+            work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
+            blocks: gemm_sol_upstream::grid,
+            bench: gemm_sol_upstream::bench_m512,
             baseline: CUBLASLT_F16,
         },
         Case {
@@ -996,8 +1028,16 @@ fn relative_range(over: &[f64]) -> f64 {
     worst / best - 1.0
 }
 
-/// What a `bench <name> [<m> <n> <k>]` argument list selects: one case, and
-/// optionally one size of it instead of that case's whole sweep.
+/// What a `bench <name>[,<name>...] [<m> <n> <k>]` argument list selects: some
+/// of the cases, and optionally one size of them instead of their whole sweep.
+///
+/// **The list is one argument, comma-separated, and that is not cosmetic.**
+/// `modal_app.py::bench` takes a single `--case` and every extra invocation is
+/// another container, another image pull and another harness build for a few
+/// seconds of device time. Three tables that have to be read against each other
+/// — a kernel, the kernel it is a port of, and their shared baseline — are also
+/// three tables that should be taken on one device on one day, and one argument
+/// is what makes that a single run.
 ///
 /// Both narrowings exist for the same reason, which is that the sweep is the
 /// wrong thing to point an instrument at. A profiler serializes and replays
@@ -1190,17 +1230,23 @@ pub fn main() -> ExitCode {
         };
     }
 
-    if let Some((name, _)) = &selected
-        && !cases().iter().any(|case| case.name == name)
+    // Each name in the list has to name a case. A list where one of three is a
+    // typo would otherwise run two tables and say nothing about the third,
+    // which is the failure mode worth being loud about: the reader gets a
+    // plausible-looking run that is missing the arm they asked for.
+    if let Some((names, _)) = &selected
+        && let Some(unknown) = names
+            .split(',')
+            .find(|name| !cases().iter().any(|case| case.name == *name))
     {
-        println!("no case named {name}; the sweep runs all of them when given no arguments");
+        println!("no case named {unknown}; the sweep runs all of them when given no arguments");
         return ExitCode::FAILURE;
     }
 
     let mut failures = 0;
     for case in cases() {
         let sizes = match &selected {
-            Some((name, _)) if name != case.name => continue,
+            Some((names, _)) if !names.split(',').any(|name| name == case.name) => continue,
             Some((_, Some(shape))) => vec![*shape],
             _ => case.sizes.to_vec(),
         };

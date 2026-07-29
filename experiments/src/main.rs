@@ -49,6 +49,10 @@ pub mod cublaslt;
 pub mod gemm;
 #[path = "../../examples/src/gemm_sol.rs"]
 pub mod gemm_sol;
+/// The kernel [`gemm_sol`] is a port *of*, unported — upstream's device code
+/// byte for byte, on this crate's clock, so the port's distance from cuBLASLt
+/// can be split into what the port costs and what upstream itself costs.
+pub mod gemm_sol_upstream;
 pub mod gemm_ws;
 
 /// The teaching crate's kernels, compiled here so [`bench`] can time them
@@ -102,6 +106,10 @@ fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> ExitCode {
         (
             "gemm_ws",
             gemm_ws::check(context).map_err(|error| error.to_string()),
+        ),
+        (
+            "gemm_sol_upstream",
+            gemm_sol_upstream::check(context).map_err(|error| error.to_string()),
         ),
     ];
     let mut failures = 0usize;

@@ -25,6 +25,12 @@ Local usage:
     modal run modal_app.py::bench --case gemm-depth
                                       # one table of that sweep; --m/--n/--k
                                       # narrows it further to a single row
+    modal run modal_app.py::bench --case gemm-sol,gemm-sol-upstream,gemm-sol-upstream-m512
+                                      # the port, the kernel it is a port of
+                                      # unported, and cuBLASLt beside both --
+                                      # one container, so one device and one
+                                      # day. --case takes a comma-separated
+                                      # list for exactly this reason
     modal run modal_app.py::bench --case swizzle
                                       # gemm's item traversal, tile held fixed
     modal run modal_app.py::bench --case tile
