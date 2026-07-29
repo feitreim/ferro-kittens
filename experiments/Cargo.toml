@@ -25,6 +25,7 @@ cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
 kittens = { package = "ferro-kittens", path = "..", features = ["host"] }
+half = "2.7.1"
 
 [profile.release]
 debug = false

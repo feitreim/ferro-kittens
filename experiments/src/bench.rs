@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use cuda_core::CudaContext;
 
-use crate::{gemm, layernorm, softmax};
+use crate::{gemm, gemm_sol, layernorm, softmax};
 
 #[path = "../../examples/src/bench.rs"]
 mod harness;
@@ -164,6 +164,18 @@ pub const CUBLASLT: Option<Baseline> = Some(Baseline {
 #[cfg(not(feature = "cublas"))]
 pub const CUBLASLT: Option<Baseline> = None;
 
+/// Closest live cuBLASLt reference for `gemm_sol`: FP16 inputs, FP32 compute,
+/// FP16 output. The port writes BF16, so the final 16-bit conversion differs
+/// while operand traffic, compute precision, and output width match.
+#[cfg(feature = "cublas")]
+pub const CUBLASLT_F16: Option<Baseline> = Some(Baseline {
+    name: "cuBLASLt FP16",
+    about: crate::cublaslt::about,
+    bench: crate::cublaslt::bench_f16,
+});
+#[cfg(not(feature = "cublas"))]
+pub const CUBLASLT_F16: Option<Baseline> = None;
+
 /// Sizes for `gemm`, picked to cross a regime rather than to be large.
 ///
 /// A cluster owns a `256 x 128` tile of `C`, so the first row is the smallest
@@ -194,6 +206,24 @@ pub const CUBLASLT: Option<Baseline> = None;
 /// `C` is 512 MiB of bf16 since #108, where it was 1 GiB of fp32 — against the
 /// 180 GiB a B200 carries, so the size is bounded by host staging time and not
 /// by the device.
+const GEMM_SOL_SIZES: &[Shape] = &[
+    Shape {
+        m: 4096,
+        n: 4096,
+        k: 4096,
+    },
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 8192,
+    },
+    Shape {
+        m: 16384,
+        n: 16384,
+        k: 16384,
+    },
+];
+
 const GEMM_SIZES: &[Shape] = &[
     // The smallest shape that is **one cluster running exactly one item**, and
     // therefore §7's "the small-size floor is one item boundary" row. It was
@@ -457,6 +487,15 @@ fn cases() -> Vec<Case> {
             baseline: CUBLASLT,
         },
         Case {
+            name: "gemm-sol",
+            bound: Bound::Compute,
+            sizes: GEMM_SOL_SIZES,
+            work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
+            blocks: gemm_sol::grid,
+            bench: gemm_sol::bench,
+            baseline: CUBLASLT_F16,
+        },
+        Case {
             name: "gemm-footprint",
             bound: Bound::Compute,
             sizes: GEMM_FOOTPRINT_SIZES,
@@ -575,7 +614,7 @@ fn compare(case: &Case, baseline: Baseline, rows: &[(Shape, Timings, Timings, St
          stream, not wall clock around the driver call."
     );
     println!(
-        "both sides read byte-identical operands — plain packed bf16 [m, k] and [n, k],\n\
+        "both sides read byte-identical operands — plain packed 16-bit [m, k] and [n, k],\n\
          K contiguous. ours reads them through a TMA tensor map and {0} through its own\n\
          matrix layouts; both descriptors are built once, outside the clock, as is every\n\
          allocation on both sides. no operand is rearranged for either party.",
@@ -587,8 +626,8 @@ fn compare(case: &Case, baseline: Baseline, rows: &[(Shape, Timings, Timings, St
     );
     println!(
         "ours computes only this form: both operands K-major, alpha 1, beta 0, no epilogue,\n\
-         and m % 256 == n % 128 == k % 64 == 0. {0} takes any of that, so a like-for-like\n\
-         rate against a library that is also general reads in our favour.",
+         with dimensions aligned to the compiled tile contract. {0} takes any of that, so a\n\
+         like-for-like rate against a library that is also general reads in our favour.",
         baseline.name
     );
     println!(

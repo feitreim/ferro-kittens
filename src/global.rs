@@ -1119,7 +1119,7 @@ mod host {
     use cuda_core::{CudaStream, DeviceBuffer};
     use cuda_device::tma::TmaDescriptor;
 
-    use crate::shared::{Bf16, Element, SharedTile, SharedVec, Swizzle, Swizzle128B};
+    use crate::shared::{Bf16, Element, F16, SharedTile, SharedVec, Swizzle, Swizzle128B};
 
     /// An [`Element`] the TMA engine can name in a tensor map.
     ///
@@ -1135,6 +1135,11 @@ mod host {
     impl TensorMapElement for Bf16 {
         const DATA_TYPE: CUtensorMapDataType =
             cuda_core::sys::CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+    }
+
+    impl TensorMapElement for F16 {
+        const DATA_TYPE: CUtensorMapDataType =
+            cuda_core::sys::CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
     }
 
     /// The box a shared destination wants delivered, as the map has to state

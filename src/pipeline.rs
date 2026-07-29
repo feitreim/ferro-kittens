@@ -497,6 +497,66 @@ impl ClcQueue {
             }
         }
     }
+
+    /// A stateful producer-side cursor for kernels whose warp roles advance
+    /// independently and therefore cannot use [`run_stealing`].
+    #[inline(always)]
+    pub const fn cursor(self) -> ClcCursor {
+        ClcCursor {
+            queue: self,
+            parity: 0,
+        }
+    }
+}
+
+/// Producer-owned view of a [`ClcQueue`], including its response phase.
+/// Exactly one designated thread per CTA drives it; both ranks participate in
+/// charging and harvesting, while rank zero alone issues the multicast query.
+pub struct ClcCursor {
+    queue: ClcQueue,
+    parity: u32,
+}
+
+impl ClcCursor {
+    /// Initialize this CTA's response barrier once before the role loops begin.
+    ///
+    /// # Safety
+    ///
+    /// One designated thread per CTA, before any query and behind a subsequent
+    /// cluster-wide publication point.
+    #[inline(always)]
+    pub unsafe fn arm(&self) {
+        unsafe { self.queue.arm() }
+    }
+
+    /// Finish the current raw work item and request another from CLC.
+    ///
+    /// # Safety
+    ///
+    /// One designated thread per CTA. Both ranks must call once per request in
+    /// the same order; no earlier response may still be read.
+    #[inline(always)]
+    pub unsafe fn next(&mut self) -> Option<u32> {
+        unsafe {
+            self.queue.charge();
+            if cluster::block_rank() == 0 {
+                self.queue.issue();
+            }
+            let next = self.queue.harvest(self.parity);
+            self.parity ^= 1;
+            next
+        }
+    }
+
+    /// Invalidate the response barrier after the final query completes.
+    ///
+    /// # Safety
+    ///
+    /// One designated thread per CTA, with no request outstanding.
+    #[inline(always)]
+    pub unsafe fn disarm(&self) {
+        unsafe { self.queue.disarm() }
+    }
 }
 
 /// Run `job` over the grid's own items, taking the first from this cluster's

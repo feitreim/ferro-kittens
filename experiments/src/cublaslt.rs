@@ -131,6 +131,7 @@ type Status = c_int;
 const SUCCESS: Status = 0;
 
 const CUDA_R_32F: c_int = 0;
+const CUDA_R_16F: c_int = 2;
 const CUDA_R_16BF: c_int = 14;
 const CUBLAS_COMPUTE_32F: c_int = 68;
 const CUBLAS_OP_N: i32 = 0;
@@ -554,6 +555,114 @@ pub fn bench(
     // relative error it returns is the same property of bf16 both sides carry,
     // and `gemm::check` is where it is reported.
     gemm::check_c(&c.to_host_vec(&stream)?, m, n, k)?;
+
+    Ok((time(&stream, &mut launch)?, describe(&heuristic)))
+}
+
+/// Live FP16-input/FP32-accumulate/FP16-output reference for
+/// [`crate::gemm_sol`]. The port writes BF16 because that is the upstream
+/// kernel's epilogue; cuBLASLt's closest supported path differs only in the
+/// final 16-bit conversion and writes the same number of bytes.
+pub fn bench_f16(
+    context: &Arc<CudaContext>,
+    shape: Shape,
+) -> Result<(Timings, String), Box<dyn Error>> {
+    let Shape { m, n, k } = shape;
+    let stream = context.default_stream();
+    let a = DeviceBuffer::<u16>::zeroed(&stream, m * k)?;
+    let b = DeviceBuffer::<u16>::zeroed(&stream, n * k)?;
+    let c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
+    let workspace = DeviceBuffer::<u8>::zeroed(&stream, WORKSPACE_BYTES)?;
+
+    let mut session = Session::new();
+    checked(
+        unsafe { cublasLtCreate(&mut session.handle) },
+        "cublasLtCreate",
+    )?;
+    checked(
+        unsafe { cublasLtMatmulDescCreate(&mut session.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) },
+        "cublasLtMatmulDescCreate",
+    )?;
+    set_transpose(session.desc, DESC_TRANSA, CUBLAS_OP_T)?;
+    set_transpose(session.desc, DESC_TRANSB, CUBLAS_OP_N)?;
+    layout(&mut session.a, CUDA_R_16F, k, n, k)?;
+    layout(&mut session.b, CUDA_R_16F, k, m, k)?;
+    layout(&mut session.d, CUDA_R_16F, n, m, n)?;
+
+    checked(
+        unsafe { cublasLtMatmulPreferenceCreate(&mut session.preference) },
+        "cublasLtMatmulPreferenceCreate",
+    )?;
+    let workspace_bytes = WORKSPACE_BYTES;
+    checked(
+        unsafe {
+            cublasLtMatmulPreferenceSetAttribute(
+                session.preference,
+                PREF_MAX_WORKSPACE_BYTES,
+                (&raw const workspace_bytes).cast(),
+                size_of::<usize>(),
+            )
+        },
+        "cublasLtMatmulPreferenceSetAttribute",
+    )?;
+
+    let mut heuristic = Heuristic {
+        algo: Algo { data: [0; 8] },
+        workspace_bytes: 0,
+        state: SUCCESS,
+        waves: 0.0,
+        reserved: [0; 4],
+    };
+    let mut returned = 0;
+    checked(
+        unsafe {
+            cublasLtMatmulAlgoGetHeuristic(
+                session.handle,
+                session.desc,
+                session.a,
+                session.b,
+                session.d,
+                session.d,
+                session.preference,
+                1,
+                &mut heuristic,
+                &mut returned,
+            )
+        },
+        "cublasLtMatmulAlgoGetHeuristic",
+    )?;
+    if returned == 0 {
+        return Err(format!("cuBLASLt has no FP16 algorithm for {m}x{n}x{k}").into());
+    }
+    checked(heuristic.state, "the FP16 algorithm the heuristic returned")?;
+
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+    let mut launch = || -> Result<(), Box<dyn Error>> {
+        checked(
+            unsafe {
+                cublasLtMatmul(
+                    session.handle,
+                    session.desc,
+                    (&raw const alpha).cast(),
+                    b.cu_deviceptr() as *const c_void,
+                    session.a,
+                    a.cu_deviceptr() as *const c_void,
+                    session.b,
+                    (&raw const beta).cast(),
+                    c.cu_deviceptr() as *const c_void,
+                    session.d,
+                    c.cu_deviceptr() as *mut c_void,
+                    session.d,
+                    &heuristic.algo,
+                    workspace.cu_deviceptr() as *mut c_void,
+                    WORKSPACE_BYTES,
+                    stream.cu_stream().cast(),
+                )
+            },
+            "cublasLtMatmul(FP16)",
+        )
+    };
 
     Ok((time(&stream, &mut launch)?, describe(&heuristic)))
 }

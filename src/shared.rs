@@ -29,8 +29,12 @@ use core::marker::PhantomData;
 
 use cuda_device::barrier::fence_proxy_async_shared_cta;
 use cuda_device::cluster;
+use cuda_device::convert::cvt_f16x2_f32;
 use cuda_device::ptx_asm;
-use cuda_device::tcgen05::{Tcgen05ElementType, cvt_f32x2_bf16x2, tcgen05_mma_shared};
+use cuda_device::tcgen05::{
+    Tcgen05ElementType, cvt_f32x2_bf16x2, tcgen05_mma_f16, tcgen05_mma_f16_cg2,
+    tcgen05_mma_shared,
+};
 use cuda_device::tma::{
     TmaDescriptor, cp_async_bulk_commit_group, cp_async_bulk_tensor_1d_g2s,
     cp_async_bulk_tensor_1d_s2g, cp_async_bulk_tensor_2d_g2s,
@@ -200,7 +204,87 @@ pub trait MmaElement: Element {
     unsafe fn mma_cg2(tmem: u32, a_desc: u64, b_desc: u64, instruction: u32, enable_d: bool);
 }
 
-/// bf16 — the only staged-operand element the tcgen05 kernels use.
+/// IEEE fp16 staged operands.
+///
+/// This is the other tcgen05 kind-0 format beside [`Bf16`]. Keeping it as its
+/// own element makes the tensor map, shared tile, operand descriptor, and MMA
+/// instruction agree on FP16 without a format flag at any call site.
+pub struct F16;
+
+impl Element for F16 {
+    type Unpacked = [f32; 2];
+    const BYTES: usize = 2;
+
+    #[inline(always)]
+    fn pack(values: [f32; 2]) -> u32 {
+        cvt_f16x2_f32(values[0], values[1])
+    }
+
+    #[inline(always)]
+    fn unpack(word: u32) -> [f32; 2] {
+        [f16_to_f32(word as u16), f16_to_f32((word >> 16) as u16)]
+    }
+
+    #[inline(always)]
+    unsafe fn read(at: *const u8) -> f32 {
+        f16_to_f32(unsafe { *(at as *const u16) })
+    }
+
+    #[inline(always)]
+    unsafe fn write(at: *mut u8, value: f32) {
+        unsafe { *(at as *mut u16) = Self::pack([value, value]) as u16 }
+    }
+
+    #[inline(always)]
+    unsafe fn write_pair(at: *mut u8, first: f32, second: f32) {
+        unsafe { *(at as *mut u32) = Self::pack([first, second]) }
+    }
+
+    #[inline(always)]
+    unsafe fn read_pair(at: *const u8) -> (f32, f32) {
+        let [first, second] = Self::unpack(unsafe { *(at as *const u32) });
+        (first, second)
+    }
+}
+
+impl MmaElement for F16 {
+    const MMA_KIND: u32 = 0;
+    const ELEMENT_TYPE: Tcgen05ElementType = Tcgen05ElementType::F16;
+
+    #[inline(always)]
+    unsafe fn mma(tmem: u32, a_desc: u64, b_desc: u64, instruction: u32, enable_d: bool) {
+        unsafe { tcgen05_mma_f16(tmem, a_desc, b_desc, instruction, enable_d) }
+    }
+
+    #[inline(always)]
+    unsafe fn mma_cg2(tmem: u32, a_desc: u64, b_desc: u64, instruction: u32, enable_d: bool) {
+        unsafe { tcgen05_mma_f16_cg2(tmem, a_desc, b_desc, instruction, enable_d) }
+    }
+}
+
+/// Expand one IEEE fp16 bit pattern to fp32 with integer bit operations.
+#[inline(always)]
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits as u32) & 0x8000) << 16;
+    let exponent = ((bits as u32) >> 10) & 0x1f;
+    let fraction = (bits as u32) & 0x03ff;
+    let widened = if exponent == 0 {
+        if fraction == 0 {
+            sign
+        } else {
+            let shift = fraction.leading_zeros() - 21;
+            let normalized = fraction << shift;
+            sign | ((127 - 14 - shift) << 23) | ((normalized & 0x03ff) << 13)
+        }
+    } else if exponent == 0x1f {
+        sign | 0x7f80_0000 | (fraction << 13)
+    } else {
+        sign | ((exponent + (127 - 15)) << 23) | (fraction << 13)
+    };
+    f32::from_bits(widened)
+}
+
+/// bf16 — the original staged-operand element used by the training kernels.
 pub struct Bf16;
 
 impl Element for Bf16 {
@@ -608,8 +692,46 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
         sem: ClusterSemaphore,
     ) -> TransactionBytes {
         unsafe {
-            self.tma_load_2d_multicast_cg2(map, leading, minor, sem, 1 << cluster::block_rank())
+            self.tma_load_2d_at_arriving_at::<R>(map, 0, leading, minor, sem)
         }
+    }
+
+    /// A partial-height [`Self::tma_load_2d_arriving_at`] landing at `dst_row`.
+    /// This builds a taller cluster operand from several adjacent tensor-map
+    /// boxes while preserving typed transaction accounting.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::tma_load_2d_arriving_at`], plus the map box being
+    /// `BOX_ROWS` tall, `dst_row + BOX_ROWS <= R`, and `dst_row` being aligned
+    /// to the swizzle's eight-row period.
+    #[inline(always)]
+    pub unsafe fn tma_load_2d_at_arriving_at<const BOX_ROWS: usize>(
+        self,
+        map: *const TmaDescriptor,
+        dst_row: usize,
+        leading: i32,
+        minor: i32,
+        sem: ClusterSemaphore,
+    ) -> TransactionBytes {
+        const {
+            assert!(BOX_ROWS <= R, "a box taller than the tile cannot land in it");
+        }
+        unsafe {
+            let mut i = 0usize;
+            while i < Self::SUBTILES {
+                cp_async_bulk_tensor_2d_g2s_multicast_cg2(
+                    self.subtile(i).add(dst_row * S::ATOM_BYTES),
+                    map,
+                    leading + (i * Self::SUBTILE_COLS) as i32,
+                    minor,
+                    sem.raw(),
+                    1 << cluster::block_rank(),
+                );
+                i += 1;
+            }
+        }
+        TransactionBytes::new(Self::SUBTILES * BOX_ROWS * S::ATOM_BYTES)
     }
 
     /// [`Self::tma_load_2d`] as a cta_group::2 multicast: every box lands in
@@ -1263,6 +1385,49 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     }
 }
 
+/// One typed value in shared memory, accessed volatile for cross-warp
+/// mailboxes whose visibility is ordered by a [`Semaphore`].
+#[derive(Clone, Copy)]
+pub struct SharedCell<T: Copy> {
+    base: *mut T,
+}
+
+impl<T: Copy> SharedCell<T> {
+    pub const BYTES: usize = size_of::<T>();
+    pub const ALIGNMENT: usize = align_of::<T>();
+
+    /// Attach to suitably aligned shared storage for one `T`.
+    ///
+    /// # Safety
+    ///
+    /// `base` must name exclusive shared storage for a `T` for the lifetime of
+    /// the returned handle.
+    #[inline(always)]
+    pub const unsafe fn attach(base: *mut u8) -> Self {
+        Self { base: base.cast() }
+    }
+
+    /// Publish one value through a volatile shared-memory store.
+    ///
+    /// # Safety
+    ///
+    /// The caller must order readers with a barrier or semaphore.
+    #[inline(always)]
+    pub unsafe fn write(self, value: T) {
+        unsafe { self.base.write_volatile(value) }
+    }
+
+    /// Read the currently published value through a volatile shared load.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have observed the synchronization event publishing it.
+    #[inline(always)]
+    pub unsafe fn read(self) -> T {
+        unsafe { self.base.read_volatile() }
+    }
+}
+
 /// `N` same-shaped tiles backing a pipeline ring: tile `i` lives in stage
 /// `i % N`. The parity arithmetic for the matching barriers lives in
 /// [`crate::sync::SemaphoreRing`].
@@ -1321,6 +1486,24 @@ mod tests {
     type Panel = SharedTile<Bf16, 64, 128, Swizzle128B>;
     type PTile = SharedTile<Bf16, 64, 64, Swizzle128B>;
     type Paired = SharedTile<Bf16, 128, 128, Swizzle128B>;
+
+    #[test]
+    fn f16_matches_the_tcgen05_operand_tables() {
+        assert_eq!(F16::BYTES, 2);
+        assert_eq!(F16::MMA_KIND, 0);
+        assert_eq!(F16::ELEMENT_TYPE, Tcgen05ElementType::F16);
+        assert_eq!(F16::PER_WORD, 2);
+    }
+
+    #[test]
+    fn f16_unpack_handles_normal_subnormal_and_special_values() {
+        let [one, minus_two] = F16::unpack(0xc000_3c00);
+        assert_eq!(one, 1.0);
+        assert_eq!(minus_two, -2.0);
+        assert_eq!(f16_to_f32(0x0001), 2.0f32.powi(-24));
+        assert_eq!(f16_to_f32(0x7c00), f32::INFINITY);
+        assert!(f16_to_f32(0x7e00).is_nan());
+    }
 
     #[test]
     fn bf16_matches_the_tcgen05_operand_tables() {

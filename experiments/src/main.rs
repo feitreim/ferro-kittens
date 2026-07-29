@@ -47,6 +47,8 @@ pub mod bench;
 #[cfg(feature = "cublas")]
 pub mod cublaslt;
 pub mod gemm;
+#[path = "../../examples/src/gemm_sol.rs"]
+pub mod gemm_sol;
 pub mod gemm_ws;
 
 /// The teaching crate's kernels, compiled here so [`bench`] can time them
