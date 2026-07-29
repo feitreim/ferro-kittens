@@ -34,7 +34,7 @@ use cuda_device::{
 use std::error::Error;
 
 use kittens::global::{GlobalLayout, GlobalRows, store_shared_rows};
-use kittens::ldst::store_tile_x4;
+use kittens::ldst::{store_packed_x4, store_tile_x4};
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, ClcCursor, ClcQueue};
 use kittens::reg::{BaseLdtm, RegTile};
@@ -152,7 +152,7 @@ const _: () = {
 /// The harness prints arm names through this rather than keeping its own table,
 /// so a value with no entry is a loud failure in a row of a table and not a
 /// silently mislabelled measurement.
-pub fn arm_name(dial: &[(&str, u8)], value: u8) -> &'static str {
+pub fn arm_name(dial: &[(&'static str, u8)], value: u8) -> &'static str {
     match dial.iter().find(|(_, listed)| *listed == value) {
         Some((name, _)) => name,
         None => "UNLISTED DIAL VALUE",
