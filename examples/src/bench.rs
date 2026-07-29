@@ -124,11 +124,15 @@ impl Timings {
         self.0[0]
     }
 
-    fn median(&self) -> f64 {
+    /// `pub` for the same reason [`Timings::min`] is, one table further on:
+    /// `gemm::residual_sweep` quotes the baseline's own spread rather than its
+    /// headline, because a ratio is only as stable as its denominator.
+    pub fn median(&self) -> f64 {
         self.0[self.0.len() / 2]
     }
 
-    fn max(&self) -> f64 {
+    /// As [`Timings::median`].
+    pub fn max(&self) -> f64 {
         self.0[self.0.len() - 1]
     }
 }
@@ -880,6 +884,23 @@ pub fn main() -> ExitCode {
         && name == "widths"
     {
         return match gemm::widths_sweep(&context, CUBLASLT) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // `bench residual` is the seventh, and it is a re-derivation rather than a
+    // lever: the ranking this repo carries was assembled across three
+    // containers and the ceiling in it predates the two changes that moved the
+    // epilogue. This re-runs the controls beside the arms in one session, and
+    // then opens the residual epilogue with a doubling ladder.
+    if let Some((name, _)) = &selected
+        && name == "residual"
+    {
+        return match gemm::residual_sweep(&context, CUBLASLT) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 println!("FAIL  {error}");

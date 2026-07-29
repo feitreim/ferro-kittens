@@ -4053,6 +4053,321 @@ cheapest place for that fact to live:
 4096x4096x256 exact on ws staged, ws staged8, ws staged4, ws staged84 (147584 B, ws staged8 ships)
 ```
 
+##### and the whole ranking, re-derived in two sessions — the ceiling is an 8192³ fact
+
+Everything above this line that orders the remaining levers was assembled out of
+three containers. #114 measured an epilogue-free `gemm` at 1850 TFLOP/s against
+cuBLASLt's 1808 — a **ratio of 1.02**, and a ceiling rather than a result, since
+a kernel with no epilogue cannot be moved by epilogue work. #116 and #117 then
+took the epilogue from 20.43 µs a tile to ~6.9. `staged84` sits at 0.944, so on
+that arithmetic the residual is worth about 7.7%, removing it would put the
+kernel *above* the library, and **the gap is still 100% epilogue**.
+
+Every number in that chain was taken somewhere else, and the 1.02 predates both
+of the changes that moved the thing it is a ceiling on. This re-runs the
+controls beside the arms — `bench residual`, two containers, five sizes — and
+the conclusion survives at one size and weakens at the others. **1.02 is a fact
+about 8192³.** It is 0.98 at 16384³ and 0.98 at 4096³, and below 2048³ there is
+no denominator stable enough to quote.
+
+**1. The ceiling, the shipped rung and the library, all in one container, twice.**
+Min ms over 30 timed launches, static schedule, `GROUP = 8`, the shipped
+`[256, 256] @ k64 s3` rung; `s84nd` is `gemm_cg2_staged_no_drain` at 114 816 B
+and `lcfnd` is #114's own `gemm_cg2_no_drain` at 98 392, neither of which
+computes a GEMM. Both sessions, `session 1 / session 2`:
+
+| shape | `s84`/theirs | `s8`/theirs | `s84nd`/theirs | `lcfnd`/theirs |
+| --- | ---: | ---: | ---: | ---: |
+| 1024³ | 0.564 / 0.650 | — / 0.639 | 0.793 / 0.868 | 0.793 / 0.894 |
+| 2048³ | 0.728 / 0.829 | — / 0.834 | 0.916 / **1.038** | 0.893 / **1.046** |
+| 4096³ | 0.791 / 0.811 | 0.795 / 0.815 | 0.955 / 0.988 | 0.944 / 0.977 |
+| **8192³** | **0.940 / 0.939** | 0.941 / 0.944 | **1.024 / 1.018** | **1.019 / 1.017** |
+| 16384³ | 0.937 / 0.932 | 0.949 / 0.927 | **0.993 / 0.984** | 0.979 / 0.983 |
+
+**At 8192³ the framing holds and holds twice.** The epilogue-free kernel is
+1.017–1.024 of cuBLASLt, which reproduces #114's 1.02 in two fresh containers
+after both of the changes that could have invalidated it. The gap is 6.5% of our
+launch (0.6549 against 0.6149); the epilogue is 7.2–7.4 µs a tile over the 7
+items a critical-path cluster walks, which is **127–136% of it**. Nothing else
+needs to be found at this size: the whole distance to the library is still the
+difference between our epilogue and theirs.
+
+**At 16384³ the ceiling is below parity, and that is new.** 0.984 and 0.993 —
+the epilogue-free kernel *loses* by 1–2%, where at 8192³ it wins by 2%. Taking
+the epilogue out of that gap leaves 10–23% of it standing, which is 0.7–1.6% of
+the launch. It is small, and the honest reading of the pair is not "a new term
+appeared" but **"the two asymptotes are the same number, and which one is 1%
+ahead depends on the size"** — which is what #114's own fit said (1798–1862
+against the library's 1851) before a single measured rung was quoted for it.
+
+**At 4096³ it is 0.977–0.988**, so the epilogue is 82–95% of that gap and the
+rest is the wave: 256 tiles over 148 clusters is two waves at 86%, a mechanism
+that has nothing to do with anything above and is reported separately for that
+reason. `s84`/theirs is 0.79–0.82 there against 0.94 at 8192³, and the
+twelve-point difference is **not** an epilogue that got dearer — the epilogue
+costs 8.7–9.0 µs a tile at 4096³ against 7.2–7.4 at 8192³, a fifth more, over a
+launch six times shorter.
+
+**2. And the denominator is not one number, which is why the rows above stop at
+4096³.** cuBLASLt timed exactly as our own rungs are — same harness, same clock,
+same `min` of 30 — with a second independent call in the same session (new
+buffers, new handle, new heuristic query) and the two sessions against each
+other:
+
+| shape | max/min in one call | call to call, one session | session to session |
+| --- | ---: | ---: | ---: |
+| 1024³ | 1.26 / 1.84 | 1.10 / 1.08 | +16% |
+| 2048³ | 1.10 / 1.16 | **1.26 / 1.23** | +15% |
+| 4096³ | 1.08 / 1.09 | 1.01 / 1.00 | +2.6% |
+| 8192³ | **1.01 / 1.01** | **1.00 / 1.00** | −1.1% |
+| 16384³ | 1.15 / 1.19 | 1.00 / 1.00 | −1.0% |
+
+**Its *minimum* moves 23–26% between two calls at 2048³** and 0.0–0.3% at
+8192³. So a ratio at 8192³ is good to a tenth of a point and a ratio at 2048³ is
+not a measurement at all — which is what the 1.038 in table 1 is, and why it is
+printed rather than celebrated. The 1.15–1.19 max/min at 16384³ is the same
+warning in a different place: the library's *median* there is 5.42 ms against a
+4.71 minimum, so `min` is doing real work in that row, and every row of this
+file quotes `min` on both sides for exactly that reason.
+
+##### what is inside the residual epilogue, by doubling rather than deleting
+
+#117 named the LDTM half and removed most of it. What is left is three things
+and nothing had priced them apart. **Subtraction cannot do it**: a rung that
+keeps the LDTM and drops the stores is a rung whose result a dead-code pass
+decides, which is the hazard [`Epilogue::DoubleDrain`]'s own doc states and the
+reason #108 built a doubling probe rather than a subtractive one. So
+`Tile::drain_staged_twice` **adds** one link of the chain at a time and prices
+the added one:
+
+| rung | the second pass runs | difference from the rung above |
+| --- | --- | --- |
+| `staged84` | — | — |
+| `s84 2g` | `store_shared_rows` | `ld.shared` + `st.global.v4` |
+| `s84 2m` | `stmatrix` + `store_shared_rows` | the `cvt` + `stmatrix` pass and its `bar.warp.sync` |
+| `s84 2x` | LDTM + `stmatrix` + `store_shared_rows` | the LDTM, issue and wait together |
+
+**Counted in the PTX**, per entry function, because #114's dead-code hazard
+applies to any epilogue rung and this is four of them. Every column that should
+be held is held, and every column that should step, steps by exactly one pass:
+
+| kernel | ldtm | stmatrix | ld.sh.v4 | st.g.v4 | st.g.b32 | cvt.bf16x2 | bar.warp |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `gemm_cg2_staged_x8x4` | 2 | 2 | 1 | 1 | 4 | 8 | 1 |
+| `gemm_cg2_staged_x8x4_2g` | 2 | 2 | **2** | **2** | **8** | 8 | 1 |
+| `gemm_cg2_staged_x8x4_2m` | 2 | **4** | 2 | 2 | 8 | **16** | **2** |
+| `gemm_cg2_staged_x8x4_2x` | **4** | 4 | 2 | 2 | 8 | 16 | 2 |
+| `gemm_cg2_staged_x8x4_hot` | 2 | 2 | 1 | 1 | 4 | 8 | 1 |
+
+The `ldtm` step from 2 to 4 is worth naming on its own. `tcgen05_ld_..._x8_pure`
+is spelled *pure*, and the second load reads a tensor memory nothing wrote in
+between, so a common-subexpression pass would have been entitled to fold it away
+and take the whole third rung with it. It is there. (`_hot` is opcode-identical
+to the rung it probes, which is what makes it a bandwidth measurement rather
+than an instruction one, and the `2m` row shows why the second column is called
+`cvt` + `stmatrix` and not `stmatrix`: the `cvt` doubles with it, because
+`Element::pack` is inside the `stmatrix` pass.)
+
+**Microseconds a tile on the critical path, both sessions.** Each column is what
+the *added* pass costs, so these are **serial** costs, with the second pass's
+stores aimed at the cluster's own first tile so its bytes stay in L2 — #108's
+arrangement. `exposed` is #114's `whole − no drain` on the same rung in the same
+table:
+
+| shape | `ld.shared`+`st.global` | `cvt`+`stmatrix` | LDTM | serial total | exposed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4096³ | 2.99 / 3.46 | **4.48 / 4.08** | 0.53 / 0.43 | 8.00 / 7.97 | 9.01 / 8.72 |
+| **8192³** | 1.96 / 2.32 | **3.84 / 4.13** | **0.09 / −0.04** | 5.89 / 6.41 | 7.37 / 7.21 |
+| 16384³ | 0.45 / 4.22 | 3.15 / 2.89 | 4.01 / −2.69 | 7.60 / 4.42 | 7.39 / 5.10 |
+
+**Four findings, and the first is the ranking.**
+
+**1. The largest thing left is the `cvt` + `stmatrix` pass, at 3.8–4.5 µs a
+tile.** It is 55–64% of the serial ladder, it is the same ~4 µs at 4096³ and at
+8192³ and in both sessions, and it is the one component with no lever pointed at
+it. `.x4` already halved the `stmatrix` *count* and bought −0.3% (#117);
+`.pack::16b` is the wrong instruction against an fp32 accumulator (#117); and a
+wider staging tile is closed by the shared budget, since `[·, 128]` is 32 768 B
+against the 18 344 the plan leaves, and 64 columns is already the narrowest bf16
+tile `Swizzle128B` admits — #116's floor and ceiling still meet at one width.
+The `cvt` inside it is not optional at all: a bf16 `C` has to be rounded
+somewhere, and `store_rows` pays the same 128 of them per band.
+
+**2. The LDTM half is exhausted.** −0.04 to +0.53 µs a tile at the two sizes the
+instrument is trustworthy at: after `.x8` a *second whole LDTM pass* is free.
+#117 said the cost was the wait and not the issue, and this is that statement
+from the other side — with the waits gone there is nothing left to remove, and
+the two `tcgen05_load_wait`s a band no longer have exposed latency in them worth
+attacking.
+
+**3. The ladder accounts for 80–91% of the exposed epilogue** (7.97 against
+8.72, 5.89 against 7.37, 6.41 against 7.21). Two readings are available and this
+sweep does not separate them: a serial-to-exposed ratio near 1 is #114's result
+reproduced on the staged rung — the epilogue is still overlapped with nothing —
+and the 9–20% shortfall is either that overlap or a cold cost the first pass
+pays and the doubled pass does not. It is quoted as a residual and not
+attributed.
+
+**4. And the 16384³ row is not a measurement**, which is the finding that
+reaches backwards. The two sessions put the LDTM half at +4.01 and −2.69 µs a
+tile. Table 6 of the sweep is what explains it, and it is a control this file has
+never taken: **the same subtraction, twice in one container**, on rungs that were
+timed minutes apart.
+
+| shape | `s84`, table 1 / table 3 | `s no drain`, table 1 / table 3 | µs/tile | spread |
+| --- | ---: | ---: | ---: | ---: |
+| 4096³ | 0.1052 / 0.1043 | 0.0864 / 0.0869 | 9.41 → 8.72 | **−7%** |
+| 8192³ | 0.6549 / 0.6539 | 0.6040 / 0.6034 | 7.28 → 7.21 | **−1%** |
+| 16384³ | 5.0518 / 5.0292 | 4.7857 / **4.8865** | 9.50 → 5.10 | **−46%** |
+
+Session 1 gives +0.4%, +5% and +39% for the same three rows. **`whole − no
+drain` reproduces to 1–5% at 8192³, to 0.4–7% at 4096³ and to 39–46% at
+16384³** — because at 16384³ it is a 0.2 ms difference between two 5 ms launches
+divided over 28 items, and launches that reproduce to 2% leave ±40% on that
+quotient. Every 16384³ epilogue figure in the sections above — #116's 16.34,
+#117's 5.81, #118's 2.91 — is inside that band and none of them carries it. The
+8192³ column is the one to hold, which is what every table here has said for a
+different reason each time.
+
+##### the global stores are not waiting on HBM, and that retires half a lever
+
+`s84 hot` is `staged84` with every global store aimed at the cluster's own first
+tile: opcode-identical, same LDTM, same `stmatrix`, same `ld.shared`, the same
+32 × 16 B stores, and the only thing that moves is that 148 clusters rewrite one
+tile each instead of streaming 134 MB or 512 MB of `C`.
+
+| shape | `staged84` ms | `s84 hot` ms | hot vs |
+| --- | ---: | ---: | ---: |
+| 4096³ | 0.1049 / 0.1043 | 0.1361 / 0.1060 | −22.9% / −1.5% |
+| 8192³ | 0.6621 / 0.6539 | 0.6627 / 0.6564 | **−0.1% / −0.4%** |
+| 16384³ | 5.0832 / 5.0292 | 4.9935 / 5.1489 | +1.8% / −2.3% |
+
+**Deleting the epilogue's entire HBM traffic is worth between −2.3% and +1.8%,
+which is nothing.** After #116 made the writes full sector transactions they are
+issue- and latency-bound and not bandwidth-bound. That is a negative result with
+a consequence: the argument for #15's original route — hand the global write to a
+TMA engine so the stores stop pressing on memory — has no pressure to relieve.
+What a TMA store could still buy is the *issue*, which the ladder above prices at
+2.0–2.3 µs a tile at 8192³, and that is a different and smaller claim than the
+one `kittens::epilogue::StoreRing` was scoped against. (#107 ran this probe on
+the register drain and reached the same verdict against a different store shape;
+this is it re-run after the shape changed, which is what that section asked for.)
+
+##### and the shared round trip is worth three times what #116 measured
+
+#116's A/B ran both arms at `.x1` and won +4.2% at 8192³. #117 then took ~8 µs a
+tile of exposed tensor-memory latency out of the staged arm **only**, so the
+published comparison prices two changes at once and the left-hand side of it —
+the register drain at `.x8` — was never built. `gemm_cg2_lcf8` is that arm:
+`TmemTile::tile_x8` where `TmemTile::tile` was, the same 98 392 B, the same
+`store_rows`, the same bytes into `C`, on the correctness gate.
+
+| shape | `lcf` ms | `lcf8` ms | `lcf8` vs `lcf` | `staged` vs `lcf` | `staged8` vs `lcf8` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4096³ | 0.1495 / 0.1399 | 0.1413 / 0.1404 | +5.8% / −0.4% | +15.4% / +7.7% | **+34.9% / +34.7%** |
+| 8192³ | 0.7519 / 0.7440 | 0.7442 / 0.7379 | +1.0% / +0.8% | +3.9% / +3.7% | **+12.6% / +12.8%** |
+| 16384³ | 5.5699 / 5.4199 | 5.5600 / 5.4780 | +0.2% / −1.1% | +4.2% / +1.5% | **+10.9% / +8.5%** |
+
+**`.x8` on the register drain is a clean null** — −1.1% to +5.8%, centred on
+nothing — against +23.6% / +8.6% / +3.6% on the staged path. This is #119's
+mechanism a third time, and here the lever is worth *zero* rather than two
+thirds: `store_rows` issues 128 scattered four-byte stores a thread per band and
+they were already covering every LDTM latency the drain paid. `ptxas` says the
+same thing from the register side — `gemm_cg2_lcf8` is **166 registers on a
+528 B frame, byte-identical to `gemm_cg2`**, where `.x8` on the staged path cost
++52 (42 → 94). The band was already all in registers, so no liveness moved, and
+no latency was exposed to remove.
+
+**Which makes the round trip worth +12.7% at 8192³, not +3.9%.** Reproduced to
+0.2 points across two containers. #116's decision is confirmed and its own
+number understated it by 3×: the recoalescing only gets paid once the drain has
+stopped waiting sixteen times a band, so the two levers are strongly
+super-additive rather than independent. The general form is worth carrying,
+because it is a prediction rather than a summary: **any change that removes
+exposed latency from this epilogue makes the store's *shape* worth more than it
+last measured.** A TMA store would be the next test of it, and on that basis the
+2.0–2.3 µs a tile the ladder prices is a lower bound rather than an estimate.
+
+**`staged8` and `staged84` trade places on `gemm` too, and #117's composition
+gain does not reproduce.** Four measurements of each across two containers:
+0.795 / 0.941 / 0.949 and 0.819 / 0.940 / 0.933 for `staged8`, against
+0.793 / 0.939 / 0.936 and 0.818 / 0.940 / 0.936 for `staged84`. They are within
+0.5% at 4096³ and 8192³ and swap sign at 16384³, which is where #117 measured
+`staged84` +1.5 points ahead — a 16384³ figure, and therefore one the
+reproducibility table above already puts inside its own noise. #118 found
+exactly this on `gemm_ws` ("within 1.1% of each other and trade places between
+sessions") and it is why `gemm_ws` ships `staged8`; **the same is now true on
+`gemm`, whose default #119 set to `staged84` on the strength of that 16384³
+row**. Nothing here says the shipped rung is the wrong one — it is a tie, and a
+tie is not a regression — but the composition is not a win to quote, and if the
+tie is ever broken again it should be broken at 8192³ where the instrument
+works.
+
+##### the ranking that comes out of it, and the three things it could not price
+
+At 8192³, where the denominator is stable to a tenth of a point and the
+subtraction to 1–5%:
+
+| what | µs/tile | of the residual epilogue | if it went to zero | the lever |
+| --- | ---: | ---: | ---: | --- |
+| `cvt` + `stmatrix` | 3.8–4.1 | 55–64% | ~+5% | **none identified** |
+| `ld.shared` + `st.global` | 2.0–2.3 | 31–36% | ~+2.7% | a TMA store out of the staging tile |
+| LDTM after `.x8` | ~0 | 0% | 0 | spent by #117 |
+| unattributed | 0.8–1.5 | 9–20% | — | — |
+
+So the next thing worth doing is the **TMA store**, at a ceiling of about 2.7%
+of the launch. `kittens::epilogue::StoreRing` (#111) exists; what it needs here
+is the `fence.proxy.async.shared::cta` the current path deliberately does not
+have — both ends are generic today — a staging tile that is CTA-visible rather
+than warp-private, and a `tma_store_wait` in the item boundary. Call it 150–250
+lines in `gemm.rs` and nothing in `src/`. It is worth doing **knowing that the
+bandwidth argument for it is dead**: table 4 says there is no HBM pressure, so
+what it buys is 64 instructions a thread a band and their latency, and the
+round-trip result above says that number may come out larger than 2.7% once it
+is measured rather than extrapolated.
+
+It is a small lever, and that is the finding. **The largest single term in the
+gap has no lever pointed at it at all**, and saying so is worth more than
+ranking the ones that do.
+
+**What could not be established, in order of what it costs.**
+
+**1. What the 4 µs is.** The ladder prices `cvt` + `stmatrix` + `bar.warp.sync`
+as one pass because they *are* one pass, and no probe here splits them. A rung
+doubling the `cvt` without the `stmatrix` has nothing consuming its result and
+is exactly the dead-code case doubling exists to avoid; a rung doubling the
+`stmatrix` without the `cvt` writes the same bf16 twice and may well be folded.
+The candidates are four — the 128 `cvt` a thread, the `stmatrix` issue, bank
+behaviour in the swizzled write, and the warp barrier — and the count argument
+is the weakest of them, since #117 already halved the `stmatrix` count for
+−0.3%. Until it is split, "the largest term has no lever" is a statement about
+the search and not about the hardware.
+
+**2. Anything at 16384³.** The subtraction carries ±40% there, so the
+decomposition, the `hot` probe and the epilogue's share of that gap all inherit
+it. The one 16384³ claim this sweep does make is the ceiling being *below*
+parity, and it makes it because it does not depend on the subtraction at all:
+two launches against the library, reproduced in two sessions at 0.984 and 0.993.
+
+**3. The tile.** #87 chose `[256, 256] s3` on arithmetic intensity against a
+budget that has since moved — registers 166 → 80, the shared plan 98 392 →
+114 816 against the 116 736 a CTA gets — and #105 is open on `[256, 256]`
+regressing 1024³ by 18% and requiring `n % 256`. Nothing here re-swept it.
+`bench tile` is the instrument and it was not run: the epilogue's decomposition
+was the question, and a tile sweep is another container's worth of work. It is
+**unranked** rather than ranked low, and at 4096³ and below — where the ratio is
+0.79–0.82 and the wave is 86% full — it is the obvious place to look next after
+the small-size denominator is stable enough to look with.
+
+**Residency is unchanged and is not re-counted.** All four new staged probes
+declare the same 114 816 B as `staged84`, and `gemm_cg2_lcf8` declares the same
+98 392 as `gemm_cg2`, so no envelope moved. `ptxas -v` reads 80 / 87 / 125 / 102
+for `staged84` / `2g` / `2m` / `2x` and **166 on a 528 B frame for `lcf8`**,
+zero spill everywhere, every one of them inside the step that
+`min(512 / 256, 233 472 / plan)` already binds at two CTAs an SM. That is the
+eleventh occasion in this file the register column has been unable to order the
+times.
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all

@@ -38,6 +38,10 @@ Local usage:
                                       # gemm's epilogue INSTRUCTION WIDTHS:
                                       # .x8 LDTM and stmatrix .x4 on the staged
                                       # epilogue, ablated and composed (#117)
+    modal run modal_app.py::bench --case residual
+                                      # where the gap to cuBLASLt lives, with
+                                      # every control re-run in one container
+                                      # and the residual epilogue decomposed
     modal run modal_app.py::profile   # one launch under Nsight Compute (see
                                       # the note there: no counters on Modal)
     modal run modal_app.py::doctor    # env / GPU sanity check
