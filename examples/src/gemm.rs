@@ -1356,7 +1356,7 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAG
     /// | `STAGE` | the second pass runs | the difference from the rung below |
     /// | ---: | --- | --- |
     /// | 1 | `store_shared_rows` | `ld.shared` + `st.global.v4` — the global half |
-    /// | 2 | `stmatrix` + `store_shared_rows` | the `stmatrix` half and its `bar.warp.sync` |
+    /// | 2 | `stmatrix` + `store_shared_rows` | the `cvt` + `stmatrix` pass and its `bar.warp.sync` |
     /// | 3 | LDTM + `stmatrix` + `store_shared_rows` | the LDTM half: the issue *and* the wait |
     ///
     /// So `STAGE = 3` minus [`Epilogue::StagedWideX4`] is one whole staged
@@ -4145,7 +4145,9 @@ pub enum Epilogue {
     /// addition so no dead-code pass gets a vote.
     StagedTwiceGlobal,
     /// **Not a GEMM. Never checked.** [`Epilogue::StagedTwiceGlobal`] with the
-    /// `stmatrix` pass doubled too, so the difference is the `stmatrix` half.
+    /// `stmatrix` pass doubled too, so the difference is that pass — which is
+    /// the `cvt` as well as the `stmatrix`, since `Element::pack` is inside it
+    /// and the census reads 8 `cvt.rn.bf16x2` against 16 across this step.
     StagedTwiceShared,
     /// **Not a GEMM. Never checked.** The whole staged epilogue twice, so this
     /// minus `staged84` is one of them **serially** and this minus
@@ -6548,7 +6550,14 @@ const RESIDUAL_RUNGS: [Epilogue; 4] = [
 ];
 
 /// What each step of that ladder is the price of.
-const RESIDUAL_PARTS: [&str; 3] = ["ld.shared + st.global", "stmatrix", "LDTM (issue + wait)"];
+/// The `cvt` travels with the `stmatrix` and the column says so: doubling that
+/// pass doubles `cvt.rn.bf16x2` too, because [`kittens::shared::Element::pack`]
+/// is inside it. `regcount`'s census reads 8 against 16 across that step.
+const RESIDUAL_PARTS: [&str; 3] = [
+    "ld.shared + st.global",
+    "cvt + stmatrix",
+    "LDTM (issue + wait)",
+];
 
 /// Where the remaining gap to cuBLASLt lives, re-derived — `cargo oxide run
 /// kittens-examples -- bench residual`, which is `modal run
