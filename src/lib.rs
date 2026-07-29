@@ -20,6 +20,7 @@
 // to resolve to; the host build is where they are checked.
 #![cfg_attr(not(feature = "host"), allow(rustdoc::broken_intra_doc_links))]
 
+pub mod epilogue;
 pub mod global;
 #[cfg(feature = "host")]
 pub mod launch;
@@ -31,6 +32,7 @@ pub mod shared;
 pub mod sync;
 pub mod tmem;
 
+pub use epilogue::StoreRing;
 pub use reg::{
     BaseLdtm, BinaryOp, ColLayout, ColVec, Fragment, FragmentLayout, ReduceOp, RegTile, RegVec,
     RowLayout, TernaryOp, UnaryOp,
