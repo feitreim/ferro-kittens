@@ -371,6 +371,23 @@ def build() -> None:
           "--features", "cublas"],
          cwd=EXPERIMENTS_DIR)
 
+    # The vendored upstream `gemm_sol_final`, which is 1300 lines of device code
+    # nothing else in this repository compiles. It is the only kernel here whose
+    # gate has to include `ptxas`: `cargo oxide build` emits its PTX happily and
+    # `opt -O2` has put sixteen illegal lookup tables in it, so a build alone
+    # would pass on a bundle that cannot load. So this step asserts both halves
+    # of the workaround at once -- that upstream's code still compiles, and that
+    # `-switch-to-lookup=false` still makes what it compiles to assemble.
+    # `upstream_ptx` is the diagnosis if this goes red; `OPT_NO_LOOKUP_TABLE` is
+    # where the reasoning lives.
+    _run(["sh", "-c", WRITE_OPT_WRAPPER], cwd="/")
+    _run([*STUB_ENV, "env", f"CUDA_OXIDE_OPT={OPT_NO_LOOKUP_TABLE}",
+          "cargo", "oxide", "build", "kittens-experiments", "--arch", "sm_100a",
+          "--features", "cublas,gemm-sol-upstream"],
+         cwd=EXPERIMENTS_DIR)
+    _run(["ptxas", "-arch=sm_100a", "-o", "/dev/null", "kittens_experiments.ptx"],
+         cwd=EXPERIMENTS_DIR)
+
 
 # `gaps` lived here until #3, and printed each aspirational kernel's remaining
 # errors by turning its cargo feature on: the missing API surface *was* the

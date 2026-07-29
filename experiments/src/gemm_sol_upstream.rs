@@ -1,10 +1,17 @@
 //! # NVLabs' own `gemm_sol_final`, unported, on this harness' clock
 //!
 //! [`crate::gemm_sol`] is a *port*: the same design rebuilt through
-//! ferro-kittens' typed tiles and pipeline primitives. It measures 0.795 /
+//! ferro-kittens' typed tiles and pipeline primitives. It measures 0.806 /
 //! 0.873 / 0.946 of cuBLASLt at 4096³ / 8192³ / 16384³, and that gap had two
 //! candidate explanations nobody could separate — the port lost something the
 //! original has, or the original itself does not reach cuBLASLt on a B200.
+//!
+//! **It is the second, mostly.** Upstream unported measures 0.877 / 0.911 /
+//! 0.966 of the same live cuBLASLt at the same variant, so 62–69% of the
+//! shortfall is where `gemm_sol_final` itself stands on this device and 31–38%
+//! is the port's. And at 8192³ under upstream's *shipped* selector — M256xN256,
+//! where #138 crosses over to M512xN256 — upstream measures 0.839 and the port
+//! beats it by 4.0%. `experiments/README.md` §7 holds all of it.
 //!
 //! This module is the second reading the separation needs. The device code
 //! below is **byte-identical to upstream's**: `gemm_sol_upstream_kernels.rs` is
