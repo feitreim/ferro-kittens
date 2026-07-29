@@ -440,19 +440,28 @@ def ws_bench() -> None:
     `examples/src/gemm.rs` gets its overlap across CTAs -- two per SM, so one
     CTA's epilogue runs against another's MMA. `examples/src/gemm_ws.rs` gets it
     inside one CTA, from six warps and a double-buffered TMEM accumulator, which
-    is 512 accumulator columns and therefore one CTA per SM. The epilogue is
-    identical in both, deliberately, so a delta is the occupancy/specialization
+    is 512 accumulator columns and therefore one CTA per SM. Table 1 holds the
+    epilogue identical in both, so that delta is the occupancy/specialization
     structure and not a store path.
+
+    Since #118 it also runs the epilogue ladder on the warp-specialized kernel
+    -- #116's staged shape and #117's `.x8` LDTM and `stmatrix.x4` -- with the
+    two epilogue-free controls those are subtracted from, and puts each design
+    point's *best* rung against the other's. Twelve timed rungs a size, at three
+    sizes, every one of them checked element-by-element first except the two
+    that write no `C` on purpose and say so in their own label.
 
     Both kernels and cuBLASLt are measured in the *same container*, because a
     control quoted from another one is not a control: #98 found 2.9% of drift
-    between runs of the same tree.
+    between runs of the same tree, and #118's own two sessions moved a 16384^3
+    row by 3%.
 
     `--features cublas` for the same reason `bench` has it -- a GEMM number with
-    no denominator is the thing that feature exists to stop shipping. Same
-    5400 s as `bench`: 16384^3 stages a gigabyte of operands and checks every
-    one of 268 million output elements, and this entry point does it for three
-    plans plus the control.
+    no denominator is the thing that feature exists to stop shipping. The
+    `SWEEPING` timeout covers a cold build plus the sweep; the sweep itself is
+    about 90 s of B200, because 16384^3 spends far more host time staging a
+    gigabyte of operands and checking 268 million output elements than it spends
+    device time launching.
     """
     _run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
           "--format=csv"], cwd="/")

@@ -15,7 +15,7 @@
 //!
 //! What moves is *where the overlap comes from*.
 //!
-//! ## Since #15 there is a second entry point, and it is a control
+//! ## Since #15 the epilogue is a ladder, and it is a control
 //!
 //! [`Entry::Staged`] is [`Tile::drain_staged`] in place of [`Tile::drain`]:
 //! `stmatrix` into a per-warp `[32, 64]` shared tile and 16-byte stores out of
@@ -29,8 +29,13 @@
 //! this kernel from 0.804 to 0.829 of cuBLASLt at the largest size. Registers
 //! go 168 → 44 with no spill, and residency cannot move — 512 accumulator
 //! columns fixed it at one CTA an SM before shared memory was consulted, and
-//! 147 584 B is well inside the 233 472 an SM has. `examples/README.md` §7 has
-//! both kernels' tables.
+//! 147 584 B is well inside the 233 472 an SM has.
+//!
+//! #118 hangs #117's two instruction widths off the same rung —
+//! [`Entry::StagedX8`], [`Entry::StagedX4`], [`Entry::StagedX8X4`] — plus the
+//! two `no drain` controls the ladder is subtracted from. All of it is
+//! [`drain`], one const on one job, and "The widths, and the floor under them"
+//! below is what it measured. `examples/README.md` §7 has both kernels' tables.
 //!
 //! [`crate::gemm`] gets it **across CTAs**. It is 98392 B of shared memory and
 //! 256 accumulator columns, which is two CTAs an SM, so one CTA's epilogue runs
@@ -184,7 +189,19 @@
 //! four waves of 74 — so the crossover is real and it is about what the SM is
 //! doing rather than about how the grid quantizes.
 //!
-//! ### The mechanism the numbers point at, which is the epilogue
+//! ### The mechanism the numbers point at, which is the epilogue — **wrong,
+//! and #118 is what says so**
+//!
+//! The rest of this section is kept as written because the correction is worth
+//! more than the paragraph. Its conclusion was that the missing 7% is the
+//! epilogue, on the grounds that an SM holding one CTA has nothing else to hide
+//! one behind. **It is not the epilogue.** #118 removed the epilogue entirely —
+//! [`kernels::gemm_ws_no_drain`], one launch parameter and one const apart from
+//! the shipped kernel — and the epilogue-free launch still runs at **0.888 of
+//! cuBLASLt at 16384³**, where #114's identical probe on [`crate::gemm`] ran at
+//! **1.02**. It is also **3.0% slower than `gemm`'s complete `staged84`
+//! launch**. A free epilogue would not close this gap, so the gap was never
+//! the epilogue. See "The widths, and the floor under them".
 //!
 //! Two facts narrow it. First, `regcount` says **168 registers and no spill**,
 //! against [`crate::gemm`]'s 166 — so the whole "255 registers are reachable"
@@ -220,6 +237,123 @@
 //! this had a right to expect, and the deliverable was the sign of the delta.
 //! The sign is negative, and this file stays in the tree because
 //! `examples/README.md` §7 keeps losers on purpose.
+//!
+//! ## The widths, and the floor under them — #118
+//!
+//! #117 took [`crate::gemm`]'s staged epilogue to `.x8` LDTM and
+//! `stmatrix.x4` and found +23.1% / +8.8% / +5.1%, on a mechanism it stated
+//! precisely: [`TmemTile::tile`] waits after **each** `.x1`, because the
+//! registers it waits on *are* the load's return value, so the drain never has
+//! two loads in flight and a `[32, 64]` band pays 16 fully exposed
+//! tensor-memory latencies. `.x8` is 2 and 2. **The win is the wait and not
+//! the issue** — `stmatrix.x4` halves an instruction count on its own and is
+//! worth −0.6% to −1.1%, which is how that was established.
+//!
+//! That mechanism makes a prediction about *this* kernel, and it is not the
+//! obvious one. A latency nobody is covering is worth removing; a latency that
+//! is already covered is not. Here the drain is deferred one item, sits on
+//! warps of its own, and the producer never stops — so if the prediction holds,
+//! `.x8` should be worth **less** here than there, and the amount by which is a
+//! measurement of how much cover this design point actually provides.
+//!
+//! One session, min of 30 timed launches, every row element-by-element exact
+//! before it was timed:
+//!
+//! | shape | `ws s4` | `staged` | `staged8` | `staged4` | `staged84` |
+//! | --- | ---: | ---: | ---: | ---: | ---: |
+//! | 4096³ | 0.1382 | 0.1340 | **0.1158** | 0.1324 | 0.1171 |
+//! | 8192³ | 0.7881 | 0.7649 | 0.7201 | 0.7648 | **0.7199** |
+//! | 16384³ | 5.7904 | 5.6645 | **5.5015** | 5.6604 | 5.5028 |
+//!
+//! in milliseconds. Against `staged`, `.x8` is **+15.7% / +6.2% / +3.0%** and
+//! `.x4` is **+1.2% / +0.0% / +0.1%** — a clean null, exactly as in
+//! [`crate::gemm`]. Composed, **+14.5% / +6.2% / +2.9%**: the two do *not*
+//! add here, and `staged8` and `staged84` are indistinguishable, trading places
+//! between sessions. Against the register epilogue this kernel ships, the best
+//! rung is **+18.1% / +9.5% / +5.2%**, taking it from 0.615 to 0.726, 0.782 to
+//! 0.856 and 0.810 to 0.852 of cuBLASLt.
+//!
+//! **The prediction holds, and the register column is why `.x4` differs.** In
+//! [`crate::gemm`] `.x8` cost +52 registers (42 → 94) and `.x4` bought 14 of
+//! them back (94 → 80), which is the whole of why that kernel's composition
+//! beat `.x8` alone at 16384³. Here `.x8` costs the same +50 (44 → 94) and
+//! `.x4` recovers **2** (94 → 92) — so it buys no liveness, and it buys no
+//! time. Zero spill in every rung, and 255 registers a thread is reachable at
+//! six warps, so nothing here was ever near a ceiling.
+//!
+//! ### What the epilogue costs, and it is not twice the LDTM
+//!
+//! By #114's `whole − no drain`, over the items the busiest cluster walks, in
+//! µs a tile — with one control per envelope, and the two controls
+//! opcode-identical PTX at 28 registers apiece:
+//!
+//! | shape | `ws s4` | `staged` | `staged8` | `staged84` | LDTM half |
+//! | --- | ---: | ---: | ---: | ---: | ---: |
+//! | 4096³ | 8.90 | 8.65 | 4.10 | 4.42 | 4.55 |
+//! | 8192³ | 8.62 | 6.97 | 3.77 | 3.76 | **3.20** |
+//! | 16384³ | 9.06 | 6.76 | 3.85 | 3.87 | 2.91 |
+//!
+//! At 8192³ [`crate::gemm`]'s register epilogue is exposed at 20.43 µs a tile
+//! (#114) and its staged one at 14.96, of which 8.07 was LDTM (#117). **The
+//! same epilogue on this kernel is exposed at 8.62, 6.97 and 3.20** — 42%,
+//! 47% and 40% of the cost, on the same instrument, for the same instructions.
+//! That is what warp specialization and the accumulator ping-pong buy, stated
+//! as a number for the first time, and it is why `.x8` is worth two thirds to
+//! five sixths here of what it was worth there.
+//!
+//! **So "`gemm_ws`'s staged rung carries twice the LDTM (16 against 8)" is true
+//! of the PTX and false of the work.** `regcount`'s opcode census does read 16
+//! `tcgen05.ld` against `gemm_cg2_staged`'s 8 — and 8 against 4 for the
+//! register rungs, 8 `stmatrix` against 4, 16 `cvt` against 8, every column
+//! doubled. The cause is that this kernel emits its epilogue at **two call
+//! sites**, [`Ws::work`] and [`Ws::finish`], where [`crate::gemm`]'s fused job
+//! has one; `finish` runs once per cluster over a whole launch and once per
+//! *item* never. A band is `RegTile<32, 64>` in both files, so the dynamic
+//! LDTM per tile is identical, and the measurement above says this kernel's
+//! LDTM half is not twice as expensive but **2.5× cheaper**.
+//!
+//! ### The floor, which is the finding
+//!
+//! [`kernels::gemm_ws_no_drain`] is this kernel with the epilogue deleted — one
+//! const and one launch parameter from the shipped one — and it is the probe
+//! #114 ran on [`crate::gemm`] to conclude that the item boundary **is** the
+//! epilogue and is fully exposed. There it reached 1850 TFLOP/s against
+//! cuBLASLt's 1808, past parity. Here:
+//!
+//! | shape | no drain ms | TFLOP/s | of cuBLASLt | vs `gemm`'s `staged84` |
+//! | --- | ---: | ---: | ---: | ---: |
+//! | 4096³ | 0.1026 | 1339.2 | 0.829 | +3.0% |
+//! | 8192³ | 0.6674 | 1647.4 | 0.923 | **−2.2%** |
+//! | 16384³ | 5.2828 | 1665.1 | 0.888 | **−3.0%** |
+//!
+//! **At the two large sizes this kernel loses to `gemm`'s complete launch with
+//! no epilogue at all.** Its best rung loses by 9.7% / 9.4% / 6.9%; deleting
+//! the epilogue outright recovers 12.7 / 7.2 / 3.9 points of that and still
+//! ends 2.2% and 3.0% behind at the two large sizes. So epilogue work could
+//! reach three quarters of the 8192³ gap and only 57% of the 16384³ one even if
+//! it were free — and #112's 7.3% closes to 6.9% after both kernels have spent
+//! everything #116 and #117 found. What is left is the multiply and the operand
+//! stream at one CTA an SM.
+//!
+//! Priced against the library, which is the only denominator that crosses
+//! containers: at 8192³ #114's epilogue-free `gemm_cg2` ran at **1.02** of
+//! cuBLASLt and this epilogue-free `gemm_ws` runs at **0.923**, so the two
+//! epilogue-free kernels are about **10% apart** and the whole of the deficit
+//! lives there. That is a ratio-of-ratios across two sessions and wants its own
+//! container before it is quoted to three digits, but the sign and the order of
+//! magnitude are not in doubt: they are the same 7–10% #112 has been carrying,
+//! now measured with the epilogue taken out of both sides.
+//!
+//! Two things follow. The first is that `kittens::epilogue::StoreRing` (#111)
+//! and the shared→global TMA mover no longer have "about 7% to find" here —
+//! they have at most 3.0%, because that is all the epilogue still costs, and
+//! the sharpened question has been sharpened out of existence on this kernel.
+//! The second is that #112's own hypothesis is now refuted twice: #114 refuted
+//! "the peer CTA hides `gemm`'s epilogue" by measuring that epilogue as fully
+//! exposed, and this refutes "the epilogue is what `gemm_ws` cannot hide" by
+//! deleting it and losing anyway. What has never been measured is what an SM
+//! running one CTA of six warps does to the *K pipeline* against two CTAs of
+//! four, and that is where the next probe belongs.
 
 use cuda_device::barrier::Barrier;
 use cuda_device::cluster;
@@ -233,7 +367,7 @@ use crate::gemm::{Scheduler, a_value, b_value, check_c, stage};
 use std::error::Error;
 
 use kittens::global::{GlobalRows, store_rows, store_shared_rows};
-use kittens::ldst::store_tile;
+use kittens::ldst::{store_tile, store_tile_x4};
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, ClcQueue, Job};
 use kittens::reg::{BaseLdtm, RegTile};
@@ -391,17 +525,20 @@ const SMS: u32 = 148;
 /// [`SHARED_BYTES`] is 131 176 against the 233 472 B an SM divides, so
 /// `233472 / 131176 = 1` as well.
 ///
-/// **Counted, on the instrument that counts rather than asks.**
-/// `device-tests`' `tmem residency census` already carries a `cg2 512` rung — a
-/// `cta_group::2` launch holding all 512 columns across the counted interval,
-/// which is this kernel's tensor memory exactly — and at that rung it reads
-/// **1 holding, 2 resident**, against a driver prediction of 1.0 that is worth
+/// **Counted, on the instrument that counts rather than asks, and since #118 at
+/// this kernel's own envelopes.** `device-tests`' `tmem residency census`
+/// carries a `cg2 512` rung — a `cta_group::2` launch holding all 512 columns
+/// across the counted interval — and at a 32 B shared plan it reads **1
+/// holding, 2 resident**, against a driver prediction of 1.0 that is worth
 /// nothing here for #77's reason. The gap between resident and holding is the
 /// extra CTA `src/tmem.rs` describes: admitted to the SM and parked inside a
-/// blocking `tcgen05.alloc`. That gap closes for *this* kernel and does not for
-/// the census rung, because the census declares a 32 B shared plan where this
-/// declares 131 176 — so the second CTA is never admitted at all here, and
-/// resident and holding are both 1.
+/// blocking `tcgen05.alloc` — 100.9 µs of it, at that rung.
+///
+/// The `ws envelope (cg2 512)` and `ws staged envelope` rungs are the same
+/// launch at 131 176 B and 147 584 B, and they close that gap: **1 resident, 1
+/// holding at both**, with the worst allocator wait down to 0.9 µs. The second
+/// CTA is never admitted at all once the real plan is declared, which is the
+/// prediction this paragraph used to make and now cites.
 const CTAS_PER_SM: u32 = 1;
 /// Clusters the persistent grid launches at most. A tuning constant and not a
 /// correctness one — [`pipeline::run`] walks every item whatever the grid is —
@@ -571,13 +708,42 @@ impl<const STAGES: usize> Tile<STAGES> {
     /// critical path, and if it is only that the epilogue was in the way, it
     /// should not.
     ///
+    /// # `WIDE` and `X4` are #117's two instruction widths, one per half
+    ///
+    /// [`crate::gemm::Tile::drain_staged`] is where both are derived; this is
+    /// the same two levers on a kernel that exposes the epilogue differently,
+    /// which is the whole reason they are worth measuring twice.
+    ///
+    /// **`WIDE` is the LDTM half.** [`TmemTile::tile`] issues
+    /// `tcgen05.ld.16x256b.x1` twice per `[16, 16]` block and waits after each
+    /// one, because the registers it waits on *are* the load's return value —
+    /// so a `[32, 64]` band is 16 loads and 16 fully exposed tensor-memory
+    /// latencies, and never two in flight. [`TmemTile::tile_x8`] is 2 and 2.
+    /// **The win #117 measured was the wait and not the issue**, and this
+    /// kernel is where that claim gets its second reading: here the epilogue
+    /// is already one item behind and already on warps of its own, so a
+    /// latency the producer is covering ought to cost less to begin with.
+    ///
+    /// **`X4` is the `stmatrix` half.** A [`kittens::reg::Fragment`] is four
+    /// `8x8` b16 matrices and `stmatrix.m8n8.x2` names two, so
+    /// [`kittens::ldst::store_tile`] issues two per block;
+    /// [`kittens::ldst::store_tile_x4`] names all four in one, at the same 32
+    /// addresses. In [`crate::gemm`] it was a clean null alone (−0.6% to
+    /// −1.1%) and bought 14 registers back in composition.
+    ///
+    /// Neither touches the global half — `store_shared_rows` issues the same
+    /// 32 × 16 B stores on the same four contiguous 128 B runs whatever these
+    /// are set to — and neither moves a byte of the plan, so all four
+    /// combinations declare [`STAGED_SHARED_BYTES`] and share one `no drain`
+    /// control.
+    ///
     /// # Safety
     ///
     /// As [`Self::drain`], and the launch must declare
     /// [`STAGED_SHARED_BYTES`] — which is what makes [`Self::stage_tile`]'s
     /// address one this launch owns.
     #[inline(always)]
-    unsafe fn drain_staged(&self, item: u32, stage: u32) {
+    unsafe fn drain_staged<const WIDE: bool, const X4: bool>(&self, item: u32, stage: u32) {
         unsafe {
             let tile = self.stage_tile();
             let accumulator = self.accumulator(stage);
@@ -588,8 +754,16 @@ impl<const STAGES: usize> Tile<STAGES> {
             let chunks = tile.chunk_writer();
             let mut column = 0u32;
             while column < BLOCK_N as u32 {
-                let band: StagedBand = accumulator.tile(32 * self.warp_id, column);
-                store_tile(chunks, 0, 0, self.lane, band);
+                let band: StagedBand = if WIDE {
+                    accumulator.tile_x8(32 * self.warp_id, column)
+                } else {
+                    accumulator.tile(32 * self.warp_id, column)
+                };
+                if X4 {
+                    store_tile_x4(chunks, 0, 0, self.lane, band);
+                } else {
+                    store_tile(chunks, 0, 0, self.lane, band);
+                }
                 store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
                     self.c,
                     row_base,
@@ -607,8 +781,8 @@ impl<const STAGES: usize> Tile<STAGES> {
     ///
     /// Carved here rather than handed down from `attach` so that a launch at
     /// the *shipped* envelope never forms the address at all: the only caller
-    /// is [`Self::drain_staged`], which is behind a `const STAGED` a
-    /// non-staged entry point makes false.
+    /// is [`Self::drain_staged`], which is behind a `const DRAIN` code that a
+    /// non-staged entry point does not name.
     ///
     /// # Safety
     ///
@@ -629,6 +803,40 @@ impl<const STAGES: usize> Tile<STAGES> {
     }
 }
 
+/// Which epilogue a launch's drain warps run — [`Ws`]'s const-generic
+/// selector, and the only thing an entry point in this file varies once the
+/// pipeline depth is fixed.
+///
+/// One code rather than a `bool` per lever. [`crate::gemm`] spells the same
+/// choice as three of them (`DRAIN`, `WIDE`, `X4`) because it has three; a
+/// fourth arrives here — the register epilogue this kernel still ships — and a
+/// launch site reading `Ws::<STAGES, true, false, false, true>` says nothing
+/// about which rung it is. These names are what the tables print.
+///
+/// `DRAIN` is a monomorphization constant, so exactly one arm of
+/// [`Ws::epilogue`] survives into any entry point. That is what keeps
+/// [`Tile::stage_tile`]'s address — which lives past [`SHARED_BYTES`] — out of
+/// a launch that declares only [`SHARED_BYTES`], and it is the same guarantee
+/// the `const STAGED` bool gave before there were four rungs to name.
+mod drain {
+    /// [`super::Tile::drain`] — a `RegTile<32, 128>` band straight to global,
+    /// the epilogue this kernel ships and the one #112 measured.
+    pub const REGISTER: u8 = 0;
+    /// [`super::Tile::drain_staged`] at `.x1` LDTM and `stmatrix.x2` — #116's
+    /// rung, and the control every width below is quoted against.
+    pub const STAGED: u8 = 1;
+    /// The same with the LDTM half at `.x8` — #117's first width.
+    pub const STAGED_X8: u8 = 2;
+    /// The same with the `stmatrix` half at `.x4` — #117's second.
+    pub const STAGED_X4: u8 = 3;
+    /// Both widths at once — the composition rung.
+    pub const STAGED_X8_X4: u8 = 4;
+    /// **No epilogue at all.** The accumulator is filled and never read, so
+    /// this computes a wrong `C` on purpose and is never checked; it is the
+    /// far end of #114's `whole − no drain` subtraction and nothing else.
+    pub const REMOVED: u8 = 5;
+}
+
 /// The warp-specialized job: one output tile per item, with the epilogue one
 /// item behind the MMA and on warps of its own.
 ///
@@ -638,14 +846,13 @@ impl<const STAGES: usize> Tile<STAGES> {
 /// the producer's fill prefix and the rest of its walk, because warp 0 is both
 /// the producer and a quarter of the epilogue; here the producer never stops.
 ///
-/// `STAGED` picks which epilogue the drain warps run — [`Tile::drain`] or
-/// [`Tile::drain_staged`] — and is a const parameter of the *same* job rather
-/// than a second one, for [`crate::gemm`]'s reason: a second spelling of this
-/// ordering argument is a place for the two arms to drift, and the argument is
-/// the hard part. Both arms compute the GEMM and both are on the correctness
-/// gate.
+/// [`drain`] picks which epilogue the drain warps run, and it is a const
+/// parameter of the *same* job rather than a second job per rung, for
+/// [`crate::gemm`]'s reason: a second spelling of this ordering argument is a
+/// place for the arms to drift, and the argument is the hard part. Every arm
+/// but [`drain::REMOVED`] computes the GEMM and is on the correctness gate.
 #[derive(Clone, Copy)]
-struct Ws<const STAGES: usize, const STAGED: bool> {
+struct Ws<const STAGES: usize, const DRAIN: u8> {
     tile: Tile<STAGES>,
     /// The item whose accumulator is still in tensor memory, or [`Self::NONE`].
     pending: u32,
@@ -661,10 +868,35 @@ struct Ws<const STAGES: usize, const STAGED: bool> {
     sequence: u32,
 }
 
-impl<const STAGES: usize, const STAGED: bool> Ws<STAGES, STAGED> {
+impl<const STAGES: usize, const DRAIN: u8> Ws<STAGES, DRAIN> {
     /// No accumulator owed. `u32::MAX` is not a reachable item: the tile grid
     /// is `tiles_m * tiles_n` and both are `u32`.
     const NONE: u32 = u32::MAX;
+
+    /// The epilogue this rung runs over `item`'s accumulator in `stage` — the
+    /// single place [`drain`]'s code is turned back into a call, so the two
+    /// sites that drain (the item loop and [`Self::finish`]) cannot disagree
+    /// about which rung they are.
+    ///
+    /// # Safety
+    ///
+    /// As [`Tile::drain`] and [`Tile::drain_staged`]: every lane of a warp
+    /// below [`EPILOGUE_WARPS`], with `stage` holding `item`'s completed
+    /// accumulator, and a launch declaring the envelope `DRAIN` implies.
+    #[inline(always)]
+    unsafe fn epilogue(&self, item: u32, stage: u32) {
+        const { assert!(DRAIN <= drain::REMOVED) };
+        unsafe {
+            match DRAIN {
+                drain::REGISTER => self.tile.drain(item, stage),
+                drain::STAGED => self.tile.drain_staged::<false, false>(item, stage),
+                drain::STAGED_X8 => self.tile.drain_staged::<true, false>(item, stage),
+                drain::STAGED_X4 => self.tile.drain_staged::<false, true>(item, stage),
+                drain::STAGED_X8_X4 => self.tile.drain_staged::<true, true>(item, stage),
+                _ => {}
+            }
+        }
+    }
 
     #[inline(always)]
     fn new(tile: Tile<STAGES>) -> Self {
@@ -701,17 +933,13 @@ impl<const STAGES: usize, const STAGED: bool> Ws<STAGES, STAGED> {
     unsafe fn finish(&self) {
         unsafe {
             if self.pending != Self::NONE && self.tile.warp_id < EPILOGUE_WARPS {
-                if STAGED {
-                    self.tile.drain_staged(self.pending, self.pending_stage());
-                } else {
-                    self.tile.drain(self.pending, self.pending_stage());
-                }
+                self.epilogue(self.pending, self.pending_stage());
             }
         }
     }
 }
 
-impl<const STAGES: usize, const STAGED: bool> Job for Ws<STAGES, STAGED> {
+impl<const STAGES: usize, const DRAIN: u8> Job for Ws<STAGES, DRAIN> {
     /// The pair shares one barrier set — the peer aims its TMA at the leader's
     /// stage barrier and the leader's MMA arrives in the peer's `free` and
     /// `done` — so the item boundary that re-arms them is the cluster's.
@@ -784,11 +1012,7 @@ impl<const STAGES: usize, const STAGED: bool> Job for Ws<STAGES, STAGED> {
                 tile.multiply(stage);
             }
             if tile.warp_id < EPILOGUE_WARPS && self.pending != Self::NONE {
-                if STAGED {
-                    tile.drain_staged(self.pending, self.pending_stage());
-                } else {
-                    tile.drain(self.pending, self.pending_stage());
-                }
+                self.epilogue(self.pending, self.pending_stage());
             }
 
             // Every thread, including the epilogue warps that have just
@@ -927,7 +1151,7 @@ pub mod kernels {
         unsafe {
             let (tile, _) =
                 attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
-            let mut job = Ws::<STAGES, false>::new(tile);
+            let mut job = Ws::<STAGES, { drain::REGISTER }>::new(tile);
             pipeline::run(&mut job, tiles_m * tiles_n);
             job.finish();
             release(&job.tile);
@@ -971,7 +1195,7 @@ pub mod kernels {
         unsafe {
             let (tile, queue) =
                 attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
-            let mut job = Ws::<STAGES, false>::new(tile);
+            let mut job = Ws::<STAGES, { drain::REGISTER }>::new(tile);
             pipeline::run_stealing(&mut job, queue);
             job.finish();
             release(&job.tile);
@@ -1019,7 +1243,7 @@ pub mod kernels {
         unsafe {
             let (tile, _) =
                 attach::<6>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
-            let mut job = Ws::<6, false>::new(tile);
+            let mut job = Ws::<6, { drain::REGISTER }>::new(tile);
             pipeline::run(&mut job, tiles_m * tiles_n);
             job.finish();
             release(&job.tile);
@@ -1067,7 +1291,211 @@ pub mod kernels {
         unsafe {
             let (tile, _) =
                 attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
-            let mut job = Ws::<STAGES, true>::new(tile);
+            let mut job = Ws::<STAGES, { drain::STAGED }>::new(tile);
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            job.finish();
+            release(&job.tile);
+        }
+    }
+
+    /// [`gemm_ws_staged`] with the LDTM half at `.x8` — #117's first width, on
+    /// the kernel it was never tried on.
+    ///
+    /// `tcgen05.ld.16x256b.x8` returns 32 f32 a thread where the `.x1` this
+    /// crate has always issued returns 4, so a `[32, 64]` staged band is 2
+    /// loads and 2 waits instead of 16 and 16. Same bytes out of tensor
+    /// memory, same `stmatrix`, same stores, same 147 584 B — so
+    /// [`gemm_ws_staged_no_drain`] is its control exactly as much as it is
+    /// [`gemm_ws_staged`]'s.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_ws_staged`]'s.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 147_584,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_ws_staged_x8(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, _) =
+                attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let mut job = Ws::<STAGES, { drain::STAGED_X8 }>::new(tile);
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            job.finish();
+            release(&job.tile);
+        }
+    }
+
+    /// [`gemm_ws_staged`] with the `stmatrix` half at `.x4` — #117's second
+    /// width, alone.
+    ///
+    /// A [`kittens::reg::Fragment`] is four `8x8` b16 matrices and `.x2` names
+    /// two, so the shipped staged path issues two `stmatrix` per `[16, 16]`
+    /// block where this issues one. The addresses are the same 32; only the
+    /// lane grouping that supplies them changes.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_ws_staged`]'s.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 147_584,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_ws_staged_x4(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, _) =
+                attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let mut job = Ws::<STAGES, { drain::STAGED_X4 }>::new(tile);
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            job.finish();
+            release(&job.tile);
+        }
+    }
+
+    /// Both of #117's widths at once — the composition rung, and the only one
+    /// that can say whether they add on this design point.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_ws_staged`]'s.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 147_584,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_ws_staged_x8x4(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, _) =
+                attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let mut job = Ws::<STAGES, { drain::STAGED_X8_X4 }>::new(tile);
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            job.finish();
+            release(&job.tile);
+        }
+    }
+
+    /// **A deliberately wrong GEMM** — [`gemm_ws_staged`] with the epilogue
+    /// removed, and the one control all four staged widths subtract from.
+    ///
+    /// [`gemm_ws_no_drain`] would not do. It declares 131 176 B where this
+    /// declares 147 584, and the point of the subtraction is that everything
+    /// but the drain is held. Since #117's widths change what the epilogue
+    /// issues and not what it occupies, one control at this envelope serves
+    /// `staged`, `staged8`, `staged4` and `staged84` alike — the clean
+    /// ablation #116 could not have, because it had a 16 408-byte envelope
+    /// change to price first.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_ws_staged`]'s, less the epilogue: it writes no `C` at all.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 147_584,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_ws_staged_no_drain(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, _) =
+                attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let mut job = Ws::<STAGES, { drain::REMOVED }>::new(tile);
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            job.finish();
+            release(&job.tile);
+        }
+    }
+
+    /// **A deliberately wrong GEMM** — [`gemm_ws`] with the epilogue removed,
+    /// at the *shipped* 131 176 B envelope.
+    ///
+    /// This is the register epilogue's own control, and it exists because #112
+    /// never established why this kernel lost. It attributed the loss to the
+    /// peer CTA hiding [`crate::gemm`]'s epilogue; #114 refuted that by
+    /// measuring `gemm_cg2`'s epilogue as **fully exposed** (`whole − no
+    /// drain` at 1.01× its serial cost). What nobody has measured is how
+    /// exposed *this* kernel's epilogue is, with the drain deferred one item
+    /// and on warps of its own — and that is one subtraction, at the envelope
+    /// the shipped kernel actually declares.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_ws`]'s, less the epilogue: it writes no `C` at all.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 131_176,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_ws_no_drain(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, _) =
+                attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let mut job = Ws::<STAGES, { drain::REMOVED }>::new(tile);
             pipeline::run(&mut job, tiles_m * tiles_n);
             job.finish();
             release(&job.tile);
@@ -1076,43 +1504,83 @@ pub mod kernels {
 }
 
 /// Which entry point a plan launches.
+///
+/// Two axes and they are deliberately not crossed: the pipeline depth
+/// ([`Entry::S4`], [`Entry::S6`]) and the epilogue ([`drain`]'s rungs). Every
+/// epilogue rung is at four stages, so an epilogue A/B moves one variable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Entry {
-    /// `gemm_ws` / `gemm_ws_clc` — four stages, the reference's depth.
+    /// `gemm_ws` / `gemm_ws_clc` — four stages, the reference's depth, and the
+    /// register epilogue this kernel ships.
     S4,
     /// `gemm_ws_s6` — six, static only.
     S6,
     /// `gemm_ws_staged` — four stages with the epilogue staged through shared
-    /// memory (#15), static only. Same depth as [`Entry::S4`], so the pair is
-    /// an epilogue comparison and nothing else.
+    /// memory (#15/#116), static only. Same depth as [`Entry::S4`], so the
+    /// pair is an epilogue comparison and nothing else.
     Staged,
+    /// `gemm_ws_staged_x8` — [`Entry::Staged`] with the LDTM half at `.x8`.
+    StagedX8,
+    /// `gemm_ws_staged_x4` — [`Entry::Staged`] with `stmatrix` at `.x4`.
+    StagedX4,
+    /// `gemm_ws_staged_x8x4` — both of #117's widths, the composition rung.
+    StagedX8X4,
+    /// `gemm_ws_staged_no_drain` — **not a GEMM**: the staged envelope with no
+    /// epilogue at all, and the far end of the four staged rungs' subtraction.
+    StagedNoDrain,
+    /// `gemm_ws_no_drain` — **not a GEMM**: the shipped envelope with no
+    /// epilogue, which is [`Entry::S4`]'s own control.
+    NoDrain,
 }
 
 impl Entry {
-    /// Pipeline depth, which is the only thing an entry varies.
+    /// Pipeline depth, which is the only thing besides the epilogue an entry
+    /// varies.
     pub fn stages(self) -> usize {
         match self {
-            Entry::S4 => STAGES,
             Entry::S6 => 6,
-            Entry::Staged => STAGES,
+            _ => STAGES,
         }
     }
 
     /// Dynamic shared memory its launch declares — the staging tiles are the
-    /// one thing that is not a function of the depth.
+    /// one thing that is not a function of the depth, and all four widths plus
+    /// their control declare the same number.
     pub fn shared(self) -> usize {
         match self {
-            Entry::Staged => staged_plan(self.stages()),
+            Entry::Staged
+            | Entry::StagedX8
+            | Entry::StagedX4
+            | Entry::StagedX8X4
+            | Entry::StagedNoDrain => staged_plan(self.stages()),
             _ => shared_plan(self.stages()),
         }
+    }
+
+    /// Whether a launch on this entry computes the GEMM. The two `no drain`
+    /// rungs do not, and each says so wherever it appears.
+    pub fn exact(self) -> bool {
+        !matches!(self, Entry::StagedNoDrain | Entry::NoDrain)
     }
 
     /// What the tables call it.
     pub fn name(self) -> String {
         match self {
-            Entry::Staged => format!("ws s{} staged", self.stages()),
-            _ => format!("ws s{}", self.stages()),
+            Entry::S4 | Entry::S6 => format!("ws s{}", self.stages()),
+            Entry::Staged => "ws staged".to_string(),
+            Entry::StagedX8 => "ws staged8".to_string(),
+            Entry::StagedX4 => "ws staged4".to_string(),
+            Entry::StagedX8X4 => "ws staged84".to_string(),
+            Entry::StagedNoDrain => "ws staged no drain".to_string(),
+            Entry::NoDrain => "ws no drain".to_string(),
         }
+    }
+
+    /// [`Entry::name`] without the kernel prefix, for tables whose every
+    /// column is this kernel and where `ws ` in each of eight headings is
+    /// three characters of nothing said eight times.
+    pub fn short(self) -> String {
+        self.name().trim_start_matches("ws ").to_string()
     }
 }
 
@@ -1255,6 +1723,21 @@ fn run<T>(
         (Entry::Staged, Scheduler::Static) => {
             launcher!(prepare_gemm_ws_staged, gemm_ws_staged)
         }
+        (Entry::StagedX8, Scheduler::Static) => {
+            launcher!(prepare_gemm_ws_staged_x8, gemm_ws_staged_x8)
+        }
+        (Entry::StagedX4, Scheduler::Static) => {
+            launcher!(prepare_gemm_ws_staged_x4, gemm_ws_staged_x4)
+        }
+        (Entry::StagedX8X4, Scheduler::Static) => {
+            launcher!(prepare_gemm_ws_staged_x8x4, gemm_ws_staged_x8x4)
+        }
+        (Entry::StagedNoDrain, Scheduler::Static) => {
+            launcher!(prepare_gemm_ws_staged_no_drain, gemm_ws_staged_no_drain)
+        }
+        (Entry::NoDrain, Scheduler::Static) => {
+            launcher!(prepare_gemm_ws_no_drain, gemm_ws_no_drain)
+        }
         // A depth comparison under a moving scheduler would be two variables.
         (entry, scheduler) => {
             return Err(format!(
@@ -1265,8 +1748,20 @@ fn run<T>(
         }
     };
     launch_once(&mut c)?;
-    let worst = check_c(&c.to_host_vec(&stream)?, m, n, k)?;
-    let label = format!("{m}x{n}x{k} exact, worst |rel| {worst:.2e} against the fp32 reference");
+    // Rule 1 of `crate::bench`, and the one exception to it is stated in the
+    // label rather than hidden: the two `no drain` rungs write no `C` at all,
+    // so checking them would fail by construction. Every rung that claims to
+    // be a GEMM — every schedule, both depths, and all four epilogue widths —
+    // goes through the element-by-element `==` before a clock can reach it.
+    let label = if plan.entry.exact() {
+        let worst = check_c(&c.to_host_vec(&stream)?, m, n, k)?;
+        format!("{m}x{n}x{k} exact, worst |rel| {worst:.2e} against the fp32 reference")
+    } else {
+        format!(
+            "{m}x{n}x{k} UNCHECKED ({} is not a GEMM)",
+            plan.entry.name()
+        )
+    };
 
     let after = then(&stream, &mut || launch_once(&mut c))?;
     Ok((label, after))
@@ -1296,6 +1791,18 @@ const ITEMS_K: usize = 256;
 /// [`pipeline::grouped`]'s short last group rather than to be fast — the same
 /// three [`crate::gemm::check`] uses and for the same reason.
 const CHECK_GROUPS: [u32; 3] = [1, 3, 6];
+
+/// The four staged rungs, and the order every table prints them in.
+///
+/// [`Entry::Staged`] is first because it is the control: #116 measured it and
+/// every column after it is a delta against that row rather than against the
+/// register epilogue.
+const STAGED_ENTRIES: [Entry; 4] = [
+    Entry::Staged,
+    Entry::StagedX8,
+    Entry::StagedX4,
+    Entry::StagedX8X4,
+];
 
 /// The correctness run: two sizes, three traversals, both schedulers, both
 /// depths, checked and nothing timed.
@@ -1337,22 +1844,29 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
             Entry::S6.name(),
             Entry::S6.shared()
         ));
-        // #15's staged epilogue, under the same widths and the same `==`. It
-        // is the same gate `crate::gemm`'s staged rung is on and for the same
-        // reasons — a swizzled tile addressed through two derivations, four
-        // warp-private tiles carved out of one run, and each reused four times
-        // with only a `bar.warp.sync` between a read and the next write.
-        for group in CHECK_GROUPS {
-            let plan = Plan {
-                scheduler: Scheduler::Static,
-                group,
-                entry: Entry::Staged,
-            };
-            run(context, m, n, k, plan, nothing_after)?;
+        // #15's staged epilogue and #117's two instruction widths on it, under
+        // the same traversals and the same `==`. It is the same gate
+        // `crate::gemm`'s staged rungs are on and for the same reasons — a
+        // swizzled tile addressed through two derivations, four warp-private
+        // tiles carved out of one run, each reused four times with only a
+        // `bar.warp.sync` between a read and the next write — plus one this
+        // kernel adds: `.x8` returns 32 f32 in a single instruction and the
+        // order they arrive in is silicon's rather than the ISA text's, which
+        // `kittens::tmem::interleave_x8` asserts is repeat-major and nothing
+        // but a wrong `C` would report.
+        for entry in STAGED_ENTRIES {
+            for group in CHECK_GROUPS {
+                let plan = Plan {
+                    scheduler: Scheduler::Static,
+                    group,
+                    entry,
+                };
+                run(context, m, n, k, plan, nothing_after)?;
+            }
         }
         notes.push(format!(
             "{m}x{n}x{k} exact on {} ({} B)",
-            Entry::Staged.name(),
+            STAGED_ENTRIES.map(|entry| entry.name()).join(", "),
             Entry::Staged.shared()
         ));
         if let Some(label) = rounding {
@@ -1397,6 +1911,17 @@ fn wave_efficiency(m: usize, n: usize) -> (u32, f64) {
     (waves, tiles as f64 / (waves * MAX_CLUSTERS) as f64)
 }
 
+/// Items the busiest cluster walks — the divisor that turns a launch-level
+/// difference into a per-tile one, and [`crate::gemm`]'s
+/// `items_on_critical_path` at this kernel's grid.
+///
+/// A persistent cluster runs `ceil(items / clusters)` items back to back, so a
+/// per-item cost appears in the launch that many times and no more.
+fn items_on_critical_path(m: usize, n: usize) -> f64 {
+    let clusters = grid_for(Scheduler::Static, m, n) / RANKS;
+    tiles(m, n).div_ceil(clusters) as f64
+}
+
 fn timed(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     shape: Shape,
@@ -1410,15 +1935,36 @@ fn timed(
     run(context, shape.m, shape.n, shape.k, plan, time).map(|(_, timings)| timings)
 }
 
+/// One epilogue rung's minimum, at the shipped depth on the static schedule —
+/// so `entry` is the only thing an epilogue table moves.
+fn rung(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    shape: Shape,
+    entry: Entry,
+) -> Result<f64, Box<dyn Error>> {
+    let plan = Plan {
+        scheduler: Scheduler::Static,
+        group: GROUP,
+        entry,
+    };
+    Ok(timed(context, shape, plan)?.min())
+}
+
 /// The A/B — `cargo oxide run kittens-examples -- ws`, which is
 /// `scripts/modal-run ws_bench`.
 ///
-/// **The control is re-measured in this session, not quoted.** Nothing here
+/// **Both controls are re-measured in this session, not quoted.** Nothing here
 /// changes [`crate::gemm`], so its numbers ought to be the ones
 /// `examples/README.md` §7 already carries; #98 found 2.9% of drift between
 /// containers and #109 came within one paragraph of publishing a false +3.6%
 /// against a baseline that had moved under it. A control that is not moving has
-/// to be one measured beside the thing it controls.
+/// to be one measured beside the thing it controls — which since #117 means two
+/// of them, the shipped `gemm` and its best rung, because "does this design
+/// point beat the other one" is now a question about two moving kernels.
+///
+/// Six tables: the two designs, the two free levers, the epilogue ladder, what
+/// the epilogue costs by subtraction, this kernel's best against `gemm`'s best,
+/// and the library.
 pub fn compare(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     baseline: Option<Baseline>,
@@ -1430,9 +1976,10 @@ pub fn compare(
          2 CTAs an SM, 256 accumulator columns. `ws` is this file: the same pair tile and\n\
          the same register epilogue at 6 warps, {} B, 1 CTA an SM, 512 accumulator\n\
          columns in two ping-ponged stages.\n\
-         One variable moves — where the overlap comes from — and the epilogue is\n\
-         deliberately identical, so a delta here is the occupancy/specialization\n\
-         structure and nothing else.",
+         In table 1 one variable moves — where the overlap comes from — and the epilogue is\n\
+         deliberately identical, so that delta is the occupancy/specialization structure and\n\
+         nothing else. Tables 3 and 4 then move the epilogue and nothing else, and table 5\n\
+         puts each design point's best rung against the other's.",
         SHARED_BYTES
     );
 
@@ -1516,53 +2063,182 @@ pub fn compare(
     }
 
     println!(
-        "\n2b. #15's staged epilogue on this kernel, and it is a CONTROL rather than a\n\
-         candidate. `gemm_cg2` gains from staging because its epilogue is the critical\n\
-         path — #114 measured `whole - no drain` at 1.01x the same epilogue's serial cost.\n\
-         Here the epilogue is already deferred one item and on warps of its own, so if the\n\
-         staged shape is worth something because it recoalesces the global write, it should\n\
-         still be worth something here; if it was only worth something because the epilogue\n\
-         was in the way, it should be worth nothing here.\n\
-         Same depth, same warp split, same schedule, {SHARED_BYTES} B against\n\
-         {STAGED_SHARED_BYTES} B — and 1 CTA an SM either way, because 512 accumulator\n\
-         columns fixed that before shared memory was consulted."
+        "\n3. the epilogue ladder — #116's staged shape and #117's two instruction widths,\n\
+         on the kernel that exposes the epilogue differently. In `gemm_cg2` the epilogue IS\n\
+         the critical path: #114 measured `whole - no drain` at 1.01x the same epilogue's\n\
+         serial cost. Here it is already deferred one item and already on warps of its own,\n\
+         with the producer never stopping — so this is not a repeat of #117. It asks whether\n\
+         a lever whose mechanism is a *latency the drain never overlaps* is worth anything\n\
+         where something else is already covering that latency.\n\
+         `ws s4`     registers -> global: 4 B a thread on 8 discontiguous 16 B runs\n\
+         `staged`    .x1 LDTM (16 loads, 16 waits a band), stmatrix .x2, 16 B stores\n\
+         `staged8`   .x8 LDTM ( 2 loads,  2 waits a band), stmatrix .x2\n\
+         `staged4`   .x1 LDTM,                             stmatrix .x4\n\
+         `staged84`  .x8 LDTM,                             stmatrix .x4\n\
+         All four staged rows declare the same {STAGED_SHARED_BYTES} B and differ only in how\n\
+         many instructions carry the same bytes to the same addresses; `ws s4` declares\n\
+         {SHARED_BYTES} B. Residency is 1 CTA an SM in every row and can be nothing else:\n\
+         {ACCUM_COLUMNS} accumulator columns are an SM's entire tensor memory."
     );
-    println!(
-        "{:<18}{:>12}{:>14}{:>14}{:>12}",
-        "shape", "ws ms", "ws staged ms", "staged TF/s", "vs ws"
-    );
-    let mut staged_ms = Vec::new();
+    print!("{:<18}{:>12}", "shape", "ws s4 ms");
+    for entry in STAGED_ENTRIES {
+        print!("{:>13}", format!("{} ms", entry.short()));
+    }
+    println!();
+    let mut ladder = Vec::new();
     for &(shape, _, ours) in &measured {
-        let staged = timed(
-            context,
-            shape,
-            Plan {
-                scheduler: Scheduler::Static,
-                group: GROUP,
-                entry: Entry::Staged,
-            },
-        )?
-        .min();
-        println!(
-            "{:<18}{:>12.4}{:>14.4}{:>14.1}{:>12}",
-            shape,
-            ours,
-            staged,
-            tflops(shape, staged),
-            format!("{:+.1}%", 100.0 * (ours / staged - 1.0))
-        );
-        staged_ms.push(staged);
+        let mut arms = Vec::new();
+        for entry in STAGED_ENTRIES {
+            arms.push(rung(context, shape, entry)?);
+        }
+        print!("{:<18}{:>12.4}", shape, ours);
+        for &arm in &arms {
+            print!("{:>13.4}", arm);
+        }
+        println!();
+        ladder.push((shape, ours, arms));
+    }
+
+    println!("\n   the same rows as throughput, and as a delta against `staged`");
+    print!("{:<18}", "shape");
+    for entry in STAGED_ENTRIES {
+        print!("{:>15}", format!("{} TF/s", entry.short()));
+    }
+    for entry in STAGED_ENTRIES.into_iter().skip(1) {
+        print!("{:>13}", format!("{} vs", entry.short()));
+    }
+    println!("{:>14}", "84 vs ws s4");
+    for (shape, ours, arms) in &ladder {
+        print!("{:<18}", shape);
+        for &arm in arms {
+            print!("{:>15.1}", tflops(*shape, arm));
+        }
+        for &arm in arms.iter().skip(1) {
+            print!("{:>13}", format!("{:+.1}%", 100.0 * (arms[0] / arm - 1.0)));
+        }
+        println!("{:>14}", format!("{:+.1}%", 100.0 * (ours / arms[3] - 1.0)));
     }
 
     println!(
-        "\n3. against cuBLASLt on the same device in the same container — the denominator,\n\
-         and the drift control that says how much of the delta above is the session."
+        "\n4. the epilogue-free floor — this kernel with no drain at all, which is what any\n\
+         epilogue here is being subtracted from and, on its own, the most useful row in this\n\
+         file. #114 ran the same probe on `gemm_cg2` and got 1850 TF/s against the library's\n\
+         1808: THAT kernel is past parity once its epilogue is gone, so its whole gap was\n\
+         the epilogue. Two controls because there are two envelopes — {SHARED_BYTES} B for the\n\
+         register rung and {STAGED_SHARED_BYTES} B for all four staged ones — and they are\n\
+         opcode-identical PTX at 28 registers apiece, differing in 16408 declared bytes that\n\
+         no instruction touches. `envelope` is what those bytes cost, and it is the noise\n\
+         floor of table 4b. Neither computes a `C` and neither is checked."
     );
     println!(
-        "{:<18}{:>14}{:>14}{:>16}{:>16}{:>18}",
-        "shape", "cuBLASLt ms", "theirs TF/s", "gemm/theirs", "ws/theirs", "ws staged/theirs"
+        "{:<18}{:>16}{:>13}{:>20}{:>13}{:>12}",
+        "shape", "no drain ms", "TF/s", "staged no drain ms", "TF/s", "envelope"
     );
-    for (&(shape, control, ours), &staged) in measured.iter().zip(&staged_ms) {
+    let mut floors = Vec::new();
+    for &(shape, _, _) in &measured {
+        let bare = rung(context, shape, Entry::NoDrain)?;
+        let staged_bare = rung(context, shape, Entry::StagedNoDrain)?;
+        println!(
+            "{:<18}{:>16.4}{:>13.1}{:>20.4}{:>13.1}{:>12}",
+            shape,
+            bare,
+            tflops(shape, bare),
+            staged_bare,
+            tflops(shape, staged_bare),
+            format!("{:+.1}%", 100.0 * (staged_bare / bare - 1.0))
+        );
+        floors.push((bare, staged_bare));
+    }
+
+    println!(
+        "\n4b. what the epilogue COSTS in each arm, by #114's subtraction: the launch with the\n\
+         drain minus the launch without it, over the items the busiest cluster walks. The\n\
+         staged columns all subtract the staged control, so the four widths are on one\n\
+         footing whatever the `envelope` row above says.\n\
+         `LDTM half` is `staged - staged8` — the same subtraction #117 used to close #109's\n\
+         8.3 us estimate to 8.07 us on `gemm_cg2`, taken here from the other container, and\n\
+         the number that says whether this kernel really carries twice the LDTM."
+    );
+    print!("{:<18}{:>15}", "shape", "ws s4 us/tile");
+    for entry in STAGED_ENTRIES {
+        print!("{:>14}", format!("{} us", entry.short()));
+    }
+    println!("{:>12}", "LDTM half");
+    for ((shape, ours, arms), &(bare, staged_bare)) in ladder.iter().zip(&floors) {
+        let per_tile =
+            |milliseconds: f64| milliseconds * 1e3 / items_on_critical_path(shape.m, shape.n);
+        print!("{:<18}{:>15.2}", shape, per_tile(ours - bare));
+        let costs: Vec<f64> = arms
+            .iter()
+            .map(|&arm| per_tile(arm - staged_bare))
+            .collect();
+        for &cost in &costs {
+            print!("{:>14.2}", cost);
+        }
+        println!("{:>12.2}", costs[0] - costs[1]);
+    }
+
+    println!(
+        "\n5. against `gemm`'s own best rung, measured in this container. #112 asked whether\n\
+         giving up the second CTA pays with both kernels on the register epilogue, and the\n\
+         answer was -7.3% at 16384^3 with no mechanism established. Both kernels have since\n\
+         gained an epilogue, so this is that question again with each design point at its\n\
+         best — and beside it the floor from table 4, which is this kernel with a FREE\n\
+         epilogue. If `ws floor` still loses to `gemm 84`, no epilogue work can close the\n\
+         gap and the gap was never the epilogue."
+    );
+    println!(
+        "{:<18}{:>12}{:>13}{:>14}{:>16}{:>14}{:>12}{:>15}",
+        "shape",
+        "gemm ms",
+        "gemm 84 ms",
+        "gemm 84 TF/s",
+        "ws staged84 ms",
+        "ws 84 vs 84",
+        "ws floor ms",
+        "floor vs 84"
+    );
+    let mut best = Vec::new();
+    for ((&(shape, control, _), (_, _, arms)), &(bare, _)) in
+        measured.iter().zip(&ladder).zip(&floors)
+    {
+        eprintln!("{shape} on gemm staged84 (the control): staging and checking");
+        let theirs =
+            crate::gemm::bench_with(context, shape, crate::gemm::Epilogue::StagedWideX4)?.min();
+        println!(
+            "{:<18}{:>12.4}{:>13.4}{:>14.1}{:>16.4}{:>14}{:>12.4}{:>15}",
+            shape,
+            control,
+            theirs,
+            tflops(shape, theirs),
+            arms[3],
+            format!("{:+.1}%", 100.0 * (theirs / arms[3] - 1.0)),
+            bare,
+            format!("{:+.1}%", 100.0 * (theirs / bare - 1.0))
+        );
+        best.push(theirs);
+    }
+
+    println!(
+        "\n6. against cuBLASLt on the same device in the same container — the denominator,\n\
+         and the drift control that says how much of every delta above is the session.\n\
+         `ws floor` is the epilogue-free kernel, the column #114's 1850-against-1808 is on."
+    );
+    println!(
+        "{:<18}{:>13}{:>13}{:>9}{:>9}{:>9}{:>11}{:>12}{:>10}",
+        "shape",
+        "cuBLASLt ms",
+        "theirs TF/s",
+        "gemm",
+        "gemm 84",
+        "ws s4",
+        "ws staged",
+        "ws staged84",
+        "ws floor"
+    );
+    for (((&(shape, control, ours), (_, _, arms)), &gemm_best), &(bare, _)) in
+        measured.iter().zip(&ladder).zip(&best).zip(&floors)
+    {
         let Some(baseline) = baseline else {
             println!(
                 "no cuBLASLt column: built without --features cublas. modal_app.py::ws_bench\n\
@@ -1573,13 +2249,16 @@ pub fn compare(
         eprintln!("{shape}: staging and checking {}", baseline.name);
         let theirs = (baseline.bench)(context, shape)?.0.min();
         println!(
-            "{:<18}{:>14.4}{:>14.1}{:>16.3}{:>16.3}{:>18.3}",
+            "{:<18}{:>13.4}{:>13.1}{:>9.3}{:>9.3}{:>9.3}{:>11.3}{:>12.3}{:>10.3}",
             shape,
             theirs,
             tflops(shape, theirs),
             theirs / control,
+            theirs / gemm_best,
             theirs / ours,
-            theirs / staged
+            theirs / arms[0],
+            theirs / arms[3],
+            theirs / bare
         );
     }
     Ok(())

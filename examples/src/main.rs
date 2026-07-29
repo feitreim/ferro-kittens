@@ -88,8 +88,9 @@ fn examples() -> Vec<Example> {
             threads: gemm_ws::THREADS,
             shared_bytes: gemm_ws::SHARED_BYTES,
             // `#[cluster_launch]` too, so the same absence for the same reason
-            // — and here the counted figure is `device-tests`' `cg2 512` rung,
-            // which holds exactly this kernel's 512 accumulator columns.
+            // — and here the counted figure is `device-tests`' `ws envelope`
+            // rungs, which hold this kernel's 512 accumulator columns at this
+            // kernel's own two shared plans and count 1 CTA an SM at both.
             entry: None,
         },
         Example {
