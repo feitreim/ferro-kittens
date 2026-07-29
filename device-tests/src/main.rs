@@ -19,10 +19,12 @@
 //! The [`SharedVec`] cases are the one family whose subject is the *absence*
 //! of a layout: an unswizzled box is the shape nothing else here builds, so
 //! they are what says the engine writes a vector contiguously rather than
-//! saying a phase was computed right. `global rows map` is the one case whose
-//! subject is the absence of an *engine*: its source is a plain pitched fp32
-//! matrix, addressed by the calling thread, with no descriptor between it and
-//! the registers.
+//! saying a phase was computed right. `global rows map` and the `shared drain`
+//! pair are the cases whose subject is the absence of an *engine*: a plain
+//! pitched matrix on the global side, addressed by the calling threads, with no
+//! descriptor between it and either the registers or a staged tile. The drain
+//! cases are also the only ones that check what a path was required *not* to
+//! write — the poison margins around the rectangle they were asked for.
 //!
 //! The `mma A·Bᵀ` … `mma transpose control` family is the one whose subject is
 //! *arithmetic* rather than addressing, and the one written against a surface
@@ -71,7 +73,9 @@ use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cluster, cluster_launch, cuda_module, debug, kernel, thread, warp};
 
 use kittens::epilogue::StoreRing;
-use kittens::global::{GlobalLayout, GlobalRows, encode_bf16_panels, load_rows, store_rows};
+use kittens::global::{
+    GlobalLayout, GlobalRows, encode_bf16_panels, load_rows, store_rows, store_shared_rows,
+};
 use kittens::ldst::{load_fragment, load_tile, load_vec, store_fragment, store_tile};
 use kittens::mma::{self, MmaShape, mm_ab, mm_abt, mm_atb, mm_atbt, mma_abt};
 use kittens::reg::{
@@ -139,6 +143,46 @@ const RING_STRIDE: usize = 37;
 const fn ring_column(column: usize, band: usize, columns: usize) -> usize {
     (column + RING_STRIDE * band) % columns
 }
+
+/// Rows of the tile the shared→global drain case stages. Capped at 64 for
+/// [`cell`]'s six-bit row field, as [`RING_ROWS`] is.
+const DRAIN_ROWS: usize = 64;
+/// Rows one warp of that case fills — the same sixteen the store ring's warps
+/// take, and for the same reason: four warps writing one staging tile is the
+/// arrangement where the barrier before the drain is load-bearing, and a
+/// one-warp probe would pass with no barrier at all.
+const DRAIN_WARP_ROWS: usize = 16;
+/// Threads the drain probe launches with, and the `THREADS` it drains under.
+const DRAIN_THREADS: u32 = (DRAIN_ROWS / DRAIN_WARP_ROWS) as u32 * 32;
+
+/// Rows of the pitched bf16 matrix the drain writes into. Taller than
+/// [`DRAIN_ROWS`] by more than [`DRAIN_ROW`], so the rectangle has margin above
+/// *and* below it that has to come back untouched.
+const DRAIN_MATRIX_ROWS: usize = 80;
+/// Its leading dimension, in bf16 elements. Wider than either tile width, not a
+/// multiple of one, and a multiple of eight elements so that the stride never
+/// limits the access ladder — every rung below is the column origin's doing.
+const DRAIN_PITCH: usize = 208;
+/// The row the rectangle starts at. Non-zero, so a drain that ignored the row
+/// origin lands on the poison above it.
+const DRAIN_ROW: u32 = 8;
+
+/// The four column origins the case drains at, one per rung of
+/// [`kittens::global::store_shared_rows`]' access ladder.
+///
+/// Against a 256-byte-aligned allocation and [`DRAIN_PITCH`], the widths they
+/// select are 16, 8, 4 and 2 bytes — `access_width`'s host tests pin that
+/// arithmetic, and these are the same numbers reached through the driver's own
+/// pointer. Each is at least 64, so there is a left margin, and each leaves the
+/// widest tile inside the pitch, so there is a right one.
+const DRAIN_COLUMNS: [u32; 4] = [64, 68, 66, 65];
+
+/// The half-word a drain's destination is seeded with: [`POISON`]'s own halves,
+/// and a value [`cell_bits`] can never take.
+const POISON_HALF: u16 = 0xffff;
+
+/// One warp's band of the drain probe, at the staging tile's full width.
+type DrainBand<const C: usize> = RegTile<DRAIN_WARP_ROWS, C, BaseLdtm>;
 
 /// Rows of the probe accumulator — one full `M128` MMA shape, and the four
 /// warps' 32 TMEM rows each.
@@ -906,6 +950,86 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn store_ring_depth_2_wide(destination: *const TmaDescriptor) {
         unsafe { store_ring_probe::<WIDE, 1>(destination) }
+    }
+
+    /// Fill a `[DRAIN_ROWS, C]` staging tile with position identities through
+    /// `store_tile`, then push it out to the `(DRAIN_ROW, column)` rectangle of
+    /// an ordinary pitched bf16 matrix with
+    /// [`kittens::global::store_shared_rows`].
+    ///
+    /// **What this proves.** There is no descriptor and no engine anywhere on
+    /// the way out: the destination is a plain row-major buffer the host seeded
+    /// with poison, addressed by the calling threads. The rectangle is narrower
+    /// than the matrix's leading dimension and starts at neither a zero row nor
+    /// a zero column, so a drain that stepped rows by the tile's own width, or
+    /// dropped an origin, lands on poison the host can name. And `column`
+    /// arrives as a kernel argument rather than a constant, which is what lets
+    /// one launch per rung of the access ladder run the same code.
+    ///
+    /// The tile is filled by four warps and read by all of them, so the one
+    /// obligation the drain does not carry — every warp's `stmatrix` visible to
+    /// every warp's reads — is the `sync_threads` below and nothing else. There
+    /// is no `fence.proxy.async.shared::cta` in this case at all: both ends are
+    /// generic-proxy, which is exactly what distinguishes this path from the
+    /// store ring's.
+    ///
+    /// What it does not establish: that the *width* the ladder chose was the
+    /// widest legal one. A narrower access at a wide-enough column would pass
+    /// this case unchanged; only `access_width`'s host tests say which rung a
+    /// cursor gets. Launch with [`DRAIN_THREADS`].
+    #[inline(always)]
+    unsafe fn shared_drain_probe<const C: usize>(column: u32, out: &mut DisjointSlice<u16>)
+    where
+        BaseLdtm: FragmentLayout<DRAIN_WARP_ROWS, C>,
+    {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tile = Tile::<DRAIN_ROWS, C>::from_raw(smem);
+            let lane = warp::lane_id();
+            let row_base = DRAIN_WARP_ROWS as u32 * warp::warp_id();
+
+            let mut values = DrainBand::<C>::zero();
+            let mut slot = 0usize;
+            while slot < DrainBand::<C>::SLOTS {
+                let mut value = 0usize;
+                while value < DrainBand::<C>::VALUES {
+                    let (row, tile_column) = DrainBand::<C>::coordinate(lane, slot, value);
+                    values.set(
+                        slot,
+                        value,
+                        cell((row_base + row) as usize, tile_column as usize),
+                    );
+                    value += 1;
+                }
+                slot += 1;
+            }
+            store_tile(tile.chunk_writer(), row_base, 0, lane, values);
+            thread::sync_threads();
+
+            let destination = GlobalRows::<Bf16>::from_slice(out, DRAIN_PITCH);
+            store_shared_rows::<Bf16, DRAIN_ROWS, C, Swizzle128B, DRAIN_THREADS>(
+                destination,
+                DRAIN_ROW,
+                column,
+                thread::threadIdx_x(),
+                tile,
+            );
+        }
+    }
+
+    /// [`shared_drain_probe`] over one subtile.
+    #[kernel]
+    pub unsafe fn shared_drain(column: u32, mut out: DisjointSlice<u16>) {
+        unsafe { shared_drain_probe::<TILE>(column, &mut out) }
+    }
+
+    /// [`shared_drain_probe`] over two stacked subtiles: chunks 8.. of every
+    /// logical row live a `SUBTILE_BYTES` stride away in shared memory and
+    /// eight elements along in global memory, which is the one place the two
+    /// sides' notions of "next" disagree.
+    #[kernel]
+    pub unsafe fn shared_drain_wide(column: u32, mut out: DisjointSlice<u16>) {
+        unsafe { shared_drain_probe::<WIDE>(column, &mut out) }
     }
 
     /// TMA the same tile [`swizzle_probe`] stages, then read every `[16, 16]`
@@ -3934,6 +4058,100 @@ fn check_store_ring<const C: usize>(
     ))
 }
 
+/// Does a staged tile reach the rectangle the arithmetic names, by plain
+/// stores and at every rung of the access ladder?
+///
+/// The shared→global half of an epilogue with no engine in it (#15). The
+/// destination is a `DRAIN_MATRIX_ROWS × DRAIN_PITCH` bf16 matrix seeded end to
+/// end with [`POISON_HALF`], and the drain is asked for a `[DRAIN_ROWS, C]`
+/// rectangle at `(DRAIN_ROW, column)` — narrower than the pitch and inset from
+/// both ends of it, so **every** failure below names itself:
+///
+/// - **A wrong row stride** walks rows by the tile's width instead of the
+///   matrix's, which past row 0 lands on elements no identity of that row can
+///   be, and leaves the rows it skipped as poison.
+/// - **A dropped origin** puts the whole rectangle at `(0, 0)`, where the
+///   margins the case checks are supposed to still be poison.
+/// - **A confused swizzle** — the chunk XOR, the base's phase, the stacked
+///   subtile stride at `C = WIDE` — permutes elements *within* a 128-byte row,
+///   so it shows up as identities of the right row at the wrong columns rather
+///   than as anything numeric.
+/// - **A short drain** leaves poison inside the rectangle, which no identity
+///   can be.
+///
+/// The four [`DRAIN_COLUMNS`] run the same kernel at each rung of the width
+/// ladder, so a 16-byte access and a 2-byte one are the same case with one
+/// argument changed. What that cannot claim is that the rung *chosen* was the
+/// widest legal one: a drain that always issued 2-byte stores passes all four.
+/// `access_width`'s host tests are what say which rung a cursor gets.
+fn check_shared_drain<const C: usize>(
+    stream: &CudaStream,
+    launch: impl Fn(LaunchConfig, u32, &mut DeviceBuffer<u16>) -> Result<(), cuda_core::DriverError>,
+) -> Result<String, Box<dyn Error>> {
+    let seed = vec![POISON_HALF; DRAIN_MATRIX_ROWS * DRAIN_PITCH];
+    for column in DRAIN_COLUMNS {
+        let mut destination = DeviceBuffer::from_host(stream, &seed)?;
+        launch(
+            launch_config(DRAIN_THREADS, Tile::<DRAIN_ROWS, C>::BYTES as u32),
+            column,
+            &mut destination,
+        )?;
+
+        let mut expected = seed.clone();
+        for row in 0..DRAIN_ROWS {
+            for tile_column in 0..C {
+                let at = (DRAIN_ROW as usize + row) * DRAIN_PITCH + column as usize + tile_column;
+                expected[at] = cell_bits(row, tile_column);
+            }
+        }
+        compare_matrix(&destination.to_host_vec(stream)?, &expected, column)?;
+    }
+    let columns = C;
+    Ok(format!(
+        "[{DRAIN_ROWS}, {columns}] at row {DRAIN_ROW} of a \
+         {DRAIN_MATRIX_ROWS}x{DRAIN_PITCH} matrix, at columns {DRAIN_COLUMNS:?}"
+    ))
+}
+
+/// Compare a whole pitched bf16 matrix against what the drain owed it —
+/// identities inside the rectangle, poison everywhere else — reporting the
+/// first few wrong elements by position, and each one as the position its value
+/// actually names.
+fn compare_matrix(observed: &[u16], expected: &[u16], column: u32) -> Result<(), Box<dyn Error>> {
+    let mut report = String::new();
+    let mut mismatches = 0usize;
+    for (index, (&got, &want)) in observed.iter().zip(expected).enumerate() {
+        if got == want {
+            continue;
+        }
+        mismatches += 1;
+        if mismatches <= 8 {
+            let (row, at) = (index / DRAIN_PITCH, index % DRAIN_PITCH);
+            let named = match decode_cell(f32::from_bits((got as u32) << 16)) {
+                Some((r, c)) => format!("the identity of tile ({r}, {c})"),
+                None if got == POISON_HALF => "poison".to_string(),
+                None => format!("{got:#06x}, which names no element"),
+            };
+            let wanted = match decode_cell(f32::from_bits((want as u32) << 16)) {
+                Some((r, c)) => format!("tile ({r}, {c})"),
+                None => "poison".to_string(),
+            };
+            let _ = write!(
+                report,
+                "\n    ({row}, {at}): wanted {wanted}, found {named}"
+            );
+        }
+    }
+    if mismatches == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "at column {column}: {mismatches} of {} elements wrong{report}",
+        expected.len()
+    )
+    .into())
+}
+
 /// Does the cursor read back what the TMA engine wrote?
 ///
 /// The staged tile is position identities in logical order and the kernel
@@ -5475,6 +5693,26 @@ fn run() -> Result<usize, Box<dyn Error>> {
         Box::new(|| {
             check_store_ring::<WIDE>(stream, ring_shared::<WIDE, 1>(), |config, map| unsafe {
                 module.store_ring_depth_2_wide(stream, config, map)
+            })
+        }),
+    ));
+    // The same half of an epilogue without the engine: `stmatrix` into a
+    // staging tile and plain vectorized stores out of it, at every rung of the
+    // access ladder. No descriptor, no proxy fence, and no wait owed at the end
+    // — which is most of what distinguishes it from the four cases above.
+    cases.push((
+        "shared drain",
+        Box::new(|| {
+            check_shared_drain::<TILE>(stream, |config, column, out| unsafe {
+                module.shared_drain(stream, config, column, out)
+            })
+        }),
+    ));
+    cases.push((
+        "shared drain wide",
+        Box::new(|| {
+            check_shared_drain::<WIDE>(stream, |config, column, out| unsafe {
+                module.shared_drain_wide(stream, config, column, out)
             })
         }),
     ));

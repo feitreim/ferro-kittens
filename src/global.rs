@@ -70,12 +70,38 @@
 //! `st.global.v2.f32` to carry two values and bf16 needs a plain 4-byte word,
 //! because two bf16 already are one. Same count, half the bytes — see
 //! [`Element::write_pair`].
+//!
+//! # Out of a staged tile instead
+//!
+//! [`store_shared_rows`] is the third mover, and the only one whose *source*
+//! is shared memory. It writes the same kind of destination [`store_rows`]
+//! does — a rectangle of a row-major buffer at a runtime leading dimension —
+//! out of a [`crate::shared::SharedTile`] rather than out of registers, with
+//! ordinary stores and no engine anywhere.
+//!
+//! It exists because a fragment layout is a bad shape to store *from*. Under
+//! [`BaseLdtm`](crate::reg::BaseLdtm) a thread owns columns `{0, 1, 8, 9}` of
+//! each 16-column block, so the widest thing [`store_rows`] can issue is a
+//! pair and the addresses a warp presents are scattered across the row. Going
+//! through shared memory first — `stmatrix` into a swizzled tile
+//! ([`crate::ldst::store_tile`]), then this — spends one extra pass over the
+//! data to buy back *both* halves of that: the accesses widen to 16 bytes and
+//! the addresses of a warp become one contiguous run. NVIDIA's own reference
+//! kernel takes exactly this route (`gemm_sol_final` in cuda-oxide at the
+//! pinned revision `b099f64`), and it is the shared→global half of an epilogue
+//! that [`crate::epilogue::StoreRing`] does with the TMA engine instead.
+//!
+//! Neither is a strictly better answer. The engine costs a host-built
+//! descriptor and the fence and group-wait discipline that comes with it, and
+//! it lands a whole box; this costs the CTA's own issue slots, and lands
+//! whatever rectangle the arithmetic names.
 
 use core::marker::PhantomData;
 
 use crate::reg::{FragmentLayout, RegTile};
-use crate::shared::Element;
+use crate::shared::{Element, SharedTile, Swizzle};
 use cuda_device::DisjointSlice;
+use cuda_device::ptx_asm;
 
 /// A row-major window of global memory: a base address, the elements per row
 /// that separate one row from the next, and the element those are.
@@ -422,6 +448,367 @@ unsafe fn load_rows_in_runs<
     }
 }
 
+/// The unit both ends of a staged drain agree on.
+///
+/// SWIZZLE_128B permutes 16-byte chunks and never the bytes inside one
+/// ([`crate::shared::SwizzledChunks`]), and 16 bytes is also the widest access
+/// PTX has (`st.global.v4.b32`). So a chunk is simultaneously the largest run
+/// that is contiguous in shared *and* in global memory, and the largest one an
+/// instruction could have carried anyway — which is the whole reason the
+/// swizzle costs the global side of [`store_shared_rows`] nothing.
+const CHUNK_BYTES: usize = 16;
+
+/// Copy a whole `[R, C]` shared tile out to the `(row, column)` rectangle of a
+/// row-major global buffer, `THREADS` threads splitting its chunks between
+/// them.
+///
+/// The other half of the epilogue [`crate::ldst::store_tile`] starts: a band
+/// that reached shared memory through `stmatrix` leaves it through this, in
+/// 16-byte accesses whose addresses across a warp are one contiguous run. No
+/// descriptor, no engine, and — see below — no proxy fence.
+///
+/// # The chunk is the unit, and the swizzle is free
+///
+/// The tile is swizzled and the destination is not, so one of the two sides
+/// has to be walked out of order. This walks the *global* side contiguously
+/// and asks the tile's own cursor where each chunk went
+/// ([`crate::shared::SwizzledChunks::at`]), rather than laying the band out
+/// linearly in shared memory so the read-back is trivial.
+///
+/// That choice costs nothing measurable in addresses, which is the argument
+/// for it. SWIZZLE_128B XORs the chunk index with the row's position in the
+/// swizzle period, so it is a *permutation of the eight chunks within one
+/// 128-byte row* and never moves a chunk to another row. A 128-byte row is
+/// exactly the 32 banks of shared memory once over; eight lanes reading the
+/// eight chunks of one row therefore touch every bank exactly once, permuted
+/// or not. The alternative — an unswizzled staging tile — would move the
+/// disorder onto the `stmatrix` that fills it, where a power-of-two row pitch
+/// puts a fragment's eight rows on the same banks, which is the conflict the
+/// swizzle exists to prevent. It would also need a `Swizzle` impl that does
+/// not exist: [`crate::shared::SharedVec`]'s docs file that under #14 and name
+/// its precondition (`ATOM_BYTES` has to stop meaning "TMA box width" first),
+/// and this mover is not the place to decide it by accident.
+///
+/// Both of those are arguments about addresses. Neither has been measured.
+///
+/// # How wide an access
+///
+/// The same question [`store_rows`] answers with [`GlobalRows::runs_aligned`],
+/// asked at four widths instead of two: a vector access must be aligned to its
+/// whole width, and the base, the row stride and the column origin are runtime
+/// numbers no tile shape can promise anything about. [`access_width`] walks
+/// 16, 8 and 4 bytes down to the element itself and takes the first the cursor
+/// admits, so a packed bf16 `C` at an even `ldc` gets `st.global.v4.b32` and an
+/// odd one gets narrower stores instead of a misaligned-address fault.
+///
+/// A narrower access never crosses a chunk, so the shared side needs no second
+/// decision: 16 bytes is `CHUNK_BYTES`, and 8, 4 and 2 divide it.
+///
+/// The choice is made once per call and the widths are separate unrolled
+/// loops, as `store_rows`' two are. The price is four instantiations of the
+/// loop body where that mover has two; the 2-byte rung is guarded on
+/// `E::BYTES == 2`, because a cursor aligned for a 4-byte element is aligned
+/// for a 4-byte access at every column it names, so at fp32 that rung is
+/// unreachable and is not emitted.
+///
+/// # Who calls it, and what is *not* in here
+///
+/// Cooperative and not collective: `THREADS` threads share the tile's chunks
+/// by a flat index, and there is no barrier, no fence and no wait inside. A
+/// warp-scope caller passes `(lane, THREADS = 32)`; the four epilogue warps of
+/// a CTA pass `(threadIdx.x, 128)`, which is the arrangement the reference
+/// kernel uses and the one that makes a warp's 32 accesses land on consecutive
+/// chunks of a row.
+///
+/// The work is split by chunk rather than by row because a row split needs
+/// `R` to divide by the warps *and* the warp's rows to divide by 32; a chunk
+/// split needs only that `THREADS` divide the tile's chunks, which the const
+/// assert checks.
+///
+/// **There is no `fence.proxy.async.shared::cta` here and its absence is not a
+/// bug.** That fence exists in [`crate::epilogue::StoreRing`] because the TMA
+/// engine reads shared memory through the *async* proxy while `stmatrix` wrote
+/// it through the generic one, and nothing but the fence orders two proxies.
+/// Both ends of this mover are generic-proxy — `ld.shared` and `st.global` are
+/// ordinary instructions — so the only thing the writes and the reads need
+/// between them is a `bar.sync`, and a warp reading back its own `stmatrix`
+/// (which is `.sync.aligned`) needs not even that. The barrier is the caller's
+/// because only the caller knows which of the two it is in.
+///
+/// The exit side is shorter than the engine's too: a plain `st.global` is
+/// visible to the host and to the next kernel when the kernel ends, with no
+/// counterpart to [`crate::epilogue::StoreRing::drain`] owed to anybody.
+///
+/// Nothing here rounds. `store_rows` narrows fp32 registers in
+/// [`Element::write`] and that is where a bf16 `C` is made; a tile is already
+/// `E`, so this moves its bytes and the element only sets how many of them a
+/// column is worth.
+///
+/// # Safety
+///
+/// The rectangle `row..row + R` by `column..column + C` must lie inside the
+/// buffer `dest` names, at `dest.stride()` elements per row.
+///
+/// Exactly the threads `0..THREADS` must call this, each passing its own
+/// `thread`. There is no barrier inside, so a thread that skips it leaves its
+/// own chunks unwritten rather than hanging the block — the same way
+/// [`store_rows`] is short by one lane's share and for the same reason.
+///
+/// The tile's bytes must already be visible to every calling thread: a
+/// `bar.sync` since the last write by another thread of the CTA, and no proxy
+/// fence. The tile must also not be written again until every calling thread
+/// has returned, which is another barrier and also the caller's.
+#[inline(always)]
+pub unsafe fn store_shared_rows<
+    E: Element,
+    const R: usize,
+    const C: usize,
+    S: Swizzle,
+    const THREADS: u32,
+>(
+    dest: GlobalRows<E>,
+    row: u32,
+    column: u32,
+    thread: u32,
+    tile: SharedTile<E, R, C, S>,
+) {
+    const {
+        assert!(
+            E::BYTES == 2 || E::BYTES == 4,
+            "the access ladder's narrowest rung is two bytes, so a narrower element has none"
+        )
+    };
+    const { assert!(THREADS > 0, "a drain needs at least one thread") };
+    const {
+        assert!(
+            (R * C * E::BYTES / CHUNK_BYTES).is_multiple_of(THREADS as usize),
+            "the drain's threads must divide the tile's 16-byte chunks between them exactly"
+        )
+    };
+    unsafe {
+        match access_width(dest, column) {
+            CHUNK_BYTES => drain_in_accesses::<CHUNK_BYTES, E, R, C, S, THREADS>(
+                dest, row, column, thread, tile,
+            ),
+            8 => drain_in_accesses::<8, E, R, C, S, THREADS>(dest, row, column, thread, tile),
+            // Const-false at a 4-byte element, which is what keeps this arm
+            // from being emitted for one: `access_width` cannot return 2 there.
+            2 if E::BYTES == 2 => {
+                drain_in_accesses::<2, E, R, C, S, THREADS>(dest, row, column, thread, tile)
+            }
+            _ => drain_in_accesses::<4, E, R, C, S, THREADS>(dest, row, column, thread, tile),
+        }
+    }
+}
+
+/// Bytes per access the ladder settles on for this cursor and column origin —
+/// the whole of [`store_shared_rows`]' width decision, split out so it is a
+/// pure function a host test can read the ladder off rather than infer it from
+/// which branch ran.
+///
+/// Descends 16, 8, 4, `E::BYTES`. Each rung is [`GlobalRows::runs_aligned`] at
+/// the run of elements that width is worth, so the three terms it weighs are
+/// the same three [`store_rows`] weighs and the answer cannot drift between the
+/// two movers.
+///
+/// The bottom rung is the element and not a fixed 2 bytes: a cursor is aligned
+/// for its own element by [`GlobalRows::from_raw`]'s contract, so an
+/// `E::BYTES`-wide access is legal at every column and the ladder always
+/// terminates. At fp32 that rung *is* the 4-byte one and 2 is never returned.
+pub fn access_width<E: Element>(dest: GlobalRows<E>, column: u32) -> usize {
+    if dest.runs_aligned(column, CHUNK_BYTES / E::BYTES) {
+        CHUNK_BYTES
+    } else if dest.runs_aligned(column, 8 / E::BYTES) {
+        8
+    } else if E::BYTES == 2 && !dest.runs_aligned(column, 2) {
+        2
+    } else {
+        4
+    }
+}
+
+/// The tile `(row, chunk)` that flat work item `item` names, in a tile of
+/// `per_row` chunks per *logical* row.
+///
+/// Chunks are counted across the whole logical row, so this is already the
+/// index [`crate::shared::SwizzledChunks::at`] takes and a column past the
+/// first stacked subtile needs nothing extra. Split out from the loop for the
+/// reason [`GlobalRows::index`] is: it is the whole of the work split, and a
+/// host test can then ask whether the split is a partition.
+const fn drain_item(item: usize, per_row: usize) -> (usize, usize) {
+    (item / per_row, item % per_row)
+}
+
+/// [`store_shared_rows`] at one access width, in bytes. A const parameter and
+/// not an argument for [`store_rows_in_runs`]' reason: the width decides which
+/// instruction the loop is made of.
+///
+/// # Safety
+///
+/// As [`store_shared_rows`], and `WIDTH` must be what [`access_width`] returned
+/// for this cursor and column.
+#[inline(always)]
+unsafe fn drain_in_accesses<
+    const WIDTH: usize,
+    E: Element,
+    const R: usize,
+    const C: usize,
+    S: Swizzle,
+    const THREADS: u32,
+>(
+    dest: GlobalRows<E>,
+    row: u32,
+    column: u32,
+    thread: u32,
+    tile: SharedTile<E, R, C, S>,
+) {
+    unsafe {
+        let chunks = tile.chunk_writer();
+        let per_row = C * E::BYTES / CHUNK_BYTES;
+        let chunk_columns = CHUNK_BYTES / E::BYTES;
+        let mut item = thread as usize;
+        while item < R * per_row {
+            let (tile_row, chunk) = drain_item(item, per_row);
+            let from = chunks.at(tile_row, chunk);
+            let to = dest.at(
+                row + tile_row as u32,
+                column + (chunk * chunk_columns) as u32,
+            );
+            let mut byte = 0usize;
+            while byte < CHUNK_BYTES {
+                copy_bytes::<WIDTH>(from.add(byte), to.add(byte));
+                byte += WIDTH;
+            }
+            item += THREADS as usize;
+        }
+    }
+}
+
+/// Move `WIDTH` bytes from shared memory to global memory, unchanged.
+///
+/// A byte copy and not a value move: the tile already holds `E`, so there is
+/// nothing to pack, unpack or round, and the element only decides how many
+/// columns a width is worth.
+///
+/// The two vector widths are inline PTX for the reason `F32`'s
+/// [`Element::write_pair`] is: widening adjacent accesses into one is a
+/// transformation the compiler may only make when the address is provably
+/// aligned, and an address built from a runtime leading dimension never is — so
+/// the caller that has actually checked ([`access_width`]) is the only one in a
+/// position to spell it. The two narrow widths need no asking: a 4- or 2-byte
+/// move is a single instruction however it is written.
+///
+/// # Safety
+///
+/// `from` must name `WIDTH` readable bytes of shared memory and `to` `WIDTH`
+/// writable bytes of global memory, both aligned to `WIDTH`.
+#[inline(always)]
+unsafe fn copy_bytes<const WIDTH: usize>(from: *const u8, to: *mut u8) {
+    const {
+        assert!(
+            WIDTH == 16 || WIDTH == 8 || WIDTH == 4 || WIDTH == 2,
+            "a shared-to-global access is 2, 4, 8 or 16 bytes wide"
+        )
+    };
+    unsafe {
+        match WIDTH {
+            16 => write_v4(to, read_shared_v4(from)),
+            8 => write_v2(to, read_shared_v2(from)),
+            4 => *(to as *mut u32) = *(from as *const u32),
+            _ => *(to as *mut u16) = *(from as *const u16),
+        }
+    }
+}
+
+/// One whole swizzle chunk out of shared memory: `ld.shared.v4.b32`.
+///
+/// Written as a load into registers rather than fused with the store so the
+/// two are separate instructions the scheduler can put chunks of work between,
+/// which a single opaque snippet spanning both would forbid.
+///
+/// # Safety
+///
+/// `from` must be a 16-byte-aligned shared-memory address with 16 readable
+/// bytes.
+#[inline(always)]
+unsafe fn read_shared_v4(from: *const u8) -> [u32; 4] {
+    unsafe {
+        let (a, b, c, d): (u32, u32, u32, u32);
+        ptx_asm!(
+            "{ .reg .u64 src; cvta.to.shared.u64 src, %4; ld.shared.v4.b32 {%0, %1, %2, %3}, [src]; }",
+            out("=r") a,
+            out("=r") b,
+            out("=r") c,
+            out("=r") d,
+            in("l") from as u64,
+            clobber("memory"),
+        );
+        [a, b, c, d]
+    }
+}
+
+/// Half a chunk: `ld.shared.v2.b32`.
+///
+/// # Safety
+///
+/// As [`read_shared_v4`], 8-byte aligned with 8 readable bytes.
+#[inline(always)]
+unsafe fn read_shared_v2(from: *const u8) -> [u32; 2] {
+    unsafe {
+        let (a, b): (u32, u32);
+        ptx_asm!(
+            "{ .reg .u64 src; cvta.to.shared.u64 src, %2; ld.shared.v2.b32 {%0, %1}, [src]; }",
+            out("=r") a,
+            out("=r") b,
+            in("l") from as u64,
+            clobber("memory"),
+        );
+        [a, b]
+    }
+}
+
+/// 16 bytes into global memory in one access: `st.global.v4.b32`.
+///
+/// The instruction the whole staging round trip is for. A warp of 32 lanes
+/// issuing this on consecutive chunks writes 512 contiguous bytes, where the
+/// same band stored straight out of a fragment layout is 32 scattered pairs.
+///
+/// # Safety
+///
+/// `to` must be a 16-byte-aligned global address with 16 writable bytes.
+#[inline(always)]
+unsafe fn write_v4(to: *mut u8, words: [u32; 4]) {
+    unsafe {
+        ptx_asm!(
+            "st.global.v4.b32 [%0], {%1, %2, %3, %4};",
+            in("l") to as u64,
+            in("r") words[0],
+            in("r") words[1],
+            in("r") words[2],
+            in("r") words[3],
+            clobber("memory"),
+        );
+    }
+}
+
+/// `st.global.v2.b32` — the rung below [`write_v4`].
+///
+/// # Safety
+///
+/// As [`write_v4`], 8-byte aligned with 8 writable bytes.
+#[inline(always)]
+unsafe fn write_v2(to: *mut u8, words: [u32; 2]) {
+    unsafe {
+        ptx_asm!(
+            "st.global.v2.b32 [%0], {%1, %2};",
+            in("l") to as u64,
+            in("r") words[0],
+            in("r") words[1],
+            clobber("memory"),
+        );
+    }
+}
+
 #[cfg(test)]
 mod rows_tests {
     use super::*;
@@ -571,6 +958,151 @@ mod rows_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::shared::{Bf16, F32};
+
+    /// 16-byte aligned, as every device allocation is, so the *column* is what
+    /// moves the ladder below and not the base.
+    const BASE: *mut u8 = 0x7f00_0000 as *mut u8;
+    /// The leading dimension the device case uses. A multiple of 8 bf16, so
+    /// the stride never limits the width and each rung below is the column's
+    /// doing alone.
+    const PITCH: usize = 208;
+    /// Chunks in one logical row of a `[64, 128]` bf16 tile, and its rows.
+    const PER_ROW: usize = 128 * 2 / CHUNK_BYTES;
+    const ROWS: usize = 64;
+    /// Elements one chunk holds at bf16.
+    const CHUNK_COLUMNS: usize = CHUNK_BYTES / 2;
+
+    fn bf16(stride: usize) -> GlobalRows<Bf16> {
+        unsafe { GlobalRows::from_raw(BASE, stride) }
+    }
+
+    /// Where work item `item` lands in the destination, in elements from the
+    /// cursor's base — the drain's whole address map, replayed off its own
+    /// [`drain_item`].
+    fn destination(rows: GlobalRows<Bf16>, row: u32, column: u32, item: usize) -> usize {
+        let (tile_row, chunk) = drain_item(item, PER_ROW);
+        rows.index(
+            row + tile_row as u32,
+            column + (chunk * CHUNK_COLUMNS) as u32,
+        )
+    }
+
+    /// The ladder, one rung per column origin. Every one of these is a cursor
+    /// a caller could build, and none of them faults: a column that cannot
+    /// carry a 16-byte store gets an 8-byte one, and so down to the element.
+    #[test]
+    fn the_ladder_takes_the_widest_access_the_cursor_admits() {
+        assert_eq!(access_width(bf16(PITCH), 64), 16);
+        assert_eq!(access_width(bf16(PITCH), 68), 8);
+        assert_eq!(access_width(bf16(PITCH), 66), 4);
+        assert_eq!(access_width(bf16(PITCH), 65), 2);
+        // The stride is the other term that shifts every row at once: an odd
+        // leading dimension flips the parity per row and costs everything.
+        assert_eq!(access_width(bf16(PITCH + 1), 64), 2);
+        // And an even stride stops the ladder wherever the row it lands on
+        // stops it: 212 bf16 is 424 bytes, which carries an 8-byte access to
+        // every row and a 16-byte one only to the first.
+        assert_eq!(access_width(bf16(212), 64), 8);
+        assert_eq!(access_width(bf16(210), 64), 4);
+    }
+
+    /// **fp32 has no bottom rung to reach**, which is not the obvious result:
+    /// a cursor is aligned for its own element by contract, so a 4-byte access
+    /// is legal at every column a 4-byte element names and the 2-byte rung is
+    /// unreachable. That is what the `E::BYTES == 2` guard in
+    /// [`store_shared_rows`] spends — the arm is not emitted at fp32 at all.
+    #[test]
+    fn a_four_byte_element_never_descends_below_its_own_width() {
+        let f32s = |stride, column| {
+            access_width(unsafe { GlobalRows::<F32>::from_raw(BASE, stride) }, column)
+        };
+        assert_eq!(f32s(PITCH, 64), 16);
+        for column in [65u32, 66, 67, 68] {
+            assert!(f32s(PITCH, column) >= 4, "column {column}");
+        }
+        for stride in [PITCH + 1, PITCH + 2, PITCH + 3] {
+            assert!(f32s(stride, 64) >= 4, "stride {stride}");
+        }
+    }
+
+    /// The property the drain rests on: the calling threads between them name
+    /// every chunk of the tile exactly once, so the stores are disjoint and the
+    /// rectangle is fully covered.
+    #[test]
+    fn the_threads_partition_the_tiles_chunks() {
+        for threads in [32usize, 64, 128, 256] {
+            let mut seen = Vec::new();
+            let mut per_thread = Vec::new();
+            for thread in 0..threads {
+                let mut item = thread;
+                let mut mine = 0usize;
+                while item < ROWS * PER_ROW {
+                    seen.push(drain_item(item, PER_ROW));
+                    mine += 1;
+                    item += threads;
+                }
+                per_thread.push(mine);
+            }
+            seen.sort_unstable();
+            let expected: Vec<(usize, usize)> = (0..ROWS)
+                .flat_map(|row| (0..PER_ROW).map(move |chunk| (row, chunk)))
+                .collect();
+            assert_eq!(seen, expected, "{threads} threads");
+            // Equal shares, which is what the const assert buys and what keeps
+            // the loop's trip count off the thread index.
+            assert!(per_thread.iter().all(|&count| count == per_thread[0]));
+        }
+    }
+
+    /// And the destination side of the same claim: the elements those chunks
+    /// carry are exactly the rectangle, at a stride wider than the tile so a
+    /// wrong leading dimension is a wrong answer rather than a benign one.
+    #[test]
+    fn the_chunks_cover_the_destination_rectangle_exactly_once() {
+        const ROW: u32 = 8;
+        const COLUMN: u32 = 64;
+        let rows = bf16(PITCH);
+        let mut touched = Vec::new();
+        for item in 0..ROWS * PER_ROW {
+            let start = destination(rows, ROW, COLUMN, item);
+            touched.extend(start..start + CHUNK_COLUMNS);
+        }
+        touched.sort_unstable();
+        let mut expected: Vec<usize> = (ROW..ROW + ROWS as u32)
+            .flat_map(|row| (COLUMN..COLUMN + 128).map(move |column| rows.index(row, column)))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(touched, expected);
+    }
+
+    /// Why the split is by chunk and not by row: consecutive threads take
+    /// consecutive chunks of one destination row, so a warp's accesses are one
+    /// contiguous run — which is the entire point of routing the band through
+    /// shared memory instead of storing it from the fragment layout.
+    #[test]
+    fn consecutive_threads_take_consecutive_chunks_of_a_row() {
+        let rows = bf16(PITCH);
+        for item in 0..PER_ROW - 1 {
+            assert_eq!(
+                destination(rows, 0, 64, item + 1) - destination(rows, 0, 64, item),
+                CHUNK_COLUMNS,
+                "item {item}"
+            );
+        }
+        // A warp of 32 covers two whole rows of a `[64, 128]` tile — 256 bytes
+        // each, one run apiece — and the second starts a leading dimension
+        // along, not a tile width.
+        assert_eq!(
+            destination(rows, 0, 64, PER_ROW) - destination(rows, 0, 64, 0),
+            PITCH
+        );
     }
 }
 
