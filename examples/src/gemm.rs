@@ -90,6 +90,36 @@
 //! intercept is everything not scaling with `K`, which after #102 is no longer
 //! only the item boundary.
 //!
+//! ## What the item boundary is, ablated rather than fitted
+//!
+//! Every figure above for a *part* of this kernel is a share of that intercept,
+//! and [`Ablation`] is what measures the parts directly: the same kernel with
+//! one phase of the item removed, priced at more than one corner so that
+//! **serial** and **exposed** costs are told apart rather than assumed. On the
+//! bf16 kernel the fit re-measures at **18.0–25.0 µs a tile**, and the
+//! decomposition of it is not the five-member chain this file has described
+//! since #86:
+//!
+//! - **The epilogue is the whole of it.** Delete the LDTM and the stores and
+//!   leave every barrier, boundary and refill where it is, and the intercept
+//!   goes to zero at every point selection. The barrier re-arm, the two cluster
+//!   boundaries and the pipeline refill are all inside the `K`-proportional
+//!   term.
+//! - **And it is exposed, not hidden.** It costs 20.4 µs a tile with the
+//!   multiply beside it and 20.6 without — a ratio of 1.01 — and #108's `2x`
+//!   measured the same quantity *serially* at 21.4 by a route sharing none of
+//!   this arithmetic. #109's reading, that the epilogue is partly overlapped
+//!   and the fit sees its residue, is refuted.
+//! - **So the gap to cuBLASLt is the epilogue.** [`Ablation::NoDrain`] measures
+//!   **1850 TFLOP/s at 8192³ and 1841 at `K = 32768`** — 82% of dense bf16
+//!   peak, flat across a 4× change in depth — against the library's 1808 in the
+//!   same container. The epilogue costs 111% of the entire distance between the
+//!   two kernels, and every other term this file has ranked lives inside the
+//!   part that is already faster than the library.
+//!
+//! `examples/README.md` §7 has the tables, the PTX census that says each rung
+//! removes what it names, and the three corners that do not run.
+//!
 //! ## The item map is grouped, not row-major
 //!
 //! That aspect-ratio sweep is what #89 was started from, and it is worth
@@ -231,11 +261,41 @@ const BLOCK_M: usize = 128;
 const BLOCK_N: usize = 256;
 /// This CTA's half of `B`.
 const HALF_N: usize = BLOCK_N / 2;
-/// K per pipeline stage: one 128-byte swizzle atom of bf16, the only width
-/// [`SharedTile::k_walk`] accepts, and four chained K=16 MMA chunks.
+/// K one linear MMA walk covers: **one 128-byte swizzle atom of bf16, and the
+/// only width [`SharedTile::k_walk`] accepts.** Not a parameter, and not
+/// because nobody swept it —
+///
+/// ```text
+/// const { assert!(C * E::BYTES == S::ATOM_BYTES,
+///     "a linear K-major walk needs K to span exactly one swizzle atom") }
+/// ```
+///
+/// — is in `k_walk` itself, and `Swizzle128B` is the only mode in tree. So 64
+/// is what a *walk* is, at bf16, and a stage that wants more K than that gets
+/// it by holding several of these atoms rather than by widening the walk. That
+/// is [`BLOCK_K`], which is a parameter.
+const ATOM_K: usize = 64;
+/// Chained K=16 MMA chunks in one atom's walk.
+const ATOM_CHUNKS: usize = ATOM_K / 16;
+/// K a pipeline stage carries, in the kernel this file ships — a whole number
+/// of [`ATOM_K`] atoms, loaded by one TMA per operand and multiplied by one
+/// walk per atom.
+///
+/// **Swept since this issue, and the sweep is more constrained than it looks.**
+/// A stage's shared bytes are `512 · BLOCK_K · STAGES` for the pair tile this
+/// kernel ships, so at the 116 736 B an SM divides two ways it is the *product*
+/// `BLOCK_K · STAGES` that is capped, at 228 — and `BLOCK_K` does not move
+/// arithmetic intensity at all, since a tile reads `(M + N) · K` bytes for
+/// `2 · M · N · K` flops however K is blocked. What it does move is the number
+/// of stage barriers, `expect_tx` charges and loop iterations an item pays, and
+/// how coarsely the ring recycles.
+///
+/// So the sweep is a *factorization* of a fixed budget rather than an
+/// independent axis, and [`RUNGS`] carries both of the pairs that hold the
+/// bytes fixed and move only the factorization: `k64 s2` against `k128 s1` at
+/// 65 KiB, and `k64 s3` against the 131 KiB `k128 s2` that is computed and not
+/// built. `examples/README.md` §7 has what they measured.
 const BLOCK_K: usize = 64;
-/// Chained MMAs per stage.
-const CHUNKS: usize = BLOCK_K / 16;
 /// Pipeline depth over K, in the shipped kernel.
 const STAGES: usize = 3;
 /// One warp per 32 accumulator rows, which is what a `[32, N]` drain wants.
@@ -260,15 +320,21 @@ const PAIR: u16 = ((1u32 << RANKS) - 1) as u16;
 /// The rank that owns the pair's MMA, its accumulator and its stage barriers.
 const LEADER: u32 = 0;
 
-/// This CTA's `A` rows, K-major. The one operand tile no rung moves: the
-/// pair's `M` is fixed at 256 by the widest `MmaShape` there is.
-type ATile = SharedTile<Bf16, BLOCK_M, BLOCK_K, Swizzle128B>;
+/// This CTA's `A` rows, K-major. The pair's `M` is fixed at 256 by the widest
+/// `MmaShape` there is, so `BLOCK_K` is the only extent a rung moves here.
+type ATile<const BLOCK_K: usize> = SharedTile<Bf16, BLOCK_M, BLOCK_K, Swizzle128B>;
 /// This CTA's `B` columns, also K-major — so the MMA carries no transpose
 /// bits and computes `A·Bᵀ`.
-type BTile<const HALF_N: usize> = SharedTile<Bf16, HALF_N, BLOCK_K, Swizzle128B>;
-type ARing<const STAGES: usize> = SharedTileRing<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>;
-type BRing<const HALF_N: usize, const STAGES: usize> =
+type BTile<const HALF_N: usize, const BLOCK_K: usize> =
+    SharedTile<Bf16, HALF_N, BLOCK_K, Swizzle128B>;
+type ARing<const BLOCK_K: usize, const STAGES: usize> =
+    SharedTileRing<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>;
+type BRing<const HALF_N: usize, const BLOCK_K: usize, const STAGES: usize> =
     SharedTileRing<Bf16, HALF_N, BLOCK_K, Swizzle128B, STAGES>;
+/// One swizzle atom of an operand tile, which is what a [`SharedTile::k_walk`]
+/// can describe — a `BLOCK_K` wider than [`ATOM_K`] is this many of these,
+/// stacked, and [`SharedTile::subtile`] is where each one starts.
+type Atom<const R: usize> = SharedTile<Bf16, R, ATOM_K, Swizzle128B>;
 /// This CTA's half of the pair's accumulator: 128 TMEM lanes by `BLOCK_N`
 /// fp32 columns. The column count is what charges tensor memory, so it is also
 /// the `512 / columns` half of the residency this kernel gets.
@@ -291,9 +357,9 @@ const fn scratch_bytes(stages: usize) -> usize {
 /// It is not trusted: [`attach`] carries a codegen-time assert that this agrees
 /// with the rings' own `BYTES`, per rung, which is the only place the two
 /// could ever drift.
-pub const fn shared_plan(block_n: usize, stages: usize) -> usize {
-    let a = BLOCK_M * BLOCK_K * 2 * stages;
-    let b = (block_n / 2) * BLOCK_K * 2 * stages;
+pub const fn shared_plan(block_n: usize, block_k: usize, stages: usize) -> usize {
+    let a = BLOCK_M * block_k * 2 * stages;
+    let b = (block_n / 2) * block_k * 2 * stages;
     a + b + scratch_bytes(stages)
 }
 
@@ -318,7 +384,7 @@ const fn pair_shape(block_n: usize) -> MmaShape {
 /// envelope, and paying them on both sides is what keeps the A/B a comparison
 /// of schedules rather than of residencies — 73 816 B still admits the three
 /// CTAs per SM that #84 counted at 73 792.
-pub const SHARED_BYTES: usize = shared_plan(BLOCK_N, STAGES);
+pub const SHARED_BYTES: usize = shared_plan(BLOCK_N, BLOCK_K, STAGES);
 
 /// `#[launch_contract]` takes literals, so the envelope is written twice; this
 /// is what keeps the two in step. The contract is not decoration: 72 KiB is
@@ -449,39 +515,49 @@ impl Scheduler {
 
 /// Which entry point a rung is compiled into.
 ///
-/// A rung is a pair tile and a pipeline depth, and both are const parameters
-/// of [`Tile`] — but `#[launch_contract]` takes a literal shared plan, so each
-/// combination is its own `#[kernel]` and this is the host's name for it. The
-/// four sweep entries are static-only; [`Scheduler::Stealing`] exists on the
-/// shipped rung alone, because a scheduler comparison at a moving tile would
-/// be two variables.
+/// A rung is a pair tile, a stage's K and a pipeline depth, and all three are
+/// const parameters of [`Tile`] — but `#[launch_contract]` takes a literal
+/// shared plan, so each combination is its own `#[kernel]` and this is the
+/// host's name for it. Every sweep entry is static-only;
+/// [`Scheduler::Stealing`] exists on the shipped rung alone, because a
+/// scheduler comparison at a moving tile would be two variables.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Entry {
-    /// `gemm_cg2` / `gemm_cg2_clc` — `[256, 256] @ STAGES = 3` since #87, the
-    /// kernel this file ships and the only rung with a stealing twin.
+    /// `gemm_cg2` / `gemm_cg2_clc` — `[256, 256] @ BLOCK_K = 64, STAGES = 3`
+    /// since #87, the kernel this file ships and the only rung with a stealing
+    /// twin.
     Shipped,
     N128S2,
     /// The kernel this file shipped through #102, kept as the control.
     N128S3,
     N128S4,
     N256S2,
+    /// `[256, 256] @ BLOCK_K = 64, STAGES = 1` — the shallow end of the depth
+    /// family, and the rung the `BLOCK_K` rung is read against at fixed depth.
+    N256K64S1,
+    /// `[256, 256] @ BLOCK_K = 128, STAGES = 1` — the same bytes in flight as
+    /// `N256S2`, factorized the other way.
+    N256K128S1,
     /// A rung the table computes and no kernel implements — see [`UNBUILT`].
     /// Launching it is an error rather than a missing arm, because the reason
     /// it is not built is a measurement and not an oversight.
     Unbuilt,
 }
 
-/// One point of #87's tile and depth sweep.
+/// One point of the tile, stage-K and depth sweep.
 ///
-/// The two numbers that move are the pair tile's columns and the pipeline's
-/// depth over K. Everything else about a rung — its shared plan, its tensor
-/// memory, the residency those two admit, its arithmetic intensity and how
-/// many output tiles a problem has — is arithmetic on them, which is the whole
-/// reason this is a table and not six kernels written out.
+/// The three numbers that move are the pair tile's columns, the K a stage
+/// carries and the pipeline's depth over K. Everything else about a rung — its
+/// shared plan, its tensor memory, the residency those admit, its arithmetic
+/// intensity, the K blocks an item walks and how many output tiles a problem
+/// has — is arithmetic on them, which is the whole reason this is a table and
+/// not eight kernels written out.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Rung {
     /// Columns of `C` the *pair* computes, and this CTA's accumulator columns.
     pub block_n: usize,
+    /// K one pipeline stage carries — a whole number of [`ATOM_K`] atoms.
+    pub block_k: usize,
     /// Pipeline depth over K.
     pub stages: usize,
     pub entry: Entry,
@@ -490,7 +566,18 @@ pub struct Rung {
 impl Rung {
     /// Dynamic shared memory this rung's launch declares.
     pub const fn shared(self) -> usize {
-        shared_plan(self.block_n, self.stages)
+        shared_plan(self.block_n, self.block_k, self.stages)
+    }
+
+    /// K in flight in one CTA's rings — `block_k * stages`, and the quantity
+    /// the shared budget actually caps.
+    ///
+    /// It is worth a name because it is what makes this sweep a
+    /// *factorization* rather than two free axes: two rungs with the same value
+    /// here declare the same shared plan to within the scratch tail and get the
+    /// same residency, and differ only in how that K is divided into barriers.
+    pub fn k_in_flight(self) -> usize {
+        self.block_k * self.stages
     }
 
     /// **Arithmetic intensity**, `M·N/(M+N)` over the pair tile: flops per
@@ -536,13 +623,15 @@ impl Rung {
 
     /// What the table calls it.
     pub fn name(self) -> String {
-        format!("[256,{}] s{}", self.block_n, self.stages)
+        format!("[256,{}] k{} s{}", self.block_n, self.block_k, self.stages)
     }
 }
 
-/// The kernel this file ships, as a rung: `[256, 256] @ STAGES = 3` (#87).
+/// The kernel this file ships, as a rung: `[256, 256] @ BLOCK_K = 64,
+/// STAGES = 3` (#87).
 pub const SHIPPED: Rung = Rung {
     block_n: BLOCK_N,
+    block_k: BLOCK_K,
     stages: STAGES,
     entry: Entry::Shipped,
 };
@@ -554,20 +643,25 @@ pub const SHIPPED: Rung = Rung {
 /// further 25–44% under a step already worth 14–16%, so it is computed and not
 /// launched. Booking a B200 on a rung whose answer two prior measurements
 /// already give is how a sweep spends money to confirm itself.
-pub const RUNGS: [Rung; 5] = [
+pub const RUNGS: [Rung; 7] = [
     Rung {
         block_n: 128,
+        block_k: 64,
         stages: 2,
         entry: Entry::N128S2,
     },
     CONTROL,
     Rung {
         block_n: 128,
+        block_k: 64,
         stages: 4,
         entry: Entry::N128S4,
     },
+    K64S1,
+    K128S1,
     Rung {
         block_n: 256,
+        block_k: 64,
         stages: 2,
         entry: Entry::N256S2,
     },
@@ -578,16 +672,67 @@ pub const RUNGS: [Rung; 5] = [
 /// the control every #87 row is read against.
 pub const CONTROL: Rung = Rung {
     block_n: 128,
+    block_k: 64,
     stages: 3,
     entry: Entry::N128S3,
 };
 
-/// The rung this sweep computes and does not build — see [`RUNGS`].
-pub const UNBUILT: Rung = Rung {
+/// One stage of one swizzle atom — the shallow end of the depth family, and
+/// the rung [`K128S1`] is read against at fixed depth.
+///
+/// At `STAGES = 1` there is no pipeline at all: the producer's `wait_recycled`
+/// cannot clear until the MMA reading the one stage has committed, so loads and
+/// arithmetic serialize. It is in the sweep because the `BLOCK_K` comparison
+/// has to be taken at fixed depth, and one stage is the only depth at which
+/// both 64 and 128 fit under two CTAs an SM.
+pub const K64S1: Rung = Rung {
     block_n: 256,
-    stages: 4,
-    entry: Entry::Unbuilt,
+    block_k: 64,
+    stages: 1,
+    entry: Entry::N256K64S1,
 };
+
+/// Two atoms in one stage — **the `BLOCK_K` rung**, and it is worth a B200
+/// because it pairs two ways.
+///
+/// Against [`K64S1`] it is the same depth carrying twice the K per stage: half
+/// the stage barriers, half the `expect_tx` charges and half the loop
+/// iterations, for the same bytes, the same TMA instruction count and the same
+/// chunk count. Against `[256, 256] @ STAGES = 2` it is the same **65 KiB of
+/// shared memory and the same 128 K in flight**, factorized the other way — one
+/// barrier over two atoms against two barriers over one atom each. That second
+/// pair is the control that says whether a K block's fixed cost or the
+/// pipelining is what the shared budget is better spent on.
+pub const K128S1: Rung = Rung {
+    block_n: 256,
+    block_k: 128,
+    stages: 1,
+    entry: Entry::N256K128S1,
+};
+
+/// The rungs this sweep computes and does not build — see [`RUNGS`].
+///
+/// Both are one CTA an SM, and #98 measured that step at a further 25–44% under
+/// a step already worth 14–16%. `[256, 256] @ k128 s2` is the one a reader asks
+/// for first — it is the shipped kernel's 192 K in flight arriving as two
+/// barriers instead of three — and it declares 131 144 B against the 116 736 B
+/// two CTAs an SM leaves. **That is the whole constraint on `BLOCK_K` in one
+/// line:** at this pair tile the shared budget is already spent, so a wider
+/// stage is only reachable by giving depth back.
+pub const UNBUILT: [Rung; 2] = [
+    Rung {
+        block_n: 256,
+        block_k: 64,
+        stages: 4,
+        entry: Entry::Unbuilt,
+    },
+    Rung {
+        block_n: 256,
+        block_k: 128,
+        stages: 2,
+        entry: Entry::Unbuilt,
+    },
+];
 
 /// The shared plans the four sweep entry points declare, against the
 /// arithmetic every host table reads.
@@ -597,11 +742,15 @@ pub const UNBUILT: Rung = Rung {
 /// against the *rings'* own byte counts at codegen; this asserts it against the
 /// literals, which is the other half of the same join.
 const _: () = {
-    assert!(shared_plan(128, 2) == 49_224);
-    assert!(shared_plan(128, 4) == 98_408);
-    assert!(shared_plan(256, 2) == 65_608);
-    assert!(shared_plan(256, 3) == 98_392);
-    assert!(shared_plan(256, 4) == 131_176);
+    assert!(shared_plan(128, 64, 2) == 49_224);
+    assert!(shared_plan(128, 64, 4) == 98_408);
+    assert!(shared_plan(256, 64, 1) == 32_824);
+    assert!(shared_plan(256, 64, 2) == 65_608);
+    assert!(shared_plan(256, 64, 3) == 98_392);
+    assert!(shared_plan(256, 128, 1) == 65_592);
+    // The two the sweep computes and does not build, both one CTA an SM.
+    assert!(shared_plan(256, 64, 4) == 131_176);
+    assert!(shared_plan(256, 128, 2) == 131_144);
 };
 
 /// One output tile of `C`, as the persistent grid's work item.
@@ -615,9 +764,9 @@ const _: () = {
 /// per *cluster* and answered in groups of [`GROUP`] tile-rows rather than
 /// row-major.
 #[derive(Clone, Copy)]
-struct Tile<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
-    a_ring: ARing<STAGES>,
-    b_ring: BRing<HALF_N, STAGES>,
+struct Tile<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAGES: usize> {
+    a_ring: ARing<BLOCK_K, STAGES>,
+    b_ring: BRing<HALF_N, BLOCK_K, STAGES>,
     /// Filled by the TMA, drained by the MMA. In the leader's copy the whole
     /// pair's four tiles complete on one barrier; the peer's own copy is
     /// unused, and initialized anyway because the plan is symmetric.
@@ -656,7 +805,9 @@ struct Tile<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
 /// The split is [`Lcsf`]'s reason for existing and nothing else moves because
 /// of it: [`Job::work`] on [`Tile`] calls all three back to back and is the
 /// kernel that shipped through #87, instruction for instruction.
-impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Tile<BLOCK_N, HALF_N, STAGES> {
+impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAGES: usize>
+    Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>
+{
     /// K blocks the producer can issue before any of them has to be recycled.
     ///
     /// [`SemaphoreRing::wait_recycled`] is a no-op below `STAGES`, so this
@@ -670,12 +821,21 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Tile<BLOCK_
     /// Issue this rank's half of K blocks `from..to`, charging the leader's
     /// stage barrier for the whole pair.
     ///
+    /// **`LOADS` is [`Ablation`]'s operand-traffic switch and is `true` in
+    /// every kernel this file ships.** At `false` the stage barrier is
+    /// completed by one bare arrival instead of by the bytes of four TMA
+    /// loads, so the loop, the recycling handshake, the barrier and the
+    /// consumer's wait on it are all exactly what they were and the only thing
+    /// gone is the traffic. It is a const parameter rather than a second loop
+    /// because a second loop is a place for the two to drift, and the shipped
+    /// kernel's codegen is what `regcount` checks did not move.
+    ///
     /// # Safety
     ///
     /// One thread of the CTA, with `from..to` inside `0..k_blocks` and every
     /// block issued exactly once across the calls that cover the walk.
     #[inline(always)]
-    unsafe fn produce(&self, tile_m: u32, tile_n: u32, from: u32, to: u32) {
+    unsafe fn produce<const LOADS: bool>(&self, tile_m: u32, tile_n: u32, from: u32, to: u32) {
         unsafe {
             // Both CTAs load their own halves, and all four tiles complete on
             // the leader's copy of the stage barrier — one barrier is what the
@@ -696,20 +856,28 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Tile<BLOCK_
             let mut k = from;
             while k < to {
                 self.free.wait_recycled(k);
-                let stage = self.load.sem(k).at_rank(LEADER);
-                let column = (BLOCK_K as u32 * k) as i32;
-                let a_bytes = self
-                    .a_ring
-                    .tile(k)
-                    .tma_load_2d_arriving_at(self.a_map, column, a_row, stage);
-                let b_bytes = self
-                    .b_ring
-                    .tile(k)
-                    .tma_load_2d_arriving_at(self.b_map, column, b_row, stage);
-                if self.rank == LEADER {
-                    self.load
-                        .sem(k)
-                        .expect_tx((a_bytes + b_bytes).across_ranks(RANKS));
+                if LOADS {
+                    let stage = self.load.sem(k).at_rank(LEADER);
+                    let column = (BLOCK_K as u32 * k) as i32;
+                    let a_bytes = self
+                        .a_ring
+                        .tile(k)
+                        .tma_load_2d_arriving_at(self.a_map, column, a_row, stage);
+                    let b_bytes = self
+                        .b_ring
+                        .tile(k)
+                        .tma_load_2d_arriving_at(self.b_map, column, b_row, stage);
+                    if self.rank == LEADER {
+                        self.load
+                            .sem(k)
+                            .expect_tx((a_bytes + b_bytes).across_ranks(RANKS));
+                    }
+                } else if self.rank == LEADER {
+                    // The one arrival the barrier was init'd for, with no
+                    // transaction bytes attached — so the stage completes on
+                    // the same barrier at the same point in the loop, having
+                    // moved nothing.
+                    self.load.sem(k).arrive();
                 }
                 k += 1;
             }
@@ -718,6 +886,14 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Tile<BLOCK_
 
     /// Chain the whole K walk into the pair's accumulator and publish it.
     ///
+    /// **`MMA` is [`Ablation`]'s arithmetic switch and is `true` in every
+    /// kernel this file ships.** At `false` the `tcgen05.mma` chain is gone and
+    /// everything around it stays: the same loop, the same wait on each stage,
+    /// the same `tcgen05.commit` releasing the operands and the same commit
+    /// publishing the accumulator. A `commit` with no outstanding MMA to cover
+    /// completes at once, which is what makes the rung run rather than hang —
+    /// and what makes it price the multiply and not the protocol.
+    ///
     /// # Safety
     ///
     /// One thread of the leader rank, with the accumulator's previous contents
@@ -725,7 +901,7 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Tile<BLOCK_
     /// accumulator, so only the very first instruction of the very first stage
     /// starts it fresh, and "first" is per *item*.
     #[inline(always)]
-    unsafe fn multiply(&self) {
+    unsafe fn multiply<const MMA: bool>(&self) {
         unsafe {
             // `MmaShape` is a re-export of `Tcgen05MmaShape` and `mma_walk_cg2`
             // takes the shape as a value, so widening the pair tile needs
@@ -736,13 +912,27 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Tile<BLOCK_
             let mut k = 0u32;
             while k < self.k_blocks {
                 self.load.wait(k);
-                mma_walk_cg2::<Bf16, CHUNKS>(
-                    self.accumulator.raw(),
-                    self.a_ring.tile(k).k_walk(),
-                    self.b_ring.tile(k).k_walk(),
-                    shape,
-                    k > 0,
-                );
+                if MMA {
+                    // One walk per swizzle atom of the stage: `k_walk` describes
+                    // exactly one, so a `BLOCK_K` wider than `ATOM_K` is that
+                    // many walks over the stacked subtiles the tile is already
+                    // stored as — the same bytes, the same chunk count, one
+                    // barrier instead of several. At `BLOCK_K = ATOM_K` this
+                    // loop is one iteration and folds away, which is what keeps
+                    // the shipped kernel's codegen where `regcount` found it.
+                    let (a, b) = (self.a_ring.tile(k), self.b_ring.tile(k));
+                    let mut atom = 0usize;
+                    while atom < ATile::<BLOCK_K>::SUBTILES {
+                        mma_walk_cg2::<Bf16, ATOM_CHUNKS>(
+                            self.accumulator.raw(),
+                            Atom::<BLOCK_M>::from_raw(a.subtile(atom)).k_walk(),
+                            Atom::<HALF_N>::from_raw(b.subtile(atom)).k_walk(),
+                            shape,
+                            k > 0 || atom > 0,
+                        );
+                        atom += 1;
+                    }
+                }
                 // The MMA releases its own operands, in both CTAs: a thread
                 // arriving here would only prove the instruction was *issued*.
                 commit_multicast_cg2(self.free.sem(k), PAIR);
@@ -840,8 +1030,8 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Tile<BLOCK_
     }
 }
 
-impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
-    for Tile<BLOCK_N, HALF_N, STAGES>
+impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAGES: usize> Job
+    for Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>
 {
     /// The pair shares one barrier set — the peer aims its TMA at the leader's
     /// stage barrier and the leader's MMA arrives in the peer's `free` and
@@ -895,10 +1085,10 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
             let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, self.group);
 
             if self.warp_id == 0 && self.lane == 0 {
-                self.produce(tile_m, tile_n, 0, self.k_blocks);
+                self.produce::<true>(tile_m, tile_n, 0, self.k_blocks);
             }
             if self.rank == LEADER && self.warp_id == 1 && self.lane == 0 {
-                self.multiply();
+                self.multiply::<true>();
             }
             self.done.wait(0);
             thread::sync_threads();
@@ -913,8 +1103,13 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
 /// **It computes a wrong `C` and is never checked.** See [`Epilogue::HotStore`]
 /// for what it is for and why an exact version of it does not exist.
 #[derive(Clone, Copy)]
-struct HotStore<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
-    tile: Tile<BLOCK_N, HALF_N, STAGES>,
+struct HotStore<
+    const BLOCK_N: usize,
+    const HALF_N: usize,
+    const BLOCK_K: usize,
+    const STAGES: usize,
+> {
+    tile: Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>,
     /// The item this cluster was launched for, and the only tile of `C` it ever
     /// writes. Read once outside the loop: [`pipeline::run`]'s first item *is*
     /// `cluster_idx`, so this is a tile the cluster would have written anyway
@@ -922,8 +1117,8 @@ struct HotStore<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> 
     home: u32,
 }
 
-impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
-    for HotStore<BLOCK_N, HALF_N, STAGES>
+impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAGES: usize> Job
+    for HotStore<BLOCK_N, HALF_N, BLOCK_K, STAGES>
 {
     const RANKS: u32 = crate::gemm::RANKS;
 
@@ -953,10 +1148,10 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
             let tile = self.tile;
             let (tile_m, tile_n) = pipeline::grouped(item, tile.tiles_m, tile.tiles_n, tile.group);
             if tile.warp_id == 0 && tile.lane == 0 {
-                tile.produce(tile_m, tile_n, 0, tile.k_blocks);
+                tile.produce::<true>(tile_m, tile_n, 0, tile.k_blocks);
             }
             if tile.rank == LEADER && tile.warp_id == 1 && tile.lane == 0 {
-                tile.multiply();
+                tile.multiply::<true>();
             }
             tile.done.wait(0);
             thread::sync_threads();
@@ -973,16 +1168,21 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
 /// [`Epilogue::DoubleDrain`] for what the second drain is measuring and why the
 /// second one goes to the home tile rather than to the item's.
 #[derive(Clone, Copy)]
-struct DoubleDrain<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
-    tile: Tile<BLOCK_N, HALF_N, STAGES>,
+struct DoubleDrain<
+    const BLOCK_N: usize,
+    const HALF_N: usize,
+    const BLOCK_K: usize,
+    const STAGES: usize,
+> {
+    tile: Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>,
     /// As [`HotStore::home`], and here for a second reason: the extra epilogue's
     /// bytes have to stay in L2 or this probe would price a doubled HBM stream
     /// as well as a doubled instruction count.
     home: u32,
 }
 
-impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
-    for DoubleDrain<BLOCK_N, HALF_N, STAGES>
+impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAGES: usize> Job
+    for DoubleDrain<BLOCK_N, HALF_N, BLOCK_K, STAGES>
 {
     const RANKS: u32 = crate::gemm::RANKS;
 
@@ -1026,14 +1226,19 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
 /// [`DoubleDrain`], whose extra pass includes the load: the difference between
 /// the two is what the LDTM costs, and the remainder is the store loop.
 #[derive(Clone, Copy)]
-struct DoubleStore<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
-    tile: Tile<BLOCK_N, HALF_N, STAGES>,
+struct DoubleStore<
+    const BLOCK_N: usize,
+    const HALF_N: usize,
+    const BLOCK_K: usize,
+    const STAGES: usize,
+> {
+    tile: Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>,
     /// As [`DoubleDrain::home`], and for both of its reasons.
     home: u32,
 }
 
-impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
-    for DoubleStore<BLOCK_N, HALF_N, STAGES>
+impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAGES: usize> Job
+    for DoubleStore<BLOCK_N, HALF_N, BLOCK_K, STAGES>
 {
     const RANKS: u32 = crate::gemm::RANKS;
 
@@ -1063,10 +1268,10 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
             let tile = self.tile;
             let (tile_m, tile_n) = pipeline::grouped(item, tile.tiles_m, tile.tiles_n, tile.group);
             if tile.warp_id == 0 && tile.lane == 0 {
-                tile.produce(tile_m, tile_n, 0, tile.k_blocks);
+                tile.produce::<true>(tile_m, tile_n, 0, tile.k_blocks);
             }
             if tile.rank == LEADER && tile.warp_id == 1 && tile.lane == 0 {
-                tile.multiply();
+                tile.multiply::<true>();
             }
             tile.done.wait(0);
             thread::sync_threads();
@@ -1118,21 +1323,23 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
 /// extra barrier at the boundary, it wants the boundary's *scope* moved inside
 /// the item.
 #[derive(Clone, Copy)]
-struct Lcsf<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> {
-    tile: Tile<BLOCK_N, HALF_N, STAGES>,
+struct Lcsf<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAGES: usize> {
+    tile: Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>,
     /// The item whose accumulator is still sitting in tensor memory, or
     /// [`Self::NONE`] before the first one and after the last.
     pending: u32,
 }
 
-impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Lcsf<BLOCK_N, HALF_N, STAGES> {
+impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAGES: usize>
+    Lcsf<BLOCK_N, HALF_N, BLOCK_K, STAGES>
+{
     /// No accumulator owed. `u32::MAX` is not a reachable item: the tile grid
     /// is `tiles_m * tiles_n` and both are `u32`, so a real item is strictly
     /// less than their product and cannot be this.
     const NONE: u32 = u32::MAX;
 
     #[inline(always)]
-    fn new(tile: Tile<BLOCK_N, HALF_N, STAGES>) -> Self {
+    fn new(tile: Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>) -> Self {
         Self {
             tile,
             pending: Self::NONE,
@@ -1160,8 +1367,8 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Lcsf<BLOCK_
     }
 }
 
-impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
-    for Lcsf<BLOCK_N, HALF_N, STAGES>
+impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAGES: usize> Job
+    for Lcsf<BLOCK_N, HALF_N, BLOCK_K, STAGES>
 {
     const RANKS: u32 = crate::gemm::RANKS;
 
@@ -1190,14 +1397,14 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
         unsafe {
             let tile = self.tile;
             let (tile_m, tile_n) = pipeline::grouped(item, tile.tiles_m, tile.tiles_n, tile.group);
-            let fill = Tile::<BLOCK_N, HALF_N, STAGES>::FILL.min(tile.k_blocks);
+            let fill = Tile::<BLOCK_N, HALF_N, BLOCK_K, STAGES>::FILL.min(tile.k_blocks);
 
             // Fill the pipe first, so the loads are in flight across the store
             // below. The producer does not block in this prefix — a stage
             // barrier below `STAGES` has nothing to recycle — so it reaches the
             // drain rather than sitting in `free.wait_recycled`.
             if tile.warp_id == 0 && tile.lane == 0 {
-                tile.produce(tile_m, tile_n, 0, fill);
+                tile.produce::<true>(tile_m, tile_n, 0, fill);
             }
             // Reconvergence, and it is load-bearing rather than tidy: `LDTM` is
             // warp-collective and the producer branch above leaves warp 0's
@@ -1223,15 +1430,124 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize> Job
             cluster::cluster_sync();
 
             if tile.warp_id == 0 && tile.lane == 0 {
-                tile.produce(tile_m, tile_n, fill, tile.k_blocks);
+                tile.produce::<true>(tile_m, tile_n, fill, tile.k_blocks);
             }
             if tile.rank == LEADER && tile.warp_id == 1 && tile.lane == 0 {
-                tile.multiply();
+                tile.multiply::<true>();
             }
             tile.done.wait(0);
             self.pending = item;
         }
     }
+}
+
+/// [`Ablation`]'s job: [`Tile`] with one phase of the item switched off per
+/// rung, and everything else — the launch geometry, the shared plan, the
+/// tensor memory, the item map, the barrier protocol and the scaffold —
+/// identical to the shipped kernel's.
+///
+/// **Every rung but `<true, true, true>` computes a wrong `C` and is never
+/// checked.** They are not GEMMs and are not supposed to be; see [`Ablation`]
+/// for what each one is subtracted from what.
+///
+/// The three switches are const parameters of the *shipped* phases rather than
+/// copies of them ([`Tile::produce`], [`Tile::multiply`], [`Tile::drain`]), so
+/// a rung cannot drift from the kernel it is meant to be a rung of, and
+/// `<true, true, true>` is `Tile::work` instruction for instruction. The tile
+/// is [`SHIPPED`]'s and not a parameter: this ladder decomposes one kernel, and
+/// re-running it at another shape is a change to [`BLOCK_N`] and [`STAGES`]
+/// rather than a second axis to sweep against.
+#[derive(Clone, Copy)]
+struct Ablated<const LOADS: bool, const MMA: bool, const DRAIN: bool> {
+    tile: Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>,
+}
+
+impl<const LOADS: bool, const MMA: bool, const DRAIN: bool> Job for Ablated<LOADS, MMA, DRAIN> {
+    const RANKS: u32 = crate::gemm::RANKS;
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn init(&self, item: u32) {
+        unsafe { self.tile.init(item) }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn inval(&self) {
+        unsafe { self.tile.inval() }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s. At `DRAIN = false` nothing reads the accumulator, which
+    /// is a wrong `C` and not a hazard; at `MMA = false` the drain reads
+    /// whatever the allocation held, which is the same.
+    #[inline(always)]
+    unsafe fn work(&mut self, item: u32) {
+        unsafe {
+            let tile = self.tile;
+            let (tile_m, tile_n) = pipeline::grouped(item, tile.tiles_m, tile.tiles_n, tile.group);
+            if tile.warp_id == 0 && tile.lane == 0 {
+                tile.produce::<LOADS>(tile_m, tile_n, 0, tile.k_blocks);
+            }
+            if tile.rank == LEADER && tile.warp_id == 1 && tile.lane == 0 {
+                tile.multiply::<MMA>();
+            }
+            tile.done.wait(0);
+            thread::sync_threads();
+            if DRAIN {
+                tile.drain(item);
+            }
+        }
+    }
+}
+
+/// [`Ablation::Idle`]'s job: an item with **no phases at all**.
+///
+/// It is a separate type rather than a fourth switch on [`Ablated`] because it
+/// differs from that family in more than one thing — no producer, no consumer,
+/// no wait on `done`, no reconvergence — and a rung that pretends to be one
+/// step from its neighbour when it is four would be exactly the ladder defect
+/// this file's method section warns about. It prices the floor: the persistent
+/// grid's item loop, the per-item barrier `init`/`inval`, and the two
+/// cluster-scope boundaries [`pipeline::run`] takes around every item.
+///
+/// **It computes nothing and is never checked.**
+#[derive(Clone, Copy)]
+struct Idle {
+    tile: Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>,
+}
+
+impl Job for Idle {
+    const RANKS: u32 = crate::gemm::RANKS;
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s. The barriers are still armed and retired per item —
+    /// that is the whole of what this rung measures.
+    #[inline(always)]
+    unsafe fn init(&self, item: u32) {
+        unsafe { self.tile.init(item) }
+    }
+
+    /// # Safety
+    ///
+    /// As [`Tile`]'s.
+    #[inline(always)]
+    unsafe fn inval(&self) {
+        unsafe { self.tile.inval() }
+    }
+
+    /// # Safety
+    ///
+    /// Nothing arrives at a barrier and nothing waits on one, so there is no
+    /// protocol left to violate.
+    #[inline(always)]
+    unsafe fn work(&mut self, _item: u32) {}
 }
 
 #[cuda_module]
@@ -1252,7 +1568,12 @@ pub mod kernels {
     /// item loop walks, and `c` must hold `ldc` columns for every row of it.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn attach<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize>(
+    unsafe fn attach<
+        const BLOCK_N: usize,
+        const HALF_N: usize,
+        const BLOCK_K: usize,
+        const STAGES: usize,
+    >(
         a_map: *const TmaDescriptor,
         b_map: *const TmaDescriptor,
         tiles_m: u32,
@@ -1261,7 +1582,7 @@ pub mod kernels {
         k_blocks: u32,
         ldc: u32,
         c: &mut DisjointSlice<u16>,
-    ) -> (Tile<BLOCK_N, HALF_N, STAGES>, ClcQueue) {
+    ) -> (Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>, ClcQueue) {
         // Everything a rung has to be true about, fired at codegen — which is
         // the only place the ring byte counts are known, and the reason `cargo
         // check` cannot stand in for `modal_app.py::build`.
@@ -1278,26 +1599,32 @@ pub mod kernels {
             assert!(BLOCK_N == 2 * HALF_N);
             assert!(BLOCK_N % DRAIN_N == 0);
             assert!(
-                shared_plan(BLOCK_N, STAGES)
-                    == ARing::<STAGES>::BYTES
-                        + BRing::<HALF_N, STAGES>::BYTES
+                shared_plan(BLOCK_N, BLOCK_K, STAGES)
+                    == ARing::<BLOCK_K, STAGES>::BYTES
+                        + BRing::<HALF_N, BLOCK_K, STAGES>::BYTES
                         + scratch_bytes(STAGES)
             );
             assert!(
-                (ARing::<STAGES>::BYTES + BRing::<HALF_N, STAGES>::BYTES + 2 * STAGES * 8 + 8 + 8)
+                (ARing::<BLOCK_K, STAGES>::BYTES
+                    + BRing::<HALF_N, BLOCK_K, STAGES>::BYTES
+                    + 2 * STAGES * 8
+                    + 8
+                    + 8)
                     % ClcQueue::ALIGNMENT
                     == 0
             );
         };
         unsafe {
-            let rings = ARing::<STAGES>::BYTES + BRing::<HALF_N, STAGES>::BYTES;
+            let rings = ARing::<BLOCK_K, STAGES>::BYTES + BRing::<HALF_N, BLOCK_K, STAGES>::BYTES;
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
             let scratch = smem.add(rings);
             let tmem_slot = scratch.add(2 * STAGES * 8 + 8) as *mut u32;
 
             let tile = Tile {
-                a_ring: ARing::<STAGES>::attach(smem),
-                b_ring: BRing::<HALF_N, STAGES>::attach(smem.add(ARing::<STAGES>::BYTES)),
+                a_ring: ARing::<BLOCK_K, STAGES>::attach(smem),
+                b_ring: BRing::<HALF_N, BLOCK_K, STAGES>::attach(
+                    smem.add(ARing::<BLOCK_K, STAGES>::BYTES),
+                ),
                 load: SemaphoreRing::<STAGES>::attach(scratch as *mut Barrier),
                 free: SemaphoreRing::<STAGES>::attach((scratch as *mut Barrier).add(STAGES)),
                 done: Semaphore::attach((scratch as *mut Barrier).add(2 * STAGES)),
@@ -1338,8 +1665,13 @@ pub mod kernels {
     /// Every thread of every rank must arrive, with the accumulator's last
     /// reader retired.
     #[inline(always)]
-    unsafe fn release<const BLOCK_N: usize, const HALF_N: usize, const STAGES: usize>(
-        tile: &Tile<BLOCK_N, HALF_N, STAGES>,
+    unsafe fn release<
+        const BLOCK_N: usize,
+        const HALF_N: usize,
+        const BLOCK_K: usize,
+        const STAGES: usize,
+    >(
+        tile: &Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>,
     ) {
         unsafe {
             tcgen05_fence_before_thread_sync();
@@ -1394,7 +1726,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            let (mut tile, _) = attach::<BLOCK_N, HALF_N, STAGES>(
+            let (mut tile, _) = attach::<BLOCK_N, HALF_N, BLOCK_K, STAGES>(
                 a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
             );
             pipeline::run(&mut tile, tiles_m * tiles_n);
@@ -1434,7 +1766,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            let (tile, _) = attach::<BLOCK_N, HALF_N, STAGES>(
+            let (tile, _) = attach::<BLOCK_N, HALF_N, BLOCK_K, STAGES>(
                 a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
             );
             let mut job = Lcsf::new(tile);
@@ -1475,7 +1807,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            let (tile, _) = attach::<BLOCK_N, HALF_N, STAGES>(
+            let (tile, _) = attach::<BLOCK_N, HALF_N, BLOCK_K, STAGES>(
                 a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
             );
             let mut job = HotStore {
@@ -1513,7 +1845,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            let (tile, _) = attach::<BLOCK_N, HALF_N, STAGES>(
+            let (tile, _) = attach::<BLOCK_N, HALF_N, BLOCK_K, STAGES>(
                 a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
             );
             let mut job = DoubleDrain {
@@ -1552,13 +1884,229 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            let (tile, _) = attach::<BLOCK_N, HALF_N, STAGES>(
+            let (tile, _) = attach::<BLOCK_N, HALF_N, BLOCK_K, STAGES>(
                 a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
             );
             let mut job = DoubleStore {
                 tile,
                 home: cluster::cluster_idx().min(tiles_m * tiles_n - 1),
             };
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            release(&job.tile);
+        }
+    }
+
+    // The ablation ladder is the five entry points below, and they are five
+    // rather than one because a `#[kernel]` cannot be generic. Every one of
+    // them launches on the shipped rung's geometry — `[256, 256] @ STAGES = 3`,
+    // 98 392 B, 2 CTAs an SM, `GROUP = 8`, the static schedule — so the only
+    // thing that differs between neighbours is which phase of the item runs.
+    // See `Ablation` for the lattice and for what each edge prices.
+    //
+    // **None of them computes a GEMM** and none is on the correctness gate.
+
+    /// **A deliberately wrong GEMM** — the ladder's `no drain` rung: the loads
+    /// and the MMA of the shipped kernel, with the epilogue removed.
+    ///
+    /// The MMA cannot be deleted along with the drain that consumed it: it is
+    /// `tcgen05.mma` behind inline PTX, its operands are released by a
+    /// `tcgen05.commit` the producer's `wait_recycled` blocks on, and its final
+    /// commit is what `done.wait` below is waiting for. Delete any of that and
+    /// this kernel hangs rather than gets faster. The ladder says so too — the
+    /// `no mma` rung below is a different number.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_cg2`]'s, less the epilogue: it writes no `C` at all.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 98_392,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_cg2_no_drain(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, _) = attach::<BLOCK_N, HALF_N, BLOCK_K, STAGES>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
+            let mut job = Ablated::<true, true, false> { tile };
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            release(&job.tile);
+        }
+    }
+
+    /// **A deliberately wrong GEMM** — the ladder's `no mma` rung: the loads
+    /// and the epilogue, with the `tcgen05.mma` chain removed and every
+    /// `tcgen05.commit` around it kept.
+    ///
+    /// The drain reads an accumulator nothing wrote, which is the wrong `C`
+    /// this rung is for. It is also what keeps the epilogue in the kernel: the
+    /// LDTM and the stores are issued whatever the values are, and no
+    /// instruction in either is data-dependent.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_cg2`]'s. It writes the tile the item names, with wrong numbers
+    /// in it.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 98_392,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_cg2_no_mma(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, _) = attach::<BLOCK_N, HALF_N, BLOCK_K, STAGES>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
+            let mut job = Ablated::<true, false, true> { tile };
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            release(&job.tile);
+        }
+    }
+
+    /// **A deliberately wrong GEMM** — the ladder's `loads` rung: the operand
+    /// stream and the barrier protocol, with neither the MMA nor the epilogue.
+    ///
+    /// It is one step from [`gemm_cg2_no_drain`] (the MMA) and one step from
+    /// [`gemm_cg2_no_mma`] (the epilogue), which is what closes the ladder's
+    /// 2 x 2: the two paths to it price the same two phases in the presence
+    /// and in the absence of each other.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_cg2`]'s, less the epilogue: it writes no `C`.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 98_392,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_cg2_loads(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, _) = attach::<BLOCK_N, HALF_N, BLOCK_K, STAGES>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
+            let mut job = Ablated::<true, false, false> { tile };
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            release(&job.tile);
+        }
+    }
+
+    /// **A deliberately wrong GEMM** — the ladder's `dry` rung: the whole
+    /// barrier protocol with **no operand traffic**.
+    ///
+    /// One step from [`gemm_cg2_loads`], and the step is the four TMA loads a
+    /// stage issues and the transaction count they are charged as. The stage
+    /// barrier is still armed, arrived at and waited on once per K block, the
+    /// ring still recycles against the consumer's commits, and the item still
+    /// walks its `k_blocks`. So `loads - dry` is what delivering the operands
+    /// costs *exposed*, and `dry` itself is a K loop with nothing in it.
+    ///
+    /// # Safety
+    ///
+    /// [`gemm_cg2`]'s, less the loads and the epilogue: the operand maps are
+    /// never read and no `C` is written.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 98_392,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_cg2_dry(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, _) = attach::<BLOCK_N, HALF_N, BLOCK_K, STAGES>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
+            let mut job = Ablated::<false, false, false> { tile };
+            pipeline::run(&mut job, tiles_m * tiles_n);
+            release(&job.tile);
+        }
+    }
+
+    /// **Not a GEMM at all** — the ladder's floor: [`pipeline::run`] over items
+    /// whose `work` does nothing.
+    ///
+    /// The TMEM allocation, the shared plan, the grid, the item count and the
+    /// per-item barrier lifecycle are the shipped kernel's; the item's body is
+    /// empty. It differs from [`gemm_cg2_dry`] in the whole barrier protocol
+    /// rather than in one phase, and is reported as a floor for that reason.
+    ///
+    /// # Safety
+    ///
+    /// The launch geometry's. It reads neither operand and writes no `C`.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 98_392,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_cg2_idle(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (tile, _) = attach::<BLOCK_N, HALF_N, BLOCK_K, STAGES>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
+            let mut job = Idle { tile };
             pipeline::run(&mut job, tiles_m * tiles_n);
             release(&job.tile);
         }
@@ -1605,7 +2153,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            let (mut tile, queue) = attach::<BLOCK_N, HALF_N, STAGES>(
+            let (mut tile, queue) = attach::<BLOCK_N, HALF_N, BLOCK_K, STAGES>(
                 a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
             );
             pipeline::run_stealing(&mut tile, queue);
@@ -1653,8 +2201,9 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            let (mut tile, _) =
-                attach::<128, 64, 2>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let (mut tile, _) = attach::<128, 64, 64, 2>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
             pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }
@@ -1692,8 +2241,9 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            let (mut tile, _) =
-                attach::<128, 64, 4>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let (mut tile, _) = attach::<128, 64, 64, 4>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
             pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }
@@ -1733,8 +2283,96 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            let (mut tile, _) =
-                attach::<256, 128, 2>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let (mut tile, _) = attach::<256, 128, 64, 2>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
+            pipeline::run(&mut tile, tiles_m * tiles_n);
+            release(&tile);
+        }
+    }
+
+    /// `[256, 256]` one atom deep, one stage — 32 824 B, and the shallow end of
+    /// the depth family.
+    ///
+    /// Tensor memory still caps it at two CTAs an SM, so the 33 KiB it does not
+    /// spend buys nothing: this rung gives up the pipeline for a resource that
+    /// was not binding. It exists to be the fixed-depth control for
+    /// [`gemm_256x256_k128_s1`], because a `BLOCK_K` comparison taken across
+    /// different `STAGES` would be two variables.
+    ///
+    /// # Safety
+    ///
+    /// As [`gemm_cg2`].
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 32_824,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_256x256_k64_s1(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (mut tile, _) = attach::<256, 128, 64, 1>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
+            pipeline::run(&mut tile, tiles_m * tiles_n);
+            release(&tile);
+        }
+    }
+
+    /// `[256, 256]` **two atoms in one stage** — 65 592 B, and the only rung in
+    /// this file where `BLOCK_K` is not 64.
+    ///
+    /// A stage is two stacked swizzle subtiles per operand, so one TMA per
+    /// operand brings both, one stage barrier covers both, and the MMA walks
+    /// each atom in turn — `SharedTile::k_walk` describes exactly one atom, so
+    /// the widening lives in the *walk count* and not in the walk. Instruction
+    /// for instruction against `gemm_256x256_k64_s1` at the same `K`, this rung
+    /// issues the same TMA loads and the same MMA chunks and **half the stage
+    /// barriers, `expect_tx` charges and loop iterations**.
+    ///
+    /// It has the same 65 KiB and the same 128 K in flight as
+    /// [`gemm_256x256_s2`], which is what makes that pair the control: same
+    /// bytes, same residency, opposite factorization.
+    ///
+    /// # Safety
+    ///
+    /// As [`gemm_cg2`]. `k_blocks` counts `BLOCK_K = 128` blocks here, which
+    /// the launcher derives from the rung rather than from a constant.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        dynamic_shared = 65_592,
+        dynamic_shared_alignment = 128
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gemm_256x256_k128_s1(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        group: u32,
+        k_blocks: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            let (mut tile, _) = attach::<256, 128, 128, 1>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
             pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }
@@ -1778,8 +2416,9 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            let (mut tile, _) =
-                attach::<128, 64, 3>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
+            let (mut tile, _) = attach::<128, 64, 64, 3>(
+                a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
+            );
             pipeline::run(&mut tile, tiles_m * tiles_n);
             release(&tile);
         }
@@ -1940,7 +2579,10 @@ fn wave_reuse(
     }
     let spanned = |flags: &[bool]| flags.iter().filter(|&&hit| hit).count();
     let (walked_rows, walked_columns) = (spanned(&spans_row), spanned(&spans_column));
-    let depth = (BLOCK_K * 2) as f64;
+    // Bytes of one swizzle atom of K, which is the unit this is quoted in for
+    // every rung: `reuse` is a ratio and does not care, and `distinct` is
+    // comparable across rungs only if the depth it is taken at is the same one.
+    let depth = (ATOM_K * 2) as f64;
     let distinct = (walked_rows * 2 * BLOCK_M + walked_columns * block_n) as f64 * depth;
     let requested = wave as f64 * (2 * BLOCK_M + block_n) as f64 * depth;
     (walked_rows, walked_columns, distinct, requested / distinct)
@@ -1961,6 +2603,9 @@ pub struct Plan {
     pub rung: Rung,
     /// Where the store phase sits — #15's variable.
     pub epilogue: Epilogue,
+    /// Which phases of the item run at all — the ablation ladder's variable,
+    /// and [`Ablation::Whole`] in every plan that computes a GEMM.
+    pub ablation: Ablation,
 }
 
 impl Plan {
@@ -1973,12 +2618,221 @@ impl Plan {
             group: GROUP,
             rung: SHIPPED,
             epilogue: Epilogue::Fused,
+            ablation: Ablation::Whole,
         }
     }
 
     /// The same plan with its store phase somewhere else — #15's variable.
     fn with(self, epilogue: Epilogue) -> Self {
         Plan { epilogue, ..self }
+    }
+
+    /// The same plan with one phase of the item switched off — the ablation
+    /// ladder's variable.
+    fn ablated(self, ablation: Ablation) -> Self {
+        Plan { ablation, ..self }
+    }
+}
+
+/// Which phases of an output tile a launch runs — the ablation ladder.
+///
+/// Every figure this file has ever published for a *part* of the kernel came
+/// from one of two instruments, and they disagree by construction. The
+/// `gemm-depth` fit's intercept is everything that does not scale with `K`,
+/// which is the part of the item boundary the pipeline is actually **exposed**
+/// to; #108's `2x`/`2s` probes add a second epilogue to an item and measure
+/// what one costs **serially**, with nothing in flight to hide it. #108
+/// measured 21.4 µs of serial epilogue against #104's 8.6–18.3 µs of *whole*
+/// fitted boundary, which is only consistent if most of the epilogue is
+/// already overlapped with something.
+///
+/// This axis asks the third question: with the kernel's own launch geometry
+/// and its own schedule, **what does the launch stop costing when a phase is
+/// taken out of it**. That is the exposed cost, measured by subtraction rather
+/// than by a fit, and it is what a change to that phase can hope to recover.
+///
+/// # It is a cube, and that is the whole design
+///
+/// An item has three phases — the operand traffic, the multiply, the epilogue
+/// — and each is either in the kernel or not, so the rungs are the eight
+/// corners of `{loads} × {mma} × {drain}` and every edge of the cube is one
+/// phase's cost *in one context*. A phase priced at a single corner has no
+/// error bar on the thing that matters: a ladder that peels phases off the end
+/// measures the epilogue in a kernel that still has its multiply, and the
+/// multiply in a kernel that has already lost its epilogue, and cannot say
+/// which of those attributions is the overlap.
+///
+/// Pricing every phase at all four of its corners is what separates
+/// **serial** from **exposed** without assuming either. The epilogue in the
+/// empty kernel (`drain - dry`) is as serial as this harness can make it; the
+/// epilogue in the whole kernel (`whole - no drain`) is what the shipped
+/// launch is exposed to; and if those two agree, the phase is overlapped with
+/// nothing, whatever a fit says about it.
+///
+/// **Five of the eight corners are built, and the missing three are an
+/// observation.** Every rung that runs the epilogue with the operand loads
+/// switched off fails to return; two were launched and stopped by hand, and
+/// [`Ablation::at`] has what separates them from the rungs that run and why the
+/// first explanation for it was wrong. The tables print `—` there. The epilogue
+/// keeps both of the contexts the question turns on — with the multiply and
+/// without — and what is lost is its cost in an *empty* kernel and the operand
+/// traffic's exposed cost.
+///
+/// [`Ablation::Idle`] sits outside the cube — it is a floor rather than a
+/// corner, differing from `dry` in the whole barrier protocol rather than in
+/// one phase, and is reported as one.
+///
+/// **Every rung but [`Ablation::Whole`] computes a wrong `C` on purpose and is
+/// excluded from the correctness gate**, which is the same exception
+/// [`Epilogue::HotStore`] and its two siblings carry, stated in the launch's
+/// own label.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ablation {
+    /// Every phase — the kernel this file ships, and the cube's `(1, 1, 1)`.
+    Whole,
+    /// The epilogue removed: no LDTM and no stores.
+    NoDrain,
+    /// The `tcgen05.mma` chain removed, and every barrier around it kept.
+    NoMma,
+    /// The operand stream and the barrier protocol, and nothing else.
+    LoadsOnly,
+    /// No phase at all: the barrier protocol walked once per K block, moving
+    /// nothing and computing nothing. The cube's `(0, 0, 0)`.
+    Dry,
+    /// An item with **no barrier protocol either** — the persistent grid's
+    /// loop, its per-item `init`/`inval`, and the two cluster boundaries around
+    /// each item. A floor rather than a corner, since it differs from
+    /// [`Ablation::Dry`] in the whole protocol rather than in one phase.
+    Idle,
+}
+
+impl Ablation {
+    /// What the benchmark prints, and the only place these names are spelled.
+    pub fn name(self) -> &'static str {
+        match self {
+            Ablation::Whole => "whole",
+            Ablation::NoDrain => "no drain",
+            Ablation::NoMma => "no mma",
+            Ablation::LoadsOnly => "loads",
+            Ablation::Dry => "dry",
+            Ablation::Idle => "idle",
+        }
+    }
+
+    /// The corner of the cube this rung sits at, as `(loads, mma, drain)`.
+    /// [`Ablation::Idle`] is not one and answers `None`, which is what keeps
+    /// the floor out of every difference the sweep takes.
+    fn corner(self) -> Option<(bool, bool, bool)> {
+        Some(match self {
+            Ablation::Whole => (true, true, true),
+            Ablation::NoDrain => (true, true, false),
+            Ablation::NoMma => (true, false, true),
+            Ablation::LoadsOnly => (true, false, false),
+            Ablation::Dry => (false, false, false),
+            Ablation::Idle => return None,
+        })
+    }
+
+    /// The rung at a corner, where one is built — the inverse of
+    /// [`Ablation::corner`], and how the sweep names the far end of an edge it
+    /// wants to difference.
+    ///
+    /// **Three corners answer `None`, and it is an observation rather than an
+    /// omission: every rung that runs the epilogue with the operand loads
+    /// switched off fails to return.**
+    ///
+    /// Two of them were built and launched at `8192x8192x512`, each produced no
+    /// result, and each was stopped by hand — `(loads 0, mma 1, drain 1)` and
+    /// `(loads 0, mma 0, drain 1)`. Their neighbours run: `(0, 0, 0)` is `dry`
+    /// and finishes in 23 µs, `(1, 0, 1)` is `no mma` and finishes at every
+    /// depth. So what separates the hanging rungs from the running ones is
+    /// **`loads = 0` and `drain = 1`**, in both MMA states, and the third
+    /// corner sharing that property is not built on this evidence rather than
+    /// on a third B200.
+    ///
+    /// **What hangs is not established, and the first guess was wrong.** That
+    /// guess was `tcgen05.mma` against never-written shared memory, and the
+    /// second hang refutes it — that rung issues no MMA at all. What is
+    /// recorded is the shape and not a mechanism: an epilogue in a kernel whose
+    /// TMA never ran is what does not come back, and neither the LDTM nor the
+    /// stores have any argument that depends on a load.
+    ///
+    /// What it costs the sweep is stated where it costs it. The epilogue keeps
+    /// both of the contexts the question turns on — with the multiply beside it
+    /// and without — so exposed-against-serial is unaffected. What is lost is
+    /// the epilogue in an *empty* kernel, which would have reproduced #108's
+    /// `2x` by a second route, and the operand traffic's exposed cost, whose
+    /// contexts with the drain present are two of these three.
+    fn at(corner: (bool, bool, bool)) -> Option<Ablation> {
+        LADDER
+            .into_iter()
+            .find(|rung| rung.corner() == Some(corner))
+    }
+
+    /// What the rung still runs, printed beside it so a row says what it is
+    /// rather than what it is called.
+    fn phases(self) -> &'static str {
+        match self.corner() {
+            None => "an empty item",
+            Some((true, true, true)) => "loads + mma + drain",
+            Some((true, true, false)) => "loads + mma",
+            Some((true, false, true)) => "loads + drain",
+            Some((true, false, false)) => "loads",
+            Some((false, false, false)) => "barriers only",
+            Some((false, _, _)) => "not built — see Ablation::at",
+        }
+    }
+
+    /// Whether a launch on this rung computes the GEMM. Only the whole kernel
+    /// does, and every other rung says so everywhere it appears.
+    fn exact(self) -> bool {
+        self == Ablation::Whole
+    }
+}
+
+/// One axis of [`Ablation`]'s cube: a phase an item either runs or does not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Loads,
+    Mma,
+    Drain,
+}
+
+/// The three of them, in the order the report prices them.
+const PHASES: [Phase; 3] = [Phase::Loads, Phase::Mma, Phase::Drain];
+
+impl Phase {
+    fn name(self) -> &'static str {
+        match self {
+            Phase::Loads => "operand traffic",
+            Phase::Mma => "the mma",
+            Phase::Drain => "the epilogue",
+        }
+    }
+
+    /// This phase set to `on`, with the other two axes left at `context` — the
+    /// corner whose difference from its twin is this phase's cost right there.
+    fn corner(self, context: (bool, bool), on: bool) -> (bool, bool, bool) {
+        match self {
+            Phase::Loads => (on, context.0, context.1),
+            Phase::Mma => (context.0, on, context.1),
+            Phase::Drain => (context.0, context.1, on),
+        }
+    }
+
+    /// What the other two axes are called, for the column that names a context.
+    fn context_of(self, context: (bool, bool)) -> String {
+        let (first, second) = match self {
+            Phase::Loads => ("mma", "drain"),
+            Phase::Mma => ("loads", "drain"),
+            Phase::Drain => ("loads", "mma"),
+        };
+        match context {
+            (false, false) => "in an empty kernel".to_string(),
+            (true, false) => format!("with {first}"),
+            (false, true) => format!("with {second}"),
+            (true, true) => format!("with {first} + {second}"),
+        }
     }
 }
 
@@ -2188,11 +3042,12 @@ fn run<T>(
     // kernel bounds-checks none of it. A size that does not divide is rejected
     // rather than launched into somebody else's memory.
     let rung = plan.rung;
-    if m % (2 * BLOCK_M) != 0 || n % rung.block_n != 0 || k % BLOCK_K != 0 {
+    if m % (2 * BLOCK_M) != 0 || n % rung.block_n != 0 || k % rung.block_k != 0 {
         return Err(format!(
-            "{m}x{n}x{k} does not divide the {}x{}x{BLOCK_K} tiling",
+            "{m}x{n}x{k} does not divide the {}x{}x{} tiling",
             2 * BLOCK_M,
-            rung.block_n
+            rung.block_n,
+            rung.block_k
         )
         .into());
     }
@@ -2216,13 +3071,16 @@ fn run<T>(
             GlobalLayout::<Bf16, 2>::packed(b.cu_deviceptr(), [k, n]),
         )
     };
-    let a_map = a_layout.tensor_map::<ATile>(&stream)?;
-    // The `B` tile is the one operand type a rung moves, and its box comes off
-    // the type — so the descriptor a `[256, 256]` rung loads through is the
-    // library's arithmetic on `BTile<128>` and not a number written here.
+    // A tensor map's box is `[R, SUBTILE_COLS]` — one swizzle atom wide,
+    // whatever the tile's own `C` — so **`BLOCK_K` does not reach the
+    // descriptor at all**: a two-atom stage is two boxes through the same map,
+    // which is what `tma_load_2d` already issues per stacked subtile. The one
+    // extent that does reach it is the tile's rows, so the `B` map is the only
+    // one a rung moves and it moves with `block_n` and not with `block_k`.
+    let a_map = a_layout.tensor_map::<ATile<ATOM_K>>(&stream)?;
     let b_map = match rung.block_n {
-        128 => b_layout.tensor_map::<BTile<64>>(&stream)?,
-        256 => b_layout.tensor_map::<BTile<128>>(&stream)?,
+        128 => b_layout.tensor_map::<BTile<64, ATOM_K>>(&stream)?,
+        256 => b_layout.tensor_map::<BTile<128, ATOM_K>>(&stream)?,
         columns => return Err(format!("no rung has {columns} pair columns").into()),
     };
 
@@ -2230,7 +3088,7 @@ fn run<T>(
     let cap = rung.max_clusters(shared_per_sm(context)?);
     let blocks = grid_for(plan.scheduler, m, n, rung, cap);
     let (tiles_m, tiles_n) = tile_grid(m, n, rung.block_n);
-    let k_blocks = (k / BLOCK_K) as u32;
+    let k_blocks = (k / rung.block_k) as u32;
     let config = LaunchConfig1D::new(blocks, THREADS, rung.shared() as u32);
 
     // One prepared launch per call, boxed because the handle's type is the
@@ -2264,49 +3122,82 @@ fn run<T>(
             Box::new(launch) as Box<dyn Fn(&mut DeviceBuffer<u16>) -> Result<(), Box<dyn Error>>>
         }};
     }
-    let launch_once = match (rung.entry, plan.scheduler, plan.epilogue) {
-        (Entry::Shipped, Scheduler::Static, Epilogue::Fused) => {
+    let launch_once = match (rung.entry, plan.scheduler, plan.epilogue, plan.ablation) {
+        // The ablation ladder first, because it is the one axis that is *only*
+        // ever taken at the shipped rung, the static schedule and the fused
+        // epilogue — a rung with a phase missing is not a thing to combine
+        // with a scheduler comparison or a store placement, and the catch-all
+        // below is what says so if anyone tries.
+        (Entry::Shipped, Scheduler::Static, Epilogue::Fused, Ablation::NoDrain) => {
+            launcher!(prepare_gemm_cg2_no_drain, gemm_cg2_no_drain)
+        }
+        (Entry::Shipped, Scheduler::Static, Epilogue::Fused, Ablation::NoMma) => {
+            launcher!(prepare_gemm_cg2_no_mma, gemm_cg2_no_mma)
+        }
+        (Entry::Shipped, Scheduler::Static, Epilogue::Fused, Ablation::LoadsOnly) => {
+            launcher!(prepare_gemm_cg2_loads, gemm_cg2_loads)
+        }
+        (Entry::Shipped, Scheduler::Static, Epilogue::Fused, Ablation::Dry) => {
+            launcher!(prepare_gemm_cg2_dry, gemm_cg2_dry)
+        }
+        (Entry::Shipped, Scheduler::Static, Epilogue::Fused, Ablation::Idle) => {
+            launcher!(prepare_gemm_cg2_idle, gemm_cg2_idle)
+        }
+        (Entry::Shipped, Scheduler::Static, Epilogue::Fused, Ablation::Whole) => {
             launcher!(prepare_gemm_cg2, gemm_cg2)
         }
-        (Entry::Shipped, Scheduler::Static, Epilogue::Deferred) => {
+        (Entry::Shipped, Scheduler::Static, Epilogue::Deferred, Ablation::Whole) => {
             launcher!(prepare_gemm_cg2_lcsf, gemm_cg2_lcsf)
         }
-        (Entry::Shipped, Scheduler::Static, Epilogue::HotStore) => {
+        (Entry::Shipped, Scheduler::Static, Epilogue::HotStore, Ablation::Whole) => {
             launcher!(prepare_gemm_cg2_hot, gemm_cg2_hot)
         }
-        (Entry::Shipped, Scheduler::Static, Epilogue::DoubleDrain) => {
+        (Entry::Shipped, Scheduler::Static, Epilogue::DoubleDrain, Ablation::Whole) => {
             launcher!(prepare_gemm_cg2_2x, gemm_cg2_2x)
         }
-        (Entry::Shipped, Scheduler::Static, Epilogue::DoubleStore) => {
+        (Entry::Shipped, Scheduler::Static, Epilogue::DoubleStore, Ablation::Whole) => {
             launcher!(prepare_gemm_cg2_2s, gemm_cg2_2s)
         }
-        (Entry::Shipped, Scheduler::Stealing, Epilogue::Fused) => {
+        (Entry::Shipped, Scheduler::Stealing, Epilogue::Fused, Ablation::Whole) => {
             launcher!(prepare_gemm_cg2_clc, gemm_cg2_clc)
         }
-        (Entry::N128S2, Scheduler::Static, Epilogue::Fused) => {
+        (Entry::N128S2, Scheduler::Static, Epilogue::Fused, Ablation::Whole) => {
             launcher!(prepare_gemm_256x128_s2, gemm_256x128_s2)
         }
-        (Entry::N128S4, Scheduler::Static, Epilogue::Fused) => {
+        (Entry::N128S4, Scheduler::Static, Epilogue::Fused, Ablation::Whole) => {
             launcher!(prepare_gemm_256x128_s4, gemm_256x128_s4)
         }
-        (Entry::N128S3, Scheduler::Static, Epilogue::Fused) => {
+        (Entry::N128S3, Scheduler::Static, Epilogue::Fused, Ablation::Whole) => {
             launcher!(prepare_gemm_256x128_s3, gemm_256x128_s3)
         }
-        (Entry::N256S2, Scheduler::Static, Epilogue::Fused) => {
+        (Entry::N256S2, Scheduler::Static, Epilogue::Fused, Ablation::Whole) => {
             launcher!(prepare_gemm_256x256_s2, gemm_256x256_s2)
         }
-        (Entry::Unbuilt, _, _) => {
-            return Err("[256,256] s4 is one CTA an SM and is computed, not built".into());
+        (Entry::N256K64S1, Scheduler::Static, Epilogue::Fused, Ablation::Whole) => {
+            launcher!(prepare_gemm_256x256_k64_s1, gemm_256x256_k64_s1)
+        }
+        (Entry::N256K128S1, Scheduler::Static, Epilogue::Fused, Ablation::Whole) => {
+            launcher!(prepare_gemm_256x256_k128_s1, gemm_256x256_k128_s1)
+        }
+        (Entry::Unbuilt, _, _, _) => {
+            return Err(format!(
+                "[256,{}] k{} s{} is one CTA an SM and is computed, not built",
+                rung.block_n, rung.block_k, rung.stages
+            )
+            .into());
         }
         // Only the shipped rung has a stealing twin, and deliberately: a
         // scheduler comparison at a moving tile would be two variables. The
         // deferred epilogue is the same rule for the same reason — it is the
         // one variable #15 moves, so it moves against the shipped kernel on the
-        // static schedule and nothing else.
-        (entry, scheduler, epilogue) => {
+        // static schedule and nothing else. The ablation ladder is the same
+        // rule once more: a rung with a phase missing exists to be subtracted
+        // from the shipped kernel and from nothing else.
+        (entry, scheduler, epilogue, ablation) => {
             return Err(format!(
-                "{entry:?} has no {} entry point on the {} schedule",
+                "{entry:?} has no {} entry point with {} on the {} schedule",
                 epilogue.name(),
+                ablation.name(),
                 scheduler.name()
             )
             .into());
@@ -2319,18 +3210,23 @@ fn run<T>(
     // every schedule, every rung, every traversal width, and #15's deferred
     // epilogue — goes through the element-by-element `==` before a clock can
     // reach it.
-    let label = if plan.epilogue.exact() {
-        // Exact on the 16-bit words, and the number beside it is the rounding
-        // those words carry — the representation error of a bf16 `C`, which is
-        // a property of the output format and not of this launch. See
-        // `check_c` for why the comparison is still `==`.
-        let worst = check_c(&c.to_host_vec(&stream)?, m, n, k)?;
-        format!("{m}x{n}x{k} exact, worst |rel| {worst:.2e} against the fp32 reference")
-    } else {
-        format!(
+    let label = match (plan.epilogue.exact(), plan.ablation.exact()) {
+        (true, true) => {
+            // Exact on the 16-bit words, and the number beside it is the
+            // rounding those words carry — the representation error of a bf16
+            // `C`, which is a property of the output format and not of this
+            // launch. See `check_c` for why the comparison is still `==`.
+            let worst = check_c(&c.to_host_vec(&stream)?, m, n, k)?;
+            format!("{m}x{n}x{k} exact, worst |rel| {worst:.2e} against the fp32 reference")
+        }
+        (false, _) => format!(
             "{m}x{n}x{k} UNCHECKED ({} is not a GEMM)",
             plan.epilogue.name()
-        )
+        ),
+        (_, false) => format!(
+            "{m}x{n}x{k} UNCHECKED ({} is not a GEMM)",
+            plan.ablation.name()
+        ),
     };
 
     let after = then(&stream, &mut || launch_once(&mut c))?;
@@ -2527,6 +3423,7 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
                     group,
                     rung: SHIPPED,
                     epilogue: Epilogue::Fused,
+                    ablation: Ablation::Whole,
                 };
                 let (label, _) = run(context, m, n, k, plan, nothing_after)?;
                 rounding.get_or_insert(label);
@@ -2555,6 +3452,7 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
                 group,
                 rung: SHIPPED,
                 epilogue: Epilogue::Deferred,
+                ablation: Ablation::Whole,
             };
             run(context, m, n, k, plan, nothing_after)?;
         }
@@ -2578,6 +3476,7 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
                     group,
                     rung,
                     epilogue: Epilogue::Fused,
+                    ablation: Ablation::Whole,
                 };
                 run(context, m, n, k, plan, nothing_after)?;
             }
@@ -2783,6 +3682,68 @@ const TILE_GROUPS: [u32; 4] = [1, 4, 8, 16];
 /// holding* — a CTA admitted and parked inside a blocking `tcgen05.alloc`.
 /// Every rung in this repo so far has had those two columns equal.
 ///
+/// # And the stage's K, which had never been swept — the second half
+///
+/// `BLOCK_K` was 64 from this file's first commit and no issue had moved it.
+/// Two facts about it turned up before any rung was built, and both are worth
+/// more than the sweep:
+///
+/// - **It cannot be swept as a walk width.** `SharedTile::k_walk` carries
+///   `const { assert!(C * E::BYTES == S::ATOM_BYTES) }` — a linear K-major walk
+///   spans exactly one swizzle atom — and `Swizzle128B` is the only mode in
+///   tree, so 64 is what a walk *is* at bf16. A wider stage is several atoms
+///   walked in turn, which is what [`Tile::multiply`] now does, and the
+///   descriptor never sees it: a tensor map's box is `[R, SUBTILE_COLS]`
+///   whatever the tile's `C`.
+/// - **It does not move arithmetic intensity.** A tile reads `(M + N) · K`
+///   bytes to do `2 · M · N · K` flops however K is blocked, so the mechanism
+///   #87 found — the whole of what the pair tile was worth — is not on this
+///   axis at all. What `BLOCK_K` moves is the *count* of stage barriers,
+///   `expect_tx` charges and loop iterations an item pays, and how coarsely the
+///   ring recycles.
+///
+/// And the shared budget makes it a factorization rather than an axis: a stage
+/// is `512 · BLOCK_K` bytes at this pair tile, so two CTAs an SM cap
+/// `BLOCK_K · STAGES` at 228 and every extra atom in a stage is a stage given
+/// back. [`K128S1`] and `[256, 256] @ s2` are the pair that holds the bytes
+/// fixed and moves only the factorization.
+///
+/// ## The predictions, written down before the rungs ran
+///
+/// 1. **`k64 s1` is a catastrophe.** One stage is no pipeline: the producer's
+///    `wait_recycled` cannot clear until the MMA reading that stage has
+///    committed, so loads and arithmetic serialize outright. Predicted
+///    **−35% to −55%** against the shipped kernel at 8192³.
+///    **Confirmed: −44.5% and −45.6%.**
+/// 2. **`k128 s1` loses to `k64 s2` at equal bytes**, and by most of what the
+///    load/MMA overlap is worth. Predicted **−20% to −45%**. **Refuted in
+///    magnitude: −14.4% and −16.6%** — right sign, half the size.
+/// 3. **`k128 s1` beats `k64 s1`**, and *this is the actual `BLOCK_K`
+///    measurement* — same depth, twice the K per barrier. Predicted **+5% to
+///    +20%**, from a halved per-K-block fixed cost. **Refuted upward, and it is
+///    the informative one: +38.2% and +42.4%.** Far too large to be barrier
+///    issue: the ablation's `dry` rung prices the *whole* barrier protocol at
+///    22 µs a tile against a 105 µs launch, and halving that cannot buy 38%.
+///    What a wider stage halves at one stage is **the number of times the
+///    pipeline is exposed to a load latency**, because the producer cannot
+///    refill until the MMA releases the one buffer. `BLOCK_K` is a
+///    latency-amortization lever and not a fixed-cost one, and it competes for
+///    the same bytes as the better lever.
+/// 4. **Nothing here beats the shipped kernel.** Confirmed.
+/// 5. **The register column says nothing again.** Confirmed: `k128 s1` prices
+///    at **246 registers** against `k64 s1`'s 168, zero spill either way, and
+///    is 38% faster. Eighth time (#47, #63, #67, #76, #94, #100, #109).
+///
+/// **What the sweep bought is a design rule, not a win**, and the 65 KiB pair
+/// is what states it: `k128 s1` and `k64 s2` are sixteen bytes apart, at
+/// identical residency, tiles, waves, reuse and K in flight, differing only in
+/// one barrier over two atoms against two barriers over one atom each — and
+/// **two shallow stages beat one deep one by 14–17%**. At a fixed shared
+/// budget, spend it on stages rather than on stage width. Which is why
+/// `BLOCK_K = 64`, the narrowest a walk admits, is right here rather than
+/// merely inherited: **it is swept, and the answer is that it was already
+/// right**, for a reason this file had not stated.
+///
 /// Every row is checked against the CPU reference before it is timed, by the
 /// same [`run`] the rest of the harness uses. The losers stay in the table.
 pub fn tile_sweep(
@@ -2797,20 +3758,38 @@ pub fn tile_sweep(
          memory an SM divides *queried* rather than written down. It is predicted; the\n\
          counted figure is `device-tests`' `tmem residency census`, and predicted and\n\
          counted disagreeing is a finding rather than a rounding error.\n\
-         `intensity` is the pair tile's M*N/(M+N), flops per operand byte."
+         `intensity` is the pair tile's M*N/(M+N), flops per operand byte — a\n\
+         property of the pair tile alone, so BLOCK_K does not move it and the two k128\n\
+         rungs are there to move something else. `K in flight` is block_k * stages, which\n\
+         is what the shared budget actually caps: two rungs sharing it declare the same\n\
+         plan and differ only in how that K is divided into stage barriers."
     );
 
     println!("\n1. the rungs, and what each one costs before anything is launched");
     println!(
-        "{:<16}{:>8}{:>10}{:>12}{:>10}{:>10}{:>12}",
-        "rung", "stages", "shared B", "TMEM cols", "CTA/SM", "clusters", "intensity"
+        "{:<18}{:>8}{:>8}{:>12}{:>10}{:>12}{:>10}{:>10}{:>12}",
+        "rung",
+        "block_k",
+        "stages",
+        "K in flight",
+        "shared B",
+        "TMEM cols",
+        "CTA/SM",
+        "clusters",
+        "intensity"
     );
-    for rung in RUNGS.into_iter().chain([UNBUILT]) {
-        let built = if rung == UNBUILT { "  (not built)" } else { "" };
+    for rung in RUNGS.into_iter().chain(UNBUILT) {
+        let built = if rung.entry == Entry::Unbuilt {
+            "  (not built)"
+        } else {
+            ""
+        };
         println!(
-            "{:<16}{:>8}{:>10}{:>12}{:>10}{:>10}{:>12.1}{built}",
+            "{:<18}{:>8}{:>8}{:>12}{:>10}{:>12}{:>10}{:>10}{:>12.1}{built}",
             rung.name(),
+            rung.block_k,
             rung.stages,
+            rung.k_in_flight(),
             rung.shared(),
             rung.block_n,
             rung.ctas_per_sm(per_sm),
@@ -2847,6 +3826,7 @@ pub fn tile_sweep(
                 group: GROUP,
                 rung,
                 epilogue: Epilogue::Fused,
+                ablation: Ablation::Whole,
             };
             eprintln!("{shape} on {}: staging and checking", rung.name());
             let (_, timings) = run(context, shape.m, shape.n, shape.k, plan, time)?;
@@ -2894,6 +3874,7 @@ pub fn tile_sweep(
                 group,
                 rung,
                 epilogue: Epilogue::Fused,
+                ablation: Ablation::Whole,
             };
             eprintln!(
                 "{SWEEP} on {} at group {group}: staging and checking",
@@ -2957,6 +3938,444 @@ pub fn tile_sweep(
     Ok(())
 }
 
+/// The cube, ordered by how many phases a rung still runs, then by which —
+/// which is the order the report prints and the order a reader can subtract in.
+/// [`Ablation::Idle`] is last and is the floor rather than a corner.
+const LADDER: [Ablation; 6] = [
+    Ablation::Whole,
+    Ablation::NoDrain,
+    Ablation::NoMma,
+    Ablation::LoadsOnly,
+    Ablation::Dry,
+    Ablation::Idle,
+];
+
+/// Items a cluster on the critical path walks at `m`x`n` — the divisor every
+/// per-tile figure in this file uses, and the deepest-loaded cluster rather
+/// than the average, because the launch ends when that one finishes.
+fn items_on_critical_path(m: usize, n: usize) -> f64 {
+    let items = tiles(m, n, BLOCK_N);
+    let clusters = grid_for(Scheduler::Static, m, n, SHIPPED, MAX_CLUSTERS) / RANKS;
+    items.div_ceil(clusters) as f64
+}
+
+/// Least squares of `y` on `x`, as `(slope, intercept)`.
+///
+/// The one statistical object in this file, kept to four lines because every
+/// fit it is asked for has between two and four points and the interesting
+/// question is never the arithmetic — it is which points went in, which is why
+/// every caller prints all of its selections rather than a preferred one.
+fn least_squares(points: &[(f64, f64)]) -> (f64, f64) {
+    let n = points.len() as f64;
+    let (sx, sy) = points
+        .iter()
+        .fold((0.0, 0.0), |(sx, sy), (x, y)| (sx + x, sy + y));
+    let (sxx, sxy) = points
+        .iter()
+        .fold((0.0, 0.0), |(sxx, sxy), (x, y)| (sxx + x * x, sxy + x * y));
+    let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+    (slope, (sy - slope * sx) / n)
+}
+
+/// The ablation ladder — `modal run modal_app.py::bench --case ablation`.
+///
+/// # What this measures that nothing else here does
+///
+/// Every figure this file publishes for a *part* of the kernel comes from one
+/// of two instruments, and they answer different questions. #104's `gemm-depth`
+/// fit puts the item boundary at **8.6–18.3 µs a tile** — the intercept, which
+/// is everything that does not scale with `K`, so it sees only what the
+/// pipeline is **exposed** to. #108's `2x`/`2s` probes run a second epilogue
+/// inside an item and price it at **21.4 µs, of which 13.1 is stores and 8.3
+/// is LDTM** — which is more than the whole fitted boundary, and can only be,
+/// because the second epilogue has nothing in flight to hide behind and so
+/// measures the epilogue's **serial** cost.
+///
+/// So most of the epilogue is overlapped with something and neither instrument
+/// says how much. This one does: it takes a phase *out* of the shipped kernel
+/// and measures what the launch stops costing. That is the exposed cost, by
+/// subtraction, with the launch geometry, the shared plan, the tensor memory,
+/// the residency, the traversal, the schedule and the item count all held
+/// fixed — and it is the quantity a change to that phase can hope to recover.
+///
+/// # The predictions, written down before the first run, and how they went
+///
+/// The first session ran the four corners with the loads always on. Two of
+/// these were refuted and the refutations are the result; they are kept as
+/// written, because a pre-registration edited after the fact is worth nothing.
+///
+/// 1. **The epilogue's exposed cost at 8192³ is well under #108's serial
+///    21.4 µs** — the fit sees 8.6–18.3 µs for the *whole* boundary and the
+///    epilogue is only part of it. Predicted **4–12 µs a tile**.
+///    **Refuted: 20.4 µs**, which is the serial figure to within 5%.
+/// 2. **The epilogue costs more with the multiply gone**, because there is then
+///    nothing left to cover it. Predicted a ratio of **1.5x to 4x**. **Refuted:
+///    1.01x.** The epilogue is overlapped with nothing, so #108's serial number
+///    and #104's fitted boundary have no reconciliation of the kind this
+///    function was built expecting — and the fit is the instrument that is
+///    wrong, not the probe.
+/// 3. **The MMA, exposed, is most of the launch.** Predicted 60–85% of 8192³.
+///    **Refuted downward: 24.6%**, and the reason is the same one #98 found —
+///    what a lone CTA's stall is covered by is the *other CTA*, not by another
+///    phase of its own item.
+/// 4. **The operand traffic is small.** Predicted under 15% of the launch at
+///    `K = 8192`. **Refuted: 33% — but only serially.** The corner that would
+///    have priced it with the multiply in place is one of the two that hang,
+///    so this number is the traffic in a kernel with no arithmetic to cover it
+///    and the prediction is not, strictly, settled. Stated that way rather
+///    than quoted as a share.
+/// 5. **`idle` is a few µs a tile and `K`-independent.** Confirmed: 1.7 µs a
+///    tile, 0.0122 ms a launch at every depth to three digits.
+/// 6. **Registers move and nothing follows them.** Confirmed, and it is the
+///    eighth time in this repo (#47, #63, #67, #76, #94, #100, #109): a rung
+///    with no epilogue is **28 registers on a zero frame** against the shipped
+///    kernel's 166 on 528 B, and the epilogue is the whole of both.
+///
+/// **And the result the whole thing is for.** The epilogue's exposed cost is
+/// **20.4 µs a tile at 8192³ against #108's serial 21.4**, and the `no drain`
+/// rung's own fit has **no fixed per-tile cost at all** — so the item boundary
+/// is the epilogue and nothing else, and it is overlapped with nothing. `no
+/// drain` measures **1850 TFLOP/s** where cuBLASLt in the same container
+/// measures 1808, and the epilogue is **111% of the whole gap to the library**.
+/// `examples/README.md` §7 has the tables and what they do to `stmatrix`.
+///
+/// # What a rung cannot prove
+///
+/// The decomposition is **context-dependent**, and the cube is what bounds
+/// that rather than hides it: an edge attributes to its phase everything the
+/// launch stops paying when that phase goes, which includes whatever the phase
+/// was *making other work wait for*. Two phases that overlap have a cost
+/// between them that neither subtraction owns — which is why every phase is
+/// priced at all four corners rather than one, and why the four numbers are
+/// printed rather than averaged.
+///
+/// It also cannot see **inside** a phase. `no mma` removes the whole
+/// `tcgen05.mma` chain, not its issue rate; `no loads` removes the traffic, not
+/// the TMA instruction; and no rung here separates the epilogue's LDTM from its
+/// stores, which is what #108's `2s` is for and this sweep deliberately does
+/// not duplicate. Every rung but the first computes a wrong `C`, so none is on
+/// the correctness gate and none of their numbers is a throughput.
+///
+/// # The hazard this ladder is most likely to fail on
+///
+/// A deleted drain can let a compiler delete the MMA that fed it. Four things
+/// say it did not, and the argument is the standard #101 set:
+///
+/// - **Counted, in the PTX.** An opcode census over `kittens_examples.ptx`,
+///   per entry function, is the direct check and it is unambiguous:
+///   `gemm_cg2_no_drain` carries **4 `tcgen05.mma`** — the same four chained
+///   chunks `gemm_cg2` has — with **0 `tcgen05.ld`, 0 `st.global` and 0
+///   `cvt.rn.bf16x2`**. The epilogue is gone and the arithmetic is not.
+///   `gemm_cg2_no_mma` is the mirror: **0 mma**, with all four LDTM, five
+///   stores and five `cvt` still there. `gemm_cg2_dry` is the only rung
+///   carrying a bare `mbarrier.arrive` and the only one with zero
+///   `cp.async.bulk.tensor`. Each rung removes exactly what it names.
+/// - **Structural.** The MMA is inline PTX writing tensor memory; its operands
+///   are released by a `tcgen05.commit` the producer's `wait_recycled` blocks
+///   on, and its last commit is what `done.wait` is waiting for. A dead-code
+///   pass that removed it would produce a kernel that hangs.
+/// - **Measured, by the cube itself.** `no drain` and `loads` differ only in
+///   the MMA. If the MMA had been deleted from `no drain` the two rungs would
+///   be the same kernel and would measure the same time. They differ by 26 µs
+///   a tile at 8192³.
+/// - **Priced.** `regcount` reports every one of these entry points off
+///   `ptxas -v` in the same run: 166 registers on a 528 B frame wherever the
+///   epilogue is, 20–28 on a zero frame wherever it is not, and no spill
+///   anywhere.
+pub fn ablation_ladder(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    baseline: Option<crate::bench::Baseline>,
+) -> Result<(), Box<dyn Error>> {
+    let sizes = crate::bench::GEMM_DEPTH_SIZES;
+    println!(
+        "gemm ablation ladder — min ms over 30 timed launches, static schedule, GROUP = {GROUP},\n\
+         the shipped [256,{BLOCK_N}] @ STAGES = {STAGES} rung throughout: same grid, same\n\
+         {SHARED_BYTES} B shared plan, same {BLOCK_N} accumulator columns, same {CTAS_PER_SM} CTAs\n\
+         an SM, same item count. One phase of the item is removed per rung and NOTHING ELSE\n\
+         MOVES.\n\
+         ONLY THE `whole` ROW COMPUTES A GEMM. It is checked element-by-element against the\n\
+         CPU reference before it is timed; every other row is UNCHECKED and computes a wrong\n\
+         `C` on purpose, exactly as `hot`, `2x` and `2s` do.\n\
+         M and N are 8192 in every row, so tiles, waves, grid, `C` bytes and the wave's own\n\
+         working set are identical everywhere and only the arithmetic between two item\n\
+         boundaries moves — which is what lets each rung carry its own fit."
+    );
+
+    println!("\n1. the ladder, at four reduction depths");
+    println!(
+        "{:<12}{:<22}{:>10}{:>10}{:>10}{:>10}",
+        "rung", "what it runs", "K=512", "K=2048", "K=8192", "K=32768"
+    );
+    let mut measured: Vec<(Ablation, Vec<f64>)> = Vec::new();
+    for rung in LADDER {
+        let mut row = Vec::new();
+        for &shape in sizes {
+            let plan = Plan::new(Scheduler::Static).ablated(rung);
+            eprintln!("{shape} on ablation rung `{}`: staging", rung.name());
+            let (_, timings) = run(context, shape.m, shape.n, shape.k, plan, time)?;
+            row.push(timings.min());
+        }
+        println!(
+            "{:<12}{:<22}{}",
+            rung.name(),
+            rung.phases(),
+            row.iter()
+                .map(|ms| format!("{ms:>10.4}"))
+                .collect::<String>()
+        );
+        measured.push((rung, row));
+    }
+    let at = |rung: Ablation, column: usize| {
+        measured
+            .iter()
+            .find(|row| row.0 == rung)
+            .map(|row| row.1[column])
+            .expect("every rung of LADDER was measured above")
+    };
+
+    println!(
+        "\n2. every phase priced at all four corners of the cube, in microseconds per output\n\
+         tile on the critical path. A row is one edge — two rungs differing in exactly that\n\
+         phase — so it is what the launch stops paying when the phase goes, IN THAT CONTEXT.\n\
+         The bottom row of each block is the phase in an otherwise empty kernel, which is as\n\
+         SERIAL as this harness can make it; the top row is the phase in the whole kernel,\n\
+         which is what the shipped launch is EXPOSED to. Those two agreeing means the phase\n\
+         is overlapped with nothing."
+    );
+    println!(
+        "{:<18}{:<24}{:>10}{:>10}{:>10}{:>10}",
+        "phase", "context", "K=512", "K=2048", "K=8192", "K=32768"
+    );
+    let per_tile = |shape: Shape, milliseconds: f64| {
+        milliseconds * 1e3 / items_on_critical_path(shape.m, shape.n)
+    };
+    const CONTEXTS: [(bool, bool); 4] =
+        [(true, true), (true, false), (false, true), (false, false)];
+    let edge = |phase: Phase, context: (bool, bool), column: usize| {
+        let with = Ablation::at(phase.corner(context, true))?;
+        let without = Ablation::at(phase.corner(context, false))?;
+        Some(at(with, column) - at(without, column))
+    };
+    for phase in PHASES {
+        for (row, context) in CONTEXTS.into_iter().enumerate() {
+            let cells: String = sizes
+                .iter()
+                .enumerate()
+                .map(|(column, &shape)| match edge(phase, context, column) {
+                    Some(milliseconds) => format!("{:>10.2}", per_tile(shape, milliseconds)),
+                    None => format!("{:>10}", "—"),
+                })
+                .collect();
+            println!(
+                "{:<18}{:<24}{cells}",
+                if row == 0 { phase.name() } else { "" },
+                phase.context_of(context)
+            );
+        }
+    }
+    let floor: String = sizes
+        .iter()
+        .enumerate()
+        .map(|(column, &shape)| format!("{:>10.2}", per_tile(shape, at(Ablation::Idle, column))))
+        .collect();
+    println!("{:<18}{:<24}{floor}", "the floor", "an empty item");
+    let protocol: String = sizes
+        .iter()
+        .enumerate()
+        .map(|(column, &shape)| {
+            format!(
+                "{:>10.2}",
+                per_tile(
+                    shape,
+                    at(Ablation::Dry, column) - at(Ablation::Idle, column)
+                )
+            )
+        })
+        .collect();
+    println!("{:<18}{:<24}{protocol}", "the protocol", "over the floor");
+
+    println!(
+        "\n3. the same thing as the answer it is for: SERIAL against EXPOSED, at each depth,\n\
+         with `hidden` the fraction of the phase's serial cost that the rest of the kernel\n\
+         was covering. `serial` is the phase in an empty kernel and `exposed` is the phase\n\
+         in the whole one, both in microseconds per tile.\n\
+         This is the column that reconciles — or does not — #108's 21.4 us of serial\n\
+         epilogue with #104's 8.6-18.3 us of whole fitted item boundary."
+    );
+    println!(
+        "{:<18}{:<10}{:>12}{:>12}{:>10}{:>12}",
+        "phase", "shape", "serial us", "exposed us", "ratio", "hidden"
+    );
+    for phase in PHASES {
+        for (column, &shape) in sizes.iter().enumerate() {
+            let (Some(serial), Some(exposed)) = (
+                edge(phase, (false, false), column),
+                edge(phase, (true, true), column),
+            ) else {
+                continue;
+            };
+            let (serial, exposed) = (per_tile(shape, serial), per_tile(shape, exposed));
+            println!(
+                "{:<18}{:<10}{:>12.2}{:>12.2}{:>10}{:>12}",
+                if column == 0 { phase.name() } else { "" },
+                format!("K={}", shape.k),
+                serial,
+                exposed,
+                format!("{:.2}x", exposed / serial),
+                format!("{:.0}%", 100.0 * (1.0 - exposed / serial))
+            );
+        }
+    }
+
+    println!(
+        "\n3b. the exposed cost as a share of the launch it was taken out of, which is the\n\
+         form a lever is ranked in: it is the most a change to that phase could ever be\n\
+         worth at that size, and every real change recovers some fraction of it."
+    );
+    println!(
+        "{:<18}{:>12}{:>12}{:>12}{:>12}",
+        "phase", "K=512", "K=2048", "K=8192", "K=32768"
+    );
+    for phase in PHASES {
+        let cells: String = sizes
+            .iter()
+            .enumerate()
+            .map(|(column, _)| match edge(phase, (true, true), column) {
+                Some(exposed) => {
+                    format!("{:>11.1}%", 100.0 * exposed / at(Ablation::Whole, column))
+                }
+                None => format!("{:>12}", "—"),
+            })
+            .collect();
+        println!("{:<18}{cells}", phase.name());
+    }
+
+    println!(
+        "\n4. a fit per rung, so the FIXED per-tile cost is decomposed and not only the\n\
+         launch. ms against K is a line whose intercept is everything that does not scale\n\
+         with K; #104 warns that since #102 that bucket also holds a K-dependent locality\n\
+         term, which is why all three point selections are printed and the spread between\n\
+         them is the honest uncertainty. `per tile` divides the intercept by the {} items a\n\
+         cluster on the critical path walks. The `whole` row is `gemm-depth` re-fitted, and\n\
+         has to reproduce #104's 21.5-27.2 us on the fp32 kernel for the rest to be read as\n\
+         a decomposition of that fit.",
+        items_on_critical_path(8192, 8192)
+    );
+    println!(
+        "{:<12}{:>20}{:>14}{:>14}{:>16}",
+        "rung", "points", "fixed ms", "per tile us", "steady TFLOP/s"
+    );
+    let selections: [(&str, &[usize]); 3] = [
+        ("8192, 32768", &[2, 3]),
+        ("2048, 8192, 32768", &[1, 2, 3]),
+        ("all four", &[0, 1, 2, 3]),
+    ];
+    let mut fits: Vec<(Ablation, Vec<(f64, f64)>)> = Vec::new();
+    for rung in LADDER {
+        let mut per_selection = Vec::new();
+        for (row, (label, points)) in selections.into_iter().enumerate() {
+            let taken: Vec<(f64, f64)> = points
+                .iter()
+                .map(|&column| (sizes[column].k as f64, at(rung, column)))
+                .collect();
+            let (slope, intercept) = least_squares(&taken);
+            per_selection.push((slope, intercept));
+            // A rung with no arithmetic in it has a slope near zero, and
+            // dividing by one produces a rate with no meaning rather than a
+            // large one. It is printed as absent instead.
+            let steady = 2.0 * 8192.0 * 8192.0 / (slope / 1e3) / 1e12;
+            println!(
+                "{:<12}{:>20}{:>14.4}{:>14.1}{:>16}",
+                if row == 0 { rung.name() } else { "" },
+                label,
+                intercept,
+                intercept * 1e3 / items_on_critical_path(8192, 8192),
+                if slope > 1e-6 {
+                    format!("{steady:.0}")
+                } else {
+                    "—".to_string()
+                }
+            );
+        }
+        fits.push((rung, per_selection));
+    }
+
+    println!(
+        "\n4b. the fits differenced along the cube's edges — how much of each phase's cost\n\
+         is FIXED per tile rather than proportional to K, which is the direct answer to what\n\
+         the item boundary is MADE OF. A phase whose intercept difference is the whole\n\
+         kernel's intercept is the whole boundary; one whose difference is zero is not in\n\
+         the boundary at all, whatever it costs per launch."
+    );
+    println!(
+        "{:<18}{:<24}{:>16}{:>16}{:>16}",
+        "phase", "context", "fixed us/tile", "3pt", "all four"
+    );
+    let fit_at = |rung: Ablation, selection: usize| {
+        fits.iter()
+            .find(|row| row.0 == rung)
+            .map(|row| row.1[selection].1)
+            .expect("every rung of LADDER was fitted above")
+    };
+    for phase in PHASES {
+        for (row, context) in [(true, true), (false, false)].into_iter().enumerate() {
+            let cells: String = (0..3)
+                .map(|selection| {
+                    let difference = Ablation::at(phase.corner(context, true))
+                        .zip(Ablation::at(phase.corner(context, false)))
+                        .map(|(with, without)| {
+                            fit_at(with, selection) - fit_at(without, selection)
+                        });
+                    match difference {
+                        Some(milliseconds) => format!(
+                            "{:>16.2}",
+                            milliseconds * 1e3 / items_on_critical_path(8192, 8192)
+                        ),
+                        None => format!("{:>16}", "—"),
+                    }
+                })
+                .collect();
+            println!(
+                "{:<18}{:<24}{cells}",
+                if row == 0 { phase.name() } else { "" },
+                phase.context_of(context)
+            );
+        }
+    }
+
+    let Some(baseline) = baseline else {
+        println!(
+            "\nno cuBLASLt drift control: built without --features cublas. modal_app.py::bench\n\
+             turns it on, and #109 is why this table wants one."
+        );
+        return Ok(());
+    };
+    println!(
+        "\n5. the drift control. Nothing here changes the shipped kernel, so `whole` at\n\
+         8192³ has to reproduce the published 0.812-0.825 of cuBLASLt for the rest of this\n\
+         run to be readable as a decomposition of THAT kernel — which is #109's lesson\n\
+         about a control the change itself moved."
+    );
+    println!(
+        "{:<18}{:>14}{:>14}{:>16}",
+        "shape", "cuBLASLt ms", "theirs TF/s", "whole/theirs"
+    );
+    for (column, &shape) in sizes.iter().enumerate() {
+        if shape.k != 8192 {
+            continue;
+        }
+        eprintln!("{shape}: staging and checking {}", baseline.name);
+        let theirs = (baseline.bench)(context, shape)?.0.min();
+        println!(
+            "{:<18}{:>14.4}{:>14.1}{:>16.3}",
+            shape,
+            theirs,
+            tflops(shape, theirs),
+            theirs / at(Ablation::Whole, column)
+        );
+    }
+    Ok(())
+}
 /// Sizes the epilogue sweep runs, chosen so the answer has to be a *shape* and
 /// not a number.
 ///
@@ -3310,6 +4729,7 @@ pub fn swizzle(
                 group,
                 rung: SHIPPED,
                 epilogue: Epilogue::Fused,
+                ablation: Ablation::Whole,
             },
         )?;
         let clc_ms = timed(
@@ -3320,6 +4740,7 @@ pub fn swizzle(
                 group,
                 rung: SHIPPED,
                 epilogue: Epilogue::Fused,
+                ablation: Ablation::Whole,
             },
         )?;
         let (rows, columns, distinct, reuse) =
@@ -3375,6 +4796,7 @@ pub fn swizzle(
                     group,
                     rung: SHIPPED,
                     epilogue: Epilogue::Fused,
+                    ablation: Ablation::Whole,
                 },
             )
         };

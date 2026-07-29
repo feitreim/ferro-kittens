@@ -852,6 +852,24 @@ pub fn main() -> ExitCode {
         };
     }
 
+    // `bench ablation` is the fourth, and the one that decomposes rather than
+    // sweeps: the same size sweep `gemm-depth` runs, with one phase of the
+    // item removed per rung and everything else held at the shipped kernel's.
+    // Where the three above ask "which setting is fastest", this asks "what is
+    // the time made of", which is the question a fitted intercept has been
+    // standing in for since #90.
+    if let Some((name, _)) = &selected
+        && name == "ablation"
+    {
+        return match gemm::ablation_ladder(&context, CUBLASLT) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     if let Some((name, _)) = &selected
         && !cases().iter().any(|case| case.name == name)
     {
