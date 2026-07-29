@@ -74,12 +74,31 @@ use cuda_device::cluster;
 use cuda_device::shared::SharedArray;
 use cuda_device::tcgen05::{
     Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor, Tcgen05MmaShape,
-    cvt_f32x2_bf16x2, stmatrix_m8n8_x2, tcgen05_alloc_cg2, tcgen05_commit_multicast_cg2,
-    tcgen05_dealloc_cg2, tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_mma_f16_cg2,
+    cvt_f32x2_bf16x2, tcgen05_alloc_cg2, tcgen05_commit_multicast_cg2, tcgen05_dealloc_cg2,
+    tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_mma_f16_cg2,
     tcgen05_relinquish_alloc_permit_cg2,
 };
 use cuda_device::tma::{TmaDescriptor, cp_async_bulk_tensor_2d_g2s_multicast_cg2};
 use cuda_device::{DisjointSlice, cluster_launch, cuda_module, kernel, thread, warp};
+// The one name below that does not resolve to what upstream's `main.rs`
+// resolves it to, and the reason this module exists at all rather than a copy
+// of upstream's binary.
+//
+// `cuda_device::tcgen05::stmatrix_m8n8_x2` does not lower for `sm_100a` on
+// this toolchain: it reaches the NVPTX back end as
+// `llvm.nvvm.stmatrix.sync.aligned.m8n8.x2.b16.p3`, is selected by nothing, and
+// is emitted as a call to an `.extern .func` that does not exist. `ptxas`
+// stops on it — *"line 10; fatal: Parsing error near '.nvvm'"* — and since a
+// package's kernels share one embedded bundle, one such call takes down the
+// load of every kernel in this crate, the port included. It is the same defect
+// `kittens::ldst` documents at `b099f64` and works around with `ptx_asm!`, and
+// `kittens::ldst::stmatrix_m8n8_x2` has upstream's exact signature and emits
+// upstream's exact instruction, `stmatrix.sync.aligned.m8n8.x2.shared.b16`.
+//
+// So this is a one-line change to *which implementation of one instruction*
+// the device code links against. `gemm_sol_upstream_kernels.rs` is still not
+// modified — it cannot be, and the alternative is no measurement at all.
+use kittens::ldst::stmatrix_m8n8_x2;
 
 use crate::bench::{Shape, Timings, time};
 use crate::gemm_sol::{check_output, stage_f16};

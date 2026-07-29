@@ -671,6 +671,19 @@ def doctor() -> None:
     _run(["cargo", "oxide", "doctor"], cwd="/opt/warmup")
 
 
+@app.function(cpu=8, timeout=CHECKING)
+@completes
+def ptxpeek() -> None:
+    """TEMPORARY: build `experiments/` and show where its PTX stops parsing."""
+    _run([*STUB_ENV, "cargo", "oxide", "build", "kittens-experiments", "--arch", "sm_100a"],
+         cwd=EXPERIMENTS_DIR)
+    _run(["sh", "-c",
+          "echo '--- lines 55..130 ---'; sed -n '55,130p' kittens_experiments.ptx;"
+          " echo '--- shared_mem_51 refs ---';"
+          " grep -n '__shared_mem_5[0-9]' kittens_experiments.ptx | head -20"],
+         cwd=EXPERIMENTS_DIR)
+
+
 @app.function(timeout=ASKING)
 @completes
 def stall(seconds: int = 120) -> None:
