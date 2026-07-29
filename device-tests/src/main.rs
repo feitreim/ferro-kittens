@@ -1610,6 +1610,57 @@ pub mod kernels {
         }
     }
 
+    /// [`ldtm_x8_map`] with all four of the band's `.x8` issues in flight
+    /// before the one wait — `TmemTile::tile_x8_batched`.
+    ///
+    /// Batching moves the wait and nothing else, so the tile it returns must be
+    /// the tile [`ldtm_x8_map`] returns, which must be the tile
+    /// [`sttm_roundtrip`] returns. What it *could* get wrong is the arrival
+    /// order: four loads outstanding at once, resolved after a single
+    /// `tcgen05.wait::ld`, is a shape no document at this pin describes, and a
+    /// wait that retired only the last issue would return three stale groups.
+    /// The seed and the dump are byte-for-byte the two cases above's, so
+    /// `observed[i] == i` says both that the wait covers every issue and that
+    /// the register order survived the batch.
+    ///
+    /// Launch with `ROWS` threads, as [`sttm_roundtrip`].
+    #[kernel]
+    pub unsafe fn ldtm_x8_batched_map(mut out: DisjointSlice<f32>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tmem = alloc_block(smem as *mut u32, COLUMNS as u32);
+            let band = Accumulator::from_raw(tmem);
+            let warp_id = warp::warp_id();
+            let lane = warp::lane_id();
+
+            let mut tile = RegTile::<32, COLUMNS, BaseLdtm>::zero();
+            let slots = RegTile::<32, COLUMNS, BaseLdtm>::SLOTS;
+            let values = RegTile::<32, COLUMNS, BaseLdtm>::VALUES;
+            let mut slot = 0usize;
+            while slot < slots {
+                let mut value = 0usize;
+                while value < values {
+                    let index = dump_index(warp_id as usize, lane, slot, value, slots, values);
+                    tile.set(slot, value, index as f32);
+                    value += 1;
+                }
+                slot += 1;
+            }
+
+            band.store_tile(32 * warp_id, 0, tile);
+            store_wait();
+            dump_band(
+                band.tile_x8_batched::<32, COLUMNS, 4>(32 * warp_id, 0),
+                warp_id,
+                lane,
+                &mut out,
+            );
+
+            thread::sync_threads();
+            dealloc_block(tmem, COLUMNS as u32);
+        }
+    }
+
     /// One CTA's whole TMEM lifecycle, over a grid that does not fit in one
     /// wave and a process that launches it more than once.
     ///
@@ -5797,6 +5848,16 @@ fn run() -> Result<usize, Box<dyn Error>> {
         Box::new(|| {
             check_sttm_roundtrip(stream, |config, out| unsafe {
                 module.ldtm_x8_map(stream, config, out)
+            })
+        }),
+    ));
+    // And the same tile again with every issue of the band outstanding at once,
+    // which is a claim about what one `tcgen05.wait::ld` retires.
+    cases.push((
+        "ldtm x8 batched map",
+        Box::new(|| {
+            check_sttm_roundtrip(stream, |config, out| unsafe {
+                module.ldtm_x8_batched_map(stream, config, out)
             })
         }),
     ));

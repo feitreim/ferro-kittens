@@ -800,6 +800,16 @@ def _measure(arch: str) -> dict[tuple[str, str], dict[str, int]]:
 CENSUS_OPCODES = (
     ("mma", "tcgen05.mma"),
     ("ldtm", "tcgen05.ld"),
+    # The *waits*, which are a separate claim from the issues and the only
+    # column that can see one.
+    #
+    # #117 found that the LDTM half of a staged epilogue is its wait and not its
+    # issue, and `TmemTile::tile_x8_batched` acts on that by putting a band's
+    # issues in flight before a single `tcgen05.wait::ld`. That changes no other
+    # count in this table -- same `tcgen05.ld`, same `stmatrix`, same stores --
+    # so without this column a batched drain and an unbatched one census
+    # identically and the arm cannot be gated at all.
+    ("ldtm.wait", "tcgen05.wait::ld"),
     ("tma", "cp.async.bulk.tensor"),
     ("stmatrix", "stmatrix"),
     ("ld.sh.v4", "ld.shared.v4"),

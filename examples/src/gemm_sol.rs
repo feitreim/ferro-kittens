@@ -46,6 +46,50 @@ pub const ISSUE_ONLY: u8 = 2;
 /// without being read, so the difference against [`WHOLE`] is the epilogue's
 /// cost *including* whatever of it fails to overlap.
 pub const NO_DRAIN: u8 = 3;
+/// The whole kernel with the drain's **global half** run a second time per
+/// band: an extra `ld.shared` + `st.global.v4` pass over the staging tile,
+/// aimed at the cluster's own first output tile so the extra bytes stay in L2.
+///
+/// The three `TWICE_*` arms are one ladder, and each rung's difference from the
+/// one below prices one third of the `tcgen05.ld` → `stmatrix` → `st.global`
+/// chain. [`TWICE_ALL`] against [`WHOLE`] is a whole extra drain, so it prices
+/// the drain **serially** — which is the term `whole − no drain` cannot
+/// separate from the drain's failure to overlap.
+///
+/// They compute a wrong `C` and are on no correctness gate, as every doubling
+/// probe in this repo is.
+pub const TWICE_GLOBAL: u8 = 4;
+/// [`TWICE_GLOBAL`] with the `cvt` + `stmatrix` pass doubled as well, so it
+/// also owes the write-after-read `warp::sync_mask` a second `stmatrix` pass
+/// costs.
+pub const TWICE_SHARED: u8 = 5;
+/// [`TWICE_SHARED`] with the LDTM doubled too — the whole drain twice.
+pub const TWICE_ALL: u8 = 6;
+
+/// 64-column bands with **a wait per LDTM issue** — the drain that shipped
+/// through #144, and the one `gemm_sol_ablate`'s doubling ladder decomposes.
+pub const DRAIN_PER_ISSUE: u8 = 0;
+/// A 64-column band with **both** of its LDTM issues in flight before one wait,
+/// through [`TmemTile::tile_x8_batched`]. Half the waits per byte of `C`, the
+/// same instruction in every other column of the census, the same shared plan.
+///
+/// It is worth **+0.9% of the launch at 8192³ and nothing at 4096³**, in two
+/// round-robin passes each (0.5864/0.5860 → 0.5820/0.5810 ms, and 0.1056/0.1058
+/// → 0.1054/0.1058), and it ships on that.
+pub const DRAIN_PAIRED: u8 = 1;
+/// A 128-column band, all four issues in flight before one wait: a quarter of
+/// [`DRAIN_PER_ISSUE`]'s waits per byte of `C`, at 128 f32 a thread live.
+///
+/// **It loses** — −1.1 to −1.3% at 4096³ and +0.2 to +0.3% at 8192³ — and it is
+/// kept because a rung that loses is the evidence for the one that wins. It is
+/// also the only rung here that is not free: the wider band takes registers to
+/// 176/168 and the stack frame from 256 B to 512, where [`DRAIN_PAIRED`] moves
+/// neither at M256 and only registers at M512. Some of the loss is that frame
+/// and this file does not separate the two.
+pub const DRAIN_WIDE: u8 = 2;
+/// The drain both shipped entries take, named once here so a rung that wins its
+/// A/B ships by moving this line — which is what [`DRAIN_PAIRED`] did.
+pub const SHIPPED_DRAIN: u8 = DRAIN_PAIRED;
 
 const fn loads(ablate: u8) -> bool {
     ablate != ISSUE_ONLY
@@ -54,7 +98,16 @@ const fn multiplies(ablate: u8) -> bool {
     ablate != FEED_ONLY
 }
 const fn drains(ablate: u8) -> bool {
-    ablate == WHOLE
+    ablate == WHOLE || ablate >= TWICE_GLOBAL
+}
+/// How much of the drain the doubling ladder repeats: 0 none, 1 the global
+/// half, 2 the `stmatrix` half too, 3 the whole of it including LDTM.
+const fn twice(ablate: u8) -> u8 {
+    if ablate >= TWICE_GLOBAL {
+        ablate - TWICE_GLOBAL + 1
+    } else {
+        0
+    }
 }
 
 const BLOCK_M: usize = 128;
@@ -294,22 +347,42 @@ impl Common {
         }
     }
 
+    /// This warp's slice of the staging plan, as the `[32, STAGE_N]` tile the
+    /// drain writes and reads back.
     #[inline(always)]
-    unsafe fn drain<const STAGE_N: usize>(
+    unsafe fn staging<const STAGE_N: usize>(self) -> SharedTile<Bf16, 32, STAGE_N, Swizzle128B> {
+        unsafe {
+            SharedTile::from_raw(
+                self.stage_base.add(
+                    self.warp_id as usize * SharedTile::<Bf16, 32, STAGE_N, Swizzle128B>::BYTES,
+                ),
+            )
+        }
+    }
+
+    /// The shipped drain, and the doubling ladder that prices it.
+    ///
+    /// At [`WHOLE`] this is the loop #126 describes and nothing else: a band of
+    /// [`BAND_N`] columns out of TMEM, `stmatrix` into the warp's staging tile,
+    /// the whole tile out to `C`, and the write-after-read the next band owes
+    /// itself. At a `TWICE_*` arm the named half runs a second time with its
+    /// global stores aimed at `again` — the cluster's own first output tile, so
+    /// the extra bytes stay in L2 and the probe prices instructions rather than
+    /// a doubled HBM stream.
+    #[inline(always)]
+    unsafe fn drain<const ABLATE: u8, const STAGE_N: usize>(
         self,
         accumulator: Accumulator,
         tile_row: u32,
         tile_column: u32,
+        again: (u32, u32),
     ) {
         unsafe {
             const {
                 assert!(STAGE_N.is_multiple_of(BAND_N));
                 assert!(BLOCK_N.is_multiple_of(STAGE_N));
             };
-            let stage =
-                SharedTile::<Bf16, 32, STAGE_N, Swizzle128B>::from_raw(self.stage_base.add(
-                    self.warp_id as usize * SharedTile::<Bf16, 32, STAGE_N, Swizzle128B>::BYTES,
-                ));
+            let stage = self.staging::<STAGE_N>();
             let row = tile_row + self.rank * BLOCK_M as u32 + self.warp_id * 32;
             let mut column = 0u32;
             while column < BLOCK_N as u32 {
@@ -318,7 +391,81 @@ impl Common {
                     let band: StageBand =
                         accumulator.tile_x8(32 * self.warp_id, column + band_column);
                     store_tile_x4(stage.chunk_writer(), 0, band_column, self.lane, band);
+                    if twice(ABLATE) >= 2 {
+                        // The band is still live here, so rung 2 doubles the
+                        // `cvt` + `stmatrix` pass alone and rung 3 doubles the
+                        // LDTM in front of it. The extra write lands on words
+                        // nothing has read yet, so no rung owes an extra
+                        // `sync_mask` and the ladder holds the syncs fixed.
+                        let restaged: StageBand = if twice(ABLATE) >= 3 {
+                            accumulator.tile_x8(32 * self.warp_id, column + band_column)
+                        } else {
+                            band
+                        };
+                        store_tile_x4(stage.chunk_writer(), 0, band_column, self.lane, restaged);
+                    }
                     band_column += BAND_N as u32;
+                }
+                warp::sync_mask(u32::MAX);
+                store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
+                    self.c,
+                    row,
+                    tile_column + column,
+                    self.lane,
+                    stage,
+                );
+                if twice(ABLATE) >= 1 {
+                    store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
+                        self.c,
+                        again.0 + self.rank * BLOCK_M as u32 + self.warp_id * 32,
+                        again.1 + column,
+                        self.lane,
+                        stage,
+                    );
+                }
+                warp::sync_mask(u32::MAX);
+                column += STAGE_N as u32;
+            }
+        }
+    }
+
+    /// [`Self::drain`] with the band's LDTM issues batched behind one wait, and
+    /// the band width a parameter.
+    ///
+    /// `BAND` columns and `ISSUES = BAND / 32` `.x8` loads — two per 64 columns,
+    /// one per 16 rows of the warp's 32. Nothing else moves: the same
+    /// `stmatrix`, the same staging tile, the same `store_shared_rows`, the same
+    /// two `warp::sync_mask` per staged pass, and the same shared plan, so the
+    /// difference against [`Self::drain`] is the wait structure and the band's
+    /// register liveness and nothing besides.
+    #[inline(always)]
+    unsafe fn drain_batched<const STAGE_N: usize, const BAND: usize, const ISSUES: usize>(
+        self,
+        accumulator: Accumulator,
+        tile_row: u32,
+        tile_column: u32,
+    ) where
+        BaseLdtm: kittens::reg::FragmentLayout<32, BAND>,
+    {
+        unsafe {
+            const {
+                assert!(STAGE_N.is_multiple_of(BAND));
+                assert!(BLOCK_N.is_multiple_of(STAGE_N));
+                assert!(ISSUES == BAND / 32);
+            };
+            let stage = self.staging::<STAGE_N>();
+            let row = tile_row + self.rank * BLOCK_M as u32 + self.warp_id * 32;
+            let mut column = 0u32;
+            while column < BLOCK_N as u32 {
+                let mut band_column = 0u32;
+                while band_column < STAGE_N as u32 {
+                    let band: RegTile<32, BAND, BaseLdtm> = accumulator
+                        .tile_x8_batched::<32, BAND, ISSUES>(
+                            32 * self.warp_id,
+                            column + band_column,
+                        );
+                    store_tile_x4(stage.chunk_writer(), 0, band_column, self.lane, band);
+                    band_column += BAND as u32;
                 }
                 warp::sync_mask(u32::MAX);
                 store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
@@ -330,6 +477,29 @@ impl Common {
                 );
                 warp::sync_mask(u32::MAX);
                 column += STAGE_N as u32;
+            }
+        }
+    }
+
+    /// Which drain a `DRAIN` value names. The dead arms fold away: `DRAIN` is a
+    /// const and every arm is instantiated with literal widths.
+    #[inline(always)]
+    unsafe fn drain_dial<const ABLATE: u8, const DRAIN: u8, const STAGE_N: usize>(
+        self,
+        accumulator: Accumulator,
+        tile_row: u32,
+        tile_column: u32,
+        again: (u32, u32),
+    ) {
+        unsafe {
+            match DRAIN {
+                DRAIN_PAIRED => {
+                    self.drain_batched::<STAGE_N, BAND_N, 2>(accumulator, tile_row, tile_column)
+                }
+                DRAIN_WIDE => {
+                    self.drain_batched::<STAGE_N, 128, 4>(accumulator, tile_row, tile_column)
+                }
+                _ => self.drain::<ABLATE, STAGE_N>(accumulator, tile_row, tile_column, again),
             }
         }
     }
@@ -470,21 +640,32 @@ impl Small {
     }
 
     #[inline(always)]
-    unsafe fn epilogue<const ABLATE: u8>(self) {
+    unsafe fn epilogue<const ABLATE: u8, const DRAIN: u8>(self) {
         unsafe {
             let common = self.common;
             let mut sequence = 0u32;
+            let mut again = (0u32, 0u32);
             loop {
                 let info = common.next_info(sequence);
                 if info.has_work == 0 {
                     break;
                 }
+                let (row, column) = (
+                    info.row * (2 * BLOCK_M) as u32,
+                    info.column * BLOCK_N as u32,
+                );
+                // Only the doubling probes have a second destination, and only
+                // they pay for tracking it.
+                if twice(ABLATE) > 0 && sequence == 0 {
+                    again = (row, column);
+                }
                 common.full.wait(sequence);
                 if drains(ABLATE) {
-                    common.drain::<SMALL_STAGE_N>(
+                    common.drain_dial::<ABLATE, DRAIN, SMALL_STAGE_N>(
                         Common::accumulator(self.accumulator, sequence),
-                        info.row * (2 * BLOCK_M) as u32,
-                        info.column * BLOCK_N as u32,
+                        row,
+                        column,
+                        again,
                     );
                 }
                 common.release_accumulator(sequence);
@@ -646,23 +827,28 @@ impl Large {
     }
 
     #[inline(always)]
-    unsafe fn epilogue<const ABLATE: u8>(self) {
+    unsafe fn epilogue<const ABLATE: u8, const DRAIN: u8>(self) {
         unsafe {
             let common = self.common;
             let mut sequence = 0u32;
+            let mut again = (0u32, 0u32);
             loop {
                 let info = common.next_info(sequence);
                 if info.has_work == 0 {
                     break;
                 }
+                if twice(ABLATE) > 0 && sequence == 0 {
+                    again = (info.row * 512, info.column * BLOCK_N as u32);
+                }
                 let mut half = 0u32;
                 while half < 2 {
                     common.full.sem(half).wait(sequence & 1);
                     if drains(ABLATE) {
-                        common.drain::<LARGE_STAGE_N>(
+                        common.drain_dial::<ABLATE, DRAIN, LARGE_STAGE_N>(
                             self.accumulator.columns_right(half * BLOCK_N as u32),
                             info.row * 512 + half * 256,
                             info.column * BLOCK_N as u32,
+                            again,
                         );
                     }
                     let empty = common.empty.sem(half);
@@ -689,7 +875,7 @@ impl Large {
 ///
 /// As [`kernels::gemm_sol_m256`].
 #[inline(always)]
-pub unsafe fn m256_body<const ABLATE: u8>(
+pub unsafe fn m256_body<const ABLATE: u8, const DRAIN: u8>(
     a_map: *const TmaDescriptor,
     b_map: *const TmaDescriptor,
     tiles_m: u32,
@@ -727,7 +913,7 @@ pub unsafe fn m256_body<const ABLATE: u8>(
         } else if common.warp_id == MMA_WARP && common.lane == 0 {
             state.multiply::<ABLATE>();
         } else if common.warp_id < EPILOGUE_WARPS {
-            state.epilogue::<ABLATE>();
+            state.epilogue::<ABLATE, DRAIN>();
         }
 
         common.retire();
@@ -741,7 +927,7 @@ pub unsafe fn m256_body<const ABLATE: u8>(
 ///
 /// As [`kernels::gemm_sol_m512`].
 #[inline(always)]
-pub unsafe fn m512_body<const ABLATE: u8>(
+pub unsafe fn m512_body<const ABLATE: u8, const DRAIN: u8>(
     a_map: *const TmaDescriptor,
     b_map: *const TmaDescriptor,
     tiles_m: u32,
@@ -780,7 +966,7 @@ pub unsafe fn m512_body<const ABLATE: u8>(
         } else if common.warp_id == MMA_WARP && common.lane == 0 {
             state.multiply::<ABLATE>();
         } else if common.warp_id < EPILOGUE_WARPS {
-            state.epilogue::<ABLATE>();
+            state.epilogue::<ABLATE, DRAIN>();
         }
 
         common.retire();
@@ -815,7 +1001,9 @@ pub mod kernels {
     ) {
         unsafe {
             const { assert!(SMALL_SHARED_BYTES == 196_864) };
-            m256_body::<WHOLE>(a_map, b_map, tiles_m, tiles_n, k_blocks, ldc, &mut c);
+            m256_body::<WHOLE, SHIPPED_DRAIN>(
+                a_map, b_map, tiles_m, tiles_n, k_blocks, ldc, &mut c,
+            );
         }
     }
 
@@ -841,7 +1029,9 @@ pub mod kernels {
     ) {
         unsafe {
             const { assert!(LARGE_SHARED_BYTES == 229_632) };
-            m512_body::<WHOLE>(a_map, b_map, tiles_m, tiles_n, k_blocks, ldc, &mut c);
+            m512_body::<WHOLE, SHIPPED_DRAIN>(
+                a_map, b_map, tiles_m, tiles_n, k_blocks, ldc, &mut c,
+            );
         }
     }
 }
@@ -903,15 +1093,20 @@ fn validate_shape(m: usize, n: usize, k: usize, variant: Variant) -> Result<(), 
     Ok(())
 }
 
-fn a_value(row: usize, depth: usize) -> f32 {
+/// The `A` operand this file's own correctness gate stages, `pub` because the
+/// ablation arms that compute a *right* `C` are checked against the same
+/// reference from the other crate.
+pub fn a_value(row: usize, depth: usize) -> f32 {
     ((row * 5 + depth * 3) % 7) as f32 - 3.0
 }
 
-fn b_value(column: usize, depth: usize) -> f32 {
+/// The `B` operand, per [`a_value`].
+pub fn b_value(column: usize, depth: usize) -> f32 {
     ((column * 4 + depth * 5) % 21) as f32 - 10.0
 }
 
-fn stage_f16(rows: usize, k: usize, value: impl Fn(usize, usize) -> f32) -> Vec<u16> {
+/// One operand staged as row-major FP16, per [`a_value`].
+pub fn stage_f16(rows: usize, k: usize, value: impl Fn(usize, usize) -> f32) -> Vec<u16> {
     let mut staged = Vec::with_capacity(rows * k);
     for row in 0..rows {
         for depth in 0..k {
@@ -921,7 +1116,12 @@ fn stage_f16(rows: usize, k: usize, value: impl Fn(usize, usize) -> f32) -> Vec<
     staged
 }
 
-fn check_output(observed: &[u16], m: usize, n: usize, k: usize) -> Result<f64, Box<dyn Error>> {
+/// Every element of `C` against the exact product of [`a_value`] and
+/// [`b_value`], compared as BF16 words with `==` and no tolerance at all.
+///
+/// Returns the worst relative error seen, which is a diagnostic and not the
+/// gate: a single unequal word is an `Err` however small its error was.
+pub fn check_output(observed: &[u16], m: usize, n: usize, k: usize) -> Result<f64, Box<dyn Error>> {
     let exact: Vec<f32> = (0..7 * 21)
         .map(|cell| {
             (0..k)

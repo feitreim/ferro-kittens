@@ -104,6 +104,14 @@ fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> ExitCode {
             "gemm_ws",
             gemm_ws::check(context).map_err(|error| error.to_string()),
         ),
+        // The two rebuilt `gemm_sol` drains. They are the only arms in
+        // `gemm_sol_ablate` that compute a right `C`, and a batched LDTM that
+        // returns its registers in another order is exactly the failure this
+        // catches.
+        (
+            "gemm_sol_drains",
+            gemm_sol_ablate::check(context).map_err(|error| error.to_string()),
+        ),
     ];
     let mut failures = 0usize;
     for (name, result) in checks {
