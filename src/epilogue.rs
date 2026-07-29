@@ -111,7 +111,7 @@
 //! a warp-private staging tile is a real layout — it is what `gemm`'s
 //! `stmatrix` path wants and what `device-tests`' `store ring warp` covers —
 //! and because the arm that lost is what makes the arm that won a measurement
-//! rather than an assumption. `examples/README.md` §7 has the rows.
+//! rather than an assumption. `experiments/README.md` §7 has the rows.
 
 use core::marker::PhantomData;
 

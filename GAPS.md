@@ -155,7 +155,8 @@ already on the clock: it is also the **walk step**. `SharedTile::k_walk` asserts
 `C * E::BYTES == S::ATOM_BYTES`, so at bf16 a K-major walk is 64 wide and
 nothing else, and `gemm` reaches a `BLOCK_K = 128` stage by re-wrapping each
 subtile as a narrower tile type to get a walk out of it
-(`examples/src/gemm.rs:1199-1209`, and `gemm.rs:5846-5852` says why). The
+(`experiments/src/gemm.rs:1199-1209`, and `experiments/src/gemm.rs:5846-5852`
+says why). The
 arithmetic to cross a stacked subtile already exists — `mma::k_major_offset`
 does it for the typed walks — so a multi-atom `OperandWalk` is separable from
 the swizzle work. Both halves are recorded on #14.
@@ -566,7 +567,7 @@ Still missing from `prototype/`:
   epilogue's instructions fixed while removing its HBM traffic puts the
   write-bound part of the GEMM's epilogue at **0–1.2%**, so the term `lcsf`
   exists to overlap is not costing this kernel anything to begin with.
-  `examples/README.md` §7 has both tables. A kernel whose epilogue is genuinely
+  `experiments/README.md` §7 has both tables. A kernel whose epilogue is genuinely
   latency-exposed may still want it; a `Job` whose accumulator is
   single-buffered in TMEM cannot overlap more than one pipeline fill's worth of
   it, which is the constraint that decided this one.
@@ -643,22 +644,23 @@ Still missing from `prototype/`:
   an SM by `%smid` and `%globaltimer` rather than asking the occupancy query,
   which is what refuted #70's and #74's readings (see `src/tmem.rs`).
 
-  The matching global *store* is checked by `examples/gemm.rs` instead, whose
-  register-drain rung is one `store_rows` compared elementwise against an exact
-  CPU reference — and whose shipped rung since #119 is `store_tile_x4` into a
-  per-warp shared tile and `store_shared_rows` out of it, on the same gate and
-  the same `==`. Still verified only by downstream kernels being numerically
+  The matching global *store* is checked by the GEMMs instead: the
+  register-drain rung (`experiments/src/gemm.rs`) is one `store_rows` compared
+  elementwise against an exact CPU reference, and the shipped rung since #119
+  (`examples/src/gemm.rs`) is `store_tile_x4` into a per-warp shared tile and
+  `store_shared_rows` out of it, on the same gate and the same `==`. Still verified only by downstream kernels being numerically
   correct: the phase-parity rules, the pipeline scaffold, the masking ops
   (`mask_probe` is a codegen probe and says so in its own doc comment), and
   every cluster/multicast path — those last live in `examples/src/gemm.rs` and
-  are covered by `modal_app.py::examples` rather than by a case here.
+  `experiments/src/gemm.rs` and are covered by `modal_app.py::examples` rather
+  than by a case here.
 - **CI, in three tiers** (#17). `ci.yml` runs `fmt`, lockfile freshness,
   `clippy --all-targets -- -D warnings`, `test` and `cargo doc` under
   `RUSTDOCFLAGS=-D warnings` on every push and pull request, with no toolkit and
   no credential — the library's default features are device-only and
   `cuda-device` is ordinary Rust. `cuda.yml` is `modal_app.py::build`: the
   `host` feature, its tests and its docs, plus a real
-  `cargo oxide build --arch sm_100a` of both kernel crates against the driver
+  `cargo oxide build --arch sm_100a` of all three kernel crates against the driver
   stub. That last is the tier that earns its money, because a
   post-monomorphization `const { assert!(..) }` in a tile shape fires at
   *codegen* and `cargo check` cannot see it. `gpu.yml` runs the B200 harness
@@ -666,7 +668,7 @@ Still missing from `prototype/`:
   uncovered: fork pull requests get tier 1 only, since the two tiers above it
   need a Modal token.
 - **Register cost is swept now, not sampled** (#60). Every claim in this file
-  and in `examples/README.md` used to be measured at 32 and 128 columns, and
+  and in `experiments/README.md` used to be measured at 32 and 128 columns, and
   the reason was structural rather than budgetary: `ptxas` is a host compiler
   and a width costs milliseconds, but each width was a *hand-written* probe.
   `device-tests`' `ladder!` generates one per (shape, spelling), so `modal run
@@ -766,7 +768,9 @@ Three things every kernel writes for itself, ordered by size:
   (`DynamicSharedArray::get_raw`, the `*mut Barrier` cast, `alloc_cluster`'s
   staging word). **#125**, and the largest single thing in this audit.
 - **The epilogue.** `drain_staged`'s *loop* is the same program in
-  `gemm.rs:1371-1403` and `gemm_ws.rs:780-813` — same band selection on
+  `experiments/src/gemm.rs:1371-1403` and `experiments/src/gemm_ws.rs:780-813`
+  — and, with the two const parameters resolved, in
+  `examples/src/gemm.rs:496-520` — same band selection on
   `WIDE`/`X4`, same `store_tile{,_x4}` into the same `store_shared_rows`, same
   warp-scope write-after-read, same `STAGE_N` stride — while the preambles
   differ, because `gemm_ws` has two accumulator stages to select between and
@@ -781,8 +785,9 @@ Three things every kernel writes for itself, ordered by size:
   times inline in `flash_forward.rs`. The `32` is `BaseLdtm`'s rows per warp,
   which the library never names, and `DRAIN_N = 128` — the widest band a thread
   can drain before 256 fp32 crosses the 255-register ceiling — is derived
-  independently in both GEMMs' docs. Both are library facts living in
-  `examples/`. Named in #126.
+  independently in both GEMMs' docs (`experiments/src/gemm.rs:412`,
+  `experiments/src/gemm_ws.rs:447`). Both are library facts living in
+  `examples/` and `experiments/`. Named in #126.
 
 ### 7.5 Types that exist and are not used by the operation that needs them
 
