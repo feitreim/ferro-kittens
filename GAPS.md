@@ -781,15 +781,25 @@ all, so `use kittens::*` yields types with no verbs. **#129.**
 
 ### 7.4 What a kernel still open-codes, which is the coverage question restated
 
-Three things every kernel writes for itself, ordered by size:
+Three things every kernel wrote for itself when this section was written,
+ordered by size. The first of them has since closed.
 
-- **The shared plan.** Five kernels, each computing it twice — a
-  host-visible `SHARED_BYTES` and an in-kernel pointer walk — related only by a
-  hand-written `const { assert!(..) }`. The two GEMM walks are the same program.
-  Almost everything in them is arithmetic over library objects whose sizes the
-  library knows, and it is the source of three of §7.2's four intrinsic leaks
-  (`DynamicSharedArray::get_raw`, the `*mut Barrier` cast, `alloc_cluster`'s
-  staging word). **#125**, and the largest single thing in this audit.
+- **The shared plan — landed (#125), with one half of it left standing.**
+  `plan::SharedPlan` is a `Copy` cursor: it starts at the launch's base, hands
+  out one typed handle per reservation, aligns each to what that handle's type
+  requires, and its `bytes()` is the total the launch declares. All five kernels
+  are on it, and the four intrinsic leaks this entry named are gone —
+  `DynamicSharedArray::get_raw` is `SharedPlan::attach`, the `*mut Barrier` cast
+  is `semaphore`/`semaphores`, `alloc_cluster`'s staging word is `tmem_slot`,
+  and `ClcQueue::ALIGNMENT`'s proof obligation is `clc_queue`. `layernorm`'s
+  ordering argument is discharged by the type rather than by a comment.
+  **What did not close**: a `const fn` over *values* cannot instantiate a
+  const-generic tile type, so `experiments`' rung table — which answers for
+  rungs no kernel implements — still spells its reservations in bytes through
+  `SharedPlan::reserve`, and one `const { assert!(..) }` per GEMM joins the two.
+  The three kernels whose plan parameters are module constants have neither.
+  That is a language limit (`generic_const_exprs`), and it is the only place in
+  the repo a plan is still written twice.
 - **The epilogue.** `drain_staged`'s *loop* is the same program in
   `experiments/src/gemm.rs:1371-1403` and `experiments/src/gemm_ws.rs:780-813`
   — and, with the two const parameters resolved, in
@@ -836,7 +846,8 @@ to go stale, which is how this file earned #65.
 What was open on 2026-07-29, and where it lives. `gh issue list` is the live
 version; this is a snapshot with a date on it. The 2026-07-28 snapshot listed
 #15, #50 and #51 as open and all three had closed by the next day, which is the
-argument for keeping this table dated and short rather than complete.
+argument for keeping this table dated and short rather than complete — and #125
+came off this table the same day it went on, which is the same argument again.
 
 | # | Issue | Section |
 | --- | --- | --- |
@@ -845,7 +856,6 @@ argument for keeping this table dated and short rather than complete.
 | 42 | Reduction TMA stores — upstream rather than a local `ptx_asm!` | 2.3 |
 | 49 | Cluster geometry beyond the 2-CTA pair | 2.4 |
 | 124 | Scope is in the type once and spelled three other ways | 1.1, 7.1 |
-| 125 | The shared plan is open-coded, in bytes, twice per kernel | 7.4 |
 | 126 | The shipped epilogue is open-coded in both GEMMs | 7.4 |
 | 128 | TMEM columns unchecked; the MMA takes an address, not a tile | 3.3, 7.5 |
 | 129 | Two conventions each for constructors, `unsafe`, verbs, re-exports | 7.3 |

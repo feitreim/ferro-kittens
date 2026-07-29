@@ -378,9 +378,7 @@
 //! running one CTA of six warps does to the *K pipeline* against two CTAs of
 //! four, and that is where the next probe belongs.
 
-use cuda_device::barrier::Barrier;
 use cuda_device::cluster;
-use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{DisjointSlice, cluster_launch, cuda_module, kernel, launch_contract, warp};
@@ -393,6 +391,7 @@ use kittens::global::{GlobalRows, store_rows, store_shared_rows};
 use kittens::ldst::{store_tile, store_tile_x4};
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, ClcQueue, Job};
+use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
@@ -479,24 +478,78 @@ type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
 /// One warp's band of it, drained [`DRAIN_N`] columns at a time.
 type Band = RegTile<32, DRAIN_N, BaseLdtm>;
 
-/// Barriers, the TMEM staging word and the scheduler's queue, in the tail of
-/// the shared plan — the same tail [`crate::gemm`] has, because the pipeline
-/// this kernel drives is the same pipeline.
-const fn scratch_bytes(stages: usize) -> usize {
-    2 * stages * 8 + 8 + 8 + ClcQueue::BYTES
+/// The staging run, as a ring of one [`StageTile`] per epilogue warp — the
+/// per-warp offset is [`SharedTileRing::tile`]'s arithmetic rather than a
+/// written-down `warp_id * StageTile::BYTES`.
+type StageRun = SharedTileRing<Bf16, 32, STAGE_N, Swizzle128B, { EPILOGUE_WARPS as usize }>;
+
+/// Everything the launch's dynamic shared memory holds before the staging run,
+/// in declaration order — the same walk [`crate::gemm`] has, because the
+/// pipeline this kernel drives is the same pipeline.
+struct Shared<const STAGES: usize> {
+    a_ring: ARing<STAGES>,
+    b_ring: BRing<STAGES>,
+    load: SemaphoreRing<STAGES>,
+    free: SemaphoreRing<STAGES>,
+    done: Semaphore,
+    tmem_slot: *mut u32,
+    queue: ClcQueue,
+    /// The cursor past the queue: [`SharedPlan::bytes`] of it is
+    /// [`shared_plan`], and it is where [`staged`] picks up.
+    plan: SharedPlan,
+}
+
+/// The plan, as one walk — [`SharedPlan::attach`] for the handles,
+/// [`SharedPlan::sizing`] for the envelope.
+#[inline(always)]
+const fn shared<const STAGES: usize>(at: SharedPlan) -> Shared<STAGES> {
+    let (a_ring, at) = at.tile_ring::<Bf16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>();
+    let (b_ring, at) = at.tile_ring::<Bf16, HALF_N, BLOCK_K, Swizzle128B, STAGES>();
+    let (load, at) = at.semaphores::<STAGES>();
+    let (free, at) = at.semaphores::<STAGES>();
+    let (done, at) = at.semaphore();
+    let (tmem_slot, at) = at.tmem_slot();
+    let (queue, at) = at.clc_queue();
+    Shared {
+        a_ring,
+        b_ring,
+        load,
+        free,
+        done,
+        tmem_slot,
+        queue,
+        plan: at,
+    }
+}
+
+/// The staging run on the end of it, 128-byte aligned by
+/// [`SharedPlan::tile_ring`].
+#[inline(always)]
+const fn staged(at: SharedPlan) -> (StageRun, SharedPlan) {
+    at.tile_ring::<Bf16, 32, STAGE_N, Swizzle128B, { EPILOGUE_WARPS as usize }>()
+}
+
+/// [`shared`]'s walk as a `const fn` over *values*, because a const parameter
+/// cannot be a function argument and the host needs this number outside any
+/// monomorphization — `#[launch_contract]` takes a literal and [`Entry::shared`]
+/// answers for a depth chosen at runtime.
+///
+/// [`crate::gemm`]'s `shared_cursor` states the same limit at more length, and
+/// [`kernels::attach`] carries the one assert that joins the two.
+const fn shared_cursor(stages: usize) -> SharedPlan {
+    let at = SharedPlan::sizing();
+    let (_, at) = at.reserve(BLOCK_M * BLOCK_K * 2 * stages, SharedPlan::TILE_ALIGN);
+    let (_, at) = at.reserve(HALF_N * BLOCK_K * 2 * stages, SharedPlan::TILE_ALIGN);
+    let (_, at) = at.barriers(2 * stages + 1);
+    let (_, at) = at.tmem_slot();
+    let (_, at) = at.clc_queue();
+    at
 }
 
 /// Dynamic shared memory a `stages`-deep launch asks for: the two operand
 /// rings and the scratch tail.
-///
-/// Stated as arithmetic because `#[launch_contract]` takes a literal and the
-/// host needs the same number outside any monomorphization. It is not trusted:
-/// [`kernels::attach`] carries a codegen-time assert that this agrees with the
-/// rings' own `BYTES`, which is the only place the two could drift.
 pub const fn shared_plan(stages: usize) -> usize {
-    let a = BLOCK_M * BLOCK_K * 2 * stages;
-    let b = HALF_N * BLOCK_K * 2 * stages;
-    a + b + scratch_bytes(stages)
+    shared_cursor(stages).bytes()
 }
 
 /// Dynamic shared memory a **register-drain** launch must provide —
@@ -516,12 +569,8 @@ pub const SHARED_BYTES: usize = shared_plan(STAGES);
 /// because [`ACCUM_COLUMNS`] is the SM's entire tensor memory, so the 16 384 B
 /// come out of 102 296 B of slack rather than out of 18 344.
 pub const fn staged_plan(stages: usize) -> usize {
-    shared_plan(stages).next_multiple_of(128) + EPILOGUE_WARPS as usize * (32 * STAGE_N * 2)
+    staged(shared_cursor(stages)).1.bytes()
 }
-
-/// Where the first epilogue warp's [`StageTile`] starts in the launch's
-/// dynamic shared memory.
-const STAGE_OFFSET: usize = SHARED_BYTES.next_multiple_of(128);
 
 /// The staged entry points' envelope, and the literal their contracts repeat
 /// — since #119 **the envelope the shipped launch declares**, since
@@ -824,17 +873,18 @@ impl<const STAGES: usize> Tile<STAGES> {
     ///
     /// The launch must declare [`STAGED_SHARED_BYTES`], and `warp_id` must be
     /// below [`EPILOGUE_WARPS`].
+    ///
+    /// The run's offset is `Self`'s own `STAGES` since #125, where it used to
+    /// be a module-level `STAGE_OFFSET` derived from the shipped depth. Every
+    /// instantiation that reaches here is at that depth — `Ws::<6, ..>` is
+    /// `drain::REGISTER` and names no staged arm — so the two agree everywhere
+    /// they are both defined, and only this one is defined everywhere.
     #[inline(always)]
     unsafe fn stage_tile(&self) -> StageTile {
-        const {
-            assert!(STAGE_OFFSET >= SHARED_BYTES && STAGE_OFFSET.is_multiple_of(128));
-            assert!(
-                STAGED_SHARED_BYTES == STAGE_OFFSET + EPILOGUE_WARPS as usize * StageTile::BYTES
-            );
-        };
         unsafe {
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            StageTile::from_raw(smem.add(STAGE_OFFSET + self.warp_id as usize * StageTile::BYTES))
+            staged(shared::<STAGES>(SharedPlan::attach()).plan)
+                .0
+                .tile(self.warp_id)
         }
     }
 }
@@ -1088,38 +1138,30 @@ pub mod kernels {
         ldc: u32,
         c: &mut DisjointSlice<u16>,
     ) -> (Tile<STAGES>, ClcQueue) {
-        // Fired at codegen, which is the only place the ring byte counts are
-        // known — and the reason `cargo check` cannot stand in for
-        // `scripts/modal-run build`.
+        // The join between the two spellings of this depth's plan — the walk
+        // and the value-parameterized arithmetic the host needs. Fired at
+        // codegen, which is the only place the ring byte counts are known, and
+        // the reason `cargo check` cannot stand in for `scripts/modal-run
+        // build`. The queue's `ALIGNMENT` used to be a second assert here and
+        // is `SharedPlan::clc_queue`'s since #125.
         const {
-            assert!(
-                shared_plan(STAGES)
-                    == ARing::<STAGES>::BYTES + BRing::<STAGES>::BYTES + scratch_bytes(STAGES)
-            );
-            assert!(
-                (ARing::<STAGES>::BYTES + BRing::<STAGES>::BYTES + 2 * STAGES * 8 + 8 + 8)
-                    % ClcQueue::ALIGNMENT
-                    == 0
-            );
+            assert!(shared::<STAGES>(SharedPlan::sizing()).plan.bytes() == shared_plan(STAGES));
         };
         unsafe {
-            let rings = ARing::<STAGES>::BYTES + BRing::<STAGES>::BYTES;
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let scratch = smem.add(rings);
-            let tmem_slot = scratch.add(2 * STAGES * 8 + 8) as *mut u32;
+            let shared = shared::<STAGES>(SharedPlan::attach());
 
             let tile = Tile {
-                a_ring: ARing::<STAGES>::attach(smem),
-                b_ring: BRing::<STAGES>::attach(smem.add(ARing::<STAGES>::BYTES)),
-                load: SemaphoreRing::<STAGES>::attach(scratch as *mut Barrier),
-                free: SemaphoreRing::<STAGES>::attach((scratch as *mut Barrier).add(STAGES)),
-                done: Semaphore::attach((scratch as *mut Barrier).add(2 * STAGES)),
+                a_ring: shared.a_ring,
+                b_ring: shared.b_ring,
+                load: shared.load,
+                free: shared.free,
+                done: shared.done,
                 a_map,
                 b_map,
                 // Both stages in one allocation. The allocator's unit is the
                 // CTA, so a second stage is a column offset and never a second
                 // `tcgen05.alloc`.
-                accumulator: Accumulator::from_raw(alloc_cluster(tmem_slot, ACCUM_COLUMNS)),
+                accumulator: Accumulator::from_raw(alloc_cluster(shared.tmem_slot, ACCUM_COLUMNS)),
                 c: GlobalRows::<Bf16>::from_slice(c, ldc as usize),
                 tiles_m,
                 tiles_n,
@@ -1129,10 +1171,7 @@ pub mod kernels {
                 warp_id: warp_id(),
                 lane: lane(),
             };
-            (
-                tile,
-                ClcQueue::attach(smem.add(rings + 2 * STAGES * 8 + 8 + 8)),
-            )
+            (tile, shared.queue)
         }
     }
 

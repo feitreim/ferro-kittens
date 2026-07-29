@@ -362,13 +362,23 @@ pub struct ClcQueue {
 impl ClcQueue {
     /// The response's size, which is the ISA's (`.b128`) and is also exactly
     /// the transaction count its mbarrier is charged.
-    const RESPONSE_BYTES: usize = 16;
+    ///
+    /// Crate-visible so [`crate::plan::SharedPlan::clc_queue`] can reserve the
+    /// response and the barrier as the two objects they are.
+    pub(crate) const RESPONSE_BYTES: usize = 16;
     /// Shared bytes to reserve: the response, then the barrier under it.
     pub const BYTES: usize = Self::RESPONSE_BYTES + 8;
     /// The response is a 128-bit store, so the base is 16-byte aligned.
     pub const ALIGNMENT: usize = 16;
 
     /// Lay a queue over [`Self::BYTES`] of shared memory.
+    ///
+    /// Lay a queue over [`Self::BYTES`] of shared memory.
+    ///
+    /// The raw form. A kernel that has a [`crate::plan::SharedPlan`] should
+    /// take [`crate::plan::SharedPlan::clc_queue`] instead, which reserves the
+    /// two objects below at their own alignments and owes no proof that
+    /// [`Self::ALIGNMENT`] was met.
     ///
     /// # Safety
     ///
@@ -377,9 +387,27 @@ impl ClcQueue {
     /// at the same offset in every CTA of the cluster.
     #[inline(always)]
     pub const unsafe fn attach(base: *mut u8) -> Self {
+        unsafe { Self::from_parts(base, base.add(Self::RESPONSE_BYTES) as *mut Barrier) }
+    }
+
+    /// The queue as the two objects it is — the `.b128` response, and the
+    /// mbarrier its multicast delivery completes on — placed separately.
+    ///
+    /// [`crate::plan::SharedPlan::clc_queue`] is the caller, and it exists
+    /// because a plan walked for its *size* has no allocation to offset a
+    /// pointer inside of, so a constructor that derives one address from the
+    /// other cannot be const-evaluated on the host side. See
+    /// [`crate::plan::SharedPlan::reserve`].
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::attach`], with `sem` [`Self::RESPONSE_BYTES`] past
+    /// `response` and both inside the same reservation.
+    #[inline(always)]
+    pub(crate) const unsafe fn from_parts(response: *mut u8, sem: *mut Barrier) -> Self {
         Self {
-            response: base as *mut u64,
-            sem: unsafe { Semaphore::attach(base.add(Self::RESPONSE_BYTES) as *mut Barrier) },
+            response: response as *mut u64,
+            sem: unsafe { Semaphore::attach(sem) },
         }
     }
 

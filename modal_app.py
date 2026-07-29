@@ -795,6 +795,20 @@ CENSUS_OPCODES = (
     ("bar.sync", "bar.sync"),
     ("bar.warp", "bar.warp.sync"),
     ("mbar.arrive", "mbarrier.arrive"),
+    # Predication a kernel pays for, and the column #125 added it for.
+    #
+    # `kittens::plan::SharedPlan::reserve` branches on whether the cursor has
+    # memory under it, because the device and const eval want different pointer
+    # arithmetic and no operation serves both (see its doc). The flag is a
+    # literal in both constructors and the claim is that it folds. Two
+    # side-effect-free pointer values under an `if` is the shape LLVM
+    # if-converts to a `select`, so a surviving branch is a `selp` and the
+    # count is the check: `gemm_cg2_idle` calls the whole eight-reservation
+    # walk and then does nothing, so if the flag did not fold it would carry
+    # eight of them. It carries **zero**, which is what settled #125's last
+    # open question. Keep this column: the argument is cheap to re-derive and
+    # expensive to re-litigate.
+    ("selp", "selp"),
 )
 
 # Which entry functions the census prints. The whole table would be forty-odd

@@ -44,7 +44,7 @@
 //!
 //! ## The shared plan, and the 0 it used to report
 //!
-//! [`SHARED_BYTES`] is 147536 B — 144 KiB, and 4.5x what `softmax` asks for.
+//! [`SHARED_BYTES`] is 147532 B — 144 KiB, and 4.5x what `softmax` asks for.
 //! It is worth seeing by component rather than as one number:
 //!
 //! | component | shape | bytes | share |
@@ -53,8 +53,14 @@
 //! | `K` ring | 3 x `[64, 128]` bf16 | 49152 | 33% |
 //! | `V` ring | 3 x `[64, 128]` bf16 | 49152 | 33% |
 //! | `P` staging | `[128, 64]` bf16 | 16384 | 11% |
-//! | barriers + TMEM word | 9 x 8 B + 8 B | 80 | — |
-//! | **total** | | **147536** | |
+//! | barriers + TMEM word | 9 x 8 B + 4 B | 76 | — |
+//! | **total** | | **147532** | |
+//!
+//! The numbers #70 measured below are quoted at the 147536 this plan was
+//! before #125 gave it to [`kittens::plan::SharedPlan`], which reserves the
+//! `tcgen05.alloc` staging word as the four-byte `u32` it is. Four bytes out
+//! of 144 KiB decides nothing here and the measurements are left as they were
+//! taken.
 //!
 //! Two thirds of it is the pipeline: [`STAGES`] deep over both `K` and `V`,
 //! at 16384 B a stage a side. Dropping to two stages would save 32768 B.
@@ -136,20 +142,20 @@
 //! first three lines: the thread identities and the proxy fence were
 //! `cuda_device` calls, because `kittens` exposed neither. They are
 //! [`kittens::lane`], [`kittens::warp_id`] and
-//! [`kittens::shared::publish_to_async_proxy`] since #127. What still reaches
-//! past the library is the *shared plan* — `DynamicSharedArray::get_raw`, the
-//! `*mut Barrier` cast, the byte offsets (#125, #85) — `thread`'s
-//! `sync_threads` and block indices (#124), and the kernel ABI itself, which
-//! no tile library replaces. None of it is register-side.
+//! [`kittens::shared::publish_to_async_proxy`] since #127, and the shared plan
+//! — `DynamicSharedArray::get_raw`, the `*mut Barrier` cast, the byte offsets
+//! — is [`kittens::plan::SharedPlan`] since #125. What still reaches past the
+//! library is `thread`'s `sync_threads` and block indices (#124), the
+//! allocator's column count (#85), and the kernel ABI itself, which no tile
+//! library replaces. None of it is register-side.
 
-use cuda_device::barrier::Barrier;
-use cuda_device::shared::DynamicSharedArray;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
 use kittens::global::{GlobalRows, store_rows};
 use kittens::ldst::store_tile;
 use kittens::mma::{MmaShape, commit, mm_ab, mm_abt};
+use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, RegTile, RegVec, online_rescale};
 use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, Swizzle128B, publish_to_async_proxy};
 use kittens::sync::{Semaphore, SemaphoreRing};
@@ -219,11 +225,65 @@ const _: () = assert!(
     "tcgen05.alloc takes a power of two in [32, 512] that covers the scores and the output"
 );
 
-/// The two rings, `q_loaded`, `scored`, `accumulated`, and the TMEM staging
-/// word.
-const SCRATCH_BYTES: usize = 2 * STAGES * 8 + 3 * 8 + 8;
-pub const SHARED_BYTES: usize =
-    QTile::BYTES + KRing::BYTES + VRing::BYTES + PTile::BYTES + SCRATCH_BYTES;
+/// Everything the launch's dynamic shared memory holds, in declaration order.
+///
+/// This file used to state the layout twice in the same 40 lines — once as a
+/// `SCRATCH_BYTES` in bytes and once as a pointer walk in `Barrier` units, so
+/// the barrier count read `2 * STAGES * 8 + 3 * 8` at one end and
+/// `.add(2 * STAGES + 3)` at the other. #125 is that finding; it is one walk
+/// now, and the units are the handles'.
+struct Shared {
+    q: QTile,
+    k_ring: KRing,
+    v_ring: VRing,
+    p: PTile,
+    load: SemaphoreRing<STAGES>,
+    free: SemaphoreRing<STAGES>,
+    q_loaded: Semaphore,
+    scored: Semaphore,
+    accumulated: Semaphore,
+    tmem_slot: *mut u32,
+    plan: SharedPlan,
+}
+
+#[inline(always)]
+const fn shared(at: SharedPlan) -> Shared {
+    let (q, at) = at.tile::<Bf16, QUERIES, HEAD, Swizzle128B>();
+    let (k_ring, at) = at.tile_ring::<Bf16, KEYS, HEAD, Swizzle128B, STAGES>();
+    let (v_ring, at) = at.tile_ring::<Bf16, KEYS, HEAD, Swizzle128B, STAGES>();
+    let (p, at) = at.tile::<Bf16, QUERIES, KEYS, Swizzle128B>();
+    let (load, at) = at.semaphores::<STAGES>();
+    let (free, at) = at.semaphores::<STAGES>();
+    let (q_loaded, at) = at.semaphore();
+    let (scored, at) = at.semaphore();
+    let (accumulated, at) = at.semaphore();
+    let (tmem_slot, at) = at.tmem_slot();
+    Shared {
+        q,
+        k_ring,
+        v_ring,
+        p,
+        load,
+        free,
+        q_loaded,
+        scored,
+        accumulated,
+        tmem_slot,
+        plan: at,
+    }
+}
+
+/// Dynamic shared memory the launch declares — 144 KiB and change, which is
+/// 4.5× what `softmax` asks for and why this kernel needs
+/// [`kittens::launch::admit_shared_plan`].
+///
+/// 147 532 rather than the 147 536 this file carried until #125: the staging
+/// word `tcgen05.alloc` writes is a `u32` and [`SharedPlan::tmem_slot`]
+/// reserves four bytes for it at four-byte alignment, where the hand-written
+/// `SCRATCH_BYTES` charged eight. Nothing else in the plan moved, and the
+/// residency cannot: this plan is over the 116 736 B half of an SM either way,
+/// so it is one CTA per SM at both numbers.
+pub const SHARED_BYTES: usize = shared(SharedPlan::sizing()).plan.bytes();
 pub const THREADS: u32 = (QUERIES / 32) as u32 * 32;
 
 #[cuda_module]
@@ -245,19 +305,19 @@ pub mod kernels {
         mut out: DisjointSlice<f32>,
     ) {
         unsafe {
-            let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let q = QTile::from_raw(smem);
-            let k_ring = KRing::attach(smem.add(QTile::BYTES));
-            let v_ring = VRing::attach(smem.add(QTile::BYTES + KRing::BYTES));
-            let p = PTile::from_raw(smem.add(QTile::BYTES + KRing::BYTES + VRing::BYTES));
-            let scratch =
-                smem.add(QTile::BYTES + KRing::BYTES + VRing::BYTES + PTile::BYTES) as *mut Barrier;
-            let load = SemaphoreRing::<STAGES>::attach(scratch);
-            let free = SemaphoreRing::<STAGES>::attach(scratch.add(STAGES));
-            let q_loaded = Semaphore::attach(scratch.add(2 * STAGES));
-            let scored = Semaphore::attach(scratch.add(2 * STAGES + 1));
-            let accumulated = Semaphore::attach(scratch.add(2 * STAGES + 2));
-            let tmem_slot = scratch.add(2 * STAGES + 3) as *mut u32;
+            let Shared {
+                q,
+                k_ring,
+                v_ring,
+                p,
+                load,
+                free,
+                q_loaded,
+                scored,
+                accumulated,
+                tmem_slot,
+                ..
+            } = shared(SharedPlan::attach());
 
             let warp_id = warp_id();
             let lane = lane();
