@@ -11,9 +11,16 @@
 //! artifact the same way `cuda-device` does, so a kernel crate pays nothing
 //! for the abstraction unless ptxas says otherwise.
 //!
-//! Libdevice math is legal beside tcgen05 in the same pure-PTX artifact at
-//! cuda-oxide b099f64. Software approximations remain where their lowering is
-//! a measured kernel optimization rather than an artifact-path workaround.
+//! Libdevice math is legal beside tcgen05 in the same pure-PTX artifact. That
+//! was established at cuda-oxide `b099f64` and the citation stays there: no gate
+//! re-establishes it at the pin, because **nothing in this tree makes a
+//! libdevice call**. `reg.rs`'s `Abs` clears the sign bit rather than calling
+//! `fabsf`, `fmax`/`fmin` are comparison-selects, `Sqrt` and `rsqrt` lower to
+//! native `sqrt.rn.f32`, and `exp2`/`log2` are FMA polynomials or the `ex2`
+//! SFU. So a green `build` says nothing about it either way, and moving the
+//! hash would assert it at a revision nobody checked. Software approximations
+//! remain where their lowering is a measured kernel optimization rather than an
+//! artifact-path workaround.
 //!
 // `global`'s types are all `feature = "host"`, and docs across the crate link
 // to them. Off that feature they are not compiled, so the links have nothing

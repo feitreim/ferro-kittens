@@ -1922,11 +1922,11 @@ example inverted against the function's own doc. That was true of a revision and
 is not true of ours. Upstream fixed it in `61f4a563` on 2026-06-29 — along with
 the flow diagram and all three `clc_query_get_first_ctaid_*` docs, which were
 wrong the same way — and then replaced the hand-written module doc with a
-generated one, so the pinned `b099f64c` ships a thirteen-line `clc.rs` with no
+generated one, so the pinned `20a56163` ships a thirteen-line `clc.rs` with no
 usage example to be wrong. The claim traced to a **stale sibling cargo
 checkout**: `~/.cargo/git/checkouts/cuda-oxide-…/4514af2` is v0.2.1 from
-2026-06-10, and of the six checkouts in that directory it is the only one still
-carrying the bug. The file cited as settling it, `crates/mir-lower/…/clc.rs`,
+2026-06-10, and of the seven checkouts now in that directory it is the only one
+still carrying the bug. The file cited as settling it, `crates/mir-lower/…/clc.rs`,
 exists at no upstream revision at all.
 
 Nothing here needs changing — `!= 0` was and is right, and the probe above is
@@ -3680,7 +3680,7 @@ in this file since the port.**
 **`.pack::16b` is not a lever — but the register count was the wrong reason, and
 #147 closed it properly.** The scoping read it as folding the fp32→bf16 convert
 into the load: eliminating the `cvt` and halving the registers reaching
-`stmatrix`. At `b099f64c1a32869b74be99f4f88242fb68655b51`,
+`stmatrix`. At `20a56163f258e09f2c51e4c27ae4e4ff17582443`,
 `intrinsics/abi-v1.toml` gives `tcgen05_ld_16x256b_x8_pack16` the result type
 `[u32; 32]`, **the same 32 registers as `_x8_raw`**, and
 `intrinsics/generated-reference.md` validates it as
@@ -3727,7 +3727,7 @@ every shape. The removed intrinsics took a shared-memory *pointer*; every
 generated variant at this pin is `status = "active"` with an array **result**,
 and `_x8_pure` and `_x8_raw` share one LLVM intrinsic
 (`llvm.nvvm.tcgen05.ld.16x256b.x8`) and one validated encoding. Checked against
-the checkout at `b099f64`, `git rev-parse HEAD` confirmed — not against the
+the checkout at `20a5616`, `git rev-parse HEAD` confirmed — not against the
 stale `4514af2` in the same cargo directory.
 
 **What no document settles is the register *order*, and that got a case.**
@@ -4878,7 +4878,12 @@ not copies — so both kernels read byte-identical operands and both pass the sa
 exact-BF16 comparison before either is timed. `modal_app.py::upstream_bench` is
 one container, so one device, one cuBLASLt, one day.
 
-`gemm_sol_final` is identical at `20a5616`, so none of this turns on the pin.
+The revision above is the one the copy was taken at and the port was measured
+against, and it is no longer the pin — `20a5616` is. Nothing here moves with it:
+`gemm_sol_final/` is byte-identical at both revisions, and upstream's
+`kernels.rs` and the vendored copy all three hash to
+`6746e517eca19fdcc01cb0d5003e924bb638f5ee42e8c333d457a0d6f334d6e9`. The
+provenance stays at `b099f64` because that is where it was read.
 
 **Each arm at the variant it should be judged at.** cuBLASLt is the mean of its
 four readings per shape; it repeats to 0.03% at 16384³, 0.15% at 8192³ and
@@ -4930,7 +4935,10 @@ clone, in its own workspace, at its own profile, and it does not assemble:
    comes out as a call to an `.extern .func` that does not exist — *"line 10;
    fatal: Parsing error near '.nvvm'"*. `kittens::ldst` had already written this
    workaround for itself at `b099f64`, and the vendored copy binds the name to
-   it: same signature, same instruction, upstream's file untouched.
+   it: same signature, same instruction, upstream's file untouched. **The defect
+   survives the move to `20a5616`** — same extern, same line, same `ptxas`
+   message — so the workaround is not removable at this pin, and `upstream_ptx`
+   is the check that would say when it is.
 2. `opt -O2` turns upstream's four-way stage selects into **sixteen** lookup
    tables emitted as `.global` arrays of `.shared` addresses, which PTX forbids
    outright. `CUDA_OXIDE_OPT` pointed at an `opt` wrapper carrying

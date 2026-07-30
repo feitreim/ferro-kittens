@@ -80,7 +80,7 @@ import modal
 
 # Keep this revision in sync with the git deps in Cargo.toml: the codegen
 # backend and the device/host/core crates must come from the same revision.
-CUDA_OXIDE_REF = "b099f64c1a32869b74be99f4f88242fb68655b51"
+CUDA_OXIDE_REF = "20a56163f258e09f2c51e4c27ae4e4ff17582443"
 RUST_TOOLCHAIN = "nightly-2026-04-03"
 GIT_REPO = "https://github.com/NVlabs/cuda-oxide.git"
 
@@ -774,10 +774,13 @@ def upstream_ptx() -> None:
     and behind that one, sixteen `switch_$_table` arrays of `.shared` addresses.
     Two independent lowering defects, both fatal, both upstream's own. Ours are
     the same two, and `kittens::ldst` had already written the workaround for the
-    first one at `b099f64`.
+    first one at `b099f64` -- the revision it was observed at, which is no longer
+    the pin.
 
     Run it after a pin bump: if this comes back clean, the two workarounds
     `gemm_sol_upstream.rs` and `OPT_NO_LOOKUP_TABLE` carry can both be dropped.
+    It did not come back clean at `20a5616` (#145): same extern, same line. So
+    the bump to `20a5616` drops neither workaround, and both stay.
     """
     _run(["git", "clone", "--filter=blob:none", GIT_REPO, "/tmp/oxide"], cwd="/")
     _run(["git", "checkout", CUDA_OXIDE_REF], cwd="/tmp/oxide")
