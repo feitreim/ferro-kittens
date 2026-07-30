@@ -1082,42 +1082,55 @@ def _print_census() -> None:
 # not. `mma` counts alone cannot see it: 16 and 32 is exactly what the two
 # entries should carry. What matters is how many non-`mma` instructions sit
 # between them, so this prints the span rather than a count of it.
-MMA_STREAM_KERNELS = ("gemm_sol_m256", "gemm_sol_m512")
+MMA_STREAM_KERNELS = (
+    "gemm_sol_m256",
+    "gemm_sol_m512",
+    # The same two with the ring index computed from `global_k` instead of
+    # handed in as a const, which is what the port carried before the two were
+    # measured against each other. Printing both is what makes the fold
+    # visible rather than asserted: the folded stream carries literal barrier
+    # offsets and a constant accumulate predicate where this one carries
+    # arithmetic.
+    "gemm_sol_m256_runtime",
+    "gemm_sol_m512_runtime",
+)
 
 
 def _print_mma_stream() -> None:
     """The instruction span between the first and last `tcgen05.mma` of a kernel.
 
-    Split on `.visible .entry` exactly as `_census` does, for the same reason:
-    the bodies carry `ptx_asm!` verbatim and that text is the thing worth
-    reading. `mma` is one warp's stream in a warp-specialized kernel, so the span
-    between the first and last of them is that warp's K-loop body and nothing
-    else -- no other warp's code is interleaved into it by the compiler, because
-    each warp's path is a separate branch.
+    Split on `.visible .entry` exactly as `_census` does, for the same reason: the
+    bodies carry `ptx_asm!` verbatim and that text is the thing worth reading.
+    `mma` belongs to one warp in a warp-specialized kernel and each warp's path is
+    a separate branch, so the span between the first and last of them is that
+    warp's K-loop body and nothing else.
     """
-    for ptx in sorted(Path(EXAMPLES_DIR).rglob("*.ptx")):
-        for chunk in ptx.read_text().split(".visible .entry ")[1:]:
-            name = chunk.split("(", 1)[0].strip()
-            if name not in MMA_STREAM_KERNELS:
-                continue
-            lines = [line.strip() for line in chunk.splitlines()]
-            # Substring rather than prefix: cuda-oxide emits `ptx_asm!` bodies
-            # verbatim, and a `tcgen05.mma` can arrive with a predicate or a
-            # brace in front of it. `_census` counts the same substring, so the
-            # two agree by construction.
-            issues = [i for i, line in enumerate(lines) if "tcgen05.mma" in line]
-            if not issues:
-                continue
-            span = lines[issues[0] : issues[-1] + 1]
-            code = [line for line in span if line and not line.startswith("//")]
-            mma = [line for line in code if "tcgen05.mma" in line]
-            print(
-                f"\n  {name}: {len(mma)} tcgen05.mma over {len(code)} instructions "
-                f"({len(code) - len(mma)} between them, "
-                f"{(len(code) - len(mma)) / len(mma):.1f} per issue)"
-            )
-            for line in span:
-                print(f"    {line}")
+    seen: set[str] = set()
+    for directory in (EXAMPLES_DIR, EXPERIMENTS_DIR):
+        for ptx in sorted(Path(directory).rglob("*.ptx")):
+            for chunk in ptx.read_text().split(".visible .entry ")[1:]:
+                name = chunk.split("(", 1)[0].strip()
+                if name not in MMA_STREAM_KERNELS or name in seen:
+                    continue
+                lines = [line.strip() for line in chunk.splitlines()]
+                # Substring rather than prefix: a `tcgen05.mma` arrives inside a
+                # braced `ptx_asm!` body with its predicate in front of it.
+                # `_census` counts the same substring, so the two agree by
+                # construction.
+                issues = [i for i, line in enumerate(lines) if "tcgen05.mma" in line]
+                if not issues:
+                    continue
+                seen.add(name)
+                span = lines[issues[0] : issues[-1] + 1]
+                code = [line for line in span if line and not line.startswith("//")]
+                mma = [line for line in code if "tcgen05.mma" in line]
+                between = len(code) - len(mma)
+                print(
+                    f"\n  {name}: {len(mma)} tcgen05.mma over {len(code)} instructions "
+                    f"({between} between them, {between / len(mma):.1f} per issue)"
+                )
+                for line in span:
+                    print(f"    {line}")
 
 
 def _print_kernels(measured: dict[tuple[str, str], dict[str, int]]) -> None:

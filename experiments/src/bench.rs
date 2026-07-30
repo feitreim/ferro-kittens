@@ -1294,6 +1294,21 @@ pub fn main() -> ExitCode {
         };
     }
 
+    // `bench sol-k` is the loose end #146 left: one shape it ran did not return.
+    // It is its own case and never part of another table, because a launch that
+    // hangs takes every row after it, which is exactly how it was found.
+    if let Some((name, _)) = &selected
+        && name == "sol-k"
+    {
+        return match crate::sol::sweep_k(&context, CUBLASLT_F16) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // Each name in the list has to name a case. A list where one of three is a
     // typo would otherwise run two tables and say nothing about the third,
     // which is the failure mode worth being loud about: the reader gets a

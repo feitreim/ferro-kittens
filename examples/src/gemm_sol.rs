@@ -8,9 +8,19 @@
 //! Three entries, expressed through ferro-kittens' typed tiles and pipeline
 //! primitives, differing only in the cluster tile they own: `[256, 128]`,
 //! `[256, 256]` and `[512, 256]`. They share CLC work stealing, a two-CTA
-//! cluster, four TMA/shared stages, two TMEM accumulator halves, an unrolled K
-//! loop, and L2-aware output ordering, and [`select_variant`] picks between them
-//! on wave arithmetic alone.
+//! cluster, four TMA/shared stages, two TMEM accumulator halves, a K loop
+//! unrolled four ways over a **compile-time** ring stage, and L2-aware output
+//! ordering, and [`select_variant`] picks between them on wave arithmetic alone.
+//!
+//! What the K loop is bound by is measured rather than assumed, and it is not the
+//! same thing at the two 256-row entries. `bench sol-ablate` ladders every phase
+//! in `K`: the tensor core can be issued at peak from one warp
+//! (`issue only` is 100.0% of peak a K block), the barrier round trip is zero,
+//! and the whole of `[256, 256]`'s 21% deficit is its **feed's duty cycle** — the
+//! operand pipeline alone needs 95.5% of the time the tensor core is busy, where
+//! `[512, 256]`'s needs 55.7%, because a `[256, 256]` cluster tile moves 1.33× the
+//! operand bytes per flop. That is a property of the tile, so it is [`Variant`]'s
+//! to answer and not the K loop's.
 //!
 //! On B200 that is `[256, 128]` at and below 37 wide output tiles — half a wave
 //! of them — `[256, 256]` through 4K, and `[512, 256]` from 8K. The two narrow-tile branches are what
@@ -109,9 +119,14 @@ const BAND_N: usize = 64;
 /// shared one map: the narrow entry's half-panel *is* 64 rows, so 64 is the only
 /// height all three can name. Nothing about the wide entries asks for it — their
 /// half-panel is `128 x 64`, the same shape as [`ATile`], which already arrives
-/// in a single TMA — so they pay two instructions where one would do. `bench
-/// sol-ablate`'s wide-`B` arms are that map built per entry instead of once, at
-/// byte-for-byte identical traffic.
+/// in a single TMA — so they pay two instructions where one would do.
+///
+/// **And it costs nothing, which is why 64 still ships.** `bench sol-ablate`'s
+/// wide-`B` arms are that map built per entry instead of once, at byte-for-byte
+/// identical traffic, and they move the launch by 0.998 and 1.014 across two
+/// passes, the K-block rate from 0.3503 to 0.3484 µs, and `feed only` — where the
+/// feed is alone and has nothing to hide behind — by 1.008 and 0.981. The feed's
+/// ceiling is bytes, not instructions.
 pub const B_BOX: usize = 64;
 /// The box the two 256-wide entries' half-panel would arrive in whole.
 pub const WIDE_B_BOX: usize = HALF_N;

@@ -1,11 +1,59 @@
-//! What `gemm_sol`'s time is made of, and why the small entry's K loop is short
-//! of peak — `bench sol-ablate`.
+//! Why the small entry's K loop is short of peak, and what each phase of the
+//! launch costs — `bench sol-ablate`.
 //!
-//! #144 built this file's first tables and #146 settled the tiling, and between
-//! them they left one number owned by nobody: **the `[256, 256]` entry's K loop
-//! runs at 75.8% of tensor-core peak where the `[512, 256]` entry's runs at
-//! 99.4%, on the same K-loop code.** This file is the instrument that found that
-//! and the one that explains it.
+//! #144 built the first arms and #146 settled the tiling, and between them they
+//! left one number owned by nobody: **the `[256, 256]` entry's K loop ran at
+//! 75.8% of tensor-core peak where the `[512, 256]` entry's ran at 99.4%, on the
+//! same K-loop code.** This file is the instrument that explains it, and the
+//! answer is one number per entry.
+//!
+//! # The answer: the feed's duty cycle
+//!
+//! `feed only` is the operand pipeline with the MMA and the drain removed, and
+//! laddered in `K` it gives the time the feed needs for one K block with nothing
+//! competing. Against the time the tensor core needs for the same K block at
+//! peak:
+//!
+//! | entry | feed alone | MMA at peak | **the feed's duty** |
+//! | --- | ---: | ---: | ---: |
+//! | `[256, 256]` | 0.2636 µs | 0.2759 µs | **95.5%** |
+//! | `[512, 256]` | 0.3075 µs | 0.5518 µs | **55.7%** |
+//!
+//! The small entry needs its feed running 95.5% of the time the tensor core is
+//! busy; the large entry needs it 55.7%. That is the 1.33× in operand bytes per
+//! flop between a `[256, 256]` cluster tile and a `[512, 256]` one — #146's
+//! "0.75× the operand traffic per flop" seen from the other end — and at 95.5%
+//! there is no slack for the TMA's writes and the tensor core's operand reads to
+//! get out of each other's way. The cost of them not doing so is measured
+//! directly: `no drain − issue only` is **+0.0675 µs a K block, 24.5%**, at
+//! `[256, 256]` and **+0.0002 µs, 0.0%**, at `[512, 256]`.
+//!
+//! **Everything else in the K loop is free, and each of those is a measurement
+//! rather than an argument.** Laddered in `K` at 4096² on `[256, 256]`, in µs a
+//! K block against 0.2759 at peak:
+//!
+//! | arm | µs a K block | of peak |
+//! | --- | ---: | ---: |
+//! | `feed only` | 0.2636 | 104.6% |
+//! | `mma only` | 0.2742 | **100.6%** |
+//! | `issue only` | 0.2758 | **100.0%** |
+//! | `no drain` | 0.3433 | 80.4% |
+//! | `whole` | 0.3503 | 78.8% |
+//! | `runtime stage` | 0.3615 | 76.3% |
+//!
+//! - **The tensor core can be issued at peak from one warp at this tile.**
+//!   `issue only` is 100.0% and `mma only` 100.6%. There is no `tcgen05` issue-rate
+//!   deficit, and the 11 points that *appeared* to be one in the un-laddered
+//!   launch were the arm's own per-tile constant — which is why every arm here is
+//!   laddered and none is quoted off a launch.
+//! - **The barrier round trip is zero.** `issue only − mma only` differs by one
+//!   const — the MMA warp's `load.wait`, dropped — and the two agree to 0.6%,
+//!   with the arm that keeps the wait nominally *faster*. #144 listed this as
+//!   unseparated; it is separated, and it is nothing.
+//! - **The drain costs the K loop 2.0%** (`whole − no drain` on the rate) and
+//!   2.9 µs a tile on the constant. That constant reproduces PR #147's
+//!   independently measured 2.82 µs of serial drain per tile.
+//! - **The producer's instruction count is not a term.** See below.
 //!
 //! # The arms
 //!
@@ -22,57 +70,65 @@
 //! | `mma only` | arrives on `load`, no TMA | `tcgen05.mma`, commit, **no wait** | handshake only |
 //!
 //! **Every barrier survives every arm but the last, which drops exactly one.**
-//! `mma only` is #144's missing fifth arm: it names the thing #144 listed as
-//! unseparated, because `issue only` keeps the whole `load`/`free` handshake and
-//! therefore fuses barrier round-trip latency with tensor-core issue rate.
-//! Dropping the MMA warp's `load.wait` and nothing else makes
-//! `issue only − mma only` the round trip alone. The producer keeps
-//! `free.wait_recycled` so it is still throttled, and `ready` still bounds the
-//! MMA warp one output tile at a time, so what runs unthrottled is the K loop and
-//! only the K loop.
+//! In `mma only` the producer keeps `free.wait_recycled` so it is still
+//! throttled, and `ready` still bounds the MMA warp one output tile at a time, so
+//! what runs unthrottled is the K loop and only the K loop.
 //!
 //! **These compute a wrong `C` on purpose** and are on no correctness gate.
 //! `regcount`'s opcode census is the gate instead: `feed only` must show zero in
 //! the `mma` column and the whole kernel's `tma` count, `issue only` the reverse,
 //! `no drain` zero across `ldtm`, `stmatrix` and the store columns while keeping
-//! both of the others, and every arm the same `mbar.arrive`. An arm whose census
-//! does not read that way did not remove what it names, and its number is void.
+//! both of the others. An arm whose census does not read that way did not remove
+//! what it names, and its number is void.
 //!
-//! # The wide-`B` arms, which are not ablations
+//! # The two levers, one of which pays
 //!
-//! `wide B` and `wide B feed` are the same body at `BOX = 128` instead of
-//! `BOX = 64`: a rank's `B` half-panel arriving in **one** TMA instead of two, at
-//! byte-for-byte identical traffic. They are here rather than in the shipped
-//! kernels because they are a prediction under test, and they are the test that
-//! separates two readings of the same feed number.
+//! Neither is an ablation: both compute the same `C` as the shipped kernel and
+//! differ from it in one const.
 //!
-//! The producer is one lane of one warp, and its serial instruction count per K
-//! block is what differs between the two entries that differ in nothing else:
-//! **3 TMA at `[256, 256]` against 4 at `[512, 256]`**, for 4 MMA against 8. If
-//! the K loop's ceiling is *operand bandwidth*, merging two `B` boxes into one
-//! moves nothing, because the bytes do not move. If it is the producer's
-//! *instruction issue rate*, it takes the small entry from 3 TMA to 2 and buys
-//! back most of the 24% — and the same lever takes the large entry from 4 to 3,
-//! where it should buy nothing, because that entry is already MMA-bound. Two
-//! predictions with opposite signs, from one const.
+//! **`runtime stage` pays, and it is the port defect.** The MMA warp used to
+//! index both operand rings and both stage barriers off
+//! `global_k = sequence * k_blocks + k`, a runtime value, so every offset and
+//! both operand descriptors were runtime arithmetic inside its stream — and the
+//! `mbarrier.try_wait.parity` spin loop re-derived the barrier's address on every
+//! poll. But `k_blocks` is a multiple of `STAGES` (the shape contract is
+//! `k % 256 == 0`), so `global_k % STAGES == k % STAGES` and the four positions
+//! of the four-way unroll are always stages 0, 1, 2, 3. Handing each its stage as
+//! a const folds the offsets to literals and the parity to one register a turn.
+//! It is worth **+2.2% to +4.3% at 4096³** across two containers and four passes,
+//! and it takes the K loop from 76.3% to 78.8% of peak. Upstream states the same
+//! fact — *"`k_iters % 4 == 0` … keeping this expression loop-local lets the
+//! unroll pass fold each stage match"* — and spells it `#[unroll(4)]` over a
+//! loop-local `k_idx & 3`; that attribute is rewritten only inside a `#[kernel]`
+//! or `#[device_function]` body, so a const parameter is the spelling reachable
+//! from a plain `impl` method. Its gain is **not** in the MMA issue stream:
+//! `mma only` against `runtime mma` is 1.018 / 1.001 / 1.005 / 0.998, null. It is
+//! in the barrier poll loop, which is the one place the folded address is
+//! re-materialized per iteration.
 //!
-//! #144 read its `feed only` arm as bandwidth and concluded "the feed is not the
-//! problem", by comparing the feed's ceiling against the loop's *in-situ* rate —
-//! which is low because the loop is slow, so that comparison cannot fail. The
-//! comparison that can fail is the feed's ceiling against what **peak MMA
-//! demands**: at `[256, 256]` the feed needs 85% of the peak-MMA time and at
-//! `[512, 256]` it needs 58%. And #144's own numbers read as issue rate rather
-//! than bandwidth when divided the other way — 90 ns and 81 ns per TMA
-//! instruction, 11% apart, against 18.0 and 22.4 TB/s, which are 24% apart.
+//! **`wide B` does not pay, and that is the result.** It is the same body at
+//! `BOX = 128`: a rank's `B` half-panel arriving in **one** TMA instead of two, at
+//! byte-for-byte identical traffic, which takes the producer from 3 instructions
+//! a K block to 2 at `[256, 256]` and from 4 to 3 at `[512, 256]`. It moves
+//! nothing — 0.998 and 1.014 on the launch across two passes, 0.3484 against
+//! 0.3503 µs a K block on the rate, and 1.008 / 0.981 on `feed only` itself,
+//! where the feed is alone and has nothing to hide behind. So the feed's ceiling
+//! is bytes and not instructions, and **#144's conclusion that the feed is not
+//! an instruction-rate problem survives** even though the comparison it drew
+//! (ceiling against in-situ rate) could not have failed. The comparison that can
+//! fail is ceiling against what peak MMA demands, and that is the duty-cycle
+//! table at the top — which says the feed is not the problem at `[512, 256]` and
+//! *is* the whole of it at `[256, 256]`.
 //!
-//! # The reference the port is measured against
+//! # The reference
 //!
-//! The last table is the same K ladder on #145's byte-for-byte copy of upstream's
-//! `gemm_sol_final` at the same `[256, 256]` tile, so the small entry's
-//! per-K-block rate has a reference and not only a peak. #145 found the port 7.8%
-//! behind upstream at 4096³ — its worst of three sizes, and the shape this entry
-//! serves — so this splits the K-loop deficit into what is structural to the
-//! algorithm at this tile and what is the port's.
+//! The last table is the same ladder on #145's byte-for-byte copy of upstream's
+//! `gemm_sol_final` at the same tile: **0.3352 µs a K block, 82.3% of peak**. So
+//! the deficit splits. 17.7 points are structural — upstream pays them too, and
+//! the duty-cycle table says why — and the port's own share was 6.0 points before
+//! the fold and is 3.5 after it. Our drain-free K loop (80.4%) is still 1.9 points
+//! behind upstream's drain-inclusive one, so about two points of what is left is
+//! in the feed's interaction rather than in the epilogue.
 
 use std::error::Error;
 use std::sync::Arc;

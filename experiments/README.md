@@ -4922,6 +4922,157 @@ and reads **1320.7 / 1871.4 / 2041.0** against **1322.7 / 1871.5 / 2041.4** —
 own rows reproduce #138's published 1289.0 / 1867.7 / 2045.5 to 2.5% / 0.2% /
 0.2% across two sessions and two days.
 
+##### and the small entry's K loop is its feed's duty cycle, not its cadence — #144, #146
+
+#144 left `[256, 256]`'s K loop at **75.8% of tensor-core peak** against
+`[512, 256]`'s **99.4%**, on the same K-loop code, and listed two things it could
+not separate. `bench sol-ablate` separates them, and the separation kills three
+hypotheses before it names the term.
+
+**Every arm is laddered in `K`.** That is the methodological point and it is not
+cosmetic: an arm's *launch* fuses its per-K-block cadence with a per-tile constant
+it carries for its own reasons, and at 64 k blocks one microsecond of constant is
+5.7 points of "of peak". The un-laddered launches said the MMA warp reached only
+88.7% of peak; laddered, it reaches 100.0%. One of those two numbers is a
+measurement of the K loop and the other is not.
+
+At 4096² on `[256, 256]`, µs a K block against **0.2759 at peak**:
+
+| arm | µs a K block | of peak | what it says |
+| --- | ---: | ---: | --- |
+| `feed only` | 0.2636 | 104.6% | the feed alone beats the tensor core by 4.6% |
+| `mma only` | 0.2742 | **100.6%** | no barrier wait, no TMA, no drain |
+| `issue only` | 0.2758 | **100.0%** | the same, with the wait back |
+| `no drain` | 0.3433 | 80.4% | the feed in situ costs **24.5%** |
+| `whole` | 0.3503 | 78.8% | the drain costs the rate another 2.0% |
+| `runtime stage` | 0.3615 | 76.3% | the spelling before this PR |
+| **upstream** | **0.3352** | **82.3%** | the same algorithm, unported |
+
+**The answer is one number per entry.** `feed only` is the operand pipeline's own
+time for a K block; peak MMA is the tensor core's. Their ratio is the fraction of
+the tensor core's busy time the feed has to be running:
+
+| entry | feed alone | MMA at peak | **the feed's duty** | feed in situ |
+| --- | ---: | ---: | ---: | ---: |
+| `[256, 256]` | 0.2636 µs | 0.2759 µs | **95.5%** | **+24.5%** |
+| `[512, 256]` | 0.3075 µs | 0.5518 µs | **55.7%** | **+0.0%** |
+
+At 95.5% duty there is no slack for the TMA's writes and the tensor core's
+operand reads to stay out of each other's way, and the cost of them not doing so
+is the whole deficit. At 55.7% there is 44% of slack and it is free. That 1.72×
+in duty is the 1.33× in operand bytes per flop between a `[256, 256]` cluster tile
+and a `[512, 256]` one — #146's "0.75× the operand traffic per flop" read from the
+other end — so **the term is the tile's arithmetic intensity, acting through the
+feed's duty cycle rather than through raw bandwidth.** At `[512, 256]` nothing in
+the K loop moves at all: feed, drain, barriers and ring index are 0.5557, 0.5572,
+0.5570 and 0.5547 µs, every one of them 99.0–99.5% of peak.
+
+**Three hypotheses died on the way, and each was cheap to kill.**
+
+*Not enough arithmetic per barrier round trip* — the leading one, and the one the
+second `A` ring at `[512, 256]` suggests — is dead twice. On arithmetic: both
+entries execute exactly **one** `load.wait` per K block, so the large entry buys a
+second MMA chain per *the same* round-trip count and additionally pays two `free`
+commits where the small entry pays one; a fixed cost `C` of 88 ns from the small
+entry's row would force the large one to 86% of peak against a measured 99.4%. And
+on measurement: `mma only` is `issue only` with the MMA warp's `load.wait` dropped
+and nothing else, and the two agree to **0.6%, with the arm that keeps the wait
+nominally faster**. The barrier round trip is zero. #144's unseparated row is
+closed.
+
+*A `tcgen05` issue-rate ceiling* is dead: `issue only` is 100.0% of peak and
+`mma only` 100.6%. One warp can saturate the tensor core at this tile.
+
+*The producer's instruction count* is dead, and this one needed an experiment
+rather than an argument. A rank's `B` half-panel is `128 x 64` — the same shape as
+`A`, which already arrives in one TMA — and it arrives in two 64-row boxes only
+because one 64-row tensor map served all three entries. Building it per entry
+takes the producer from **3 instructions a K block to 2** at `[256, 256]` and from
+4 to 3 at `[512, 256]`, at byte-for-byte identical traffic. It moves nothing:
+0.998 and 1.014 on the launch over two passes, 0.3484 against 0.3503 µs on the
+rate, and **1.008 and 0.981 on `feed only` itself**, where the feed is alone and
+has nothing to hide behind. So the feed's ceiling is bytes and not instructions,
+and #144's conclusion that the feed is not an instruction-rate problem survives —
+though the comparison it drew for it (the feed's ceiling against the loop's
+*in-situ* rate, which is low because the loop is slow) could not have failed. The
+comparison that can fail is ceiling against what peak MMA demands, and that is the
+duty-cycle table.
+
+**What did pay is a port defect with upstream's own comment as its spec.** The MMA
+warp indexed both operand rings and both stage barriers off
+`global_k = sequence * k_blocks + k`, a runtime value. But `k_blocks` is a multiple
+of `STAGES` — every entry's shape contract is `k % (STAGES · BLOCK_K) == 0` — so
+`global_k % STAGES == k % STAGES`, and the four positions of the four-way unroll
+are always stages 0, 1, 2, 3. Handing each position its stage as a **const** folds
+both barrier addresses to literals, both operand descriptors out of the loop, the
+accumulate predicate to a constant at three of the four positions, and the phase
+parity to one register a turn rather than four. The PTX shows all four:
+`add.s64 %rd199, %rd200, 131080` where the offset used to be computed, one
+`%r158` carrying the parity across all four slots, and `mov.b32 %r130, 1` where
+the predicate used to be a `setp`.
+
+Upstream states the same fact and spells it differently — `#[unroll(4)]` over a
+loop-local `k_idx & 3` with a `match` on it, and the comment *"`k_iters % 4 == 0`,
+so the producer's global stage and this local stage agree at every tile boundary.
+Keeping this expression loop-local lets the unroll pass fold each stage match."*
+That attribute exists at our pin and **nothing in this repo uses it**; it is
+rewritten only inside a `#[kernel]` or `#[device_function]` body, so a const
+parameter is the spelling reachable from a plain `impl` method, and it does not
+depend on an unroll pass firing.
+
+| 4096³, `[256, 256]` | runtime stage | const stage | ratio |
+| --- | ---: | ---: | ---: |
+| container A, pass 1 | 1281.7 | 1333.8 | **1.041** |
+| container A, pass 2 | 1274.5 | 1329.7 | **1.043** |
+| container B, pass 1 | 1289.0 | 1327.2 | **1.030** |
+| container B, pass 2 | 1300.7 | 1328.9 | **1.022** |
+| K-block rate | 0.3615 µs | 0.3503 µs | 76.3% → **78.8%** of peak |
+
+**+2.2% to +4.3%, two containers, four passes** — quoted as a range because each
+row's own launches spread 2.6–5.7% and a ratio inherits that. At 8192³ on
+`[512, 256]` it is 1.001–1.003, which is the predicted null: that K loop had
+nothing to give.
+
+**Its gain is in the barrier poll loop, not in the MMA issue stream**, which is
+where the mechanism was expected and is not. `mma only` against `runtime mma` is
+1.018 / 1.001 / 1.005 / 0.998 — null across four passes — so folding the ring
+index does not speed up `tcgen05` issue. What it does speed up is
+`mbarrier.try_wait.parity`, whose spin loop re-materializes the barrier's address
+on **every poll**; a literal offset shortens that loop and therefore the wake-up
+after data lands. Stated as the measurement rather than as the mechanism it was
+built for.
+
+**Against the two bars, in one container.** cuBLASLt 1707.7 and upstream 1453.5 at
+4096³; ours 1294.9 before and 1328.1 after (means of the two passes):
+
+| | of cuBLASLt | of upstream |
+| --- | ---: | ---: |
+| before | 0.758 | 0.891 |
+| after | **0.778** | **0.917** |
+
+So the port's K-loop share of the deficit was 6.0 points of peak and is 3.5, and
+**the fold closed 42% of it.** What remains splits two ways: our drain-free K loop
+(80.4%) is still 1.9 points behind upstream's drain-*inclusive* one (82.3%), so
+roughly two points of the residual is in the feed's interaction rather than in the
+epilogue, and it is not the ring index, not the barrier, not the issue rate and
+not the producer's instruction count — all four are now measured at zero.
+
+**What this does not separate.** Why the feed in situ costs 24.5% at 95.5% duty
+and 0.0% at 55.7% is a duty-cycle argument, not a mechanism: bank conflicts
+between the TMA's writes and `tcgen05`'s operand reads, and the shared-memory
+write port, are not distinguished from each other here, and no arm in this file can
+distinguish them. The per-tile constants the ladders fit are two-point fits of
+small differences between large numbers, so only the large one — the drain's 2.9 µs
+a tile, which reproduces #147's independently measured 2.82 — is quoted.
+
+**The consequence for tiling, which is somebody else's to act on.** The term is the
+tile's operand bytes per flop, so the lever is the tile, and #146 swept it and
+found `[512, 256]` at 4096³ a dead heat (0.985) because it halves the tile count
+and so doubles the per-tile constant each tile must amortize. This file prices that
+constant at 3.4 µs a tile, of which the drain is 2.9. If the drain falls, the
+crossover should move below 8192 — the entry that is already at 99.3% of peak in
+its K loop would then be the right one at 4096³ too.
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all
