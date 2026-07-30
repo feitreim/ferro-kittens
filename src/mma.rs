@@ -1,31 +1,11 @@
 //! Chained tcgen05 MMA walks over shared-tile operands.
 //!
-//! tcgen05's native step is `D (+)= A·Bᵀ` over a K=16 bf16 chunk; a full
-//! tile multiply is a chain of those steps with `enable_d` linking every
-//! step after the first into the accumulator. The single-CTA walks name the
-//! layout in their types — [`mma_abt`]/[`mma_ab`] from a flash-attention
-//! forward, [`mma_atb`]/[`mma_atbt`] completing that square — and the
-//! cluster-pair [`mma_walk_cg2`] of a GEMM names it in [`OperandWalk`]
-//! values, because that kernel selects K-major vs MN-major at runtime.
-//!
-//! Chunk geometry, fixed by a 2-byte element and the 128-byte swizzle atom:
-//! one K=16 chunk is 32 bytes along a row, so a subtile row holds four
-//! chunks. A **K-major** operand (`[MN, K]`, K contiguous) walks
-//! `(k / 4) * SUBTILE_BYTES + (k % 4) * 32` across its stacked subtiles; an
-//! **MN-major** operand (`[K, MN]`, MN contiguous — the transpose-bit forms)
-//! supplies K along rows instead, 16 rows (`16 * ATOM_BYTES` bytes) per
-//! chunk, and reaches MN past its first 64 columns through the descriptor's
-//! *leading* offset rather than a step along the row: that is
-//! [`SharedTile::mn_walk`], and every MN-major operand here is one.
-//!
-//! Which transpose bits the instruction descriptor carries is that same
-//! choice of walk, so every walk builds its own descriptor ([`MmaShape`] plus
-//! [`MmaElement::ELEMENT_TYPE`]) and a caller has no way to pair a walk with
-//! a descriptor that disagrees. That pairing used to be prose, and getting it
-//! wrong does not fault: the MMA reads the operands under the wrong
-//! interpretation and fills the accumulator with wrong numbers.
-//!
-//! The four operand orders, and what each one's tiles are shaped like:
+//! tcgen05's native step is `D (+)= A·Bᵀ` over a K=16 chunk; a tile multiply is
+//! a chain of those steps, every one after the first linked into the
+//! accumulator. Each walk names its operand layout in its types and builds its
+//! own descriptor from that layout, so a caller cannot pair a walk with a
+//! descriptor that disagrees — which does not fault, it fills the accumulator
+//! with wrong numbers.
 //!
 //! | Walk | `A` | `B` | transpose `(a, b)` |
 //! | --- | --- | --- | --- |
@@ -34,15 +14,36 @@
 //! | [`mma_atb`] | `[K, M]` | `[K, N]` | `(true, true)` |
 //! | [`mma_atbt`] | `[K, M]` | `[N, K]` | `(true, false)` |
 //!
-//! Every one of them comes in an [`mm_abt`]-style twin that starts the
-//! accumulator fresh — see [`mm_abt`] for why that is a separate entry point
-//! rather than a `false`.
+//! Each has an [`mm_abt`]-style twin that *replaces* the accumulator rather than
+//! adding to it, and [`mma_walk_cg2`] is the cluster-pair form, taking
+//! [`OperandWalk`] values so a kernel choosing K-major vs MN-major at runtime
+//! issues one loop either way. Operands are generic over their [`MmaElement`],
+//! which also routes tcgen05's `KIND`; the chunk geometry is still 2-byte-only
+//! and asserted as such at every walk that depends on it.
 //!
-//! The tile operands are generic over their [`MmaElement`], and so is the
-//! *instruction*: the walks issue through [`MmaElement::mma`], which routes
-//! tcgen05's `KIND` from the element (#12). The chunk geometry above is what
-//! is still bf16-shaped, and the walks assert a 2-byte element until issue
-//! #16 has a second one to check a wider form against.
+//! A K loop, published to its consumers once:
+//!
+//! ```no_run
+//! # use kittens::mma::{MmaShape, commit, mma_abt};
+//! # use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
+//! # use kittens::Semaphore;
+//! # unsafe fn demo(
+//! #     accumulator: u32,
+//! #     a: SharedTile<Bf16, 128, 64, Swizzle128B>,
+//! #     b_ring: SharedTileRing<Bf16, 64, 64, Swizzle128B, 3>,
+//! #     done: Semaphore,
+//! # ) { unsafe {
+//! let mut block = 0u32;
+//! while block < 8 {
+//!     mma_abt(accumulator, a, b_ring.tile(block % 3), MmaShape::M128_N64, block > 0);
+//!     block += 1;
+//! }
+//! commit(done);
+//! # } }
+//! ```
+//!
+//! `docs/library/mma.md` has the chunk geometry the walks are derived from, and
+//! why `mm_*` is a separate entry point rather than a `false`.
 
 use cuda_device::tcgen05::{
     Tcgen05AccumulatorType, Tcgen05InstructionDescriptor, tcgen05_commit_multicast_cg2,
@@ -53,8 +54,8 @@ use crate::shared::{MmaElement, OperandWalk, SharedTile, Swizzle};
 use crate::sync::Semaphore;
 
 /// The `M`×`N` an MMA instruction covers — the accumulator band the caller
-/// allocated and, under `cta_group::2`, the pair's shared `M256` class. The
-/// one descriptor field no walk can know.
+/// allocated and, under `cta_group::2`, the pair's shared `M256` class. The one
+/// descriptor field no walk can derive from its operands.
 pub use cuda_device::tcgen05::Tcgen05MmaShape as MmaShape;
 
 /// K elements per chained-MMA chunk (one 16-bit core-matrix step).
@@ -65,11 +66,9 @@ const K_CHUNK_BYTES: usize = K_CHUNK * 2;
 /// atom).
 const CHUNKS_PER_ROW: usize = 128 / K_CHUNK_BYTES;
 
-/// The one thing in this module that is still bf16-shaped, asserted at the
-/// walks that depend on it rather than generalized on a guess: the chunk
-/// geometry above assumes 32 bytes per K=16 chunk. Issue #16 widens it,
-/// against a second element it can be checked with. (The *instruction* is no
-/// longer on this list — [`MmaElement::mma`] routes `KIND` from the element.)
+/// The chunk offsets below assume 32 bytes per K=16 chunk, which is a 2-byte
+/// element. Asserted at the walks that depend on it rather than generalized on a
+/// guess.
 const fn assert_two_byte_element<E: MmaElement>() {
     assert!(
         E::BYTES == 2,
@@ -77,15 +76,12 @@ const fn assert_two_byte_element<E: MmaElement>() {
     );
 }
 
-/// The instruction descriptor for a walk that reads its operands with the
-/// given transpose configuration: everything the walk and its element already
-/// fix, leaving `shape` as the caller's one degree of freedom.
+/// The instruction descriptor for a walk that reads its operands with the given
+/// transpose configuration: everything the walk and its element already fix,
+/// leaving `shape` as the caller's one degree of freedom.
 ///
-/// The accumulator stays fp32 because a walk names TMEM by a bare `u32` and
-/// has no accumulator type to read one off; fp16 accumulation is a
-/// `.kind::f16`-only mode no kernel here uses, and threading a typed
-/// accumulator through belongs with whatever gives the walks a [`crate::tmem`]
-/// tile instead of an address.
+/// The accumulator stays fp32 because a walk names TMEM by a bare `u32` and has
+/// no accumulator type to read one off.
 #[inline(always)]
 fn descriptor<E: MmaElement>(shape: MmaShape, transpose_a: bool, transpose_b: bool) -> u32 {
     Tcgen05InstructionDescriptor::builder()
@@ -109,18 +105,30 @@ const fn k_rows_offset(k: usize, atom_bytes: usize) -> usize {
     k * K_CHUNK * atom_bytes
 }
 
-/// `D (+)= A·Bᵀ` with both operands K-major `[rows, K]` — flash's
-/// `S = Q·Kᵀ` walk. One chained MMA per K=16 chunk from the current leader
-/// thread, under a descriptor this builds with no transpose bits; `shape`
-/// names the caller's accumulator band. The operands may stack different row
-/// counts (7e15's paired-`[128, K]` A against an unpaired `[64, K]` B) —
-/// each walks its own subtile stride.
+/// `D (+)= A·Bᵀ` with both operands K-major `[rows, K]` — a flash forward's
+/// `S = Q·Kᵀ` walk.
+///
+/// One chained MMA per K=16 chunk, no transpose bits. `A` and `B` may stack
+/// different row counts; each walks its own subtile stride.
+///
+/// ```no_run
+/// # use kittens::mma::{MmaShape, mma_abt};
+/// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+/// # unsafe fn demo(
+/// #     tmem: u32,
+/// #     q: SharedTile<Bf16, 128, 64, Swizzle128B>,
+/// #     k: SharedTile<Bf16, 64, 64, Swizzle128B>,
+/// # ) { unsafe {
+/// mma_abt(tmem, q, k, MmaShape::M128_N64, false);
+/// # } }
+/// ```
 ///
 /// # Safety
 ///
-/// Exactly one thread issues this; `tmem` names an accumulator `shape` fits;
-/// both tiles hold committed operand data until the MMA's own commit is
-/// observed.
+/// - Exactly one thread issues this.
+/// - `tmem` names an accumulator `shape` fits.
+/// - Both tiles hold committed operand data until the MMA's own commit is
+///   observed.
 #[inline(always)]
 pub unsafe fn mma_abt<
     E: MmaElement,
@@ -158,15 +166,28 @@ pub unsafe fn mma_abt<
     }
 }
 
-/// `D (+)= A·B` — flash's `O = P·V` / gradient walk. `A` is K-major
-/// `[rows, K]`; `B` supplies K along its rows, so the descriptor this builds
-/// sets `transpose_b`. One 64-wide output band per `B` subtile, accumulated
-/// into `tmem + subtile * 64`. `accumulate` false starts every band's
-/// accumulator fresh.
+/// `D (+)= A·B` — a flash forward's `O = P·V` walk. `A` is K-major `[rows, K]`;
+/// `B` supplies K along its rows, so this sets `transpose_b`.
+///
+/// One 64-wide output band per `B` subtile, accumulated into
+/// `tmem + subtile * 64`; `accumulate` false starts every band fresh.
+///
+/// ```no_run
+/// # use kittens::mma::{MmaShape, mma_ab};
+/// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+/// # unsafe fn demo(
+/// #     tmem: u32,
+/// #     p: SharedTile<Bf16, 128, 64, Swizzle128B>,
+/// #     v: SharedTile<Bf16, 64, 128, Swizzle128B>,
+/// # ) { unsafe {
+/// mma_ab(tmem, p, v, MmaShape::M128_N128, true);
+/// # } }
+/// ```
 ///
 /// # Safety
 ///
-/// As [`mma_abt`]; `tmem` must own `64 * B::SUBTILES` fp32 columns.
+/// - As [`mma_abt`].
+/// - `tmem` owns `64 * B::SUBTILES` fp32 columns.
 #[inline(always)]
 pub unsafe fn mma_ab<E: MmaElement, const AR: usize, const K: usize, const N: usize, S: Swizzle>(
     tmem: u32,
@@ -201,19 +222,17 @@ pub unsafe fn mma_ab<E: MmaElement, const AR: usize, const K: usize, const N: us
 }
 
 /// `D (+)= Aᵀ·B` — both operands MN-major, `[K, M]` and `[K, N]`, so both
-/// transpose bits are set. The walk this issues is the one the *pair* path
-/// already had as a value ([`SharedTile::mn_walk`]): a K=16 chunk is 16 rows,
-/// and MN past the first 64 columns is reached through the descriptor's
-/// leading offset, so one instruction covers the whole `[M, N]` band rather
-/// than one per stacked subtile.
+/// transpose bits are set.
 ///
-/// The transpose bits are read back off the walks rather than written down
-/// beside them, exactly as [`mma_walk_cg2`] does — the operand order and the
-/// descriptor cannot disagree because only one of them is stated.
+/// Both go through [`SharedTile::mn_walk`]: a K=16 chunk is 16 rows, and MN past
+/// the first 64 columns is reached through the descriptor's leading offset, so
+/// **one instruction covers the whole `[M, N]` band** rather than one per
+/// stacked subtile as in [`mma_ab`].
 ///
 /// # Safety
 ///
-/// As [`mma_abt`]; `shape` must be the `[M, N]` the two tiles describe.
+/// - As [`mma_abt`].
+/// - `shape` is the `[M, N]` the two tiles describe.
 #[inline(always)]
 pub unsafe fn mma_atb<E: MmaElement, const K: usize, const M: usize, const N: usize, S: Swizzle>(
     tmem: u32,
@@ -240,9 +259,8 @@ pub unsafe fn mma_atb<E: MmaElement, const K: usize, const M: usize, const N: us
     }
 }
 
-/// `D (+)= Aᵀ·Bᵀ` — `A` MN-major `[K, M]`, `B` K-major `[N, K]`. The last of
-/// the four operand orders, and the mirror of [`mma_ab`]: each walks one
-/// operand the way the other walks its second.
+/// `D (+)= Aᵀ·Bᵀ` — `A` MN-major `[K, M]`, `B` K-major `[N, K]`. The mirror of
+/// [`mma_ab`]: each walks one operand the way the other walks its second.
 ///
 /// # Safety
 ///
@@ -282,27 +300,35 @@ pub unsafe fn mma_atbt<
     }
 }
 
-/// A cta_group::2 chained MMA over [`OperandWalk`] operands — one
-/// instruction per chunk drives the CTA pair's shared `M256`-class
-/// accumulator, each CTA contributing its own operand halves. The layout
-/// lives in the walk values ([`SharedTile::k_walk`] /
-/// [`SharedTile::mn_walk`]), so a kernel selecting K-major vs MN-major at
-/// runtime (gemm's `transposed`) issues one loop either way — and the
-/// descriptor's transpose bits come from [`OperandWalk::transposed`], so a
-/// runtime layout choice moves the walk and the instruction together.
+/// A `cta_group::2` chained MMA over [`OperandWalk`] operands: one instruction
+/// per chunk drives the CTA pair's shared `M256`-class accumulator, each CTA
+/// contributing its own operand halves.
 ///
-/// The element is the one field this cannot take from its operands: an
-/// [`OperandWalk`] has already erased it, so `E` is named by the caller
-/// (`mma_walk_cg2::<Bf16, CHUNKS>`) rather than derived as in [`mma_abt`].
-/// It stays that way now that `E` routes the instruction as well as the
-/// operand format (#12): a walk that carried its element back would have to
-/// carry a `KIND` too, which is to say it would stop being layout-only.
+/// The layout lives in the walk values ([`SharedTile::k_walk`] /
+/// [`SharedTile::mn_walk`]) and the descriptor's transpose bits come from
+/// [`OperandWalk::transposed`], so a runtime layout choice moves the walk and the
+/// instruction together. `E` is named by the caller rather than derived, because
+/// an [`OperandWalk`] has already erased it.
+///
+/// ```no_run
+/// # use kittens::mma::{MmaShape, mma_walk_cg2};
+/// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+/// # unsafe fn demo(
+/// #     tmem: u32,
+/// #     a: SharedTile<Bf16, 128, 64, Swizzle128B>,
+/// #     b: SharedTile<Bf16, 64, 128, Swizzle128B>,
+/// #     transposed: bool,
+/// # ) { unsafe {
+/// let a_walk = if transposed { a.mn_walk() } else { a.k_walk() };
+/// mma_walk_cg2::<Bf16, 4>(tmem, a_walk, b.mn_walk(), MmaShape::M256_N128, true);
+/// # } }
+/// ```
 ///
 /// # Safety
 ///
-/// As [`mma_abt`], from the *leader* CTA's issuing thread only, with the
-/// cluster's peer holding its operand halves at the same shared offsets;
-/// both walks must cover `CHUNKS` K=16 chunks of committed data, of `E`.
+/// - As [`mma_abt`], from the *leader* CTA's issuing thread only.
+/// - The cluster's peer holds its operand halves at the same shared offsets.
+/// - Both walks cover `CHUNKS` K=16 chunks of committed data, of `E`.
 #[inline(always)]
 pub unsafe fn mma_walk_cg2<E: MmaElement, const CHUNKS: usize>(
     tmem: u32,
@@ -331,18 +357,23 @@ pub unsafe fn mma_walk_cg2<E: MmaElement, const CHUNKS: usize>(
 /// `D = A·Bᵀ` — [`mma_abt`] with the accumulator *replaced* rather than added
 /// to, which is tcgen05's `mm` half of `{mm, mma}`.
 ///
-/// The instruction is the same one either way; what changes is who owes the
-/// invariant. `mma_abt(.., false)` reads as an argument, so a call site that
-/// means "this is the first MMA into a fresh band" and a call site that means
-/// "and I have checked nothing else wrote there" spell themselves
-/// identically, and a `false` that should have been `true` silently discards
-/// an accumulator. Naming the two cases puts that in the type: everything
-/// below takes no `accumulate` because there is nothing left to decide.
+/// Reach for the `mm_*` form whenever the choice is static: a `false` that
+/// should have been `true` silently discards an accumulator, and these take no
+/// `accumulate` because there is nothing left to decide. The `mma_*` walks keep
+/// the parameter for callers whose choice is *runtime*, such as a GEMM's
+/// `k > 0`.
 ///
-/// The `accumulate` parameter stays on the `mma_*` walks for the callers
-/// whose choice is *runtime* — gemm's `k > 0` is one value threaded through
-/// one chain, and splitting it into two typed arms would duplicate the chain
-/// for no gain (see [`OperandWalk`]).
+/// ```no_run
+/// # use kittens::mma::{MmaShape, mm_abt};
+/// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+/// # unsafe fn demo(
+/// #     tmem: u32,
+/// #     q: SharedTile<Bf16, 128, 64, Swizzle128B>,
+/// #     k: SharedTile<Bf16, 64, 64, Swizzle128B>,
+/// # ) { unsafe {
+/// mm_abt(tmem, q, k, MmaShape::M128_N64);
+/// # } }
+/// ```
 ///
 /// # Safety
 ///
@@ -426,21 +457,33 @@ pub unsafe fn mm_walk_cg2<E: MmaElement, const CHUNKS: usize>(
 /// Publish the issued MMA chain to `sem`: every consumer that `wait`s the
 /// semaphore afterward observes the accumulator complete.
 ///
+/// This is what makes an accumulator safe to drain — no LDTM may read a band
+/// before the MMA writing it has been committed and waited on.
+///
 /// # Safety
 ///
-/// Same issuing thread as the MMAs it commits; `sem` initialized.
+/// - Same issuing thread as the MMAs it commits.
+/// - `sem` is initialized.
 #[inline(always)]
 pub unsafe fn commit(sem: Semaphore) {
     unsafe { tcgen05_commit_shared_cluster(sem.raw() as *mut u64) }
 }
 
-/// Publish a cta_group::2 MMA chain to every CTA in `cta_mask`'s copy of
+/// Publish a `cta_group::2` MMA chain to every CTA in `cta_mask`'s copy of
 /// `sem` — the pair-UMMA commit (`0b11` for both halves of the pair).
+///
+/// ```no_run
+/// # use kittens::mma::commit_multicast_cg2;
+/// # use kittens::Semaphore;
+/// # unsafe fn demo(done: Semaphore) { unsafe {
+/// commit_multicast_cg2(done, 0b11);
+/// # } }
+/// ```
 ///
 /// # Safety
 ///
-/// As [`commit`], from the leader CTA's issuing thread, with each masked
-/// CTA holding an initialized barrier at `sem`'s address.
+/// - As [`commit`], from the leader CTA's issuing thread.
+/// - Each masked CTA holds an initialized barrier at `sem`'s address.
 #[inline(always)]
 pub unsafe fn commit_multicast_cg2(sem: Semaphore, cta_mask: u16) {
     unsafe { tcgen05_commit_multicast_cg2(sem.raw() as *mut u64, cta_mask) }
@@ -467,8 +510,7 @@ mod tests {
 
     #[test]
     fn each_walks_descriptor_encodes_its_own_transpose_configuration() {
-        // The three descriptors the call sites used to hand-build: flash's
-        // score MMA, its output MMA, and gemm's cta_group::2 stage.
+        // Flash's score MMA, its output MMA, and a GEMM's cta_group::2 stage.
         assert_eq!(
             descriptor::<Bf16>(MmaShape::M128_N64, false, false),
             bf16_f32_descriptor(128, 64, false, false)
