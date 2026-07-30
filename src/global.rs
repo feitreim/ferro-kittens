@@ -1,100 +1,17 @@
 //! Global memory: the TMA-descriptor path, and the direct one.
 //!
-//! # Through a descriptor
+//! [`GlobalLayout`] is the host side of a TMA operand — base address, extents,
+//! byte strides, dimension 0 contiguous — and [`GlobalLayout::tensor_map`]
+//! encodes one for a given [`crate::shared::SharedTile`], so the descriptor and
+//! the tile it feeds agree by construction. Host-only (`feature = "host"`).
 //!
-//! The device side of a TMA operand is just a `*const TmaDescriptor` kernel
-//! parameter; what the type system can hold is the *host* side. A
-//! [`GlobalLayout`] is everything `cuTensorMapEncodeTiled` needs about the
-//! buffer — base address, per-dimension extents, per-dimension byte strides,
-//! dimension 0 the contiguous one — and nothing about the transfer. The box
-//! comes from the [`crate::shared::SharedTile`] the map is paired with, so
-//! descriptor and tile agree by construction rather than by convention: one
-//! box per subtile, [`crate::shared::SharedTile::SUBTILE_COLS`] wide and `R`
-//! rows tall, in the tile's own swizzle mode and element type. A layout paired
-//! with the wrong element does not typecheck.
+//! [`GlobalRows`], [`load_rows`], [`store_rows`] and [`store_shared_rows`] are
+//! the direct path: ordinary loads and stores against a row-major window at a
+//! runtime leading dimension, no engine and nothing asynchronous. It is what an
+//! fp32 epilogue, a small irregular operand, or a band staged through shared
+//! memory takes to reach global memory.
 //!
-//! Only the *rank* is a type parameter. Extents and strides are runtime
-//! values because every buffer a kernel here maps has a runtime shape — a
-//! GEMM's `K`, a batch count — while the rank decides the arity of the arrays
-//! the driver call takes, which is exactly what a const generic is for. A
-//! per-dimension compile-time/runtime marker (ThunderKittens' `gl` has one)
-//! would buy constant folding in address arithmetic that happens entirely
-//! inside the TMA engine, and would need array lengths computed from the
-//! markers — `generic_const_exprs`, which this crate avoids.
-//!
-//! Host-only (`feature = "host"`): `cuTensorMapEncodeTiled` lives in
-//! cuda-core, and the device crates never see it.
-//!
-//! # Without one
-//!
-//! [`GlobalRows`], [`load_rows`] and [`store_rows`] are the other path —
-//! ThunderKittens' `global_to_register.cuh`, and the reason a descriptor is
-//! not the only way out of a kernel. An epilogue that must reach global memory
-//! **as fp32** has no descriptor route at all: `TensorMapElement` is
-//! `Bf16`-only and `stmatrix` is b16, so the staging half of the round trip
-//! cannot be spelled and the choice through shared memory is to round or to
-//! widen. And a small irregular operand — a bias row, a lookup table, a ragged
-//! tail — is not worth a descriptor built on the host in the first place.
-//!
-//! An epilogue whose output *is* bf16 (#108) has both routes open, and this one
-//! is still the shorter: the cursor's element is where the rounding happens,
-//! and nothing is staged.
-//!
-//! There is no engine here and nothing asynchronous: a thread computes the
-//! address of each value it owns from the fragment layout's own
-//! `(lane, slot, value) -> (row, column)` map and stores it. Which is why the
-//! movers are the only ones in the crate generic over [`FragmentLayout`]
-//! rather than pinned to [`BaseLdtm`](crate::reg::BaseLdtm) — `ldmatrix`,
-//! `stmatrix` and LDTM each fix a lane map in hardware, and a plain
-//! `st.global` fixes nothing.
-//!
-//! # Two values at a time
-//!
-//! A map that gives a thread *adjacent* columns has told the mover something:
-//! those two accesses are one. [`crate::reg::ColLayout::CONTIGUOUS_VALUES`] is
-//! that claim, and [`store_rows`]/[`load_rows`] spend it through
-//! [`Element::write_pair`] — half the memory instructions, and, because the two
-//! words of a pair sat in the same 32-byte sector either way, the same
-//! transactions carrying twice the useful bytes (#91).
-//!
-//! It is stated on the layout rather than read off `BaseLdtm`'s arithmetic
-//! because the shape set is open (#23): a layout written later gets the
-//! default `1` and scalar accesses, which is wrong about nothing, until it
-//! claims better. What the mover adds is the half the layout cannot know — a
-//! *vector* access must be aligned to its own width, and a cursor's base,
-//! stride and column origin are runtime numbers. So the pairing is checked
-//! once per call ([`GlobalRows::runs_aligned`]) rather than promised in a
-//! safety contract that an odd leading dimension would quietly break.
-//!
-//! What the *element* decides is only the instruction: fp32 needs a
-//! `st.global.v2.f32` to carry two values and bf16 needs a plain 4-byte word,
-//! because two bf16 already are one. Same count, half the bytes — see
-//! [`Element::write_pair`].
-//!
-//! # Out of a staged tile instead
-//!
-//! [`store_shared_rows`] is the third mover, and the only one whose *source*
-//! is shared memory. It writes the same kind of destination [`store_rows`]
-//! does — a rectangle of a row-major buffer at a runtime leading dimension —
-//! out of a [`crate::shared::SharedTile`] rather than out of registers, with
-//! ordinary stores and no engine anywhere.
-//!
-//! It exists because a fragment layout is a bad shape to store *from*. Under
-//! [`BaseLdtm`](crate::reg::BaseLdtm) a thread owns columns `{0, 1, 8, 9}` of
-//! each 16-column block, so the widest thing [`store_rows`] can issue is a
-//! pair and the addresses a warp presents are scattered across the row. Going
-//! through shared memory first — `stmatrix` into a swizzled tile
-//! ([`crate::ldst::store_tile`]), then this — spends one extra pass over the
-//! data to buy back *both* halves of that: the accesses widen to 16 bytes and
-//! the addresses of a warp become one contiguous run. NVIDIA's own reference
-//! kernel takes exactly this route (`gemm_sol_final` in cuda-oxide at the
-//! pinned revision `20a5616`), and it is the shared→global half of an epilogue
-//! that [`crate::epilogue::StoreRing`] does with the TMA engine instead.
-//!
-//! Neither is a strictly better answer. The engine costs a host-built
-//! descriptor and the fence and group-wait discipline that comes with it, and
-//! it lands a whole box; this costs the CTA's own issue slots, and lands
-//! whatever rectangle the arithmetic names.
+//! Design notes and measurements: `docs/library/global.md`.
 
 use core::marker::PhantomData;
 
@@ -106,20 +23,22 @@ use cuda_device::ptx_asm;
 /// A row-major window of global memory: a base address, the elements per row
 /// that separate one row from the next, and the element those are.
 ///
-/// The device-side counterpart of [`GlobalLayout`], and deliberately much less
-/// than one. A descriptor describes a whole tensor because the TMA engine
-/// bounds-checks against it; this describes only what address arithmetic
-/// needs, because the arithmetic is the calling thread's and nothing checks
-/// it. Extents are therefore absent rather than forgotten — see
-/// [`store_rows`]' safety contract for what the caller owes instead.
+/// The device-side counterpart of [`GlobalLayout`], carrying only what address
+/// arithmetic needs. There are no extents and nothing bounds-checks a cursor —
+/// see [`store_rows`]' safety contract for what the caller owes instead.
 ///
-/// **The element used to be fp32 and nothing else**, on the argument that a
-/// register tile *is* fp32 and this path exists to move one without rounding.
-/// #108 is what asked for the other direction: a training GEMM's `C` is bf16,
-/// so the rounding is the point rather than the loss, and it belongs in the
-/// store instruction rather than in a round trip through a shared tile. What
-/// the parameter costs is what the doc that predicted it said — a bound, and
-/// `E::read`/`E::write` where a raw `f32` used to be.
+/// `E` is the *destination's* element, not the register tile's: a tile is fp32
+/// either way, and an `E` narrower than fp32 rounds in the store instruction.
+///
+/// ```
+/// use kittens::global::GlobalRows;
+/// use kittens::shared::F32;
+///
+/// // A window into a buffer whose rows are 1024 elements apart.
+/// let c = 0x7f00_0000usize as *mut u8;
+/// let rows = unsafe { GlobalRows::<F32>::from_raw(c, 1024) };
+/// assert_eq!(rows.index(3, 5), 3 * 1024 + 5);
+/// ```
 pub struct GlobalRows<E: Element> {
     base: *mut u8,
     stride: usize,
@@ -140,14 +59,13 @@ impl<E: Element> GlobalRows<E> {
     ///
     /// # Safety
     ///
-    /// `base` must be a device address, aligned for `E`, of a live buffer that
-    /// outlives every use of the cursor. Nothing here dereferences it; the
-    /// movers' contracts say which elements they touch.
+    /// - `base` is a device address of a live buffer that outlives every use of
+    ///   the cursor, and is aligned for `E`.
+    /// - A cursor built from a *shared* reference's pointer — a `&[f32]` kernel
+    ///   parameter — may only be read from ([`load_rows`]).
     ///
-    /// A read-only source — a `&[f32]` kernel parameter — may be wrapped by
-    /// casting its pointer, provided [`load_rows`] is the only thing issued on
-    /// the cursor: a write through a pointer derived from a shared reference
-    /// is undefined however this type spells it.
+    /// Nothing here dereferences `base`; the movers' contracts say which
+    /// elements they touch.
     #[inline(always)]
     pub const unsafe fn from_raw(base: *mut u8, stride: usize) -> Self {
         Self {
@@ -160,18 +78,28 @@ impl<E: Element> GlobalRows<E> {
     /// The same, from the [`DisjointSlice`] a kernel's output parameter
     /// arrives as.
     ///
-    /// The slice's element is whatever storage word the launch declared — `f32`
-    /// for an fp32 output, `u16` for a bf16 one, since the device crate has no
-    /// bf16 scalar and a tile is bytes either way. Only the *width* has to
-    /// agree with `E`, and that is asserted at codegen rather than carried as a
-    /// type equality nobody could spell for the narrow case.
+    /// `T` is whatever storage word the launch declared — `f32` for an fp32
+    /// output, `u16` for a bf16 one, since the device crate has no bf16 scalar.
+    /// Only its *width* has to agree with `E`, which a const assert checks.
+    ///
+    /// ```no_run
+    /// use kittens::global::GlobalRows;
+    /// use kittens::shared::Bf16;
+    /// use cuda_device::DisjointSlice;
+    ///
+    /// # unsafe fn epilogue(c: &mut DisjointSlice<'_, u16>, ldc: usize) {
+    /// // A bf16 output arrives as `u16` storage words; the cursor names it bf16.
+    /// let dest = unsafe { GlobalRows::<Bf16>::from_slice(c, ldc) };
+    /// # let _ = dest;
+    /// # }
+    /// ```
     ///
     /// # Safety
     ///
-    /// As [`Self::from_raw`], and the cursor is `Copy` where the slice is
-    /// borrowed: it carries none of `DisjointSlice`'s uniqueness proof, so
-    /// the disjointness of what the threads write is the mover's contract to
-    /// keep and no longer the slice's.
+    /// - As [`Self::from_raw`].
+    /// - The cursor is `Copy` and carries none of `DisjointSlice`'s uniqueness
+    ///   proof, so keeping the threads' writes disjoint becomes the mover's
+    ///   contract rather than the slice's.
     #[inline(always)]
     pub unsafe fn from_slice<T, Space>(
         slice: &mut DisjointSlice<'_, T, Space>,
@@ -195,9 +123,7 @@ impl<E: Element> GlobalRows<E> {
     /// Index of `(row, column)` from the cursor's base, in elements.
     ///
     /// The whole of the address map, split out from [`Self::at`] so it is a
-    /// pure function a host test can call — the same split
-    /// [`crate::ldst::fragment_address`] makes on the shared side, and for the
-    /// same reason.
+    /// pure function a host test can call.
     #[inline(always)]
     pub const fn index(self, row: u32, column: u32) -> usize {
         row as usize * self.stride + column as usize
@@ -213,30 +139,31 @@ impl<E: Element> GlobalRows<E> {
         unsafe { self.base.add(E::BYTES * self.index(row, column)) }
     }
 
-    /// Whether a `run`-wide fp32 vector access is legally aligned at *every*
+    /// Whether a `run`-element vector access is legally aligned at *every*
     /// `(row, column + run * k)` this cursor names.
     ///
-    /// A vector access must be aligned to its whole width, which is the one
-    /// thing a fragment layout cannot promise: it knows `run` divides the
-    /// column it hands out, and nothing about where the buffer starts or how
-    /// far apart its rows are. Three terms have to agree, and only these
-    /// three, because `run * k` is aligned by construction:
+    /// A vector access must be aligned to its whole width, so three terms have
+    /// to agree — and only these three, because `run * k` is aligned by
+    /// construction:
     ///
     /// - the base address, so element 0 of row 0 is;
     /// - the column origin the band lands at, which shifts every row equally;
     /// - the row stride, so that every *other* row is too.
     ///
-    /// A cursor over a packed buffer at an even leading dimension passes for
-    /// pairs; one at an odd `ldc` does not, and gets scalar accesses instead
-    /// of a misaligned-address fault.
+    /// A packed buffer at an even leading dimension passes for pairs; an odd
+    /// `ldc` does not, and gets scalar accesses instead of a misaligned-address
+    /// fault. The answer does not depend on `E`: a narrower element halves the
+    /// offset a column costs *and* the width to align to.
     ///
-    /// The width is the *element's* — 4 bytes for a bf16 pair where an fp32
-    /// pair needs 8 — and that turns out to leave the answer unchanged, which
-    /// is not the obvious result. A narrower element halves the byte offset a
-    /// column costs as well as the width it must be aligned to, so both sides
-    /// scale together and what survives is an even stride and an even column
-    /// origin at either element
-    /// (`the_pairing_test_is_the_same_at_either_element`).
+    /// ```
+    /// use kittens::global::GlobalRows;
+    /// use kittens::shared::F32;
+    ///
+    /// let base = 0x7f00_0000usize as *mut u8;
+    /// assert!(unsafe { GlobalRows::<F32>::from_raw(base, 1024) }.runs_aligned(128, 2));
+    /// // An odd leading dimension flips the parity every row.
+    /// assert!(!unsafe { GlobalRows::<F32>::from_raw(base, 1023) }.runs_aligned(128, 2));
+    /// ```
     #[inline(always)]
     pub fn runs_aligned(self, column: u32, run: usize) -> bool {
         let width = run * E::BYTES;
@@ -251,49 +178,43 @@ impl<E: Element> GlobalRows<E> {
 /// The global twin of [`crate::ldst::store_tile`], and the direct answer to a
 /// register epilogue: no shared tile, no descriptor, and the destination's
 /// leading dimension is a runtime number the cursor carries. One store per
-/// owned value, addressed by `L::row_of`/`L::col_of` — the same coordinates
-/// [`RegTile::coordinate`] reports, so a kernel that used to open-code this
-/// loop against them gets the identical stores.
+/// owned value, at the coordinates [`RegTile::coordinate`] reports.
 ///
-/// The tile is fp32 whatever `E` is, because a register tile is: an `E`
-/// narrower than fp32 rounds here, in [`Element::write`] or
-/// [`Element::write_pair`], and that is the only place it does. Rounding once
-/// at the store is what a bf16 output wants (#108) and what an fp32 one must
-/// not have, which is why the element is the cursor's and not the tile's.
+/// The tile is fp32 whatever `E` is. An `E` narrower than fp32 rounds here, in
+/// [`Element::write`] or [`Element::write_pair`], and that is the only place it
+/// does — which is why the element is the cursor's and not the tile's.
 ///
-/// A thread's row address is formed once per slot and its values indexed off
-/// it, which is what makes the inner loop a run of offsets from one register
-/// rather than a multiply each. Under [`BaseLdtm`](crate::reg::BaseLdtm) the
-/// four values of a 16-column block sit at column offsets `{0, 1, 8, 9}` — two
-/// adjacent pairs, which the layout states as
-/// `CONTIGUOUS_VALUES = 2` and this mover spends on one `st.global.v2.f32` per
-/// pair when the cursor is aligned for it (#91). A `[128, 128]` accumulator
-/// band is 512 stores a lane scalar and 256 paired, over the same eight
-/// 32-byte sectors a warp touched either way.
-///
-/// The choice is made once per call, not once per value: the two spellings are
-/// separate unrolled loops and the alignment test picks between them, so
+/// Two values a layout declares adjacent
+/// ([`crate::reg::ColLayout::CONTIGUOUS_VALUES`]) become one access when the
+/// cursor is aligned for it, halving the store count. The test is
+/// [`GlobalRows::runs_aligned`], taken once per call rather than per value, so
 /// neither path carries a branch.
 ///
-/// Nothing here is warp-collective, which is the one way this mover differs
-/// from every other one in the crate: `stmatrix` is one instruction fed by 16
-/// lanes' addresses, and this is 32 threads each storing their own values. So
-/// a lane that does not call it leaves its own values unwritten rather than
-/// making an instruction ill-formed — the rectangle is covered when all 32
-/// lanes call, and short by exactly one lane's share when one does not.
+/// Not warp-collective: this is 32 threads each storing their own values, so a
+/// lane that does not call it leaves its own values unwritten rather than
+/// making an instruction ill-formed.
+///
+/// ```no_run
+/// use kittens::global::{GlobalRows, store_rows};
+/// use kittens::reg::{BaseLdtm, RegTile};
+/// use kittens::shared::Bf16;
+///
+/// # unsafe fn epilogue(c: *mut u8, ldc: usize, lane: u32) {
+/// let accumulator = RegTile::<32, 128, BaseLdtm>::zero();
+/// let dest = unsafe { GlobalRows::<Bf16>::from_raw(c, ldc) };
+/// // Rounds fp32 registers to bf16 in the store instruction itself.
+/// unsafe { store_rows(dest, 0, 128, lane, accumulator) };
+/// # }
+/// ```
 ///
 /// # Safety
 ///
-/// The rectangle `row..row + M` by `column..column + N` must lie inside the
-/// buffer `dest` names, at `dest.stride()` elements per row.
-///
-/// The threads write disjoint elements exactly when `L`'s map is injective
-/// across the warp, which is a property of the layout and not of this loop —
-/// `BaseLdtm`'s is
-/// (`base_ldtm_covers_each_coordinate_once`). A layout that replicated a
-/// coordinate would have every holder write the same value, so the store
-/// stays idempotent, as [`crate::ldst::store_vec`]'s does; what it would not
-/// be is a single writer per element.
+/// - The rectangle `row..row + M` by `column..column + N` lies inside the
+///   buffer `dest` names, at `dest.stride()` elements per row.
+/// - `L`'s map is injective across the warp, or the threads do not write
+///   disjoint elements. `BaseLdtm`'s is
+///   (`base_ldtm_covers_each_coordinate_once`); a layout that replicated a
+///   coordinate would keep the store idempotent but lose the single writer.
 #[inline(always)]
 pub unsafe fn store_rows<E: Element, const M: usize, const N: usize, L: FragmentLayout<M, N>>(
     dest: GlobalRows<E>,
@@ -314,9 +235,6 @@ pub unsafe fn store_rows<E: Element, const M: usize, const N: usize, L: Fragment
 /// Whether this cursor and this layout together make two consecutive values
 /// one memory access — the whole of the decision [`store_rows`] and
 /// [`load_rows`] take, so they take it the same way.
-///
-/// `2` divides the run rather than equalling it: a layout claiming runs of
-/// four contains two aligned pairs, and one claiming three contains none.
 #[inline(always)]
 fn pairs_are_one_access<E: Element, const M: usize, const N: usize, L: FragmentLayout<M, N>>(
     rows: GlobalRows<E>,
@@ -332,9 +250,8 @@ fn pairs_are_one_access<E: Element, const M: usize, const N: usize, L: FragmentL
 }
 
 /// [`store_rows`] at one access width: `RUN` values per instruction, from a
-/// `RUN`-aligned value index. A const parameter and not an argument because
-/// the width decides which instruction the loop is made of, and a loop that
-/// asked per value would have spent more on the question than on the answer.
+/// `RUN`-aligned value index. A const parameter because the width decides which
+/// instruction the loop is made of.
 ///
 /// # Safety
 ///
@@ -376,19 +293,30 @@ unsafe fn store_rows_in_runs<
 /// into registers — the inverse of [`store_rows`], over the same addresses.
 ///
 /// What a small or irregular operand takes to reach a kernel that has no
-/// reason to build a descriptor for it. A tile this arrives in is an ordinary
+/// reason to build a descriptor for it. The tile it arrives in is an ordinary
 /// [`RegTile`]: it can be masked, reduced or mapped, but it is *not* an MMA
 /// operand — those come from shared memory, and staging one still means a TMA
 /// or a [`crate::ldst::store_tile`].
 ///
-/// The pairing is the same: the addresses are the same addresses, so a layout
-/// whose values are adjacent reads them in one access under the same alignment
-/// test [`store_rows`] applies (#91).
+/// The addresses are [`store_rows`]' addresses, so the same pairing applies
+/// under the same alignment test.
+///
+/// ```no_run
+/// use kittens::global::{GlobalRows, load_rows};
+/// use kittens::reg::{BaseLdtm, RegTile};
+/// use kittens::shared::F32;
+///
+/// # unsafe fn bias(table: *mut u8, ld: usize, lane: u32) -> RegTile<16, 64, BaseLdtm> {
+/// let src = unsafe { GlobalRows::<F32>::from_raw(table, ld) };
+/// unsafe { load_rows(src, 0, 0, lane) }
+/// # }
+/// ```
 ///
 /// # Safety
 ///
-/// As [`store_rows`], reading instead of writing: the rectangle must lie
-/// inside the buffer, and no other thread may be writing it.
+/// - As [`store_rows`], reading instead of writing: the rectangle lies inside
+///   the buffer `src` names.
+/// - No other thread is writing that rectangle.
 #[inline(always)]
 pub unsafe fn load_rows<E: Element, const M: usize, const N: usize, L: FragmentLayout<M, N>>(
     src: GlobalRows<E>,
@@ -448,14 +376,9 @@ unsafe fn load_rows_in_runs<
     }
 }
 
-/// The unit both ends of a staged drain agree on.
-///
-/// SWIZZLE_128B permutes 16-byte chunks and never the bytes inside one
-/// ([`crate::shared::SwizzledChunks`]), and 16 bytes is also the widest access
-/// PTX has (`st.global.v4.b32`). So a chunk is simultaneously the largest run
-/// that is contiguous in shared *and* in global memory, and the largest one an
-/// instruction could have carried anyway — which is the whole reason the
-/// swizzle costs the global side of [`store_shared_rows`] nothing.
+/// The unit both ends of a staged drain agree on: the largest run contiguous in
+/// shared *and* in global memory, and the widest access PTX has
+/// (`st.global.v4.b32`).
 const CHUNK_BYTES: usize = 16;
 
 /// Copy a whole `[R, C]` shared tile out to the `(row, column)` rectangle of a
@@ -464,100 +387,43 @@ const CHUNK_BYTES: usize = 16;
 ///
 /// The other half of the epilogue [`crate::ldst::store_tile`] starts: a band
 /// that reached shared memory through `stmatrix` leaves it through this, in
-/// 16-byte accesses whose addresses across a warp are one contiguous run. No
-/// descriptor, no engine, and — see below — no proxy fence.
+/// accesses up to 16 bytes wide whose addresses across a warp are one
+/// contiguous run. No descriptor, no engine, and no proxy fence.
 ///
-/// # The chunk is the unit, and the swizzle is free
-///
-/// The tile is swizzled and the destination is not, so one of the two sides
-/// has to be walked out of order. This walks the *global* side contiguously
-/// and asks the tile's own cursor where each chunk went
-/// ([`crate::shared::SwizzledChunks::at`]), rather than laying the band out
-/// linearly in shared memory so the read-back is trivial.
-///
-/// That choice costs nothing measurable in addresses, which is the argument
-/// for it. SWIZZLE_128B XORs the chunk index with the row's position in the
-/// swizzle period, so it is a *permutation of the eight chunks within one
-/// 128-byte row* and never moves a chunk to another row. A 128-byte row is
-/// exactly the 32 banks of shared memory once over; eight lanes reading the
-/// eight chunks of one row therefore touch every bank exactly once, permuted
-/// or not. The alternative — an unswizzled staging tile — would move the
-/// disorder onto the `stmatrix` that fills it, where a power-of-two row pitch
-/// puts a fragment's eight rows on the same banks, which is the conflict the
-/// swizzle exists to prevent. It would also need a `Swizzle` impl that does
-/// not exist: [`crate::shared::SharedVec`]'s docs file that under #14 and name
-/// its precondition (`ATOM_BYTES` has to stop meaning "TMA box width" first),
-/// and this mover is not the place to decide it by accident.
-///
-/// Both of those are arguments about addresses. Neither has been measured.
-///
-/// # How wide an access
-///
-/// The same question [`store_rows`] answers with [`GlobalRows::runs_aligned`],
-/// asked at four widths instead of two: a vector access must be aligned to its
-/// whole width, and the base, the row stride and the column origin are runtime
-/// numbers no tile shape can promise anything about. [`access_width`] walks
-/// 16, 8 and 4 bytes down to the element itself and takes the first the cursor
-/// admits, so a packed bf16 `C` at an even `ldc` gets `st.global.v4.b32` and an
-/// odd one gets narrower stores instead of a misaligned-address fault.
-///
-/// A narrower access never crosses a chunk, so the shared side needs no second
-/// decision: 16 bytes is `CHUNK_BYTES`, and 8, 4 and 2 divide it.
-///
-/// The choice is made once per call and the widths are separate unrolled
-/// loops, as `store_rows`' two are. The price is four instantiations of the
-/// loop body where that mover has two; the 2-byte rung is guarded on
-/// `E::BYTES == 2`, because a cursor aligned for a 4-byte element is aligned
-/// for a 4-byte access at every column it names, so at fp32 that rung is
-/// unreachable and is not emitted.
-///
-/// # Who calls it, and what is *not* in here
-///
-/// Cooperative and not collective: `THREADS` threads share the tile's chunks
-/// by a flat index, and there is no barrier, no fence and no wait inside. A
+/// Cooperative and not collective. `THREADS` threads share the tile's chunks by
+/// a flat index, and there is no barrier, no fence and no wait inside. A
 /// warp-scope caller passes `(lane, THREADS = 32)`; the four epilogue warps of
-/// a CTA pass `(threadIdx.x, 128)`, which is the arrangement the reference
-/// kernel uses and the one that makes a warp's 32 accesses land on consecutive
-/// chunks of a row.
+/// a CTA pass `(threadIdx.x, 128)`, which is what makes a warp's 32 accesses
+/// land on consecutive chunks of one destination row.
 ///
-/// The work is split by chunk rather than by row because a row split needs
-/// `R` to divide by the warps *and* the warp's rows to divide by 32; a chunk
-/// split needs only that `THREADS` divide the tile's chunks, which the const
-/// assert checks.
+/// [`access_width`] picks the widest access this cursor and column origin
+/// admit, once per call, so an odd `ldc` gets narrower stores rather than a
+/// misaligned-address fault. Nothing here rounds: a tile is already `E`.
 ///
-/// **There is no `fence.proxy.async.shared::cta` here and its absence is not a
-/// bug.** That fence exists in [`crate::epilogue::StoreRing`] because the TMA
-/// engine reads shared memory through the *async* proxy while `stmatrix` wrote
-/// it through the generic one, and nothing but the fence orders two proxies.
-/// Both ends of this mover are generic-proxy — `ld.shared` and `st.global` are
-/// ordinary instructions — so the only thing the writes and the reads need
-/// between them is a `bar.sync`, and a warp reading back its own `stmatrix`
-/// (which is `.sync.aligned`) needs not even that. The barrier is the caller's
-/// because only the caller knows which of the two it is in.
+/// ```no_run
+/// use kittens::global::{GlobalRows, store_shared_rows};
+/// use kittens::shared::{Bf16, SharedTile, Swizzle128B};
 ///
-/// The exit side is shorter than the engine's too: a plain `st.global` is
-/// visible to the host and to the next kernel when the kernel ends, with no
-/// counterpart to [`crate::epilogue::StoreRing::drain`] owed to anybody.
-///
-/// Nothing here rounds. `store_rows` narrows fp32 registers in
-/// [`Element::write`] and that is where a bf16 `C` is made; a tile is already
-/// `E`, so this moves its bytes and the element only sets how many of them a
-/// column is worth.
+/// # unsafe fn drain(staged: *mut u8, c: *mut u8, ldc: usize, thread: u32) {
+/// let tile = unsafe { SharedTile::<Bf16, 64, 128, Swizzle128B>::from_raw(staged) };
+/// let dest = unsafe { GlobalRows::<Bf16>::from_raw(c, ldc) };
+/// // The four epilogue warps of a CTA, after the `bar.sync` that publishes
+/// // the `stmatrix` writes.
+/// unsafe { store_shared_rows::<_, 64, 128, _, 128>(dest, 0, 0, thread, tile) };
+/// # }
+/// ```
 ///
 /// # Safety
 ///
-/// The rectangle `row..row + R` by `column..column + C` must lie inside the
-/// buffer `dest` names, at `dest.stride()` elements per row.
-///
-/// Exactly the threads `0..THREADS` must call this, each passing its own
-/// `thread`. There is no barrier inside, so a thread that skips it leaves its
-/// own chunks unwritten rather than hanging the block — the same way
-/// [`store_rows`] is short by one lane's share and for the same reason.
-///
-/// The tile's bytes must already be visible to every calling thread: a
-/// `bar.sync` since the last write by another thread of the CTA, and no proxy
-/// fence. The tile must also not be written again until every calling thread
-/// has returned, which is another barrier and also the caller's.
+/// - The rectangle `row..row + R` by `column..column + C` lies inside the
+///   buffer `dest` names, at `dest.stride()` elements per row.
+/// - Exactly the threads `0..THREADS` call this, each passing its own `thread`.
+///   There is no barrier inside, so a thread that skips it leaves its own
+///   chunks unwritten rather than hanging the block.
+/// - The tile's bytes are already visible to every calling thread: a `bar.sync`
+///   since the last write by another thread of the CTA, and no proxy fence.
+/// - The tile is not written again until every calling thread has returned,
+///   which is another barrier and also the caller's.
 #[inline(always)]
 pub unsafe fn store_shared_rows<
     E: Element,
@@ -602,19 +468,26 @@ pub unsafe fn store_shared_rows<
 }
 
 /// Bytes per access the ladder settles on for this cursor and column origin —
-/// the whole of [`store_shared_rows`]' width decision, split out so it is a
-/// pure function a host test can read the ladder off rather than infer it from
-/// which branch ran.
+/// the whole of [`store_shared_rows`]' width decision, as a pure function.
 ///
-/// Descends 16, 8, 4, `E::BYTES`. Each rung is [`GlobalRows::runs_aligned`] at
-/// the run of elements that width is worth, so the three terms it weighs are
-/// the same three [`store_rows`] weighs and the answer cannot drift between the
-/// two movers.
+/// Descends 16, 8, 4, `E::BYTES`, each rung a [`GlobalRows::runs_aligned`] at
+/// the run of elements that width is worth. The bottom rung is the element and
+/// not a fixed 2 bytes, so the ladder always terminates: a cursor is aligned for
+/// its own element by [`GlobalRows::from_raw`]'s contract. At fp32 that rung
+/// *is* the 4-byte one and 2 is never returned.
 ///
-/// The bottom rung is the element and not a fixed 2 bytes: a cursor is aligned
-/// for its own element by [`GlobalRows::from_raw`]'s contract, so an
-/// `E::BYTES`-wide access is legal at every column and the ladder always
-/// terminates. At fp32 that rung *is* the 4-byte one and 2 is never returned.
+/// ```
+/// use kittens::global::{GlobalRows, access_width};
+/// use kittens::shared::Bf16;
+///
+/// // A bf16 `C` at a leading dimension of 208, one column origin per rung.
+/// let ldc = |column| unsafe {
+///     access_width(GlobalRows::<Bf16>::from_raw(0x7f00_0000usize as *mut u8, 208), column)
+/// };
+/// assert_eq!(ldc(64), 16);
+/// assert_eq!(ldc(68), 8);
+/// assert_eq!(ldc(65), 2);
+/// ```
 pub fn access_width<E: Element>(dest: GlobalRows<E>, column: u32) -> usize {
     if dest.runs_aligned(column, CHUNK_BYTES / E::BYTES) {
         CHUNK_BYTES
@@ -632,16 +505,15 @@ pub fn access_width<E: Element>(dest: GlobalRows<E>, column: u32) -> usize {
 ///
 /// Chunks are counted across the whole logical row, so this is already the
 /// index [`crate::shared::SwizzledChunks::at`] takes and a column past the
-/// first stacked subtile needs nothing extra. Split out from the loop for the
-/// reason [`GlobalRows::index`] is: it is the whole of the work split, and a
-/// host test can then ask whether the split is a partition.
+/// first stacked subtile needs nothing extra. Split out from the loop so a host
+/// test can ask whether the split is a partition.
 const fn drain_item(item: usize, per_row: usize) -> (usize, usize) {
     (item / per_row, item % per_row)
 }
 
-/// [`store_shared_rows`] at one access width, in bytes. A const parameter and
-/// not an argument for [`store_rows_in_runs`]' reason: the width decides which
-/// instruction the loop is made of.
+/// [`store_shared_rows`] at one access width, in bytes. A const parameter for
+/// [`store_rows_in_runs`]' reason: the width decides which instruction the loop
+/// is made of.
 ///
 /// # Safety
 ///
@@ -687,21 +559,18 @@ unsafe fn drain_in_accesses<
 /// Move `WIDTH` bytes from shared memory to global memory, unchanged.
 ///
 /// A byte copy and not a value move: the tile already holds `E`, so there is
-/// nothing to pack, unpack or round, and the element only decides how many
-/// columns a width is worth.
+/// nothing to pack, unpack or round.
 ///
-/// The two vector widths are inline PTX for the reason `F32`'s
-/// [`Element::write_pair`] is: widening adjacent accesses into one is a
-/// transformation the compiler may only make when the address is provably
-/// aligned, and an address built from a runtime leading dimension never is — so
-/// the caller that has actually checked ([`access_width`]) is the only one in a
-/// position to spell it. The two narrow widths need no asking: a 4- or 2-byte
-/// move is a single instruction however it is written.
+/// The two vector widths are inline PTX because the compiler may only widen
+/// adjacent accesses when the address is provably aligned, which one built from
+/// a runtime leading dimension never is; [`access_width`] is what has actually
+/// checked. The two narrow widths are a single instruction either way.
 ///
 /// # Safety
 ///
-/// `from` must name `WIDTH` readable bytes of shared memory and `to` `WIDTH`
-/// writable bytes of global memory, both aligned to `WIDTH`.
+/// - `from` names `WIDTH` readable bytes of shared memory.
+/// - `to` names `WIDTH` writable bytes of global memory.
+/// - Both are aligned to `WIDTH`.
 #[inline(always)]
 unsafe fn copy_bytes<const WIDTH: usize>(from: *const u8, to: *mut u8) {
     const {
@@ -722,14 +591,12 @@ unsafe fn copy_bytes<const WIDTH: usize>(from: *const u8, to: *mut u8) {
 
 /// One whole swizzle chunk out of shared memory: `ld.shared.v4.b32`.
 ///
-/// Written as a load into registers rather than fused with the store so the
-/// two are separate instructions the scheduler can put chunks of work between,
-/// which a single opaque snippet spanning both would forbid.
+/// A load into registers rather than a snippet fused with the store, so the two
+/// stay separate instructions the scheduler can put other work between.
 ///
 /// # Safety
 ///
-/// `from` must be a 16-byte-aligned shared-memory address with 16 readable
-/// bytes.
+/// - `from` is a 16-byte-aligned shared-memory address with 16 readable bytes.
 #[inline(always)]
 unsafe fn read_shared_v4(from: *const u8) -> [u32; 4] {
     unsafe {
@@ -751,7 +618,7 @@ unsafe fn read_shared_v4(from: *const u8) -> [u32; 4] {
 ///
 /// # Safety
 ///
-/// As [`read_shared_v4`], 8-byte aligned with 8 readable bytes.
+/// - As [`read_shared_v4`], 8-byte aligned with 8 readable bytes.
 #[inline(always)]
 unsafe fn read_shared_v2(from: *const u8) -> [u32; 2] {
     unsafe {
@@ -769,13 +636,12 @@ unsafe fn read_shared_v2(from: *const u8) -> [u32; 2] {
 
 /// 16 bytes into global memory in one access: `st.global.v4.b32`.
 ///
-/// The instruction the whole staging round trip is for. A warp of 32 lanes
-/// issuing this on consecutive chunks writes 512 contiguous bytes, where the
-/// same band stored straight out of a fragment layout is 32 scattered pairs.
+/// The instruction the whole staging round trip is for — a warp of 32 lanes
+/// issuing it on consecutive chunks writes 512 contiguous bytes.
 ///
 /// # Safety
 ///
-/// `to` must be a 16-byte-aligned global address with 16 writable bytes.
+/// - `to` is a 16-byte-aligned global address with 16 writable bytes.
 #[inline(always)]
 unsafe fn write_v4(to: *mut u8, words: [u32; 4]) {
     unsafe {
@@ -795,7 +661,7 @@ unsafe fn write_v4(to: *mut u8, words: [u32; 4]) {
 ///
 /// # Safety
 ///
-/// As [`write_v4`], 8-byte aligned with 8 writable bytes.
+/// - As [`write_v4`], 8-byte aligned with 8 writable bytes.
 #[inline(always)]
 unsafe fn write_v2(to: *mut u8, words: [u32; 2]) {
     unsafe {
@@ -894,7 +760,7 @@ mod rows_tests {
 
     /// The three terms a vector access needs aligned, one at a time. Each of
     /// the failures below is a real cursor a caller could build, and each
-    /// costs the pairing rather than faulting on it (#91).
+    /// costs the pairing rather than faulting on it.
     #[test]
     fn a_pair_needs_the_base_the_stride_and_the_column_to_agree() {
         // 0x7f00_0000 is 8-byte aligned, and an even stride keeps every row so.
@@ -915,15 +781,14 @@ mod rows_tests {
     }
 
     /// **The element does not move this test**, which is worth a case of its
-    /// own because the obvious expectation is that it does (#108). A narrower
-    /// element halves the offset a column costs *and* halves the width a pair
-    /// must be aligned to, so the two cancel and what is left is the same
-    /// question at either element: an even stride and an even column origin,
-    /// off a base aligned for the element it is.
+    /// own because the obvious expectation is that it does. A narrower element
+    /// halves the offset a column costs *and* halves the width a pair must be
+    /// aligned to, so the two cancel and what is left is the same question at
+    /// either element: an even stride and an even column origin, off a base
+    /// aligned for the element it is.
     ///
-    /// So a bf16 `C` does not buy the pairing anywhere an fp32 `C` was denied
-    /// it, and cannot lose it anywhere an fp32 `C` had it. Every row below is
-    /// the fp32 case above with the element swapped and the same answer.
+    /// Every row below is the fp32 case above with the element swapped and the
+    /// same answer.
     #[test]
     fn the_pairing_test_is_the_same_at_either_element() {
         let bf16 = |stride| unsafe { GlobalRows::<Bf16>::from_raw(BASE, stride) };
@@ -1123,10 +988,10 @@ mod host {
 
     /// An [`Element`] the TMA engine can name in a tensor map.
     ///
-    /// Separate from `Element` because the data-type enum is a cuda-core
-    /// value and `Element` is device-side, and separate from
-    /// [`crate::shared::MmaElement`] for the same reason that trait is
-    /// separate: a buffer the TMA moves need never reach an MMA.
+    /// Separate from `Element` because the data-type enum is a cuda-core value
+    /// and `Element` is device-side, and separate from
+    /// [`crate::shared::MmaElement`] because a buffer the TMA moves need never
+    /// reach an MMA.
     pub trait TensorMapElement: Element {
         /// The `CUtensorMapDataType` the driver reads this element as.
         const DATA_TYPE: CUtensorMapDataType;
@@ -1147,17 +1012,14 @@ mod host {
     ///
     /// Implemented by the shared-memory types themselves, so the numbers in a
     /// descriptor are the destination's own constants and cannot be restated
-    /// wrong at a call site. The two impls answer the same question
-    /// differently, which is the point of the trait rather than a wart:
+    /// wrong at a call site. The two impls answer differently:
     ///
-    /// - [`SharedTile`] — the box is one *subtile*, not one tile.
-    ///   [`SharedTile::tma_load`] issues one `cp.async.bulk.tensor` per stacked
-    ///   subtile, lifting the leading coordinate by `SUBTILE_COLS` each time,
-    ///   and the box is swizzled because an MMA operand must be.
+    /// - [`SharedTile`] — the box is one *subtile*, not one tile, and is
+    ///   swizzled. [`SharedTile::tma_load`] issues one `cp.async.bulk.tensor`
+    ///   per stacked subtile, lifting the leading coordinate by `SUBTILE_COLS`
+    ///   each time, so a wider tile does not widen the box.
     /// - [`SharedVec`] — the box is the whole vector, one row tall and
-    ///   unswizzled, delivered by a single instruction. A swizzle atom is the
-    ///   wrong unit for a one-row run of elements; see [`SharedVec`] for why
-    ///   that is a layout decision and not a missing `Swizzle` mode.
+    ///   unswizzled, delivered by a single instruction.
     pub trait TileBox {
         /// The element the tile is made of, which is also the map's.
         type Element: TensorMapElement;
@@ -1180,10 +1042,7 @@ mod host {
 
     /// A vector is one unswizzled box `N` elements wide and one row tall. The
     /// row count is what lets a rank-1 layout describe it at all
-    /// (`GlobalLayout::descriptor_shape` asserts exactly that), and the
-    /// width is `N` itself rather than a constant of a swizzle mode — the
-    /// difference from the tile impl, and the reason `Swizzle` is not in the
-    /// picture.
+    /// (`GlobalLayout::descriptor_shape` asserts exactly that).
     impl<E: TensorMapElement, const N: usize> TileBox for SharedVec<E, N> {
         type Element = E;
         const BOX_COLS: usize = N;
@@ -1204,22 +1063,30 @@ mod host {
 
     /// A `RANK`-dimensional global buffer of `E`, dimension 0 contiguous.
     ///
-    /// The dimension order is the driver's, not a matrix reader's: dimension 0
-    /// varies fastest, so a row-major `[rows, columns]` matrix is
-    /// `extents = [columns, rows]`. It is also the order the TMA coordinates
-    /// in [`SharedTile::tma_load_2d`] are given in, which is why the two are
-    /// not reversed here to read more naturally.
+    /// **The dimension order is the driver's, not a matrix reader's**:
+    /// dimension 0 varies fastest, so a row-major `[rows, columns]` matrix is
+    /// `extents = [columns, rows]`. It is also the order the TMA coordinates in
+    /// [`SharedTile::tma_load_2d`] are given in.
     ///
-    /// Does not borrow the buffer: the constructors are `unsafe` and the
-    /// caller promises the allocation outlives every launch consuming a map
-    /// built from it.
+    /// Does not borrow the buffer: the constructors are `unsafe` and the caller
+    /// promises the allocation outlives every launch consuming a map built from
+    /// it.
+    ///
+    /// ```no_run
+    /// use kittens::global::GlobalLayout;
+    /// use kittens::shared::Bf16;
+    ///
+    /// # fn layout(base: u64) -> GlobalLayout<Bf16, 2> {
+    /// // A row-major [4096 rows, 1024 columns] bf16 matrix.
+    /// unsafe { GlobalLayout::<Bf16, 2>::packed(base, [1024, 4096]) }
+    /// # }
+    /// ```
     pub struct GlobalLayout<E: Element, const RANK: usize> {
         base: u64,
         extents: [usize; RANK],
         /// Byte stride of each dimension, `[0]` being `E::BYTES`. The driver
-        /// takes only dimensions `1..`, but carrying the full array keeps the
-        /// length a plain `RANK` instead of `RANK - 1`, which would need
-        /// `generic_const_exprs`.
+        /// takes only dimensions `1..`; the full array keeps the length a plain
+        /// `RANK` instead of a `RANK - 1` needing `generic_const_exprs`.
         strides: [u64; RANK],
         _marker: PhantomData<E>,
     }
@@ -1237,9 +1104,10 @@ mod host {
         ///
         /// # Safety
         ///
-        /// `base` must be the device address of a live buffer of at least
-        /// `extents.iter().product()` elements of `E`, staying allocated at
-        /// that address for every launch that consumes a map built from it.
+        /// - `base` is the device address of a live buffer of at least
+        ///   `extents.iter().product()` elements of `E`.
+        /// - It stays allocated at that address for every launch that consumes
+        ///   a map built from this layout.
         pub unsafe fn packed(base: u64, extents: [usize; RANK]) -> Self {
             let mut strides = [E::BYTES as u64; RANK];
             let mut dimension = 1;
@@ -1252,13 +1120,25 @@ mod host {
 
         /// A buffer whose dimensions are spaced by `element_strides` rather
         /// than by their extents — a matrix with a leading dimension wider
-        /// than its columns, or a slice of a larger tensor. `element_strides[0]`
-        /// must be 1: the TMA engine reads dimension 0 contiguously.
+        /// than its columns, or a slice of a larger tensor.
+        ///
+        /// Panics unless `element_strides[0] == 1`: the TMA engine reads
+        /// dimension 0 contiguously.
+        ///
+        /// ```no_run
+        /// use kittens::global::GlobalLayout;
+        /// use kittens::shared::Bf16;
+        ///
+        /// # fn layout(base: u64) -> GlobalLayout<Bf16, 2> {
+        /// // A [128, 64] window of a buffer whose rows are 1024 elements apart.
+        /// unsafe { GlobalLayout::<Bf16, 2>::strided(base, [64, 128], [1, 1024]) }
+        /// # }
+        /// ```
         ///
         /// # Safety
         ///
-        /// As [`Self::packed`], for a buffer spanning
-        /// `Σ (extents[i] - 1) * element_strides[i] + 1` elements.
+        /// - As [`Self::packed`], for a buffer spanning
+        ///   `Σ (extents[i] - 1) * element_strides[i] + 1` elements.
         pub unsafe fn strided(
             base: u64,
             extents: [usize; RANK],
@@ -1298,9 +1178,9 @@ mod host {
 
         /// The `globalDim` and `boxDim` arrays for a map delivering `T`.
         ///
-        /// Split out from [`GlobalLayout::tensor_map`] because it is the whole
-        /// of the shape agreement and the only part of a descriptor that can
-        /// be read back: `CUtensorMap` is 128 opaque bytes.
+        /// Split out from [`GlobalLayout::tensor_map`]: it is the whole of the
+        /// shape agreement, and `CUtensorMap` itself is 128 opaque bytes a test
+        /// cannot read back.
         fn descriptor_shape<T: TileBox>(&self) -> ([u64; RANK], [u32; RANK]) {
             const {
                 assert!(
@@ -1328,10 +1208,32 @@ mod host {
     impl<E: TensorMapElement, const RANK: usize> GlobalLayout<E, RANK> {
         /// Encode and upload the tensor map that loads `T` out of this buffer.
         ///
-        /// Every field the caller would otherwise state — data type, box
-        /// shape, swizzle mode — comes from `T`, so the only way to build a
-        /// descriptor that disagrees with the tile it feeds is to pair the
-        /// layout with a different tile type than the kernel loads.
+        /// Every field the caller would otherwise state — data type, box shape,
+        /// swizzle mode — comes from `T`, so the only way to build a descriptor
+        /// that disagrees with the tile it feeds is to pair the layout with a
+        /// different tile type than the kernel loads.
+        ///
+        /// Errors name the field that broke a driver rule: a 16-byte-aligned
+        /// base, dimension strides a multiple of 16 bytes, a box dimension 0 a
+        /// whole number of 16-byte lines, no box wider than its extent, and no
+        /// box over 256.
+        ///
+        /// ```no_run
+        /// use kittens::global::GlobalLayout;
+        /// use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+        ///
+        /// # fn build(
+        /// #     stream: &cuda_core::CudaStream,
+        /// #     base: u64,
+        /// # ) -> Result<(), Box<dyn std::error::Error>> {
+        /// let layout = unsafe { GlobalLayout::<Bf16, 2>::packed(base, [1024, 4096]) };
+        /// // The box is one [64, 64] subtile of this tile, swizzled as it is.
+        /// let map = layout.tensor_map::<SharedTile<Bf16, 64, 128, Swizzle128B>>(stream)?;
+        /// let parameter = map.as_ptr();
+        /// # let _ = parameter;
+        /// # Ok(())
+        /// # }
+        /// ```
         pub fn tensor_map<T: TileBox<Element = E>>(
             &self,
             stream: &CudaStream,
@@ -1402,8 +1304,8 @@ mod host {
             }
             // The engine moves the contiguous dimension in 16-byte lines, so a
             // box whose innermost width is not a whole number of them has no
-            // legal transfer — the rule a swizzled box satisfies for free (its
-            // width *is* an atom) and an unswizzled one has to be checked for.
+            // legal transfer. A swizzled box satisfies this for free — its
+            // width *is* an atom — and an unswizzled one has to be checked.
             let innermost = box_shape[0] as u64 * E::BYTES as u64;
             if !innermost.is_multiple_of(ALIGNMENT) {
                 return Err(format!(
@@ -1445,8 +1347,7 @@ mod host {
         }
     }
 
-    /// The 3-D bf16 panel map, under the name it had before layouts were a
-    /// type. [`encode_bf16_panels`] is its constructor.
+    /// The 3-D bf16 panel map [`encode_bf16_panels`] builds.
     pub type PanelMap = TensorMap;
 
     /// Encode a SWIZZLE_128B tensor map loading `[R, 64]` bf16 subtiles of a
@@ -1456,17 +1357,30 @@ mod host {
     /// stacked subtile (columns `64*i..64*(i+1)`) via the first — which
     /// [`SharedTile::tma_load`] walks automatically.
     ///
-    /// `rows` must be a whole number of `R`-row boxes: the kernel steps its
-    /// row coordinate by `R`, so a ragged tail would arrive silently
+    /// Panics unless `rows` is a whole number of `R`-row boxes: the kernel
+    /// steps its row coordinate by `R`, so a ragged tail would arrive silently
     /// zero-filled rather than as a short tile. That is this staging layout's
-    /// convention and not a rule of [`GlobalLayout`], which leaves edge boxes
-    /// to the TMA engine's out-of-bounds fill.
+    /// convention and not a rule of [`GlobalLayout`], which leaves edge boxes to
+    /// the TMA engine's out-of-bounds fill.
+    ///
+    /// ```no_run
+    /// # fn build(
+    /// #     stream: &cuda_core::CudaStream,
+    /// #     base: u64,
+    /// # ) -> Result<(), Box<dyn std::error::Error>> {
+    /// // Four [256, 128] bf16 panels, delivered as [64, 128] tiles.
+    /// let map = unsafe { kittens::global::encode_bf16_panels::<64, 128>(stream, base, 256, 4)? };
+    /// # let _ = map;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Safety
     ///
-    /// `base` must be the device address of a live buffer of at least
-    /// `planes * rows * C` bf16 elements, staying allocated at that address
-    /// for every launch that consumes the returned map.
+    /// - `base` is the device address of a live buffer of at least
+    ///   `planes * rows * C` bf16 elements.
+    /// - It stays allocated at that address for every launch that consumes the
+    ///   returned map.
     pub unsafe fn encode_bf16_panels<const R: usize, const C: usize>(
         stream: &CudaStream,
         base: u64,
@@ -1511,7 +1425,7 @@ mod host {
 
         #[test]
         fn the_box_is_one_subtile_of_the_tile_it_is_paired_with() {
-            // What encode_bf16_panels built by hand: [SUBTILE_COLS, R, 1].
+            // The box is [SUBTILE_COLS, R, 1].
             let layout = unsafe { GlobalLayout::<Bf16, 3>::packed(BASE, [128, 256, 4]) };
             let (extents, shape) = layout.descriptor_shape::<Panel>();
             assert_eq!(extents, [128, 256, 4]);
@@ -1533,8 +1447,8 @@ mod host {
 
         #[test]
         fn the_encoding_matches_what_encode_bf16_panels_wrote_by_hand() {
-            // The pre-GlobalLayout builder's arrays, for R = C = 64,
-            // rows = 64, planes = 1 — the shape every device test uses.
+            // R = C = 64, rows = 64, planes = 1 — the shape every device test
+            // uses, with the arrays `encode_bf16_panels` names for it.
             let layout = unsafe { GlobalLayout::<Bf16, 3>::packed(BASE, [64, 64, 1]) };
             let (extents, shape) = layout.descriptor_shape::<Square>();
             assert_eq!(extents, [64, 64, 1]);
