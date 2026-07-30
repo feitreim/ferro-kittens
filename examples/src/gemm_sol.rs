@@ -3,46 +3,31 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! A kittens port of cuda-oxide's canonical Blackwell `gemm_sol_final`.
+//! A kittens port of cuda-oxide's canonical Blackwell `gemm_sol_final`:
+//! `C = A·Bᵀ` for row-major FP16 `A [M, K]` and `B [N, K]` into packed
+//! row-major BF16 `C [M, N]`, with `k` a multiple of 256.
 //!
-//! Three entries, expressed through ferro-kittens' typed tiles and pipeline
-//! primitives, differing only in the cluster tile they own: `[256, 128]`,
-//! `[256, 256]` and `[512, 256]`. They share CLC work stealing, a two-CTA
-//! cluster, four TMA/shared stages, two TMEM accumulator halves, a K loop
-//! unrolled four ways over a **compile-time** ring stage, and L2-aware output
-//! ordering, and [`select_variant`] picks between them on wave arithmetic alone.
+//! One launch is one two-CTA cluster per output tile and one CTA per SM, at 192
+//! threads a CTA: four epilogue warps, one TMA warp, one MMA warp. The producer
+//! walks `K` in 64-deep blocks through four TMA/shared stages, the MMA warp
+//! issues `tcgen05.mma` at `cta_group::2` into two TMEM accumulator halves, and
+//! the epilogue lifts 64-column bands out of TMEM, `stmatrix`es them into a
+//! per-warp staging tile and stores whole rows of `C`. The K loop is unrolled
+//! four ways over a compile-time ring stage, and CLC work stealing hands out the
+//! next output tile in an L2-aware `grouped` order.
 //!
-//! What the K loop is bound by is measured rather than assumed, and it is not the
-//! same thing at the two 256-row entries. `bench sol-ablate` ladders every phase
-//! in `K`: the tensor core can be issued at peak from one warp
-//! (`issue only` is 100.0% of peak a K block), the barrier round trip is zero,
-//! and the whole of `[256, 256]`'s 21% deficit is its **feed's duty cycle** — the
-//! operand pipeline alone needs 95.5% of the time the tensor core is busy, where
-//! `[512, 256]`'s needs 55.7%, because a `[256, 256]` cluster tile moves 1.33× the
-//! operand bytes per flop. That is a property of the tile, so it is [`Variant`]'s
-//! to answer and not the K loop's.
+//! Three entries differ only in the cluster tile they own — `[256, 128]`,
+//! `[256, 256]` and `[512, 256]` — and [`select_variant`] picks between them on
+//! wave arithmetic alone: the narrow tile at and below half a wave of wide ones,
+//! `[256, 256]` through 4K, `[512, 256]` from 8K. `n` is a multiple of the
+//! entry's own `N`, which is the one place the shape contract widens.
 //!
-//! On B200 that is `[256, 128]` at and below 37 wide output tiles — half a wave
-//! of them — `[256, 256]` through 4K, and `[512, 256]` from 8K. The two narrow-tile branches are what
-//! `bench sol` and `bench sol-small` added; the doc on [`select_variant`] is the
-//! rule and the measurements that bound it.
+//! [`check`] runs all three against an exact reference; `experiments/`'
+//! `bench sol` and `bench sol-ablate` time them and take them apart, through the
+//! `ABLATE`, `DRAIN` and `WATCH` dials below.
 //!
-//! Data layout is the upstream contract: row-major FP16 A `[M, K]`, row-major
-//! FP16 B `[N, K]` (therefore `A·Bᵀ`), and packed row-major BF16 C `[M, N]`.
-//! `n` is a multiple of 256 for the two 256-wide entries and of 128 for
-//! `[256, 128]`, which is the one place the shape contract widens.
-//!
-//! **The item handoff is [`ITEMS`] deep and the depth is derived, not chosen.** A
-//! cluster's producer publishes a work item's coordinates through a mailbox behind
-//! a phase-parity wait, and such a mailbox is sound only while the producer leads
-//! its slowest consumer by less than the ring's depth. This was **one** barrier and
-//! **one** cell through #148 — upstream spells it that way too — while the chain of
-//! back-pressure between the producer, the MMA warp and the epilogue lets **four**
-//! publications be outstanding. #149 is what that cost: `4096x4096x1024` did not
-//! return, inside its own shape contract. The derivation is on [`ITEMS`], the
-//! exhaustive search that checks it is
-//! [`kittens::sync::handoff::depth_needed`], and the depth costs no shared memory
-//! — it fits in the padding the staging buffer already left.
+//! Why the kernel is shaped this way, and every measurement behind it:
+//! `docs/kernels/gemm_sol.md`.
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::cluster;
@@ -66,67 +51,29 @@ use kittens::shared::{
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
 
-/// The whole kernel. Every shipped entry passes this and nothing else does.
+/// The whole kernel: the arm every shipped entry passes.
 pub const WHOLE: u8 = 0;
-/// TMA and every barrier, with the MMA and the drain removed: what the memory
-/// pipeline alone can sustain.
+/// TMA and every barrier, with the MMA and the drain removed.
 pub const FEED_ONLY: u8 = 1;
 /// The MMA and every barrier, with the loads removed — the producer arrives on
-/// `load` instead of filling it, so the ring recycles on tensor-core issue and
-/// no global traffic occurs at all.
+/// `load` instead of filling it, so no global traffic occurs at all.
 pub const ISSUE_ONLY: u8 = 2;
 /// The whole kernel except the drain: the accumulator fills and is released
-/// without being read, so the difference against [`WHOLE`] is the epilogue's
-/// cost *including* whatever of it fails to overlap.
+/// without being read.
 pub const NO_DRAIN: u8 = 3;
-/// [`ISSUE_ONLY`] with the MMA warp's `load.wait` removed as well, so the K loop
-/// issues `tcgen05.mma` with nothing in front of it.
-///
-/// This is the arm #144 did not have and named as the thing it could not
-/// separate. `issue only` keeps the whole `load`/`free` handshake, so the
-/// distance it measures is barrier round-trip *fused with* tensor-core issue
-/// rate; this arm drops one of the two and `issue only − mma only` is the round
-/// trip alone. The producer keeps `free.wait_recycled`, so it is still throttled
-/// and the `ready` publication still bounds the MMA warp one output tile at a
-/// time — what runs unthrottled is exactly the K loop, which is what is being
-/// priced.
+/// [`ISSUE_ONLY`] without the MMA warp's `load.wait`, so the K loop issues
+/// `tcgen05.mma` with nothing in front of it.
 pub const MMA_ONLY: u8 = 4;
-/// The whole kernel with the drain's **global half** run a second time per band:
-/// an extra `ld.shared` + `st.global.v4` pass over the staging tile, aimed at the
-/// cluster's own first output tile so the extra bytes stay in L2.
-///
-/// The three `TWICE_*` arms are one ladder, and each rung's difference from the
-/// one below prices one third of the `tcgen05.ld` → `stmatrix` → `st.global`
-/// chain. [`TWICE_ALL`] against [`WHOLE`] is a whole extra drain, and an extra
-/// pass has nothing left to hide behind, so it prices the drain **serially** —
-/// which is the term `whole − no drain` cannot separate from the drain's failure
-/// to overlap.
-///
-/// They compute a wrong `C` and are on no correctness gate, as every doubling
-/// probe in this repo is.
+/// The drain's **global half** run a second time per band, aimed at the
+/// cluster's own first output tile so the extra bytes stay in L2. It computes a
+/// wrong `C` and is on no correctness gate, as every doubling probe here is.
 pub const TWICE_GLOBAL: u8 = 5;
-/// [`TWICE_GLOBAL`] with the `cvt` + `stmatrix` pass doubled as well. The band's
-/// registers are still live, so this rung adds no LDTM.
+/// [`TWICE_GLOBAL`] with the `cvt` + `stmatrix` pass doubled as well.
 pub const TWICE_SHARED: u8 = 6;
 /// [`TWICE_SHARED`] with the LDTM doubled too — the whole drain twice.
 pub const TWICE_ALL: u8 = 7;
 
-/// **Every `ABLATE` value, in one place, with the guard that keeps them
-/// distinct.**
-///
-/// The dial is a bare `u8` because it is a const generic parameter and const
-/// generics take no enums. That is exactly the shape two experiment sets can
-/// extend independently and collide in, and a collision here does not fail to
-/// build: it silently remaps one arm onto another, and every number downstream
-/// is wrong while looking fine. It nearly happened — #144's [`MMA_ONLY`] and
-/// #147's [`TWICE_GLOBAL`] were both `4`, on two branches, and the merge is the
-/// only place it would have been caught.
-///
-/// So the values are listed here and asserted to be a **permutation of
-/// `0..ABLATE_ARMS.len()`**: reusing a value fails the assert, and adding an arm
-/// without widening the array fails it too. The list is also what [`arm_name`]
-/// reads, so it is load-bearing rather than decorative — an arm that is not in it
-/// has no name to print.
+/// Every `ABLATE` value, with the name [`arm_name`] prints for it.
 pub const ABLATE_ARMS: [(&str, u8); 8] = [
     ("whole", WHOLE),
     ("feed only", FEED_ONLY),
@@ -138,7 +85,7 @@ pub const ABLATE_ARMS: [(&str, u8); 8] = [
     ("twice all", TWICE_ALL),
 ];
 
-/// [`ABLATE_ARMS`] for the drain dial. Same reasoning, same guard.
+/// Every `DRAIN` value, per [`ABLATE_ARMS`].
 pub const DRAIN_RUNGS: [(&str, u8); 5] = [
     ("per issue", DRAIN_PER_ISSUE),
     ("paired", DRAIN_PAIRED),
@@ -147,35 +94,13 @@ pub const DRAIN_RUNGS: [(&str, u8); 5] = [
     ("nocvt", DRAIN_NOCVT),
 ];
 
-/// [`ABLATE_ARMS`] for the watch dial. Same reasoning, same guard.
+/// Every `WATCH` value, per [`ABLATE_ARMS`].
 pub const WATCH_RUNGS: [(&str, u8); 3] = [
     ("off", WATCH_OFF),
     ("watched", WATCH_DEEP),
     ("watched one deep", WATCH_ONE_DEEP),
 ];
 
-/// The guard every dial is held to: dense from zero, and no value twice.
-///
-/// # The other half of the rule, which no assert can state
-///
-/// A dial value that collides fails to build here. A dial value that is **legal on
-/// its own and illegal in combination** does not, and it fails somewhere much less
-/// obvious: at monomorphization, *including in match arms that cannot be reached*.
-/// `DRAIN_WIDE` drains a 128-column band, a band has to divide the per-warp staging
-/// tile, and at [`TWO_WARPGROUPS`] that tile is 64 wide — so a literal `128` inside
-/// [`Common::drain_dial`]'s `DRAIN_WIDE` arm breaks the *two-warpgroup* build even
-/// though two warpgroups never take that arm. Rust monomorphizes both sides of a
-/// `match` on a const before anything folds it away.
-///
-/// So the convention these dials are held to has two halves:
-///
-/// 1. **Values are a permutation of `0..len`** — this function, checked at compile
-///    time, because a collision otherwise silently remaps one arm onto another.
-/// 2. **Every *combination* of dials must be legal, not just the reachable ones.**
-///    A shape a dial implies has to come from whoever knows all the dials — the
-///    entry — rather than being written as a literal where one dial can see it and
-///    the others cannot. That is why the band and its issue count are parameters
-///    ([`Common::drain_dial`]'s `WIDE_BAND`/`WIDE_ISSUES`) and not constants.
 const fn dial_is_a_permutation<const N: usize>(dial: [(&str, u8); N]) -> bool {
     let mut seen = [false; N];
     let mut arm = 0usize;
@@ -201,11 +126,6 @@ const _: () = {
     assert!(dial_is_a_permutation(WATCH_RUNGS));
 };
 
-/// What a dial value is called, off the one list that defines it.
-///
-/// The harness prints arm names through this rather than keeping its own table,
-/// so a value with no entry is a loud failure in a row of a table and not a
-/// silently mislabelled measurement.
 pub fn arm_name(dial: &[(&'static str, u8)], value: u8) -> &'static str {
     match dial.iter().find(|(_, listed)| *listed == value) {
         Some((name, _)) => name,
@@ -225,8 +145,8 @@ const fn drains(ablate: u8) -> bool {
 const fn waits_on_load(ablate: u8) -> bool {
     ablate != MMA_ONLY
 }
-/// How much of the drain the doubling ladder repeats: 0 none, 1 the global half,
-/// 2 the `cvt` + `stmatrix` half too, 3 the whole of it including LDTM.
+/// How much of the drain the doubling ladder repeats: 0 none, 1 the global
+/// half, 2 the `cvt` + `stmatrix` half too, 3 the whole of it including LDTM.
 const fn twice(ablate: u8) -> u8 {
     if ablate >= TWICE_GLOBAL && ablate <= TWICE_ALL {
         ablate - TWICE_GLOBAL + 1
@@ -235,108 +155,40 @@ const fn twice(ablate: u8) -> u8 {
     }
 }
 
-/// 64-column bands with **a wait per LDTM issue** — the drain that shipped
-/// through #144, and the one the doubling ladder decomposes.
+/// 64-column bands with a wait per LDTM issue.
 pub const DRAIN_PER_ISSUE: u8 = 0;
-/// A 64-column band with **both** of its LDTM issues in flight before one wait,
-/// through [`TmemTile::tile_x8_batched`]. Half the waits per byte of `C`, the
-/// same instruction in every other column of the census, the same shared plan.
-///
-/// It is worth **+0.9% of the launch at 8192³ and nothing at 4096³**, in two
-/// round-robin passes each, and it ships on that.
+/// A 64-column band with **both** of its LDTM issues in flight before one wait.
 pub const DRAIN_PAIRED: u8 = 1;
-/// A 128-column band, all four issues in flight before one wait: a quarter of
-/// [`DRAIN_PER_ISSUE`]'s waits per byte of `C`, at 128 f32 a thread live.
-///
-/// **It loses** — −1.1 to −1.3% at 4096³ and +0.2 to +0.3% at 8192³ — and it is
-/// kept because a rung that loses is the evidence for the one that wins. It is
-/// also the only rung that is not free: the wider band takes registers to 176/168
-/// and the stack frame from 256 B to 512, and this file does not separate its loss
-/// from that frame.
+/// A 128-column band, all four issues in flight before one wait, at 128 f32 a
+/// thread live.
 pub const DRAIN_WIDE: u8 = 2;
-/// The drain with `tcgen05.ld.16x256b.x8.pack::16b` in place of the `.x8` load
-/// and **no `cvt` at all** — the oracle that prices the convert.
+/// `tcgen05.ld.16x256b.x8.pack::16b` in place of the `.x8` load and **no `cvt`**.
 ///
-/// **It computes a wrong `C` by construction and is on no correctness gate.**
-/// `.pack::16b` packs the 16-bit elements of two consecutive TMEM columns into one
-/// register; this accumulator holds fp32, so what it packs is the mantissa halves
-/// of two floats. That is why the instruction is not a route to a cheaper drain,
-/// and it is *also* why it is the perfect ablation of the convert: same TMEM bits
-/// read, same registers returned, same `stmatrix` count, same stores, same shared
-/// plan — and the `cvt.rn.bf16x2` column goes to **zero**. `whole − pack16` is
-/// therefore the `cvt` pass's cost with none of the write-after-write the
-/// [`TWICE_SHARED`] rung pays on its own staging tile.
-/// **It faults on the device and nothing launches it.** `bench sol-ablate` took
-/// it once and every SM raised `Xid 13, Out Of Range Address` — 148 SMs of
-/// warp exceptions and `DriverError(700)`. So `.pack::16b` against an fp32
-/// accumulator is not merely the wrong *values*, it is not addressable: the
-/// qualifier reads the segment as 16-bit-typed and the addressing that follows
-/// from that does not land inside a `[128, N]` fp32 allocation. The kernel stays
-/// because its **census** is the finding — `cvt.bf16x2` goes from 8 to 0 while
-/// `stmatrix` and every store column hold, which is the question #117's register
-/// count could not answer — and [`DRAIN_NOCVT`] is the oracle that can be timed.
+/// **It faults on the device and nothing launches it** — `.pack::16b` reads the
+/// segment as 16-bit-typed and does not address an fp32 allocation. Its SASS
+/// census is the finding; [`DRAIN_NOCVT`] is the oracle that can be timed.
 pub const DRAIN_PACK16: u8 = 3;
-/// The oracle that prices the convert: the ordinary batched `.x8` load, and the
-/// band's words handed to `stmatrix` **without the `cvt`**.
-///
-/// **It computes a wrong `C` by construction** — fp32 bit patterns are not bf16
-/// pairs — and is on no correctness gate. What it is, is the shipped drain with
-/// exactly one thing removed: same LDTM count, same wait count, same `stmatrix`
-/// count, same `ld.shared`, same `st.global`, same shared plan, and `cvt` zero.
-/// `paired − nocvt` is therefore the convert's own cost, with none of the
-/// write-after-write on its own staging tile that [`TWICE_SHARED`] pays and none
-/// of [`DRAIN_PACK16`]'s addressing.
-///
-/// Half the band's words go unused, which is what keeps the `stmatrix` count
-/// equal: a `[32, BAND_N]` band is 64 f32 a lane and 32 packed words, so a drain
-/// that skips the pack has twice the words it needs and writes the first half.
-///
-/// **The convert is free.** This rung is 0.0 to 1.4% *slower* than
-/// [`DRAIN_PAIRED`], in two round-robin passes at both shapes, so removing 32
-/// `cvt.rn.bf16x2` a band buys nothing — and the 69% of the drain that the
-/// `twice shared` rung prices is the `stmatrix` pass and the write-after-write a
-/// doubled one owes its own staging tile, not the `cvt` beside it. That is also
-/// what closes [`DRAIN_PACK16`] for good: it folds the convert into the load, and
-/// folding the convert away is worth nothing.
+/// The shipped drain with the `cvt` pass removed and nothing else, so
+/// `paired − nocvt` is what the convert costs. **It computes a wrong `C` by
+/// construction** and is on no correctness gate.
 pub const DRAIN_NOCVT: u8 = 4;
-/// The drain every shipped entry takes, named once here so a rung that wins its
-/// A/B ships by moving this line — which is what [`DRAIN_PAIRED`] did.
 pub const SHIPPED_DRAIN: u8 = DRAIN_PAIRED;
 
-/// **The third dial, and the only one that is not about what the kernel does.**
-///
-/// `ABLATE` says which phase runs and `DRAIN` says how the epilogue issues; this
-/// says whether the launch is allowed to hang. At [`WATCH_OFF`] the kernel is
-/// byte for byte the shipped one. Above it, every spin becomes
-/// [`kittens::sync::Semaphore::wait_before`] and every warp writes a four-word
-/// mark past the end of `C` at each loop head and on each expiry — so a launch
-/// that stops making progress *terminates*, carrying where all six of its warps
-/// were.
-///
-/// #149 is why. A launch that does not return costs a container and says
-/// nothing: the watchdog stops it and every warp's position is lost, which is
-/// how one shape survived three PRs with four candidate mechanisms and no way to
-/// tell them apart. Its own axis rather than an `ABLATE` arm because it removes
-/// no phase and computes the same `C` — the two are orthogonal, and a reader
-/// should be able to watch any arm.
+/// No watching: the kernel is byte for byte the shipped one. Above this every
+/// spin becomes [`kittens::sync::Semaphore::wait_before`] and every warp writes a
+/// four-word mark past the end of `C`, so a launch that stops making progress
+/// terminates carrying where all six of its warps were.
 pub const WATCH_OFF: u8 = 0;
 /// Deadlines and marks on the shipped [`ITEMS`]-deep item handoff.
 pub const WATCH_DEEP: u8 = 1;
-/// [`WATCH_DEEP`] on a **one-deep** item handoff — a single `ready` barrier and a
-/// single `info` cell, which is what the port carried before #149.
-///
-/// This is the arm that reproduces the defect under the instrument instead of
-/// arguing about it. It differs from [`WATCH_DEEP`] in [`items`] and in nothing
-/// else: same body, same barriers, same shared plan, same `C` to compare
-/// against, so the pair is a controlled test of the depth.
+/// [`WATCH_DEEP`] on a **one-deep** item handoff, which reproduces under the
+/// instrument the defect [`ITEMS`] fixes. It differs from [`WATCH_DEEP`] in the
+/// handoff's depth and in nothing else.
 pub const WATCH_ONE_DEEP: u8 = 2;
 
-/// Whether every spin carries a deadline and every warp leaves a mark.
 const fn watches(watch: u8) -> bool {
     watch != WATCH_OFF
 }
-/// Items the tile handoff holds at once, which is [`ITEMS`] everywhere except the
-/// one arm built to reproduce #149.
 const fn items(watch: u8) -> u32 {
     if watch == WATCH_ONE_DEEP {
         1
@@ -346,10 +198,7 @@ const fn items(watch: u8) -> u32 {
 }
 
 const BLOCK_M: usize = 128;
-/// Columns of `C` one wide cluster tile owns — `pub` because the ablation arms
-/// instantiate the same device body at the same width.
 pub const BLOCK_N: usize = 256;
-/// The half-panel of `B` a rank of a wide cluster tile loads.
 pub const HALF_N: usize = BLOCK_N / 2;
 const BLOCK_K: usize = 64;
 const CHUNKS: usize = BLOCK_K / 16;
@@ -357,103 +206,32 @@ const STAGES: usize = 4;
 /// Items the tile handoff holds at once: the depth of the `ready`
 /// [`SemaphoreRing`] and of the `info` [`SharedCellRing`] behind it.
 ///
-/// **This is #149's fix, and four is the minimum rather than a margin.** Derive
-/// it from what the back-pressure guarantees, since a mailbox behind a parity
-/// wait is sound only while the producer leads the consumer by less than the
-/// ring's depth:
-///
-/// 1. The producer publishes index `p` only after item `p-1`'s loads have all
-///    been issued, and the last of those passed
-///    `free.wait_recycled(p * k_blocks - 1)`, which is the MMA warp's `free`
-///    commit for K block `p * k_blocks - 1 - STAGES`.
-/// 2. At `k_blocks == STAGES` — `k = 256`, the shallowest `k` the contract
-///    admits — that block belongs to item `p - 2`. So all the producer's own
-///    throttle says is that the MMA warp has *finished item `p - 2`*.
-/// 3. [`Small`]'s accumulator ring is two deep, so the MMA warp finishing item
-///    `p - 2` means the epilogue released `empty(p - 4)` — it has read index
-///    `p - 4` and is about to wait on `p - 3`.
-/// 4. Indices `0..=p` are published against a consumer waiting on `p - 3`: four
-///    outstanding.
-///
-/// A handoff shallower than four therefore either overwrites an item's
-/// coordinates before the epilogue reads them, or lands its wait on a parity the
-/// producer has already passed — and once the producer has published
-/// `has_work = false` and left, on one that will never flip again. The second is
-/// #149: `4096x4096x1024` announced and never returned, while every `k` at and
-/// above 1280 won the same race on timing alone.
-///
-/// [`Large`]'s chain is one step tighter (a one-deep accumulator interlock per
-/// half, so step 3 gives `p - 3`), so four covers it with a margin of one. Both
-/// entries kept the same depth because one shared plan is worth more than the
-/// barrier the large one could save, and — see the offsets below — **the depth
-/// costs no shared memory at all**: four barriers and four `TileInfo` cells fit
-/// inside the padding the 128-byte-aligned staging buffer already left.
-///
-/// The four steps above are an argument, so they are also a test:
-/// [`kittens::sync::handoff::depth_needed`] enumerates every interleaving the
-/// same three throttles admit and answers 4 at `k_blocks == STAGES`, 3 above it,
-/// and — the part the argument missed — **2 at one item per cluster**, which is
-/// the only regime any correctness gate ran before #149. So the one-deep handoff
-/// was never sound at any legal shape; it was winning a race, by a margin that
-/// `k` sets.
+/// Four is the minimum the chain of back-pressure admits and not a margin. The
+/// four-step derivation, and the exhaustive search in
+/// [`kittens::sync::handoff::depth_needed`] that checks it, are in
+/// `docs/kernels/gemm_sol.md`.
 const ITEMS: usize = 4;
-/// Output tiles [`Small`] keeps in flight — the `full`/`empty` rings' depth, and
-/// step 3 of [`ITEMS`]' derivation.
+/// Output tiles [`Small`] keeps in flight, and step 3 of [`ITEMS`]' derivation.
 const ACCUMULATORS: usize = 2;
 const _: () = assert!(ITEMS >= ACCUMULATORS + 2, "steps 3 and 4 above");
-/// Ticks of the SM clock a [`WATCH_DEEP`] spin gives a phase before it calls the
+/// Ticks of the SM clock a watched spin gives a phase before it calls the
 /// protocol stalled — about 0.6 s at 1.8 GHz, four orders of magnitude past the
-/// ~26 µs an output tile takes at 4096³, so no arm can time out on being slow.
+/// ~26 µs an output tile takes at 4096³, so no arm times out on being slow.
 const DEADLINE: u64 = 1 << 30;
 const NARROW_N: usize = BLOCK_N / 2;
 const HALF_NARROW_N: usize = NARROW_N / 2;
 /// TMEM rows one warp owns, and therefore how many epilogue warps **one
-/// warpgroup** can have.
-///
-/// `tcgen05.ld` reaches the 32 tensor-memory lanes of the issuing warp's own
-/// sub-partition, and which sub-partition that is comes from the warp's index
-/// *within its warpgroup*. A `[128, N]` accumulator is 128 lanes, so four warps
-/// tile its rows exactly and **a fifth warp of the same warpgroup has no rows
-/// left to own.** That is hardware arithmetic, not a tuning knob, and it is why
-/// the epilogue cannot be widened along the row axis at all.
+/// warpgroup** can have: `tcgen05.ld` reaches only the 32 tensor-memory lanes of
+/// the issuing warp's own sub-partition, indexed within its warpgroup, so four
+/// warps tile a `[128, N]` accumulator's rows exactly and a fifth has none left.
 const EPILOGUE_ROWS: u32 = (BLOCK_M / 32) as u32;
-/// Warpgroups the epilogue runs across, which is the axis that *is* open.
-///
-/// Warp 4 is warpgroup 1's warp 0 and owns the **same** rows 0-31 warp 0 owns, so
-/// a second warpgroup cannot split the accumulator's rows any finer than
-/// [`EPILOGUE_ROWS`] already does — what it can split is the accumulator's
-/// **columns**. Warp `w` then drains rows `32 · (w % EPILOGUE_ROWS)` of column
-/// half `w / EPILOGUE_ROWS`, and every warp still reads only the lanes its
-/// sub-partition index entitles it to: lane ownership is satisfied twice over
-/// rather than relaxed.
-///
-/// It is free in the resource that binds. Residency is one CTA/SM on shared
-/// memory, and doubling the warps halves each one's staging width, so
-/// [`shared_plan`] is **byte-identical** at every entry — which is also what lets
-/// one `no drain` control serve both spellings.
+/// Warpgroups the epilogue runs across. Warp `w` drains rows
+/// `32 · (w % EPILOGUE_ROWS)` of column half `w / EPILOGUE_ROWS`, so a second
+/// warpgroup splits the accumulator's **columns** and not its rows.
 pub const ONE_WARPGROUP: u32 = 1;
-/// [`ONE_WARPGROUP`]'s twin: eight epilogue warps splitting the columns.
-///
-/// **It does not pay, and the reason closes the direction.** Two round-robin
-/// passes each: −1.4% and −1.8% of the launch at 4096³, +0.3% and +0.4% at 8192³,
-/// against a `no drain` control at *its own* 320 threads that is identical to the
-/// 192-thread one — so the two extra warps are free when they do nothing and the
-/// loss is the drain being slower once it is split. The drain itself moves by −9%
-/// at 4096³ and +3% at 8192³ for **twice the warps at the same total work**.
-///
-/// So the drain's latency is not warp-parallelizable, and the mechanism is the
-/// same resource that fixed [`EPILOGUE_ROWS`]: warps 0 and 4 own the *same* 32
-/// tensor-memory lanes, so a column split does not spread the LDTM traffic over
-/// more sub-partitions — it puts **two requesters on each of the same four**. The
-/// axis that is free to split is not the axis the hardware parallelizes, and
-/// there is no third axis: rows are tiled out at four warps by lane ownership and
-/// columns are shared with the warp that already owns those lanes.
-///
-/// Kept as a rung. It is exact at both entries over 1 048 576 BF16 outputs, which
-/// is what says the split itself is right and the null is about the hardware
-/// rather than about the code.
+/// [`ONE_WARPGROUP`]'s twin: eight epilogue warps splitting the columns. Kept as
+/// a rung — it is exact, and it loses.
 pub const TWO_WARPGROUPS: u32 = 2;
-/// The warpgroup count both shipped entries take.
 pub const SHIPPED_GROUPS: u32 = ONE_WARPGROUP;
 
 const fn epilogue_warps(groups: u32) -> u32 {
@@ -465,50 +243,30 @@ const fn tma_warp(groups: u32) -> u32 {
 const fn mma_warp(groups: u32) -> u32 {
     tma_warp(groups) + 1
 }
-/// Threads a launch of this kernel takes at `groups` epilogue warpgroups — 192 at
-/// one, 320 at two. It is a `const fn` and not a constant because the two
-/// spellings are launched side by side.
+/// Threads a launch takes at `groups` epilogue warpgroups: 192 at one, 320 at two.
 pub const fn threads(groups: u32) -> u32 {
     (mma_warp(groups) + 1) * 32
 }
-/// The thread count the shipped entries are launched with.
 pub const THREADS: u32 = threads(SHIPPED_GROUPS);
 const RANKS: u32 = 2;
 const LEADER: u32 = 0;
 const PAIR: u16 = 0b11;
-/// Columns of the accumulator a warp lifts into registers in one pass — `pub`
-/// because the warpgroup-split arms name it as their widest legal band.
+/// Columns of the accumulator a warp lifts into registers in one pass.
 pub const BAND_N: usize = 64;
-/// The TMA box `B` arrives in, and therefore the step the load loop takes
-/// through the half-panel a rank owns — the shipped value, which every entry
-/// carried unconditionally until it became [`Small`]'s and [`Large`]'s `BOX`
-/// parameter.
+/// The TMA box `B` arrives in, and therefore the step the load loop takes through
+/// the half-panel a rank owns.
 ///
-/// It is 64 because `B`'s tensor map is built for a 64-row box and every entry
-/// shared one map: the narrow entry's half-panel *is* 64 rows, so 64 is the only
-/// height all three can name. Nothing about the wide entries asks for it — their
-/// half-panel is `128 x 64`, the same shape as [`ATile`], which already arrives
-/// in a single TMA — so they pay two instructions where one would do.
-///
-/// **And it costs nothing, which is why 64 still ships.** `bench sol-ablate`'s
-/// wide-`B` arms are that map built per entry instead of once, at byte-for-byte
-/// identical traffic, and they move the launch by 0.998 and 1.014 across two
-/// passes, the K-block rate from 0.3503 to 0.3484 µs, and `feed only` — where the
-/// feed is alone and has nothing to hide behind — by 1.008 and 0.981. The feed's
-/// ceiling is bytes, not instructions.
+/// It is 64 because all three entries share one tensor map and the narrow entry's
+/// half-panel *is* 64 rows. The wide entries therefore pay two instructions where
+/// one would do, which measures as nothing: the feed's ceiling is bytes.
 pub const B_BOX: usize = 64;
 /// The box the two 256-wide entries' half-panel would arrive in whole.
 pub const WIDE_B_BOX: usize = HALF_N;
-/// The `[512, 256]` entry's staging width — `pub` because `experiments/`'
-/// warpgroup-split arms halve it for their own per-warp tile.
 pub const LARGE_STAGE_N: usize = HALF_N;
 
 const _: () = {
     assert!(THREADS == 192);
     assert!(threads(TWO_WARPGROUPS) == 320);
-    // The claim that makes the warpgroup split's `no drain` control clean, as an
-    // assert rather than as prose: twice the warps staging half the columns each is
-    // the same number of bytes, at every entry.
     assert!(
         epilogue_warps(ONE_WARPGROUP) as usize * BLOCK_N
             == epilogue_warps(TWO_WARPGROUPS) as usize * (BLOCK_N / 2)
@@ -521,8 +279,6 @@ const _: () = {
         epilogue_warps(ONE_WARPGROUP) as usize * LARGE_STAGE_N
             == epilogue_warps(TWO_WARPGROUPS) as usize * (LARGE_STAGE_N / 2)
     );
-    // The column split has to divide the columns, and each half has to still be a
-    // whole number of staging passes. `LARGE_STAGE_N` is the tightest.
     assert!(BLOCK_N.is_multiple_of(2 * BAND_N));
     assert!(NARROW_N.is_multiple_of(2 * BAND_N));
     assert!(LARGE_STAGE_N.is_multiple_of(2 * BAND_N));
@@ -532,14 +288,9 @@ const _: () = {
     assert!(HALF_N.is_multiple_of(WIDE_B_BOX));
 };
 
-/// The `A` tile a tensor map is built for — `pub` because `experiments/`' arms
-/// build the same maps this file's own runner does.
 pub type ATile = SharedTile<F16, BLOCK_M, BLOCK_K, Swizzle128B>;
 
-/// The `B` panel a tensor map is built for at [`B_BOX`], per [`ATile`].
 pub type BPanel = SharedTile<F16, B_BOX, BLOCK_K, Swizzle128B>;
-/// The `B` panel a tensor map is built for at [`WIDE_B_BOX`]: a rank's whole
-/// half-panel in one box.
 pub type WideBPanel = SharedTile<F16, WIDE_B_BOX, BLOCK_K, Swizzle128B>;
 type ARing = SharedTileRing<F16, BLOCK_M, BLOCK_K, Swizzle128B, STAGES>;
 type BRing = SharedTileRing<F16, HALF_N, BLOCK_K, Swizzle128B, STAGES>;
@@ -547,10 +298,6 @@ type NarrowBRing = SharedTileRing<F16, HALF_NARROW_N, BLOCK_K, Swizzle128B, STAG
 type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
 type StageBand = RegTile<32, BAND_N, BaseLdtm>;
 
-/// The `tcgen05` shape a `[256, N]` cluster tile issues. It is a `const fn`
-/// rather than a `Variant` method because the MMA warp reads it inside a
-/// width-generic body, where the width is a const parameter and the shape has
-/// to fold away with it.
 const fn mma_shape(n: usize) -> MmaShape {
     match n {
         NARROW_N => MmaShape::M256_N128,
@@ -567,36 +314,27 @@ struct TileInfo {
     has_work: u32,
 }
 
-/// Words a [`Common::mark`] leaves: site, `sequence`, ring index, parity.
+/// A watched arm's marks land in [`REPORT_ROWS`] rows of `C` past the output:
+/// [`REPORT_SLOTS`] warp slots a CTA — its six warps rounded up — of
+/// [`REPORT_FIELDS`] words each, being site, `sequence`, ring index and parity.
 pub const REPORT_FIELDS: u32 = 4;
-/// Slots a CTA gets, which is its six warps rounded to a power of two.
 pub const REPORT_SLOTS: u32 = 8;
-/// Rows of `C` a [`WATCH_DEEP`] arm must allocate past the output for the report.
-/// `ldc >= 2048` at every shape these arms are run at, so four rows hold the 512
-/// CTAs of a 4096² grid; the launcher asserts it rather than trusting it.
+/// Four rows hold the 512 CTAs of a 4096² grid at the `ldc >= 2048` these arms
+/// are run at; the launcher asserts it rather than trusting it.
 pub const REPORT_ROWS: usize = 4;
 
-/// The report's sites, in the order a healthy launch walks them. `_HEAD` marks
-/// are written at a loop head and are where a warp was; the rest are stalls.
 pub const SITE_FEED: u32 = 1;
 pub const SITE_QUERY: u32 = 2;
 pub const SITE_MULTIPLY: u32 = 3;
 pub const SITE_DRAIN: u32 = 4;
 pub const SITE_EXIT: u32 = 5;
-/// Stalled waiting for the item handoff — #149's site.
 pub const SITE_READY: u32 = 6;
-/// Stalled waiting for an operand stage to be recycled.
 pub const SITE_FREE: u32 = 7;
-/// Stalled waiting for a CLC response.
 pub const SITE_CLC: u32 = 8;
-/// Stalled waiting for an accumulator to be drained.
 pub const SITE_EMPTY: u32 = 9;
-/// Stalled waiting for an accumulator to be filled.
 pub const SITE_FULL: u32 = 10;
-/// Stalled waiting for an operand stage to arrive.
 pub const SITE_LOAD: u32 = 11;
 
-/// What a site number means, for the host side of the report.
 pub const fn site_name(site: u32) -> &'static str {
     match site {
         0 => "-",
@@ -621,8 +359,6 @@ const fn align_up(offset: usize, alignment: usize) -> usize {
 
 const A0_OFFSET: usize = 0;
 const SMALL_B_OFFSET: usize = A0_OFFSET + ARing::BYTES;
-/// Where the wide one-accumulator entry's rings end, which is the offset every
-/// barrier and the epilogue staging buffer are placed after.
 pub const SMALL_RINGS_END: usize = SMALL_B_OFFSET + BRing::BYTES;
 const NARROW_RINGS_END: usize = SMALL_B_OFFSET + NarrowBRing::BYTES;
 const LARGE_A1_OFFSET: usize = A0_OFFSET + ARing::BYTES;
@@ -653,14 +389,9 @@ const fn info_offset(rings_end: usize) -> usize {
         SharedCellRing::<TileInfo, ITEMS>::ALIGNMENT,
     )
 }
-/// The [`WATCH_DEEP`] arms' one-word "somebody has stalled" flag, which every role
-/// polls at its loop head so a warp that gave up takes the other five out with
-/// it and the launch reaches `cluster_sync` instead of hanging on it.
-///
-/// Reserved in every arm, including the shipped ones, because the alternative is
-/// two shared plans for one kernel and the word is free: everything from here to
-/// [`stage_offset`] sits inside the padding the 128-byte-aligned staging buffer
-/// already left, which is why [`ITEMS`] and this cost nothing.
+/// The watched arms' one-word "somebody has stalled" flag, which every role polls
+/// at its loop head so a warp that gave up takes the other five out with it and
+/// the launch reaches `cluster_sync` instead of hanging on it.
 const fn stop_offset(rings_end: usize) -> usize {
     align_up(
         info_offset(rings_end) + SharedCellRing::<TileInfo, ITEMS>::BYTES,
@@ -673,9 +404,9 @@ const fn queue_offset(rings_end: usize) -> usize {
 const fn stage_offset(rings_end: usize) -> usize {
     align_up(queue_offset(rings_end) + ClcQueue::BYTES, 128)
 }
-/// `stage_n` is the **entry's** staging width, not a warp's: at two warpgroups
-/// there are twice as many warps staging half as many columns each, so this total
-/// is the same either way and every `dynamic_shared` figure below is unmoved.
+/// `stage_n` is the **entry's** staging width, not a warp's: at two epilogue
+/// warpgroups twice as many warps stage half as many columns each, so this total
+/// is the same either way.
 const fn shared_plan(rings_end: usize, stage_n: usize) -> usize {
     stage_offset(rings_end) + EPILOGUE_ROWS as usize * 32 * stage_n * Bf16::BYTES
 }
@@ -789,12 +520,6 @@ impl Common {
         }
     }
 
-    /// The `(barrier, parity)` publication `index` lands on, and the cell it
-    /// lands in — one place, so the producer's `arrive` and the consumers' `wait`
-    /// cannot disagree about the ring's depth.
-    ///
-    /// At [`items`] of one this is `(ready.sem(0), index & 1)` and cell zero,
-    /// which is the spelling the port carried and [`WATCH_ONE_DEEP`] keeps.
     #[inline(always)]
     fn handoff<const WATCH: u8>(self, index: u32) -> (Semaphore, u32, SharedCell<TileInfo>) {
         let depth = items(WATCH);
@@ -818,11 +543,6 @@ impl Common {
         }
     }
 
-    /// Item `sequence`'s coordinates, once the producer has published them.
-    ///
-    /// A [`WATCH_DEEP`] arm that gives up here returns `has_work = 0` so the caller
-    /// leaves its loop by the path it already has, having first left the mark
-    /// that says the exit was a stall and not a sentinel.
     #[inline(always)]
     unsafe fn next_info<const WATCH: u8>(self, sequence: u32) -> TileInfo {
         unsafe {
@@ -842,14 +562,6 @@ impl Common {
         }
     }
 
-    /// The MMA warp's operand-stage wait, deadline and all.
-    ///
-    /// It reports rather than returning, because the shape of the K loop that
-    /// calls it is somebody else's argument and this must not change it: the
-    /// stall sets [`Self::stop`], the K loop runs its remaining turns against
-    /// operands nobody promised, and the item loop above notices at its head.
-    /// The arm computes a deliberately wrong `C` past that point and is on no
-    /// correctness gate.
     #[inline(always)]
     unsafe fn wait_load<const WATCH: u8>(self, slot: u32, parity: u32) {
         unsafe {
@@ -863,8 +575,6 @@ impl Common {
         }
     }
 
-    /// [`Self::wait_load`] addressed by K-block index rather than by stage — the
-    /// `global_k` spelling of the same wait.
     #[inline(always)]
     unsafe fn wait_load_at<const WATCH: u8>(self, index: u32) {
         unsafe {
@@ -872,9 +582,6 @@ impl Common {
         }
     }
 
-    /// The two-accumulator entry's second-half `empty` wait, per
-    /// [`Self::wait_load`]: it sits inside that entry's K loop, so it reports and
-    /// carries on rather than returning a failure the loop would have to thread.
     #[inline(always)]
     unsafe fn wait_empty_at<const WATCH: u8>(self, half: u32, parity: u32) {
         unsafe {
@@ -888,8 +595,6 @@ impl Common {
         }
     }
 
-    /// The epilogue's accumulator-full wait, per [`Self::wait_load`]. `false` is
-    /// a stall the caller must leave its loop on.
     #[inline(always)]
     unsafe fn wait_full<const WATCH: u8>(self, sequence: u32) -> bool {
         unsafe {
@@ -911,15 +616,11 @@ impl Common {
         }
     }
 
-    /// Whether some warp of this CTA has given up. Const-false at every shipped
-    /// arm, so the poll is not in the shipped kernel at all.
     #[inline(always)]
     unsafe fn stalled<const WATCH: u8>(self) -> bool {
         unsafe { watches(WATCH) && self.stop.read() != 0 }
     }
 
-    /// Leave this warp's position in the rows of `C` past the output and stop the
-    /// rest of the CTA.
     #[inline(always)]
     unsafe fn stall(self, site: u32, sequence: u32, index: u32, parity: u32) {
         unsafe {
@@ -928,15 +629,6 @@ impl Common {
         }
     }
 
-    /// One warp's four-word position, written where the host can read it: row
-    /// `m` of `C`, which the [`WATCH_DEEP`] arms allocate [`REPORT_ROWS`] of past
-    /// the output for exactly this.
-    ///
-    /// Eight slots a CTA covers the six warps a block has, indexed by
-    /// `blockIdx.x` rather than by cluster so the two ranks of a pair are told
-    /// apart — a handoff defect is a per-CTA fact and the ranks publish
-    /// separately. Written at every loop head as well as on every stall, so the
-    /// last mark a warp left is where it was even when it never stalled at all.
     #[inline(always)]
     unsafe fn mark<const WATCH: u8>(self, site: u32, sequence: u32, index: u32, parity: u32) {
         if watches(WATCH) {
@@ -944,8 +636,6 @@ impl Common {
         }
     }
 
-    /// [`Self::mark`] with the arm's const already resolved — the one form
-    /// [`Self::stall`] can call, since a stall is a stall at every watched arm.
     #[inline(always)]
     unsafe fn write_mark(self, site: u32, sequence: u32, index: u32, parity: u32) {
         unsafe {
@@ -978,8 +668,6 @@ impl Common {
         }
     }
 
-    /// This warp's slice of the staging plan, as the `[32, STAGE_N]` tile every
-    /// drain below writes and reads back.
     #[inline(always)]
     unsafe fn staging<const STAGE_N: usize>(self) -> SharedTile<Bf16, 32, STAGE_N, Swizzle128B> {
         unsafe {
@@ -991,47 +679,27 @@ impl Common {
         }
     }
 
-    /// Which of the accumulator's [`EPILOGUE_ROWS`] row blocks this warp owns.
-    ///
-    /// `warp_id % EPILOGUE_ROWS`, which is `warp_id` at one warpgroup and wraps at
-    /// two — warp 4 owns row block 0 again, because it is warpgroup 1's warp 0 and
-    /// therefore the same tensor-memory sub-partition warp 0 is.
     #[inline(always)]
     fn row_block(self) -> u32 {
         self.warp_id % EPILOGUE_ROWS
     }
 
-    /// Which column half this warp drains: 0 at one warpgroup, 0 or 1 at two.
     #[inline(always)]
     fn column_group(self) -> u32 {
         self.warp_id / EPILOGUE_ROWS
     }
 
-    /// This warp's first row of `C` in the output tile at `tile_row`.
     #[inline(always)]
     fn drain_row(self, tile_row: u32) -> u32 {
         tile_row + self.rank * BLOCK_M as u32 + self.row_block() * 32
     }
 
-    /// This warp's first column of the accumulator, and how many it drains.
-    ///
-    /// At `GROUPS = 1` this is `(0, N)` and every expression below folds back to
-    /// what shipped; at 2 it is `(N/2 · group, N/2)`.
     #[inline(always)]
     fn drain_columns<const N: usize, const GROUPS: u32>(self) -> (u32, u32) {
         let span = N as u32 / GROUPS;
         (self.column_group() * span, span)
     }
 
-    /// The shipped drain, and the doubling ladder that prices it.
-    ///
-    /// At [`WHOLE`] this is the loop #126 describes and nothing else: a band of
-    /// [`BAND_N`] columns out of TMEM, `stmatrix` into the warp's staging tile,
-    /// the whole tile out to `C`, and the write-after-read the next band owes
-    /// itself. At a `TWICE_*` arm the named half runs a second time with its
-    /// global stores aimed at `again` — the cluster's own first output tile, so
-    /// the extra bytes stay in L2 and the probe prices instructions rather than a
-    /// doubled HBM stream.
     #[inline(always)]
     unsafe fn drain<const ABLATE: u8, const N: usize, const STAGE_N: usize, const GROUPS: u32>(
         self,
@@ -1056,11 +724,6 @@ impl Common {
                         accumulator.tile_x8(32 * self.row_block(), base + column + band_column);
                     store_tile_x4(stage.chunk_writer(), 0, band_column, self.lane, band);
                     if twice(ABLATE) >= 2 {
-                        // The band is still live here, so rung 2 doubles the
-                        // `cvt` + `stmatrix` pass alone and rung 3 doubles the
-                        // LDTM in front of it. The extra write lands on words
-                        // nothing has read yet, so no rung owes an extra
-                        // `sync_mask` and the ladder holds the syncs fixed.
                         let restaged: StageBand = if twice(ABLATE) >= 3 {
                             accumulator.tile_x8(32 * self.row_block(), base + column + band_column)
                         } else {
@@ -1093,15 +756,6 @@ impl Common {
         }
     }
 
-    /// [`Self::drain`] with the band's LDTM issues batched behind one wait, and
-    /// the band width a parameter.
-    ///
-    /// `BAND` columns and `ISSUES = BAND / 32` `.x8` loads — two per 64 columns,
-    /// one per 16 rows of the warp's 32. Nothing else moves: the same `stmatrix`,
-    /// the same staging tile, the same `store_shared_rows`, the same two
-    /// `warp::sync_mask` a staged pass, and the same shared plan, so the
-    /// difference against [`Self::drain`] is the wait structure and the band's
-    /// register liveness and nothing besides.
     #[inline(always)]
     unsafe fn drain_batched<
         const N: usize,
@@ -1153,15 +807,6 @@ impl Common {
         }
     }
 
-    /// [`Self::drain`] with `.pack::16b` in front of the `stmatrix` and **no
-    /// `cvt`** — the oracle [`DRAIN_PACK16`] describes, which computes a wrong
-    /// `C` and exists to price the convert.
-    ///
-    /// A `[32, BAND_N]` band is 2048 elements, which is 64 b16 a lane, which is
-    /// **one** `.x8.pack::16b` arrival of 32 already-packed words against the two
-    /// `.x8` arrivals and 32 `cvt` the same band costs today. The words go to the
-    /// band's eight `[16, 16]` blocks four at a time — a mapping this cannot get
-    /// right, because the bits are not bf16 in the first place.
     #[inline(always)]
     unsafe fn drain_packed<const N: usize, const STAGE_N: usize, const GROUPS: u32>(
         self,
@@ -1215,15 +860,6 @@ impl Common {
         }
     }
 
-    /// [`DRAIN_NOCVT`]: the shipped drain with the `cvt` pass removed and
-    /// nothing else, so `paired − nocvt` is what the convert costs.
-    ///
-    /// The band arrives exactly as [`Self::drain_batched`] takes it — two `.x8`
-    /// issues behind one wait — and then its raw f32 words go to `stmatrix`
-    /// unpacked, four to a block, eight blocks to a band. That writes the same
-    /// bytes to the same addresses with the same instruction at the same count;
-    /// only the 32 `cvt.rn.bf16x2` a band are gone, and so is any relation
-    /// between what is written and `C`.
     #[inline(always)]
     unsafe fn drain_nocvt<const N: usize, const STAGE_N: usize, const GROUPS: u32>(
         self,
@@ -1280,8 +916,10 @@ impl Common {
         }
     }
 
-    /// Which drain a `DRAIN` value names. The dead arms fold away: `DRAIN` is a
-    /// const and every arm is instantiated with literal widths.
+    /// Which drain a `DRAIN` value names. `WIDE_BAND` and `WIDE_ISSUES` are
+    /// parameters because Rust monomorphizes both sides of a `match` on a const: a
+    /// literal 128-column band here would break the two-warpgroup build, whose
+    /// 64-wide staging tile cannot divide it, even though it never takes that arm.
     #[inline(always)]
     unsafe fn drain_dial<
         const ABLATE: u8,
@@ -1329,20 +967,10 @@ impl Common {
     }
 }
 
-/// The one-accumulator entry, generic in the cluster tile's width.
-///
-/// `N` is the tile's columns of `C`, `HALF` the half-panel of `B` a rank
-/// loads, `BOX` the TMA box that half-panel arrives in, and `STAGE` the columns
-/// of the shared epilogue staging buffer. Two widths are instantiated —
-/// `[256, 256]` and `[256, 128]` — and they differ in nothing else, which is
-/// what makes the pair a controlled comparison of tile quantization against
-/// operand traffic.
+/// The one-accumulator entry, generic in the cluster tile's width: `N` columns of
+/// `C`, `HALF` the half-panel of `B` a rank loads, `BOX` the TMA box it arrives
+/// in, and `STAGE` **a warp's** columns of the shared epilogue staging buffer.
 #[derive(Clone, Copy)]
-/// `STAGE` is **a warp's** staging columns, not the entry's: at two epilogue
-/// warpgroups there are twice as many warps staging half as many columns each, so
-/// the entry passes `entry width / GROUPS` here and [`shared_plan`] keeps taking
-/// the entry width. That is what makes the two spellings byte-identical in shared
-/// memory.
 struct Small<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize> {
     common: Common,
     a: ARing,
@@ -1474,24 +1102,11 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
         }
     }
 
-    /// One K block at a **compile-time** stage.
-    ///
-    /// `k_blocks` is a multiple of `STAGES` — every entry's shape contract is
-    /// `k % (STAGES * BLOCK_K) == 0` — so `global_k % STAGES == k % STAGES`, and
-    /// the four positions of a four-way unroll are always stages 0, 1, 2, 3 in
-    /// that order. Handing each position its stage as a const is what turns two
-    /// operand descriptors and two barrier addresses from runtime arithmetic
-    /// into folded offsets. The phase parity is the one thing that genuinely
-    /// moves with `global_k`, and it moves once a turn instead of four times.
-    ///
-    /// Upstream's `gemm_sol_final` states the same fact — *"`k_iters % 4 == 0`,
-    /// so the producer's global stage and this local stage agree at every tile
-    /// boundary. Keeping this expression loop-local lets the unroll pass fold
-    /// each stage match."* — and spells it as `#[unroll(4)]` over a loop-local
-    /// `k_idx & 3` with a `match` on it. That attribute is rewritten only inside
-    /// a `#[kernel]` or `#[device_function]` body, so a const parameter is the
-    /// spelling reachable from a plain `impl` method; it also does not depend on
-    /// an unroll pass firing.
+    /// One K block at a **compile-time** stage. Every entry's contract is
+    /// `k % (STAGES * BLOCK_K) == 0`, so `global_k % STAGES == k % STAGES` and the
+    /// four positions of the unroll are always stages 0, 1, 2, 3 in that order;
+    /// only the phase parity moves with `global_k`, once a turn instead of four
+    /// times.
     #[inline(always)]
     unsafe fn multiply_at<const ABLATE: u8, const WATCH: u8, const SLOT: u32>(
         self,
@@ -1519,14 +1134,9 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
         }
     }
 
-    /// The K walk, `STAGES` blocks a turn.
-    ///
-    /// `FOLD` picks the spelling: [`Self::multiply_at`]'s const stage, or
-    /// [`Self::multiply_stage`]'s `global_k`, which is what the port carried
-    /// before the two were measured against each other. The two compute the same
-    /// `C` by construction — the const is `global_k % STAGES` and nothing else —
-    /// so the difference between them is entirely how much of the MMA warp's
-    /// issue stream is scalar arithmetic.
+    /// The K walk, `STAGES` blocks a turn. `FOLD` picks the spelling:
+    /// [`Self::multiply_at`]'s const stage, or [`Self::multiply_stage`]'s
+    /// `global_k`, which compute the same `C` by construction.
     #[inline(always)]
     unsafe fn walk_k<const ABLATE: u8, const FOLD: bool, const WATCH: u8>(
         self,
@@ -1633,8 +1243,6 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
                 }
                 common.mark::<WATCH>(SITE_DRAIN, sequence, info.row, info.column);
                 let (row, column) = (info.row * (2 * BLOCK_M) as u32, info.column * N as u32);
-                // Only the doubling probes have a second destination, and only
-                // they pay for tracking it.
                 if twice(ABLATE) > 0 && sequence == 0 {
                     again = (row, column);
                 }
@@ -1656,10 +1264,9 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
     }
 }
 
-/// The two-accumulator entry: two `A` rings against one shared `B` half-panel,
-/// so a K block is twice the MMA against the same one `load` round trip.
-///
-/// `BOX` is the TMA box that half-panel arrives in, exactly as on [`Small`].
+/// The two-accumulator entry: two `A` rings against one shared `B` half-panel, so
+/// a K block is twice the MMA against the same one `load` round trip. `BOX` is
+/// the TMA box that half-panel arrives in, exactly as on [`Small`].
 #[derive(Clone, Copy)]
 struct Large<const BOX: usize> {
     common: Common,
@@ -1807,12 +1414,6 @@ impl<const BOX: usize> Large<BOX> {
         }
     }
 
-    /// One K block at a compile-time stage, per [`Small::multiply_at`].
-    ///
-    /// `first` and `last` are the two places this entry's K block is not
-    /// interchangeable with its neighbours — the `empty` wait at `k == 0` and the
-    /// `full` commit at `k + 1 == k_blocks` — and both are literals at three of
-    /// the four positions, so they fold away with the stage.
     #[inline(always)]
     unsafe fn multiply_at<const ABLATE: u8, const WATCH: u8, const SLOT: u32>(
         self,
@@ -1862,7 +1463,6 @@ impl<const BOX: usize> Large<BOX> {
         }
     }
 
-    /// The K walk, per [`Small::walk_k`].
     #[inline(always)]
     unsafe fn walk_k<const ABLATE: u8, const FOLD: bool, const WATCH: u8>(self, sequence: u32) {
         unsafe {
@@ -2000,12 +1600,8 @@ impl<const BOX: usize> Large<BOX> {
     }
 }
 
-/// The width-generic device body, with two dials on it.
-///
-/// The two `[256, N]` kernels below are this at [`WHOLE`] and [`B_BOX`] and
-/// nothing else; `experiments/`' arms are the same text at another `ABLATE` or
-/// another `BOX`, so no arm can drift from the kernel it decomposes and a
-/// wide-box arm differs from the shipped kernel in exactly one const.
+/// The width-generic device body every `[256, N]` entry and every ablation arm
+/// instantiates, so no arm can drift from the kernel it decomposes.
 ///
 /// # Safety
 ///
@@ -2180,10 +1776,7 @@ pub mod kernels {
         }
     }
 
-    /// The same entry at half the width: a `[256, 128]` cluster tile, which
-    /// quadruples the tile count of a square problem against
-    /// [`gemm_sol_m256`]'s and is what a shape too small to fill a wave of the
-    /// wider one is for.
+    /// The same entry at half the width.
     ///
     /// # Safety
     ///
@@ -2304,33 +1897,16 @@ impl Variant {
     }
 }
 
-/// Clusters this device holds at once: 148 SMs, one CTA per SM, two CTAs to a
-/// cluster.
-///
-/// Both the one CTA and the two are facts rather than choices — every shared
-/// plan here declares more than half of the 233472 B an SM divides, and a
-/// `cta_group::2` MMA has to have its pair co-resident — so this is a device
-/// property, not a tuning knob. It is written down rather than queried because
-/// [`select_variant`] is a `const fn` that [`grid`] calls with a shape and
-/// nothing else; `bench sol`'s table 0 prints the same number off
-/// `cuDeviceGetAttribute` beside every row it divides, which is where a device
-/// that disagrees with this would show up.
+/// Clusters this device holds at once: 148 SMs, one CTA per SM because every
+/// shared plan here declares more than half of the 233472 B an SM divides, and
+/// two CTAs to a cluster because a `cta_group::2` MMA needs its pair resident.
 const RESIDENT_CLUSTERS: usize = 74;
 
-/// The entry a shape gets. All three branches are wave arithmetic.
-///
-/// A launch is one cluster per output tile and takes `ceil(tiles / 74)` waves of
-/// them, so `tiles / (waves * 74)` is the fraction of it that is not idling and
-/// halving the tile's `N` doubles the tile count. That doubling raises the
-/// fraction **only** while both counts fit the same number of waves — at or
-/// below half a wave of wide tiles — and above it the two are equal and the
-/// narrow tile is left paying its costs for nothing. `bench sol-small` measures
-/// exactly that boundary: at 16 and 36 wide tiles the narrow entry is 1.27x,
-/// and at 64 and 144 it is 0.93x and 0.81x, both reproduced twice.
-///
-/// `M512xN256` above 8192 is #138's crossover, which upstream takes at 16384;
-/// `bench sol` has it 1.12x at 8192³ against a wave efficiency both entries
-/// share, so what it wins there is operand traffic per flop and not tiles.
+/// The entry a shape gets; all three branches are wave arithmetic. A launch is one
+/// cluster per output tile and takes `ceil(tiles / RESIDENT_CLUSTERS)` waves of
+/// them, so `tiles / (waves * RESIDENT_CLUSTERS)` is the fraction that is not
+/// idling — and halving the tile's `N` doubles the tile count, which raises that
+/// fraction only while both counts fit the same number of waves.
 pub const fn select_variant(m: usize, n: usize) -> Variant {
     if !n.is_multiple_of(BLOCK_N) {
         // The only entry whose contract admits this `n` at all.
@@ -2344,21 +1920,11 @@ pub const fn select_variant(m: usize, n: usize) -> Variant {
     }
 }
 
-/// The N-band width [`pipeline::grouped`] walks, which was a rule inside the
-/// kernel until it became a launch parameter.
-///
-/// The rule is unchanged and the default is what it computed, because the sweep
-/// that could have changed it found nothing to change it to: `bench sol`'s
-/// table 3 takes `G` over `{1, 2, 4, 8, 16}` and gets 1880.3 to 1876.2 TFLOP/s
-/// at 8192³ — flat to 0.2% — and a 1311 to 1367 range at 4096³ against rows
-/// whose own launches spread 1.3 to 3.6%. Tuning on the second of those would be
-/// tuning on noise.
+/// The N band [`pipeline::grouped`] walks before it steps in `M`.
 pub const fn default_group(m: usize) -> u32 {
     if m / 256 <= 16 { 2 } else { 8 }
 }
 
-/// Everything the launch decides that is not the shape: which entry, and how
-/// wide a band of `N` its traversal walks before it steps in `M`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub variant: Variant,
@@ -2395,22 +1961,14 @@ fn validate_shape(m: usize, n: usize, k: usize, variant: Variant) -> Result<(), 
 
 /// `A`'s generator. Small integers, so every product and every partial sum is
 /// exact in fp32 and [`check_output`] is `==` rather than a tolerance.
-///
-/// `pub` because `experiments/`' copy of the *unported* upstream kernel is
-/// staged and checked by these four functions rather than by re-derivations of
-/// them (#138). Two kernels compared on one clock have to read byte-identical
-/// operands, and the way to guarantee that is to call the same code.
 pub fn a_value(row: usize, depth: usize) -> f32 {
     ((row * 5 + depth * 3) % 7) as f32 - 3.0
 }
 
-/// `B`'s generator, per [`a_value`].
 pub fn b_value(column: usize, depth: usize) -> f32 {
     ((column * 4 + depth * 5) % 21) as f32 - 10.0
 }
 
-/// One operand, packed f16 row-major with K contiguous — the layout both this
-/// kernel and upstream's take.
 pub fn stage_f16(rows: usize, k: usize, value: impl Fn(usize, usize) -> f32) -> Vec<u16> {
     let mut staged = Vec::with_capacity(rows * k);
     for row in 0..rows {
@@ -2421,9 +1979,6 @@ pub fn stage_f16(rows: usize, k: usize, value: impl Fn(usize, usize) -> f32) -> 
     staged
 }
 
-/// Every one of `m * n` BF16 outputs against the exact reference, per
-/// [`a_value`]. Returns the worst relative error, which is bf16's own and not
-/// a tolerance the comparison was given.
 pub fn check_output(observed: &[u16], m: usize, n: usize, k: usize) -> Result<f64, Box<dyn Error>> {
     let exact: Vec<f32> = (0..7 * 21)
         .map(|cell| {
@@ -2584,20 +2139,9 @@ fn nothing_after(
 }
 
 /// The shallowest `k` the contract admits, at a grid deep enough that a cluster
-/// has to take a second item — one shape per entry, and #149's regression.
-///
-/// `1024x1024x512` alone is why that issue survived. It is 16, 8 and 4 clusters
-/// at the three entries against 74 resident, so **every cluster gets exactly one
-/// item**, its producer publishes once and then the sentinel, and the item
-/// handoff is never asked to hold two. Every timed row in every sweep was at
-/// `k >= 2048`. So the whole of the regime the handoff's depth is about — more
-/// clusters than the device holds, at a `k` short enough that a tile's K loop is
-/// comparable to its drain — was untested at all three entries.
-///
-/// Each of these is above 74 clusters and at `k_blocks == STAGES`, which is the
-/// shape [`ITEMS`]' derivation is tight at. They cost about 20 million output
-/// comparisons between them, which is a fifth of what one `bench` row already
-/// checks.
+/// has to take a second item: each of these is above [`RESIDENT_CLUSTERS`]
+/// clusters and at `k_blocks == STAGES`, which is the shape [`ITEMS`]'
+/// derivation is tight at.
 const SHALLOW_K_GATE: [(Variant, usize, usize); 3] = [
     (Variant::M256xN128, 2048, 2048),
     (Variant::M256xN256, 2560, 2048),
@@ -2623,9 +2167,7 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
     Ok(notes.join("; "))
 }
 
-/// Check the plan at the gate size, then time it at `shape` — the order every
-/// number in this file comes out of, and the entry point a sweep varying the
-/// plan calls instead of [`bench`].
+/// Check the plan at the gate size, then time it at `shape`.
 pub fn bench_plan(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     shape: crate::bench::Shape,
@@ -2651,8 +2193,6 @@ pub fn grid(shape: crate::bench::Shape) -> u32 {
     grid_for(shape, select_variant(shape.m, shape.n))
 }
 
-/// Clusters the launch asks for, which is one per output tile — the number the
-/// wave arithmetic divides by residency.
 pub fn clusters(shape: crate::bench::Shape, variant: Variant) -> u32 {
     grid_for(shape, variant) / RANKS
 }
