@@ -24,10 +24,12 @@
 //! pull request that added it, against the checkout it came from.
 //!
 //! Upstream's revision is **`b099f64c1a32869b74be99f4f88242fb68655b51`**, which
-//! is what `Cargo.toml` pins and therefore what the port was built and measured
-//! against. `gemm_sol_final/` is *identical* at
-//! `20a56163f258e09f2c51e4c27ae4e4ff17582443`, the revision main is moving to,
-//! so this measurement does not turn on which of the two is in the manifest.
+//! is what the port was built and measured against. `Cargo.toml` now pins
+//! `20a56163f258e09f2c51e4c27ae4e4ff17582443`, and `gemm_sol_final/` is
+//! *byte-identical* at the two — upstream's `kernels.rs` and the vendored
+//! `gemm_sol_upstream_kernels.rs` all hash to
+//! `6746e517eca19fdcc01cb0d5003e924bb638f5ee42e8c333d457a0d6f334d6e9` — so this
+//! measurement does not turn on which of the two is in the manifest.
 //!
 //! ## What is upstream's and what is this harness'
 //!
@@ -98,7 +100,8 @@ use cuda_device::{DisjointSlice, cluster_launch, cuda_module, kernel, thread, wa
 // stops on it — *"line 10; fatal: Parsing error near '.nvvm'"* — and since a
 // package's kernels share one embedded bundle, one such call takes down the
 // load of every kernel in this crate, the port included. It is the same defect
-// `kittens::ldst` documents at `b099f64` and works around with `ptx_asm!`, and
+// `kittens::ldst` documents at `b099f64` and `20a5616` alike and works around
+// with `ptx_asm!`, and
 // `kittens::ldst::stmatrix_m8n8_x2` has upstream's exact signature and emits
 // upstream's exact instruction, `stmatrix.sync.aligned.m8n8.x2.shared.b16`.
 //

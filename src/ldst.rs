@@ -424,7 +424,9 @@ pub unsafe fn store_vec<E: Element, const N: usize, L: ColLayout<N>>(
 
 /// Store two packed b16 matrix fragments (`stmatrix.sync.aligned.m8n8.x2`)
 /// without routing through the unresolved LLVM stmatrix declaration emitted
-/// by cuda-oxide b099f64.
+/// by cuda-oxide. Observed at `b099f64` and **still present at the pinned
+/// `20a5616`** — same `.extern .func`, same `ptxas` line — so this is not a
+/// workaround waiting to be dropped at the next bump.
 ///
 /// The load direction needs no such workaround:
 /// [`cuda_device::wmma::ldmatrix_x2`] lowers cleanly for `sm_100a`, so
@@ -450,7 +452,7 @@ pub unsafe fn stmatrix_m8n8_x2(smem_ptr: *mut u8, r0: u32, r1: u32) {
 }
 
 /// [`stmatrix_m8n8_x2`]'s four-matrix form, through the same `ptx_asm!`
-/// workaround and for the same reason: cuda-oxide `b099f64` ships
+/// workaround and for the same reason: cuda-oxide `20a5616` ships
 /// `stmatrix_m8n8_x4` in `generated/stmatrix.rs`, and its LLVM declaration
 /// does not resolve for `sm_100a` any more than the `.x2` one does.
 ///

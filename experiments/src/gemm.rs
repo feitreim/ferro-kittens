@@ -7099,16 +7099,18 @@ const WIDTH_RUNGS: [Epilogue; 4] = [
 /// b16 matrices; `.x2` names two and `.x4` names four, at the same 32
 /// addresses.
 ///
-/// **`.pack::16b` is not a lever and the pin says so before any device time is
-/// spent on it.** The scoping read it as folding the fp32→bf16 convert into
-/// the load, halving the registers reaching `stmatrix`. At
-/// `b099f64c1a32869b74be99f4f88242fb68655b51`,
+/// **`.pack::16b` is not a lever — but the register count was the wrong reason,
+/// and #147 closed it properly.** The scoping read it as folding the fp32→bf16
+/// convert into the load, halving the registers reaching `stmatrix`. At
+/// `20a56163f258e09f2c51e4c27ae4e4ff17582443`,
 /// `intrinsics/abi-v1.toml` gives `tcgen05_ld_16x256b_x8_pack16` the result
 /// type `[u32; 32]` — **the same 32 registers as `_x8_raw`** — and
 /// `intrinsics/generated-reference.md` validates it as
 /// `tcgen05.ld.sync.aligned.16x256b.x8.pack::16b.b32 <register-list:32>`.
-/// The register count does not fall, so there is no packing of two values into
-/// one word for the same span. `.pack::16b` is the load-side twin of
+/// Equal register counts are consistent with equal *bits* moved, so they do not
+/// establish that the `cvt` survives — #147 censused `cvt.rn.bf16x2` at **0**,
+/// and the arm **faults** (`Xid 13, Out Of Range Address`), which is the reason
+/// it is not a lever. `.pack::16b` is the load-side twin of
 /// `tcgen05.st`'s `.unpack::16b`: it moves **16-bit-typed** tensor memory,
 /// pairing adjacent columns' half-words. Against an fp32 accumulator it is not
 /// a rounding mode, it is the wrong instruction — and it is `cvt.rn.bf16x2.f32`

@@ -316,14 +316,20 @@ Group scope is 1.1.
 `SharedVec` carries its own `tma_load`/`tma_load_2d`/`tma_store`/`tma_store_2d`
 beside these (1.4), at rank 1 and 2 and one instruction each.
 
-What is left of this entry is the *reduction* stores, and they are a different
-kind of missing: `cp.reduce.async.bulk.tensor` is absent from cuda-oxide at the
-pinned revision in every form — not in the generated crate and not in
-`intrinsics/imported.json` either — so unlike the plain stores they are not a
-transcription. `store_add_async` is what makes split-K and multi-CTA reduction
-epilogues cheap, and getting it means a local `ptx_asm!` intrinsic (`ldst.rs`
-sets the precedent) or an upstream contribution — filed as **#42**, which argues
-for the upstream half.
+What is left of this entry is the *reduction* stores, and this file had them
+wrong. It said `cp.reduce.async.bulk.tensor` was absent from cuda-oxide "in
+every form — not in the generated crate and not in `intrinsics/imported.json`
+either", and argued from that that they were a lowering to contribute rather
+than a transcription. **The records are there, and were there at `b099f64`
+too**: `imported.json` carries 64 of them at both revisions, spelled
+`int_nvvm_cp_async_bulk_tensor_reduce_{add,and,dec,inc,max,min,or,xor}_{tile,im2col}_{1..5}d`
+— which is why a grep for `cp_reduce_*` finds nothing and is how the claim
+survived as long as it did. What they are not is admitted to the generated
+`cuda-device` crate, where the count is zero. So, like prefetch below, this is a
+generation-list change upstream or a local `ptx_asm!` intrinsic (`ldst.rs` sets
+the precedent). `store_add_async` is what makes split-K and multi-CTA reduction
+epilogues cheap; the upstream route is filed as **#42**, and it is a smaller ask
+than this file claimed.
 
 **Prefetch is not absent for the same reason, and this file said it was.**
 `int_nvvm_cp_async_bulk_prefetch_L2` and the tensor prefetch forms *are* in
@@ -874,14 +880,16 @@ instantiations on shared **tiles** (3.1, 3.2 — the vector half is #130), an fp
 descriptor (2.6). TMA prefetch is no longer on this list in the form it was:
 see 2.3 and the note on #42.
 
-## cuda-oxide support at the pinned rev (`b099f64`)
+## cuda-oxide support at the pinned rev (`20a5616`)
 
 Checked against the source, since several gaps turn on it. **Re-checked on
 2026-07-29 against a checkout whose `HEAD` was confirmed to be
-`b099f64c1a32869b74be99f4f88242fb68655b51` before anything was read from it** —
+`20a56163f258e09f2c51e4c27ae4e4ff17582443` before anything was read from it** —
 which is #106's rule, written after a `~/.cargo` checkout at `4514af2` was cited
-for a `clc` doc that our pin does not have. There are six cuda-oxide checkouts
-on this machine; five of them are not our pin.
+for a `clc` doc that our pin does not have. There are now **seven** cuda-oxide
+checkouts in that cargo directory — the bump added one — and six of them are not
+our pin, `/Users/finn/projects/cuda-oxide` (at `29396b7`) among the ones that
+are not.
 
 "Absent" below means absent from the generated `cuda-device` crate. That is the
 line that matters for a caller and it is *not* the same as absent upstream — see
@@ -894,7 +902,7 @@ the prefetch row.
 | Sparse MMA | ✅ `tcgen05_mma_sp_*` (unused) |
 | Register → TMEM (STTM) | ✅ full `tcgen05_st_*` family + `tcgen05_store_wait` |
 | TMA store | ✅ `cp_async_bulk_tensor_{1..5}d_s2g` + commit/wait groups |
-| TMA reduction store (add/min/max) | ❌ absent from the crate **and** from `intrinsics/imported.json` — needs a new record and a lowering, or `ptx_asm!` (#42) |
+| TMA reduction store (add/min/max) | ❌ absent from the crate, ✅ **present in `intrinsics/imported.json`** (64 `int_nvvm_cp_async_bulk_tensor_reduce_*` records, 8 ops × `tile`/`im2col` × rank) — a generation-list change or `ptx_asm!` (#42) |
 | TMA prefetch | ❌ absent from the crate, ✅ **present in `intrinsics/imported.json`** (`int_nvvm_cp_async_bulk_prefetch_L2`, plain and `.L2::cache_hint`, plus the tensor forms) — a generation-list change, not a lowering (#42's thread) |
 | f32 → fp8 | ✅ `cvt_rn_satfinite_{e4m3,e5m2}x2_f32` (+ `relu`) |
 | f32 → fp4/fp6/e8m0 | ❌ absent — hand bit-packing |
