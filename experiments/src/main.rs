@@ -62,6 +62,7 @@ pub mod gemm_sol_upstream;
 pub mod gemm_ws;
 pub mod sol;
 pub mod sol_ablate;
+pub mod sol_watch;
 
 /// The teaching crate's kernels, compiled here so [`bench`] can time them
 /// against their own CPU references.
