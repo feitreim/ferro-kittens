@@ -5033,14 +5033,22 @@ row's own launches spread 2.6–5.7% and a ratio inherits that. At 8192³ on
 `[512, 256]` it is 1.001–1.003, which is the predicted null: that K loop had
 nothing to give.
 
-**Its gain is in the barrier poll loop, not in the MMA issue stream**, which is
-where the mechanism was expected and is not. `mma only` against `runtime mma` is
-1.018 / 1.001 / 1.005 / 0.998 — null across four passes — so folding the ring
-index does not speed up `tcgen05` issue. What it does speed up is
-`mbarrier.try_wait.parity`, whose spin loop re-materializes the barrier's address
-on **every poll**; a literal offset shortens that loop and therefore the wake-up
-after data lands. Stated as the measurement rather than as the mechanism it was
-built for.
+**Its gain is on the inter-stage critical path, which is neither of the two places
+it was expected.** `mma only` against `runtime mma` is 1.018 / 1.001 / 1.005 /
+0.998 — null across four passes — so it is not `tcgen05` issue. And it is not the
+`mbarrier.try_wait.parity` spin body either, which an earlier reading of this
+claimed: the PTX says that body went from **7 instructions to 8**, because folding
+the stage to a literal made LLVM re-materialize `mov.b64` of the dynamic-shared
+symbol plus `add.s64` inside the loop instead of keeping a register live — and the
+kernel got faster anyway. What is left is the scalar work **between one `load.wait`
+returning and the next being entered**: pre-fold each stage computed its own parity
+(`add.s32`, `bfe.u32`), its own ring offsets and its own two operand descriptors on
+that path; post-fold the offsets are literals, the descriptors are hoisted out of
+the K loop, the accumulate predicate is a constant at three of four positions, and
+the parity is computed once a turn rather than four times. That path exists only
+when the waits exist, which is exactly why `whole` gains 4% and `mma only` gains
+nothing — it reconciles all three rows. Stated as the measurement, and corrected
+once when the PTX contradicted the first reading.
 
 **Against the two bars, in one container.** cuBLASLt 1707.7 and upstream 1453.5 at
 4096³; ours 1294.9 before and 1328.1 after (means of the two passes):
@@ -5066,12 +5074,30 @@ two 64-row `B` panels, under its own comment *"the fixed host descriptor exposes
 therefore the same 95.5% duty. And `_print_mma_stream` counts non-`mma`
 instructions between the first and last `tcgen05.mma`: **8.8 per issue before the
 fold, 7.5 for upstream, 2.9 after** — we are 2.6× leaner than upstream and still
-3.5 points behind on the rate. So **instruction count in the MMA warp is not the
-binding constraint**, which also forecloses the tempting next lever: our barriers
-sit at offsets into a dynamic-shared allocation and cost a `mov.b64` plus `add.s64`
-inside every `try_wait` spin and a `cvta.shared.u64` chain around every
-`tcgen05.commit`, where upstream's are static `.shared` symbols — but that is an
-instruction-count argument and the table above refutes the class.
+3.5 points behind on the rate. So **static instruction count between MMA issues is
+not the binding constraint.** It does *not* foreclose the barrier-address lever,
+which an earlier reading of this claimed it did: that census counts each
+instruction once, a spin loop costs its body times its iterations, and no static
+count between issues can see the iterations. Counted directly, the poll body is
+**7 instructions pre-fold, 7 for upstream, 8 shipped** — ours needs an `add.s64`
+upstream does not, because upstream gives each mbarrier its own static `.shared`
+symbol (`__shared_mem_27..29`) where ours are const offsets into one dynamic
+allocation. The lever is alive and **its sign is unestablished**: the pre-fold
+spelling had upstream's 7-instruction body and was 4% *slower*, so poll-body length
+is dominated by something else here. It is reachable — `cuda_device` at the pin
+admits static `.shared` mbarriers, and upstream's vendored copy declares eight of
+them in this tree and runs — and it is a **library-level** change, because
+`src/sync.rs`'s `Semaphore` takes a pointer derived from a dynamic base and the
+`*_offset` consts are that base's layout (#137's one walk). It would pay every
+kernel with a pipeline, which raises its priority and also keeps it out of this PR.
+
+One thing the poll body says that is new: **five of its seven or eight
+instructions are not addressing at all** — `selp.b32`, `and.b32`, `setp.ne.b32`,
+`not.pred`, `bra`, a predicate turned into an `i32`, masked, turned back into a
+predicate and inverted, because `mbarrier_try_wait_parity` returns a Rust `bool`
+and the loop is `while !…`. A tight spin is `try_wait` then `@!p bra`, which is
+two. Upstream pays the same five, so this does not explain the gap against it — but
+it is five of eight instructions in every mbarrier spin in the repo.
 
 **What this does not separate.** Why the feed in situ costs 24.5% at 95.5% duty
 and 0.0% at 55.7% is a duty-cycle argument, not a mechanism: **bank conflicts

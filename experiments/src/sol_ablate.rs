@@ -102,9 +102,18 @@
 //! loop-local `k_idx & 3`; that attribute is rewritten only inside a `#[kernel]`
 //! or `#[device_function]` body, so a const parameter is the spelling reachable
 //! from a plain `impl` method. Its gain is **not** in the MMA issue stream:
-//! `mma only` against `runtime mma` is 1.018 / 1.001 / 1.005 / 0.998, null. It is
-//! in the barrier poll loop, which is the one place the folded address is
-//! re-materialized per iteration.
+//! `mma only` against `runtime mma` is 1.018 / 1.001 / 1.005 / 0.998, null. Nor is
+//! it in the `mbarrier.try_wait.parity` spin body: the PTX says that body went from
+//! **7 instructions to 8** — folding the stage to a literal made LLVM
+//! re-materialize `mov.b64` of the dynamic-shared symbol plus `add.s64` inside the
+//! loop rather than keep a register live — and the kernel got faster anyway. What
+//! is left is the scalar work **between one `load.wait` returning and the next
+//! being entered**: pre-fold each stage computed its own parity (`add.s32`,
+//! `bfe.u32`), its own ring offsets and its own two descriptors on that path, and
+//! post-fold the offsets are literals, the descriptors are hoisted, the accumulate
+//! predicate is constant at three of four positions, and the parity is computed
+//! once a turn. That path exists only when the waits do, which is why `whole`
+//! gains and `mma only` — which has no waits — does not.
 //!
 //! **`wide B` does not pay, and that is the result.** It is the same body at
 //! `BOX = 128`: a rank's `B` half-panel arriving in **one** TMA instead of two, at
