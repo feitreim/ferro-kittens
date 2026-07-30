@@ -749,6 +749,22 @@ impl Common {
         }
     }
 
+    /// The two-accumulator entry's second-half `empty` wait, per
+    /// [`Self::wait_load`]: it sits inside that entry's K loop, so it reports and
+    /// carries on rather than returning a failure the loop would have to thread.
+    #[inline(always)]
+    unsafe fn wait_empty_at<const WATCH: u8>(self, half: u32, parity: u32) {
+        unsafe {
+            if watches(WATCH) {
+                if !self.empty.sem(half).wait_before(parity, DEADLINE) {
+                    self.stall(SITE_EMPTY, 0, half, parity);
+                }
+            } else {
+                self.empty.sem(half).wait(parity);
+            }
+        }
+    }
+
     /// The epilogue's accumulator-full wait, per [`Self::wait_load`]. `false` is
     /// a stall the caller must leave its loop on.
     #[inline(always)]
@@ -1581,7 +1597,7 @@ impl<const BOX: usize> Large<BOX> {
                 }
 
                 if sequence > 0 && k == 0 {
-                    common.empty.sem(1).wait((sequence - 1) & 1);
+                    common.wait_empty_at::<WATCH>(1, (sequence - 1) & 1);
                 }
                 if multiplies(ABLATE) {
                     mma_walk_cg2::<F16, CHUNKS>(
@@ -1636,7 +1652,7 @@ impl<const BOX: usize> Large<BOX> {
                 }
 
                 if sequence > 0 && first {
-                    common.empty.sem(1).wait((sequence - 1) & 1);
+                    common.wait_empty_at::<WATCH>(1, (sequence - 1) & 1);
                 }
                 if multiplies(ABLATE) {
                     mma_walk_cg2::<F16, CHUNKS>(
