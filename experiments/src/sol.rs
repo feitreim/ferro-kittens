@@ -277,6 +277,67 @@ pub fn sweep_small(
     Ok(())
 }
 
+/// A `k` ladder walked downward, one row at a time, announced before each launch —
+/// `bench sol-k`. See #149.
+///
+/// #146 found `4096x4096x1024` on `[256, 256]` printing nothing for 1200 s until
+/// `scripts/modal-run`'s watchdog stopped the container, while `4096x4096x2048`
+/// runs. A `k` shorter than `m` is otherwise unexercised by this kernel, so the
+/// question is where the boundary is and what is on the far side of it.
+///
+/// It is its own entry point, and it announces each row on `stderr` *before*
+/// launching it, because the instrument has to survive the thing it measures: a
+/// launch that does not return takes the process with it, and the last line
+/// printed is then the whole of the answer. Every row is a complete
+/// stage-check-time cycle at the shipped plan, so a row that prints is a row that
+/// computed the right `C`.
+///
+/// Pipe the run through `tee` and read the file as it grows rather than waiting on
+/// the exit status: the announcements are the instrument, and a capture that
+/// buffers them until the process ends throws away the one line that matters.
+pub fn sweep_k(
+    context: &Arc<CudaContext>,
+    baseline: Option<Baseline>,
+) -> Result<(), Box<dyn Error>> {
+    let residency = Residency {
+        sms: context.multiprocessor_count()?,
+        per_sm: shared_per_sm(context)?,
+    };
+    let mut denominators = Denominators {
+        baseline,
+        context,
+        taken: Vec::new(),
+    };
+    println!(
+        "gemm-sol with `k` below `m`, descending. every row is announced on stderr before it\n\
+         is launched, so if the run stops the last announced row is the one that did not\n\
+         return. the shape contract is `k % 256 == 0` and `k >= 256`, so every row below is\n\
+         inside it, and a row that does not return is a defect rather than a misuse."
+    );
+    heading("entry");
+    for k in [2048usize, 1792, 1536, 1280, 1024, 768, 512, 256] {
+        let shape = Shape {
+            m: 4096,
+            n: 4096,
+            k,
+        };
+        row(
+            context,
+            "M256xN256",
+            shape,
+            Plan {
+                variant: Variant::M256xN256,
+                group: gemm_sol::default_group(4096),
+            },
+            residency,
+            &mut denominators,
+            None,
+        );
+    }
+    denominators.algorithms();
+    Ok(())
+}
+
 fn heading(first: &str) {
     println!(
         "{first:<14}{:<18}{:>7}{:>7}{:>10}{:>11}{:>11}{:>11}{:>10}{:>10}",
