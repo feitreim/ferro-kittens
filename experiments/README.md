@@ -5108,14 +5108,41 @@ count between issues can see the iterations. Counted directly, the poll body is
 **7 instructions pre-fold, 7 for upstream, 8 shipped** — ours needs an `add.s64`
 upstream does not, because upstream gives each mbarrier its own static `.shared`
 symbol (`__shared_mem_27..29`) where ours are const offsets into one dynamic
-allocation. The lever is alive and **its sign is unestablished**: the pre-fold
-spelling had upstream's 7-instruction body and was 4% *slower*, so poll-body length
-is dominated by something else here. It is reachable — `cuda_device` at the pin
-admits static `.shared` mbarriers, and upstream's vendored copy declares eight of
-them in this tree and runs — and it is a **library-level** change, because
-`src/sync.rs`'s `Semaphore` takes a pointer derived from a dynamic base and the
-`*_offset` consts are that base's layout (#137's one walk). It would pay every
-kernel with a pipeline, which raises its priority and also keeps it out of this PR.
+allocation. **The lever's sign is positive, and the pre-fold
+spelling is not the counter-example it looks like.** That spelling had upstream's
+7-instruction poll body and was 4% slower — but the fold changed *two* things with
+opposite signs: it added one instruction to the poll body and removed many from the
+inter-stage path. It is a two-variable change and therefore not a controlled
+experiment on poll-body length at all. Removing the per-poll `add.s64` is the
+single-variable version, and it is **additive with the fold rather than opposed to
+it**.
+
+The magnitude is worth stating in advance because it is large enough to matter. The
+MMA warp's time in the poll loop is `whole − issue only` = 0.3503 − 0.2758 =
+**0.0745 µs a K block, 21% of it**. If that loop is issue-bound, one instruction of
+eight is an eighth of it — **0.0093 µs, 2.7% of the K-block rate** — which would
+take the K loop from 78.8% to about 81.0% against upstream's 82.3% and close most of
+the residual. The named failure mode: if `mbarrier.try_wait.parity` is instead
+latency-bound on its shared read, the body's instruction count is a small fraction
+of each iteration and the win is much smaller. That is the prediction and its
+falsifier, and it is what a container should be spent against.
+
+**Feasibility is settled and the cost is structural rather than budgetary.**
+Upstream declares `static mut TMA_BAR0: Barrier = Barrier::UNINIT;` — eight of
+them — *inside* its `#[kernel]` body, and cuda-oxide at the pin places those in
+`.shared` as `__shared_mem_27..29`. So the mechanism exists and is proven in this
+tree. Two costs, neither of them residency: the barriers are ~104 B moving from the
+dynamic allocation to static shared out of the same 233472 B, so `dynamic_shared`
+in each launch contract drops by that much and nothing crosses an occupancy step;
+and **it is unproven from where this kernel would need it.** Upstream declares its
+statics inside the `#[kernel]`, while `small_body` and `large_body` are deliberately
+*outside* `#[cuda_module]` so the shipped kernels and the arms can be one text —
+and whether a `static mut Barrier` in a plain `fn` still lands in `.shared` is the
+macro's business, not the type's. If it does not, the statics have to be declared
+per `#[kernel]` and threaded in, which is the design cost. Either way it is a
+**library-level** change — `src/sync.rs`'s `Semaphore` takes a pointer derived from
+a dynamic base and the `*_offset` consts are that base's layout, which #137 made
+one walk — so it pays every kernel with a pipeline and does not belong in this PR. Filed as **#150** — and **closed**: `ptxas` folds the add, and all three poll bodies are three instructions in SASS. See the SASS section below.
 
 One thing the poll body says that is new: **five of its seven or eight
 instructions are not addressing at all** — `selp.b32`, `and.b32`, `setp.ne.b32`,
@@ -5123,7 +5150,9 @@ instructions are not addressing at all** — `selp.b32`, `and.b32`, `setp.ne.b32
 predicate and inverted, because `mbarrier_try_wait_parity` returns a Rust `bool`
 and the loop is `while !…`. A tight spin is `try_wait` then `@!p bra`, which is
 two. Upstream pays the same five, so this does not explain the gap against it — but
-it is five of eight instructions in every mbarrier spin in the repo.
+it is five of eight instructions in every mbarrier spin in the repo. Filed as
+**#151** — and **closed**: the SASS step below was built, and `ptxas` folds the whole
+round trip. Both were PTX counts of instructions the machine never runs.
 
 **What this does not separate.** Why the feed in situ costs 24.5% at 95.5% duty
 and 0.0% at 55.7% is a duty-cycle argument, not a mechanism: **bank conflicts
@@ -5147,6 +5176,100 @@ and so doubles the per-tile constant each tile must amortize. This file prices t
 constant at 3.4 µs a tile, of which the drain is 2.9. If the drain falls, the
 crossover should move below 8192 — the entry that is already at 99.3% of peak in
 its K loop would then be the right one at 4096³ too.
+
+##### and the PTX this repo counts is not always the machine's — a SASS check, and what it does and does not disturb
+
+Nearly every conclusion in the GEMM work above is a **PTX** count. `regcount`'s
+opcode census is PTX. The censuses that validate every ablation arm are PTX. The
+between-MMA instruction table that foreclosed the instruction-count family is PTX,
+and the `#[unroll]` stage fold was both diagnosed and verified in PTX. `ptxas` is a
+real optimizer sitting between all of that and the machine, and until #148 nothing
+here had ever checked one against the other.
+
+`modal_app.py::_print_sass_loops` is that check, and it is general rather than a
+one-off: point it at a kernel and it prices every tight loop the machine actually
+runs. It is CPU-only — `nvdisasm -c` over the cubin `build` already assembles — and
+**it finds loops by backward branch rather than by mnemonic**, so it needs nobody to
+know how a Blackwell mbarrier wait is spelled in SASS, which is the part nobody here
+should be guessing at. `insns` is instructions per iteration, which is the figure a
+PTX loop-body count is comparable to.
+
+**Its first use killed two levers it was built for.** #150 and #151 counted the
+`mbarrier.try_wait.parity` spin body in PTX: eight instructions, of which one was an
+`add.s64` we paid and upstream did not (our barriers are offsets into one dynamic
+allocation, upstream's are static `.shared` symbols) and five were a predicate
+round-tripped through an `i32` because the intrinsic returns a Rust `bool`. In SASS
+the whole loop is:
+
+```
+YIELD ;
+SYNCS.PHASECHK.TRANS64.TRYWAIT P0, [R5+URZ], R4 ;
+@!P0 BRA `(.L_x_1845) ;
+```
+
+| | PTX poll body | **SASS poll body** |
+| --- | ---: | ---: |
+| upstream `gemm_sol_clc_multicast_4_stage_pipeline` | 7 | **3** |
+| `gemm_sol_m256_runtime` | 7 | **3** |
+| `gemm_sol_m256` as shipped | 8 | **3** |
+
+`ptxas` folds the predicate round-trip to nothing — `TRYWAIT P0` straight to
+`@!P0 BRA` — and holds the barrier address in a register across the loop
+(`[R5+URZ]`), so the `add.s64` and the symbol rematerialization are both gone.
+**All three poll bodies are the same three instructions**, the `YIELD` is `ptxas`
+*adding* a spin hint rather than overhead, and #150's advance prediction (2.7% of
+the K-block rate) is dead — not through its named falsifier but because the
+instruction it was about does not exist. Both issues closed, no container spent.
+
+**It also confirmed the one claim that mattered.** #148 attributes the stage fold's
++2.2–4.3% to the inter-stage critical path and explicitly *not* to the poll body,
+after an earlier reading had it the other way round. The shipped and pre-fold spin
+loops are **identical at 3 instructions**, so the fold's win cannot have come from
+the poll body at any level; and the two kernels' loop tables differ in exactly one
+row — 10 instructions an iteration where the pre-fold spelling has **14** — in a
+loop that is not the poll loop. That is the fold, at the machine level, in the place
+#148 said it was.
+
+**What this disturbs, and what it does not.** Being concrete matters more here than
+being alarmed, and most of what is above survives for a structural reason: **it is
+comparative between two of our own kernels through one toolchain**, and a uniform
+`ptxas` transform applies to both sides of such a comparison.
+
+Safe, and why:
+
+- **Every ablation arm's census.** `feed only` showing 0 in the `mma` column is a
+  presence-or-absence claim about a whole phase, and `ptxas` cannot invent a
+  `tcgen05.mma` that the PTX does not contain. Removal claims are robust in a way
+  cost claims are not.
+- **`regcount`'s registers, spills, stack frames and the occupancy gate.** Those
+  come from `ptxas -v`, which is already the far side of the optimizer.
+- **#125's `selp` count.** That was a claim that a flag folded *at PTX level*, i.e.
+  that LLVM had already done it. Learning that `ptxas` folds more only makes that
+  check conservative: zero in PTX is still zero in SASS.
+- **#148's between-MMA table read as a negative.** The conclusion drawn from it was
+  that we are leaner than upstream and *still* slower, so instruction count between
+  MMA issues is not the binding constraint. If `ptxas` folds even more of both
+  sides, that negative gets stronger rather than weaker.
+
+Not safe:
+
+- **Any absolute "this costs N instructions" from a PTX count.** #150 and #151 were
+  exactly that, and both were zero. The ratios in #148's between-MMA table (2.9
+  against 7.5 per issue) should be read as directional, not as magnitudes: if
+  `ptxas` folds five of eight instructions in a spin body, it plausibly folds a good
+  deal of the scalar chain between MMA issues too, and nobody has counted that in
+  SASS.
+- **PTX counts across *different* code shapes**, where the two sides may not receive
+  the same transform. Comparing our kernel to upstream's is the case to be careful
+  with; comparing our kernel to our own kernel one const apart is the case that is
+  fine.
+
+The pattern worth keeping: **a PTX count is a hypothesis, and a timed arm or SASS is
+the evidence.** The epilogue work reached the same place from the other direction —
+its census showed `.pack::16b` removing `cvt.rn.bf16x2` outright, 8 to 0, and a
+legal `nocvt` control that removed the same converts measured 0.0–1.4% *slower*, so
+the convert was never the cost the count implied. Two independent instruments, one
+conclusion about the instrument set.
 
 #### 8. Multicast has no geometry to live in
 

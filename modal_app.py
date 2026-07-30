@@ -395,13 +395,20 @@ def build() -> None:
           "cargo", "oxide", "build", "kittens-experiments", "--arch", "sm_100a",
           "--features", "cublas,gemm-sol-upstream"],
          cwd=EXPERIMENTS_DIR)
-    _run(["ptxas", "-arch=sm_100a", "-o", "/dev/null", "kittens_experiments.ptx"],
+    # A real cubin rather than `/dev/null`, because the next two steps read it.
+    # `ptxas` succeeding is still the gate; the disassembly is a report.
+    _run(["ptxas", "-arch=sm_100a", "-o", "kittens_experiments.cubin",
+          "kittens_experiments.ptx"],
          cwd=EXPERIMENTS_DIR)
     # The MMA warp's K-loop issue stream, ours and upstream's, off the one bundle
     # that carries both. It lives here rather than in `regcount` because
     # `regcount` builds without features and so never emits upstream's kernels,
     # and because this is the only step that already pays for that codegen.
     _print_mma_stream()
+    # And the same kernels' loops as the machine runs them, which is the one place
+    # this repo's PTX counts are checked against SASS at all -- see #150 and #151.
+    _print_sass_loops(Path(EXPERIMENTS_DIR, "kittens_experiments.cubin"),
+                      MMA_STREAM_KERNELS)
 
 
 # `gaps` lived here until #3, and printed each aspirational kernel's remaining
@@ -1115,6 +1122,177 @@ MMA_STREAM_KERNELS = (
     "gemm_sol_clc_multicast_4_stage_pipeline",
     "gemm_sol_clc_multicast_4_stage_pipeline_large",
 )
+
+
+# Every conclusion in this repo's GEMM work so far is a **PTX** count: `regcount`
+# parses `ptxas -v`, the opcode censuses that validate every ablation arm are PTX,
+# and #148's between-MMA table and its `#[unroll]` fold were both diagnosed and
+# verified in PTX. `ptxas` is a real optimizer sitting between all of that and the
+# machine, and until this nothing here had ever checked one against the other.
+#
+# The immediate question is #150 and #151: two spin-loop costs counted in PTX, both
+# of which `ptxas` has every reason to fold. But the instrument is general on
+# purpose -- point it at a kernel and it prices every tight loop that kernel
+# actually executes -- because "is our PTX count what the machine runs" is a
+# question about the instrument set and not about those two issues.
+#
+# Loops are found by **backward branch** rather than by mnemonic: a branch whose
+# target address is at or below its own closes a loop, and the instructions from
+# that target through the branch are one iteration. That needs no knowledge of how
+# an mbarrier wait is spelled in SASS, which is the part nobody here should be
+# guessing at.
+SASS_LOOP_CEILING = 32
+"""Longest loop body printed. A spin loop is a handful of instructions; a K loop is
+hundreds, and printing it would bury the thing being looked for."""
+
+# Mnemonic fragments that mark a loop as a barrier spin, used only to *label* rows.
+# The loop-finding above does not depend on them, so a Blackwell spelling nobody
+# here predicted still gets found and counted -- it just prints without the label.
+SASS_BARRIER_HINTS = ("BAR", "ARRIVE", "TRYWAIT", "MBAR")
+
+
+def _sass(cubin: Path) -> str | None:
+    """Disassemble `cubin`, or `None` with a reason printed.
+
+    Tried in the order that gives the most readable output. Neither tool is used
+    anywhere else in this file, so a missing one is a fact worth printing rather
+    than an exception worth raising -- this runs inside `build`, which gates
+    everything, and a disassembler that is absent must not take that gate red.
+    """
+    for tool, argv in (
+        ("nvdisasm", ["nvdisasm", "-c", str(cubin)]),
+        ("cuobjdump", ["cuobjdump", "-sass", str(cubin)]),
+    ):
+        found = subprocess.run(["which", tool], capture_output=True, text=True)
+        if found.returncode != 0:
+            print(f"  {tool}: not in the image")
+            continue
+        run = subprocess.run(argv, capture_output=True, text=True)
+        if run.returncode != 0:
+            print(f"  {tool} failed: {run.stderr.strip()[:300]}")
+            continue
+        print(f"  disassembled by {tool}")
+        return run.stdout
+    return None
+
+
+def _sass_functions(text: str) -> dict[str, tuple[list[tuple[int, str, str]], dict[str, int]]]:
+    """Per entry function, its instructions and its label definitions.
+
+    Instructions are `(address, mnemonic, whole line)`; labels map a name to the
+    index of the instruction it precedes. Both are needed because `nvdisasm -c`
+    names branch targets as labels (`` `(.L_x_5) ``) while `cuobjdump -sass` names
+    them as absolute addresses, and a loop finder that understands only one of the
+    two silently reports no loops -- which is exactly how this was first written.
+    """
+    functions: dict[str, tuple[list[tuple[int, str, str]], dict[str, int]]] = {}
+    current: tuple[list[tuple[int, str, str]], dict[str, int]] | None = None
+    pending: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        named = re.search(r"(?:Function : |\.text\.)([A-Za-z_$][\w$]*)", stripped)
+        if named:
+            current = functions.setdefault(named.group(1), ([], {}))
+            pending = []
+            continue
+        if current is None:
+            continue
+        label = re.match(r"^(\.L[\w$.]+):$", stripped)
+        if label:
+            pending.append(label.group(1))
+            continue
+        address = re.match(r"^/\*([0-9a-fA-F]+)\*/\s*(.*)$", stripped)
+        if not address:
+            continue
+        body = address.group(2).strip()
+        if not body:
+            continue
+        mnemonic = re.sub(r"^@!?\S+\s+", "", body).split()
+        if not mnemonic:
+            continue
+        instructions, labels = current
+        for name in pending:
+            labels[name] = len(instructions)
+        pending = []
+        instructions.append((int(address.group(1), 16), mnemonic[0].rstrip(";"), body))
+    return functions
+
+
+def _sass_loops(
+    instructions: list[tuple[int, str, str]], labels: dict[str, int]
+) -> list[tuple[int, int, list[str]]]:
+    """Every backward branch and the iteration it closes, shortest first.
+
+    A branch resolving to an instruction at or before itself closes a loop, and the
+    instructions from there through the branch are one iteration -- the quantity a
+    PTX loop-body count is comparable to. Targets are resolved through both
+    spellings a disassembler uses, label and absolute address.
+    """
+    by_address = {address: index for index, (address, _, _) in enumerate(instructions)}
+    loops = []
+    for index, (address, mnemonic, body) in enumerate(instructions):
+        if not mnemonic.startswith(("BRA", "BRX", "JMP", "CBRA")):
+            continue
+        label = re.search(r"`\((\.L[\w$.]+)\)", body)
+        literal = re.search(r"0x([0-9a-fA-F]+)", body)
+        if label and label.group(1) in labels:
+            start = labels[label.group(1)]
+        elif literal and int(literal.group(1), 16) in by_address:
+            start = by_address[int(literal.group(1), 16)]
+        else:
+            continue
+        if start > index:
+            continue
+        loops.append((instructions[start][0], address, [line for _, _, line in instructions[start : index + 1]]))
+    loops.sort(key=lambda loop: len(loop[2]))
+    return loops
+
+
+def _print_sass_loops(cubin: Path, kernels: tuple[str, ...]) -> None:
+    """Tight loops per kernel, in SASS, with one iteration's instruction count.
+
+    The count is the number to compare against a PTX poll-body count; the body is
+    printed so a reader can see *why* it is that number rather than trusting it.
+    """
+    print(
+        "\nSASS loops -- one iteration per row, found by backward branch and not by\n"
+        "mnemonic. `insns` is instructions executed per iteration, which is the figure a\n"
+        "PTX loop-body count is comparable to; `ptxas` sits between the two and this is\n"
+        "the only place in this repo that checks one against the other. Bodies longer\n"
+        f"than {SASS_LOOP_CEILING} instructions are counted and not printed."
+    )
+    text = _sass(cubin)
+    if text is None:
+        print("  no disassembler in the image; #150 and #151 stay PTX-only claims.")
+        return
+    functions = _sass_functions(text)
+    if not functions:
+        print("  the disassembler's output did not parse into entry functions.")
+        return
+    for name in kernels:
+        if name not in functions:
+            continue
+        instructions, labels = functions[name]
+        loops = _sass_loops(instructions, labels)
+        tight = [loop for loop in loops if len(loop[2]) <= SASS_LOOP_CEILING]
+        print(f"\n  {name}: {len(instructions)} instructions, {len(loops)} loops, "
+              f"{len(tight)} of them tight")
+        print(f"    {'loop at':>10}{'insns':>7}  kind")
+        seen: set[int] = set()
+        for target, branch, body in tight:
+            if target in seen:
+                continue
+            seen.add(target)
+            barrier = any(hint in line.upper() for line in body for hint in SASS_BARRIER_HINTS)
+            print(f"    {hex(target):>10}{len(body):>7}  {'barrier spin' if barrier else 'loop'}"
+                  f"  (closed at {hex(branch)})")
+        for target, _, body in tight:
+            if not any(hint in line.upper() for line in body for hint in SASS_BARRIER_HINTS):
+                continue
+            print(f"\n    {name} spin at {hex(target)} -- {len(body)} instructions an iteration")
+            for line in body:
+                print(f"      {line}")
+            break
 
 
 def _print_mma_stream() -> None:
