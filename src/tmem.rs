@@ -1,97 +1,55 @@
 //! TMEM accumulator views.
 //!
 //! A tcgen05 accumulator lives in tensor memory, addressed as
-//! `base + (row << 16) + column`: the high half-word selects one of the
-//! 128 TMEM lanes (accumulator rows), the low half-word a 4-byte column.
-//! `TmemTile` carries that address plus the logical `[R, C]` fp32 shape,
-//! so kernel code names its `S`/`O`/`dP` segments as tiles instead of
-//! threading bare `u32` addresses and `(row << 16) + column` arithmetic
-//! through every drain loop.
+//! `base + (row << 16) + column`: the high half-word selects one of the 128
+//! TMEM lanes (accumulator rows), the low half-word a 4-byte column.
+//! [`TmemTile`] carries that address plus the logical `[R, C]` fp32 shape, so
+//! kernel code names its segments as tiles instead of threading bare `u32`
+//! addresses through every drain loop.
 //!
-//! MMA shapes with phantom rows (`M128` over 64-row tiles) still
-//! type the *drained* shape: `R`/`C` describe what the kernel reads back,
-//! not what the instruction touches.
+//! Two things a caller owes:
 //!
-//! # How many columns you ask for is how many CTAs fit on the SM
+//! - **The columns must go back.** A CTA that exits still holding them is a
+//!   `CUDA_ERROR_TENSOR_MEMORY_LEAK`, and the next CTA on that SM is the one
+//!   that pays.
+//! - **How many columns you ask for is how many CTAs fit.** An SM has 512, so
+//!   `512 / columns` CTAs hold allocations on it at once — a ceiling the shared
+//!   plan may already be sitting under.
 //!
-//! An SM has **512 columns** of tensor memory and the allocator divides them.
-//! `512 / columns` CTAs hold allocations on one SM at the same time:
+//! MMA shapes with phantom rows (`M128` over 64-row tiles) still type the
+//! *drained* shape: `R`/`C` describe what the kernel reads back, not what the
+//! instruction touches.
 //!
-//! | columns | CTAs an SM | who asks for it |
-//! | ---: | ---: | --- |
-//! | 32 | 16 | the allocator's smallest unit |
-//! | 64 | 8 | |
-//! | 128 | 4 | `gemm` before #104, through [`alloc_cluster`] |
-//! | 256 | 2 | `gemm` and `flash_forward` today |
-//! | 512 | 1 | the whole SM |
+//! Allocate, multiply, drain, release:
 //!
-//! Tensor memory is one of two per-CTA resources an SM divides, and residency
-//! is **whichever of the two is tighter**: `min(512 / columns, shared per SM /
-//! shared plan)`. Read the table above as a ceiling another resource may be
-//! sitting under — which it was for both kernels when this was written, at a
-//! `gemm` capped by shared memory at 3 CTAs where 128 columns would have
-//! allowed 4.
+//! ```no_run
+//! # use cuda_device::thread;
+//! # use kittens::mma::{MmaShape, commit, mm_abt};
+//! # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+//! # use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
+//! # use kittens::{BaseLdtm, RegTile, Semaphore, warp_id};
+//! # unsafe fn demo(
+//! #     slot: *mut u32,
+//! #     a: SharedTile<Bf16, 128, 64, Swizzle128B>,
+//! #     b: SharedTile<Bf16, 128, 64, Swizzle128B>,
+//! #     done: Semaphore,
+//! # ) { unsafe {
+//! const COLUMNS: u32 = 128;
+//! let accumulator = TmemTile::<128, 128>::from_raw(alloc_block(slot, COLUMNS));
+//! if thread::threadIdx_x() == 0 {
+//!     mm_abt(accumulator.raw(), a, b, MmaShape::M128_N128);
+//!     commit(done);
+//! }
+//! done.wait(0);
+//! let band: RegTile<32, 128, BaseLdtm> = accumulator.tile(32 * warp_id(), 0);
+//! thread::sync_threads();
+//! dealloc_block(accumulator.raw(), COLUMNS);
+//! # let _ = band;
+//! # } }
+//! ```
 //!
-//! **For `gemm` that has inverted, and this table is the resource that now
-//! binds it.** #104 promoted the pair tile to `[256, 256]`, so the kernel asks
-//! [`alloc_cluster`] for `BLOCK_N = 256` columns — 2 CTAs by this table — while
-//! its shared plan (114 816 B for the staged epilogue that ships, against the
-//! 116 736 B half of an SM) admits the same 2 with room left over.
-//! `examples/src/gemm.rs`'s `staged_ctas_per_sm` is that `min` written out and
-//! says which term is tight. `flash_forward` is unchanged and still capped by
-//! shared memory alone, at 1 CTA where its 256 columns would allow 2 (#84, #85).
-//!
-//! Measured on a B200 by `device-tests`' `tmem residency census`, which counts
-//! CTAs rather than asking about them: every CTA writes down its `%smid` and
-//! timestamps both ends of its allocation off `%globaltimer`, and the host
-//! sweeps the intervals for the most that were ever open at once on one SM. The
-//! counted figure is `512 / columns` exactly, at every legal column count.
-//!
-//! **`cta_group::2` is charged the same way.** A pair does *not* split the
-//! allocation: each rank is charged its full column count against its own SM's
-//! 512, so [`alloc_cluster`] at 128 columns leaves room for four CTAs an SM
-//! exactly as [`alloc_block`] at 128 does. That was the leading hypothesis for
-//! why `gemm` and `flash_forward` might differ (#78) and it is refuted.
-//!
-//! ## Do not use the occupancy query to predict this
-//!
-//! `cuOccupancyMaxActiveBlocksPerMultiprocessor` returns **1** for any kernel
-//! whose code contains a `tcgen05.alloc` — at every column count, at every
-//! block width, and even for a kernel that allocates and *releases* before
-//! doing any work at all. It is not tracking a resource the CTA holds; it is
-//! reacting to the instruction being present. `cuOccupancyMaxActiveClusters`
-//! does the same for a `#[cluster_launch]` kernel. Both queries are accurate on
-//! kernels with no allocator in them (32 and 8 CTAs an SM respectively, matched
-//! by the census to the CTA), which is what makes the 1 easy to believe.
-//!
-//! #74 and #77 read that 1 as hardware and concluded that the allocation size
-//! could not be a lever and that warps per CTA was all that was left. #51 then
-//! measured `gemm` losing 2.07× to a one-CTA-per-SM grid cap, which is
-//! impossible if one CTA per SM were the ceiling, and #83 bisected that kernel's
-//! true residency to 3 — a figure the census reproduces exactly at the same
-//! envelope, from timestamps rather than from a throughput curve.
-//!
-//! So **shrinking an allocation to the next legal power of two doubles the CTAs
-//! tensor memory will hold**, and that is a real lever where #74 and #77 said
-//! there was none. It is only worth pulling while tensor memory is the tighter
-//! of the two resources, which for both kernels here it currently is not: the
-//! thing to shrink is the shared plan.
-//!
-//! The same trap is worth naming once. #70 tried to price `flash_forward`'s
-//! shared plan by querying occupancy at 147536 B, 73792, 32800 and zero, got 1
-//! block/SM at every one of them, and concluded shared memory was not the
-//! lever. Every one of those answers was the allocator pinning the query at 1.
-//! Shared memory is in fact the *only* thing capping that kernel.
-//!
-//! ## The extra CTA, and what a blocking allocator looks like
-//!
-//! The census counts one *more* CTA resident on the SM than is holding columns
-//! — 3 resident against 2 holders at 256 columns, 5 against 4 at 128. That CTA
-//! is admitted and parked inside `tcgen05.alloc`, which blocks until the
-//! columns it asked for come free. It costs a CTA slot and its warps make no
-//! progress, so it is neither absent nor working. Nothing that reads occupancy
-//! off a throughput curve can see the difference, which is why the census
-//! timestamps `entered` and `allocated` separately.
+//! `docs/library/tmem.md` has the residency census, the occupancy-query trap
+//! that must not be used to predict it, and what `.x8` batching measures at.
 
 use cuda_device::cusimd::{CuSimd, TmemRegs4};
 use cuda_device::tcgen05::{
@@ -104,33 +62,29 @@ use cuda_device::{cluster, thread};
 
 use crate::reg::{BaseLdtm, Fragment, FragmentLayout, RegTile};
 
-/// CTA-wide TMEM allocation, the lifecycle every tcgen05 kernel opens with:
-/// warp 0 allocates `columns` into the shared staging word, a block sync
-/// publishes it, and every thread reads back the address.
+/// Take `columns` of this CTA's tensor memory and return their base address.
 ///
-/// That warp also gives up the CTA's *allocation permit*, which is a
-/// different thing from giving back the columns — those are
-/// [`dealloc_block`]'s. The permit is the right to call the allocator again,
-/// so it goes back beside the alloc rather than beside the dealloc: this
-/// library allocates once per CTA, and holding the right to allocate for the
-/// rest of a CTA's life is what the instruction exists to avoid.
+/// Warp 0 allocates into the shared staging word, a block sync publishes it,
+/// and every thread reads the address back. That warp also gives up the CTA's
+/// *allocation permit* — the right to call the allocator again, which is a
+/// different thing from giving back the columns ([`dealloc_block`]'s job).
 ///
-/// PTX requires the permit back before the CTA exits and does not say what
-/// happens otherwise. #46 predicted a deadlock — the next CTA on that SM
-/// stuck in `tcgen05.alloc` — and on a B200 that is *not* observable: with
-/// this call removed, 4736 CTAs over three launches, each taking all 512
-/// columns, all completed, and a CTA sitting on an unrelinquished permit for
-/// milliseconds did not delay a co-resident CTA's own allocation by a
-/// measurable amount. So this is conformance, not a bug fix, and the hang
-/// that motivated the issue (#40) belongs to the other half of that defect:
-/// a `cta_group::2` dealloc issued by one CTA of the pair leaks *columns*,
-/// and columns do not come back.
+/// ```no_run
+/// # use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
+/// # unsafe fn demo(slot: *mut u32) { unsafe {
+/// const COLUMNS: u32 = 256;
+/// let accumulator = TmemTile::<128, 256>::from_raw(alloc_block(slot, COLUMNS));
+/// // ... MMA into `accumulator`, drain it ...
+/// dealloc_block(accumulator.raw(), COLUMNS);
+/// # } }
+/// ```
 ///
 /// # Safety
 ///
-/// Every thread of the block must call this together, and at most once per
-/// CTA: allocating again after the permit is relinquished is illegal.
-/// `slot` must point to shared memory (a `SharedArray<u32, 1, 4>` static).
+/// - Every thread of the block calls this together.
+/// - At most once per CTA: allocating again after the permit is relinquished is
+///   illegal.
+/// - `slot` points to shared memory (a `SharedArray<u32, 1, 4>` static).
 #[inline(always)]
 pub unsafe fn alloc_block(slot: *mut u32, columns: u32) -> u32 {
     unsafe {
@@ -143,17 +97,17 @@ pub unsafe fn alloc_block(slot: *mut u32, columns: u32) -> u32 {
     }
 }
 
-/// Release the CTA's TMEM allocation from warp 0, after the caller's own
-/// fence/sync has retired every outstanding read of it.
+/// Give the CTA's columns back, from warp 0.
 ///
-/// "The caller's own fence/sync" is the pair spelled out on
-/// [`dealloc_cluster`], at block scope: `tcgen05_fence_before_thread_sync()`
-/// immediately in front of a `sync_threads()`.
+/// Retiring the outstanding reads first is the caller's: at block scope that is
+/// `tcgen05_fence_before_thread_sync()` immediately in front of a
+/// `sync_threads()`, the same pair [`dealloc_cluster`] shows at cluster scope.
 ///
 /// # Safety
 ///
-/// No thread may touch the allocation afterwards; `columns` must match the
-/// [`alloc_block`] call.
+/// - The caller's fence/sync has retired every outstanding read of the
+///   allocation, and no thread touches it afterwards.
+/// - `address` and `columns` are the [`alloc_block`] result and argument.
 #[inline(always)]
 pub unsafe fn dealloc_block(address: u32, columns: u32) {
     unsafe {
@@ -163,33 +117,32 @@ pub unsafe fn dealloc_block(address: u32, columns: u32) {
     }
 }
 
-/// Cluster-wide TMEM allocation: [`alloc_block`]'s `cta_group::2` twin, for
-/// the single allocation a 2-CTA MMA accumulates into.
+/// [`alloc_block`]'s `cta_group::2` twin: the single allocation a 2-CTA MMA
+/// accumulates into.
 ///
-/// The three `cta_group::2` allocator instructions all say the same thing
-/// about who issues them — *one full warp in each peer CTA* — so both CTAs
-/// allocate, both relinquish, both later [`dealloc_cluster`], and each reads
-/// the address out of its own staging word, because the collective writes one
-/// into each. A peer that instead maps the leader's word over distributed
-/// shared memory gets the right address and still leaves the pair's allocator
-/// half-driven, which is what hung the GEMM's second launch (#40); this body
-/// is that kernel's fix, lifted (#24), unchanged because it is the version
-/// that ran on silicon.
-///
-/// The `cluster_sync` is what publishes the staging words across the pair; a
-/// caller that stages barriers for its peer before allocating gets that
-/// publication out of the same sync.
+/// Both peers drive the allocator — both allocate, both relinquish, both later
+/// [`dealloc_cluster`] — and each reads the address out of *its own* staging
+/// word, because the collective writes one into each. The `cluster_sync` inside
+/// is what publishes those words across the pair, so a caller that stages
+/// barriers for its peer before allocating gets that publication for free.
 ///
 /// Each rank is charged `columns` against **its own SM's 512**, so the pair
-/// costs residency exactly as two independent [`alloc_block`] calls would —
-/// see the module docs. A `cta_group::2` allocation is not a half-share of one
-/// SM's tensor memory, and the pair's two CTAs are on two different SMs in any
-/// case.
+/// costs residency exactly as two independent [`alloc_block`] calls would; it is
+/// not a half-share of one SM's tensor memory.
+///
+/// ```no_run
+/// # use kittens::tmem::{TmemTile, alloc_cluster};
+/// # unsafe fn demo(slot: *mut u32) { unsafe {
+/// const COLUMNS: u32 = 256;
+/// let pair_accumulator = TmemTile::<128, 256>::from_raw(alloc_cluster(slot, COLUMNS));
+/// # let _ = pair_accumulator;
+/// # } }
+/// ```
 ///
 /// # Safety
 ///
-/// Every thread of every CTA in the cluster must call this together and at
-/// most once, with `slot` at the same shared offset in both CTAs.
+/// - Every thread of every CTA in the cluster calls this together, at most once.
+/// - `slot` is at the same shared offset in both CTAs.
 #[inline(always)]
 pub unsafe fn alloc_cluster(slot: *mut u32, columns: u32) -> u32 {
     unsafe {
@@ -205,43 +158,35 @@ pub unsafe fn alloc_cluster(slot: *mut u32, columns: u32) -> u32 {
     }
 }
 
-/// Release the cluster's TMEM allocation, warp 0 of each peer CTA taking its
-/// half — [`dealloc_block`]'s `cta_group::2` twin, and as with that one the
-/// fence and the syncs that retire the pair's reads are the caller's.
-///
-/// # What "the caller's" is, and why it stays two lines
+/// Give the cluster's columns back, warp 0 of each peer CTA taking its half.
 ///
 /// A tcgen05 read — an LDTM drain, an MMA — is retired against a thread
 /// rendezvous by `tcgen05_fence_before_thread_sync()` issued *immediately* in
-/// front of it, and for a `cta_group::2` allocation that rendezvous is
-/// `cluster::cluster_sync()`, because the reads being retired live in two
-/// CTAs:
+/// front of it. For a `cta_group::2` allocation that rendezvous is
+/// `cluster_sync`, because the reads being retired live in two CTAs, and both
+/// lines are the caller's:
 ///
-/// ```ignore
+/// ```no_run
+/// # use cuda_device::cluster;
+/// # use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
+/// # use kittens::tmem::{TmemTile, dealloc_cluster};
+/// # unsafe fn demo(accumulator: TmemTile<128, 256>) { unsafe {
+/// # const COLUMNS: u32 = 256;
 /// tcgen05_fence_before_thread_sync();
 /// cluster::cluster_sync();
 /// dealloc_cluster(accumulator.raw(), COLUMNS);
+/// # } }
 /// ```
 ///
 /// [`crate::pipeline::run`] performs exactly this pair at every item boundary,
-/// so a job whose accumulator dies with the item loop has already had it. Both
-/// GEMMs rendezvous once *outside* `run` — before this call, for the cluster
-/// that took no items at all — and write the two lines out.
-///
-/// **They stay two lines rather than becoming a `kittens` entry point (#127),
-/// and the reason is the second one.** The fence is tcgen05's and would belong
-/// here; the rendezvous is a *scope* choice, and welding `cluster_sync` into
-/// the pair would put a fifth spelling of scope beside the four §7.1 of
-/// `GAPS.md` counts — [`crate::epilogue::Scope`], `Job::RANKS`,
-/// `block_reduce`'s `WARPS`, `store_shared_rows`' `THREADS` — at the point
-/// #124 is about to unify them. It would also close no leak: a kernel calling
-/// `cluster_sync` here already imports `cuda_device::cluster` for
-/// `block_rank` in its `attach`, which all three call sites in tree do.
+/// so a job whose accumulator dies with the item loop has already had it.
 ///
 /// # Safety
 ///
-/// No thread of either CTA may touch the allocation afterwards; `address` and
-/// `columns` must be that CTA's own [`alloc_cluster`] result and argument.
+/// - The fence/rendezvous pair above has retired the pair's reads, and no
+///   thread of either CTA touches the allocation afterwards.
+/// - `address` and `columns` are *that* CTA's own [`alloc_cluster`] result and
+///   argument.
 #[inline(always)]
 pub unsafe fn dealloc_cluster(address: u32, columns: u32) {
     unsafe {
@@ -253,14 +198,24 @@ pub unsafe fn dealloc_cluster(address: u32, columns: u32) {
 
 /// Retire the calling warp's outstanding tcgen05 stores.
 ///
-/// Split out of [`TmemTile::store_fragment`] rather than folded into it
-/// because a store's registers are consumed at issue: a pass writing many
-/// fragments waits once after the last one instead of once per fragment.
+/// Separate from [`TmemTile::store_fragment`] because a store's registers are
+/// consumed at issue: a pass writing many fragments waits once at the end
+/// instead of once per fragment.
+///
+/// ```no_run
+/// # use kittens::tmem::{TmemTile, store_wait};
+/// # use kittens::{BaseLdtm, RegTile, warp_id};
+/// # unsafe fn demo(accumulator: TmemTile<128, 128>, band: RegTile<32, 128, BaseLdtm>) { unsafe {
+/// accumulator.store_tile(32 * warp_id(), 0, band);
+/// store_wait();
+/// # } }
+/// ```
 ///
 /// # Safety
 ///
-/// All 32 lanes of the warp must call this together, and it retires only that
-/// warp's stores — another warp reading the same TMEM needs its own ordering.
+/// - All 32 lanes of the warp call this together.
+/// - It retires only *that* warp's stores; another warp reading the same TMEM
+///   needs its own ordering.
 #[inline(always)]
 pub unsafe fn store_wait() {
     tcgen05_store_wait()
@@ -289,19 +244,14 @@ fn interleave(low: TmemRegs4, high: TmemRegs4) -> Fragment {
 /// Resolve one `16x256b.x8` load's 32 registers into the four `[16, 16]`
 /// blocks they cover.
 ///
-/// `.x8` is eight base accesses laid end to end along the *column* axis — the
-/// shape fixes the 16 lanes, so the repeat count is the only thing that can
-/// widen — and the register list is ordered by repeat, then by the base
-/// access's own `2*slot + pair`. So repeat `r` is exactly what
-/// [`tcgen05_ld_16x256b_pure`] would have returned at `column + 8r`, and
-/// [`interleave`]'s low/high pair for block `j` is repeats `2j` and `2j + 1`:
+/// `.x8` is eight base accesses laid end to end along the *column* axis, and
+/// the register list is repeat-major: repeat `r` is what
+/// [`tcgen05_ld_16x256b_pure`] would have returned at `column + 8r`, so
+/// [`interleave`]'s low/high pair for block `j` is repeats `2j` and `2j + 1` —
 /// register `8j + 4*(value/2) + 2*slot + value%2`.
 ///
-/// That ordering is a claim about silicon, not an inference from the ISA text.
-/// `device-tests`' `ldtm x8 map` case is what holds it: it drains one
-/// accumulator both ways and requires the tiles to be equal, so an x8 whose
-/// registers arrive in another order fails there rather than in a GEMM's
-/// tolerance.
+/// That ordering is a claim about silicon rather than the ISA text;
+/// `device-tests`' `ldtm x8 map` case is what holds it.
 #[inline(always)]
 fn interleave_x8(regs: CuSimd<f32, 32>) -> [Fragment; 4] {
     let mut blocks = [Fragment::zero(); 4];
@@ -327,10 +277,8 @@ fn interleave_x8(regs: CuSimd<f32, 32>) -> [Fragment; 4] {
 
 /// `.x8` loads [`TmemTile::tile_x8_batched`] will hold in flight at once.
 ///
-/// Four, and the bound is the register file: each one is 32 f32 a thread, so
-/// four is 128 — the widest band a warp can drain in one pass at all, which is
-/// the same 128-column limit `examples/`' GEMMs derive for themselves from the
-/// 255-register architectural ceiling.
+/// The bound is the register file: each load is 32 f32 a thread, so four is 128
+/// — the widest band a warp can drain in one pass at all.
 pub const ISSUE_LIMIT: usize = 4;
 
 /// One `.x8` arrival into its four `[16, 16]` blocks of a band, at the block
@@ -372,10 +320,11 @@ fn split(tile: Fragment) -> (TmemRegs4, TmemRegs4) {
     (CuSimd::new(low), CuSimd::new(high))
 }
 
-/// fp32 registers as the raw words every `tcgen05_st_*` form takes. There is
-/// no `_pure` store to mirror `tcgen05_ld_16x256b_pure`, and the `_unpack16`
-/// form splits each register into 16-bit halves — an accumulator's fp32 has to
-/// land bit-exact, so it goes through `_raw` and `to_bits`.
+/// fp32 registers as the raw words every `tcgen05_st_*` form takes.
+///
+/// There is no `_pure` store, and `_unpack16` splits each register into 16-bit
+/// halves; an accumulator's fp32 has to land bit-exact, so it goes through
+/// `_raw` and `to_bits`.
 #[inline(always)]
 fn raw_bits(values: TmemRegs4) -> CuSimd<u32, 4> {
     CuSimd::new([
@@ -391,10 +340,8 @@ fn raw_bits(values: TmemRegs4) -> CuSimd<u32, 4> {
 ///
 /// A thread's two slots of a 16-row block are the composed tile's slots
 /// `2 * row_block + {0, 1}`, and its four values of a 16-column block are its
-/// values `4 * column_block + {0..4}`. That is not a convention the movers
-/// chose: it is the same map the bigger shape's own [`RegTile::coordinate`]
-/// gives, which is what `reg.rs`'s `fragment_blocks_tile_the_bigger_shapes`
-/// asserts.
+/// values `4 * column_block + {0..4}` — the same map the bigger shape's own
+/// [`RegTile::coordinate`] gives.
 #[inline(always)]
 pub(crate) fn place_block<const M: usize, const N: usize>(
     tile: &mut RegTile<M, N, BaseLdtm>,
@@ -480,33 +427,44 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     }
 
     /// The next segment of the same allocation, `C2` columns wide: one
-    /// `tcgen05_alloc` of `C + C2` columns carved into a `[R, C]` and a
-    /// `[R, C2]` tile, as flash's `S` and `O` share one allocation.
+    /// allocation of `C + C2` columns carved into a `[R, C]` and a `[R, C2]`
+    /// tile, as flash's scores and output share one.
     ///
-    /// The offset is `C` rather than a parameter because a TMEM segment
-    /// spans all 128 lanes — segments can only be carved along the column
-    /// axis, so the one that follows this tile begins where it ends. An
-    /// explicit offset could name a column inside this tile instead, and
-    /// overlapping segments have no diagnostic: the two MMAs simply write
-    /// each other's accumulator.
+    /// There is no offset parameter. A TMEM segment spans all 128 lanes, so
+    /// segments can only be carved along the column axis and the next one begins
+    /// exactly where this tile ends; an explicit offset could name a column
+    /// *inside* this tile, and overlapping segments have no diagnostic — the two
+    /// MMAs simply write each other's accumulator.
+    ///
+    /// ```no_run
+    /// # use kittens::tmem::{TmemTile, alloc_block};
+    /// # unsafe fn demo(slot: *mut u32) { unsafe {
+    /// const KEYS: usize = 64;
+    /// const HEAD: usize = 128;
+    /// let scores = TmemTile::<128, KEYS>::from_raw(alloc_block(slot, (KEYS + HEAD) as u32));
+    /// let output: TmemTile<128, HEAD> = scores.split_columns();
+    /// # let _ = output;
+    /// # } }
+    /// ```
     pub const fn split_columns<const C2: usize>(self) -> TmemTile<R, C2> {
         TmemTile {
             address: self.address + C as u32,
         }
     }
 
-    /// One thread's eight-value fragment of the 16-row block at `row`:
-    /// two `16x256b` collective loads at `column` and `column + 8`, each
-    /// drained through `tcgen05_load_wait`. Under the 16x256b map a thread
-    /// holds rows `lane/4` and `lane/4 + 8` of the block at column offsets
-    /// `2*(lane%4) + {0, 1, 8, 9}` — the low simd carries the `{0, 1}`
-    /// offsets of both rows, the high simd the `{8, 9}` offsets (which is
-    /// what [`Self::fragment_tile`]'s interleaving spells out).
+    /// One thread's eight-value fragment of the 16-row block at `row`, as the
+    /// two `16x256b` collective loads it arrives in.
+    ///
+    /// Under the `16x256b` map a thread holds rows `lane/4` and `lane/4 + 8` of
+    /// the block at column offsets `2*(lane%4) + {0, 1, 8, 9}`: the low simd
+    /// carries the `{0, 1}` offsets of both rows, the high simd the `{8, 9}`.
+    /// [`Self::fragment_tile`] resolves that into `(slot, value)` coordinates.
     ///
     /// # Safety
     ///
-    /// All 32 lanes of a warp that owns the TMEM rows `row..row+16` must
-    /// call this together, after the MMA writing them has committed.
+    /// - All 32 lanes of the warp owning TMEM rows `row..row + 16` call this
+    ///   together.
+    /// - The MMA writing those rows has committed.
     #[inline(always)]
     pub unsafe fn fragment(self, row: u32, column: u32) -> (TmemRegs4, TmemRegs4) {
         unsafe {
@@ -518,16 +476,11 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
         }
     }
 
-    /// [`Self::fragment`] as a [`Fragment`] tile — the same eight values with
-    /// the simd pair's interleaving resolved into the layout's `(slot, value)`
-    /// coordinates, so a register pass indexes by row and column instead of by
-    /// which of the two collective loads a value arrived in.
+    /// [`Self::fragment`] as a [`Fragment`] tile — the same eight values indexed
+    /// by `(slot, value)` instead of by which collective load they arrived in.
     ///
-    /// A `16x256b` load hands a thread its two rows of the block by two
-    /// columns, row-major: register `2*slot + pair` is slot `slot`'s column
-    /// `pair` of that load's 8-column half. The half at `column` is the
-    /// fragment's values `{0, 1}`, the half at `column + 8` its values
-    /// `{2, 3}` — the `{0, 1, 8, 9}` offsets of
+    /// The half at `column` is the fragment's values `{0, 1}`, the half at
+    /// `column + 8` its values `{2, 3}` — the `{0, 1, 8, 9}` offsets of
     /// [`BaseLdtm::column`](crate::reg::BaseLdtm::column).
     ///
     /// # Safety
@@ -542,30 +495,25 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     }
 
     /// Write one thread's eight-value fragment back into the 16-row block at
-    /// `row`: two `16x256b` collective stores at `column` and `column + 8`,
-    /// under the same lane → `(row, column)` ownership the load side of
-    /// [`Self::fragment`] reads through, so `low` and `high` are exactly what
-    /// that call returned.
+    /// `row`, under the same lane → `(row, column)` ownership [`Self::fragment`]
+    /// reads through: `low` and `high` are exactly what that call returned.
     ///
-    /// Unlike [`Self::fragment`] this does not wait. A load must, because the
-    /// registers it waits on *are* its return value; a store's registers are
-    /// consumed at issue, so a pass writing many fragments pays one
-    /// [`store_wait`] at the end rather than one per fragment.
+    /// Does **not** wait. [`store_wait`] retires it, once per pass.
     ///
     /// # Safety
     ///
-    /// All 32 lanes of the warp owning TMEM rows `row..row+16` must call this
-    /// together. Ordering the write against whatever reads it — an MMA taking
-    /// the segment as accumulator, a later [`Self::fragment`], or
-    /// [`dealloc_block`] — is the caller's: [`store_wait`] retires it in the
-    /// issuing warp, and a consumer in another warp needs whatever sync it
-    /// would need for any warp-private write besides.
+    /// - All 32 lanes of the warp owning TMEM rows `row..row + 16` call this
+    ///   together.
+    /// - Ordering the write against whatever reads it — an MMA taking the
+    ///   segment as accumulator, a later [`Self::fragment`], or
+    ///   [`dealloc_block`] — is the caller's. [`store_wait`] retires it in the
+    ///   issuing warp; a consumer in another warp needs whatever sync any
+    ///   warp-private write would need besides.
     ///
     /// Whether a `tcgen05_fence_before_thread_sync` /
     /// `tcgen05_fence_after_thread_sync` pair is additionally required around
-    /// such a hand-off is open: this crate uses neither on any path, and
-    /// nothing has been established either way for the store side. Their
-    /// absence here is not a guarantee that they are unnecessary.
+    /// such a hand-off is **open**. This crate uses neither on any path, and
+    /// that is not a guarantee that they are unnecessary.
     #[inline(always)]
     pub unsafe fn store_fragment(self, row: u32, column: u32, low: TmemRegs4, high: TmemRegs4) {
         unsafe {
@@ -575,8 +523,8 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     }
 
     /// [`Self::store_fragment`] from a [`Fragment`] tile — the store twin of
-    /// [`Self::fragment_tile`], undoing the simd pair's interleaving so a
-    /// register pass hands back the same `(slot, value)` coordinates it read.
+    /// [`Self::fragment_tile`], taking back the same `(slot, value)`
+    /// coordinates it read.
     ///
     /// Only the `[16, 16]` block; [`Self::store_tile`] is the composed form.
     ///
@@ -592,21 +540,26 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     }
 
     /// A whole `[M, N]` band at `(row, column)`, composed out of the
-    /// `M/16 × N/16` blocks [`Self::fragment_tile`] returns — the drain a warp
-    /// holding a `RegTile<32, 128, BaseLdtm>` accumulator wants, rather than
-    /// the four-deep block loop it used to write for itself.
+    /// `M/16 × N/16` blocks [`Self::fragment_tile`] returns.
     ///
-    /// `M` and `N` are the *warp's* logical shape and `row` its first TMEM
-    /// lane, so a warp of an `M128` accumulator drains `tile::<32, N>(32 *
-    /// warp_id, 0)`. The shape set is the one [`BaseLdtm`] implements
-    /// [`FragmentLayout`] for.
+    /// `M` and `N` are the *warp's* logical shape and `row` its first TMEM lane,
+    /// so each warp of an `M128` accumulator drains its own quarter. The shape
+    /// set is the one [`BaseLdtm`] implements [`FragmentLayout`] for.
+    ///
+    /// ```no_run
+    /// # use kittens::tmem::TmemTile;
+    /// # use kittens::{BaseLdtm, RegTile, warp_id};
+    /// # unsafe fn demo(accumulator: TmemTile<128, 128>) { unsafe {
+    /// let band: RegTile<32, 128, BaseLdtm> = accumulator.tile(32 * warp_id(), 0);
+    /// # let _ = band;
+    /// # } }
+    /// ```
     ///
     /// # Safety
     ///
-    /// As [`Self::fragment`], for every block of the band: all 32 lanes of a
-    /// warp owning TMEM rows `row..row + M` must call this together after the
-    /// MMA writing them has committed, and `column + N` must fit the
-    /// allocation.
+    /// - All 32 lanes of the warp owning TMEM rows `row..row + M` call this
+    ///   together, after the MMA writing them has committed.
+    /// - `column + N` fits the allocation.
     #[inline(always)]
     pub unsafe fn tile<const M: usize, const N: usize>(
         self,
@@ -643,24 +596,16 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     /// LDTM, against the eight [`Self::fragment`] issues and eight waits that
     /// cover the same 64 columns.
     ///
-    /// `tcgen05.ld.16x256b.x8` returns 32 f32 a thread where the `.x1` this
-    /// crate has always used returns 4. Same bytes, same map, one eighth the
-    /// issues — and one eighth the waits, which is the larger half of it:
-    /// [`Self::fragment`] waits after *each* of its two loads because the
-    /// registers it waits on are its return value, so the `.x1` drain never
-    /// has more than one load in flight and pays the full TMEM latency per
-    /// four values.
-    ///
-    /// What it costs is liveness. 32 f32 arrive at once and all four blocks
-    /// are live until the caller consumes them, where the `.x1` path lets the
-    /// compiler fuse a single eight-value [`Fragment`] through to the store.
-    /// That is the trade this method exists to let a kernel measure.
+    /// Same bytes, same map. What it costs is liveness: 32 f32 arrive at once
+    /// and all four blocks stay live until the caller consumes them, where the
+    /// `.x1` path lets the compiler fuse a single eight-value [`Fragment`]
+    /// through to the store.
     ///
     /// # Safety
     ///
-    /// As [`Self::fragment`]: all 32 lanes of a warp owning TMEM rows
-    /// `row..row + 16` must call this together after the MMA writing them has
-    /// committed, and `column + 64` must fit the allocation.
+    /// - All 32 lanes of the warp owning TMEM rows `row..row + 16` call this
+    ///   together, after the MMA writing them has committed.
+    /// - `column + 64` fits the allocation.
     #[inline(always)]
     pub unsafe fn fragments_x8(self, row: u32, column: u32) -> [Fragment; 4] {
         unsafe {
@@ -671,31 +616,18 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     }
 
     /// One `.x8.pack::16b` arrival: 32 registers of **already-packed 16-bit
-    /// pairs**, drained through one [`tcgen05_load_wait`].
+    /// pairs**, off twice the columns [`Self::fragments_x8`] covers.
     ///
-    /// `.pack::16b` packs the 16-bit elements of two consecutive tensor-memory
-    /// columns into one 32-bit register, so it returns the same 32 registers
-    /// [`Self::fragments_x8`] does off **twice** the columns — 64 b16 a thread
-    /// rather than 32 f32, out of the same 1024 bits of TMEM. That is the whole
-    /// of what it is: a *reinterpretation*, not a conversion.
-    ///
-    /// **So it is not a cheaper epilogue and there is no reading of it that is.**
-    /// An fp32 accumulator's columns hold floats; packing two of their low halves
-    /// yields the mantissa halves of two numbers, which is not a narrowed value of
-    /// anything. #117 said this and then argued it from the register count, which
-    /// is the weaker claim — the register count is equal because the *bits* are
-    /// equal, and equal bits is exactly why no convert was performed.
-    ///
-    /// What it is good for is **pricing** the convert. Substituted into a drain it
-    /// holds the TMEM traffic, the register count, the `stmatrix` count and the
-    /// stores, and takes the `cvt` column to zero; the launch difference is then
-    /// the convert's cost and nothing else. `experiments/`' `pack16` rung is that
-    /// substitution, and it is on no correctness gate because it cannot be.
+    /// `.pack::16b` is a *reinterpretation*, not a conversion — **it is not a
+    /// cheaper epilogue.** Over an fp32 accumulator it yields the mantissa
+    /// halves of pairs of floats, which is not a narrowed value of anything.
+    /// What it is good for is pricing the convert; see
+    /// `docs/library/tmem.md`.
     ///
     /// # Safety
     ///
-    /// As [`Self::fragments_x8`], and the values are meaningful only if the
-    /// segment holds 16-bit data.
+    /// - As [`Self::fragments_x8`].
+    /// - The values are meaningful only if the segment holds 16-bit data.
     #[inline(always)]
     pub unsafe fn fragments_pack16_x8(self, row: u32, column: u32) -> CuSimd<u32, 32> {
         unsafe {
@@ -708,10 +640,19 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     /// [`Self::tile`] over [`Self::fragments_x8`] — the same `[M, N]` band,
     /// drained 64 columns at a time instead of 16.
     ///
-    /// `N` must be a multiple of 64, which is what makes the `.x8` land on
-    /// whole blocks; the `[M, N]` shape set is otherwise
-    /// [`Self::tile`]'s. The two must return the same tile for every shape
-    /// both accept, and `device-tests`' `ldtm x8 map` is that assertion.
+    /// `N` must be a multiple of 64, which is what makes the `.x8` land on whole
+    /// blocks; the shape set is otherwise [`Self::tile`]'s. The two return the
+    /// same tile for every shape both accept, and `device-tests`' `ldtm x8 map`
+    /// is that assertion.
+    ///
+    /// ```no_run
+    /// # use kittens::tmem::TmemTile;
+    /// # use kittens::{BaseLdtm, RegTile, warp_id};
+    /// # unsafe fn demo(accumulator: TmemTile<128, 128>) { unsafe {
+    /// let band: RegTile<32, 128, BaseLdtm> = accumulator.tile_x8(32 * warp_id(), 0);
+    /// # let _ = band;
+    /// # } }
+    /// ```
     ///
     /// # Safety
     ///
@@ -752,50 +693,35 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
         }
     }
 
-    /// [`Self::tile_x8`] with **every issue of the band in flight before the
-    /// one wait**, rather than a wait per issue. At most [`ISSUE_LIMIT`] of
-    /// them, which is the register file and not a convenience.
+    /// [`Self::tile_x8`] with **every issue of the band in flight before the one
+    /// wait**, rather than a wait per issue.
     ///
-    /// `.x8` removed seven eighths of the waits a `[16, 64]` group used to pay
-    /// (#117) and left the last one where it was: [`Self::fragments_x8`] waits
-    /// immediately, because the registers it waits on are its return value, so
-    /// a band of `ISSUES` groups still pays `ISSUES` full TMEM latencies with
-    /// never more than one load outstanding. This issues all of them first and
-    /// waits once — `tcgen05.wait::ld` waits for *prior* loads, plural, so one
-    /// wait retires the band however many issues it took.
+    /// `ISSUES` is the band's `.x8` count, `(M / 16) * (N / 64)`, stated rather
+    /// than derived because a generic const expression is not on stable; the
+    /// const asserts keep a caller from stating it wrong. At most
+    /// [`ISSUE_LIMIT`], which is the register file and not a convenience.
     ///
-    /// **It costs no registers at two issues.** The band it returns holds all
-    /// `32 * ISSUES` f32 a thread simultaneously either way, so batching only
-    /// moves where the wait sits — `gemm_sol`'s M256 drain censuses at 96
-    /// registers and a 256-byte frame both ways. At four it does cost: 176
-    /// registers and 512 bytes of frame. What it needs is register *file*, and
-    /// at one CTA per SM there is a lot of it: 192 threads at 255 registers is
-    /// 48 960 of an SM's 65 536.
+    /// Two issues behind one wait cost no registers and are worth **+0.9%** of
+    /// `gemm_sol`'s launch at 8192³; four cost 176 registers against 96 and are
+    /// a loss. `docs/library/tmem.md` has the ladder, and why the issues are
+    /// spelled out rather than looped over.
     ///
-    /// **What it is worth is small, and the reason is worth knowing.** Two
-    /// issues behind one wait is +0.9% of `gemm_sol`'s launch at 8192³ and
-    /// nothing at 4096³; four is a loss. `gemm_sol_ablate`'s doubling ladder says
-    /// why: *doubling* the LDTM count and its waits in that drain costs zero, so
-    /// the waits #117 was paid for removing are, at `.x8`, already covered by the
-    /// other three epilogue warps. This is the tail of that lever and not a new
-    /// one.
-    ///
-    /// `ISSUES` is stated rather than derived — `(M / 16) * (N / 64)` is a
-    /// generic const expression and this crate is on stable — and the const
-    /// assert below is what keeps a caller from stating it wrong.
-    ///
-    /// **The issues are spelled out rather than looped over**, and that is not
-    /// style. Written as a loop over an `[_; ISSUES]` array, LLVM unrolls it at
-    /// two issues and does not at four: the array then needs a runtime index,
-    /// lands in local memory, and the arm censuses as **one** `tcgen05.ld` with
-    /// a 1024-byte stack frame — four loads in flight through L1, which is not
-    /// the thing being measured. Four literal indices cannot do that.
+    /// ```no_run
+    /// # use kittens::tmem::TmemTile;
+    /// # use kittens::{BaseLdtm, RegTile, warp_id};
+    /// # unsafe fn demo(accumulator: TmemTile<128, 128>) { unsafe {
+    /// // [32, 128] is 2 row blocks x 2 column groups = 4 issues.
+    /// let band: RegTile<32, 128, BaseLdtm> =
+    ///     accumulator.tile_x8_batched::<32, 128, 4>(32 * warp_id(), 0);
+    /// # let _ = band;
+    /// # } }
+    /// ```
     ///
     /// # Safety
     ///
-    /// As [`Self::tile_x8`]: all 32 lanes of a warp owning TMEM rows
-    /// `row..row + M` must call this together after the MMA writing them has
-    /// committed, and `column + N` must fit the allocation.
+    /// As [`Self::tile_x8`]: all 32 lanes of the warp owning TMEM rows
+    /// `row..row + M` call this together after the MMA writing them has
+    /// committed, and `column + N` fits the allocation.
     #[inline(always)]
     pub unsafe fn tile_x8_batched<const M: usize, const N: usize, const ISSUES: usize>(
         self,
@@ -859,11 +785,10 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
         }
     }
 
-    /// The inverse of [`Self::tile`]: a whole `[M, N]` band written back
-    /// block by block through [`Self::store_fragment_tile`].
+    /// The inverse of [`Self::tile`]: a whole `[M, N]` band written back block
+    /// by block through [`Self::store_fragment_tile`].
     ///
-    /// The stores are left outstanding, as the single-block form leaves them —
-    /// one [`store_wait`] retires the whole band.
+    /// The stores are left outstanding — one [`store_wait`] retires the band.
     ///
     /// # Safety
     ///
@@ -934,9 +859,9 @@ mod tests {
     }
 
     /// The simd-pair interleaving, both directions. `split` is what the store
-    /// path hands the hardware and `interleave` what the drain path reads back
-    /// from it, so a fragment that survives the pair unchanged is the whole
-    /// register-side contract between them — the addressing either shares is
+    /// path hands the hardware and `interleave` what the drain path reads back,
+    /// so a fragment that survives the pair unchanged is the whole
+    /// register-side contract between them; the addressing either shares is
     /// what the device harness is for.
     #[test]
     fn splitting_a_fragment_inverts_the_pair_interleaving() {
@@ -965,12 +890,8 @@ mod tests {
     /// itself: a fragment placed at `(row_block, column_block)` must land in
     /// the registers whose `RegTile::coordinate` is that block's `(row,
     /// column)` offset by `16 * (row_block, column_block)`, and must come back
-    /// out of [`take_block`] unchanged.
-    ///
-    /// `reg.rs` asserts that map is what the bigger shape's own `coordinate`
-    /// gives; this is what ties the movers' storage indexing to it, in both
-    /// directions, so a composed band cannot be a transposition of the drain
-    /// that filled it.
+    /// out of [`take_block`] unchanged — so a composed band cannot be a
+    /// transposition of the drain that filled it.
     #[test]
     fn block_placement_is_the_composed_coordinate() {
         type Band = RegTile<32, 128, BaseLdtm>;

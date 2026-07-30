@@ -1,86 +1,34 @@
-//! Register vectors/tiles over a fragment ownership map, plus the scalar maps
-//! they compose with.
+//! Register tiles and vectors over a fragment ownership map, plus the scalar
+//! ops they compose with.
 //!
 //! A [`RegTile<M, N, L>`](RegTile) is a *logical* `[M, N]` fp32 tile spread
-//! across the 32 lanes of a warp. The layout `L` owns the
-//! `(lane, slot, value) -> (row, column)` map and the per-thread storage that
-//! map implies, so ops are written against the logical shape and never spell
-//! the map by hand. [`BaseLdtm`] — the tcgen05 `16x256b` drain the validated
-//! kernels use — is the crate's only layout, and its doc carries the ownership
-//! contract every op here assumes.
+//! across the 32 lanes of one warp; the layout `L` owns the
+//! `(lane, slot, value) -> (row, column)` map, so ops are written against the
+//! logical shape. [`BaseLdtm`] is the crate's only layout and its doc carries
+//! the map every op here assumes. Elementwise work goes through [`UnaryOp`] /
+//! [`BinaryOp`] / [`TernaryOp`] and the `*_map` methods, each of which has an
+//! `_assign` twin that rewrites the receiver instead of returning a tile.
 //!
-//! `exp2` exists twice — [`exp2_approx`] (the FMA polynomial, bit-identical
-//! to what the flash kernels shipped with) and [`exp2_hw`] (one `ex2.approx`
-//! SFU instruction, `cuda_device::float::ex2_approx_f32`, which is a generated
-//! intrinsic at the pinned revision and so needs no libdevice call, exactly as
-//! [`Sqrt`] does not).
+//! Everything here is **warp scope** — nothing makes several warps agree — and
+//! every mask takes a **coordinate origin**, because a tile is normally a
+//! sub-block of a much larger matrix ([`RegTile::make_causal_at`]).
 //!
-//! **On a clock the SFU wins by 2.7×**: #76 timed both on `softmax` at
-//! `CHUNK = 16` over 8192 blocks, and the polynomial is 50 registers on a
-//! 128 B frame at 1178 GB/s against the SFU's 48 on a zero frame at
-//! **3153 GB/s**. Accuracy does not separate them either — `softmax`'s
-//! exactness check measures a worst relative error of 1.97e-3 either way,
-//! because the bf16 round trip dominates and not the transcendental. This
-//! header used to say the measurement did not favour the SFU, on a *register
-//! count* taken on a probe shape no kernel has; #81 is that correction.
+//! `docs/library/reg.md` carries the measurements: by-value against in-place,
+//! the two `exp2`s, and the ThunderKittens naming inversion.
 //!
-//! **The default has not moved.** `exp2` still resolves to [`Exp2Approx`]
-//! (`exp2_stays_the_polynomial_everywhere` is what says so): which one a
-//! *name* means is a numerics change, and `flash_forward` — the other caller,
-//! twice per element in its inner loop — has no CPU reference to check one
-//! against. #81 carries the decision and the sweep it needs. `softmax` calls
-//! [`exp2_hw`] explicitly today; ports that must hold "same SASS" keep the
-//! polynomial.
-//!
-//! Elementwise work goes through [`UnaryOp`] / [`BinaryOp`] / [`TernaryOp`]
-//! and the `*_map` methods, so a scalar function is written once and reaches
-//! [`RegTile`], [`RegVec`] and [`ColVec`] alike. The named methods (`exp2`,
-//! `mul_row`, `scale`, …) are wrappers over those.
-//!
-//! Every map comes in two spellings: by value, and in place through
-//! `&mut self` with an `_assign` suffix (#31). They compute the same thing —
-//! `in_place_tile_maps_are_their_by_value_twins` is what says so — and differ
-//! only in what the register allocator has to hold. Which to write is a
-//! measured question with a surprising answer; [`RegTile::bin_map_assign`]
-//! carries the table and the rule that falls out of it.
-//!
-//! A *scalar* operand is a [`BinaryOp`] too — `scalar_map::<Mul>(k)` is
-//! `scale`, `scalar_map::<Add>(k)` is `shift` — rather than a stateful op
-//! trait, because a `UnaryOp` is a unit struct with an associated function and
-//! has nowhere to keep a `k`. The consequence is that every tile-against-scalar
-//! form the op set can express is reachable without a new op.
-//!
-//! Masking ([`RegTile::make_causal`], `tril`/`triu`, the fills) is the other
-//! use of the ownership map: a select at each value's logical `(row, column)`,
-//! in place, with no lane learning anything from another. Every one of them
-//! takes a **coordinate origin** — a `diagonal`, or a fill index — because the
-//! tile being masked is a sub-block of a much larger score matrix and its
-//! diagonal sits at `query_base - key_base`. Masking a tile against its own
-//! `row == column` instead compiles, runs, and is wrong everywhere off the
-//! diagonal block; see [`RegTile::make_causal_at`].
-//!
-//! Reductions take the same [`BinaryOp`] and come in two halves: a thread's own
-//! registers, then a `shuffle_xor` butterfly over the lanes the map spreads the
-//! folded axis across. Which lanes those are is the entire correctness
-//! question, and it is decided by [`BaseLdtm`]'s two maps — `row_of` ignores
-//! `lane % 4`, `col_of` ignores `lane / 4` — so a row reduction shuffles masks
-//! 1 and 2, a column reduction 4, 8 and 16, and a whole-tile reduction all
-//! five. A wrong mask there yields a plausible wrong number rather than a
-//! crash, which is why `reduction_masks_are_the_ownership_maps_lane_groups`
-//! derives the groups from the maps instead of restating the constants.
-//! All of it is **warp scope**; nothing here makes several warps agree.
-//!
-//! **ThunderKittens naming.** TK names a register vector for the axis it
-//! *spans*: its `col_vec` has one entry per row, its `row_vec` one per column.
-//! We name for the axis that *indexes* it, so TK's `col_vec` is our
-//! [`RegVec`] and TK's `row_vec` is our [`ColVec`] — inverted. The op names
-//! do agree: TK's `row_map`/`mul_row` and ours both broadcast a per-row scalar
-//! along each row.
+//! ```no_run
+//! # use kittens::lane;
+//! # use kittens::reg::{BaseLdtm, RegTile};
+//! # unsafe fn softmax(mut scores: RegTile<32, 64, BaseLdtm>) -> RegTile<32, 64, BaseLdtm> {
+//! scores.make_causal_at(lane(), 0, 0, -1.0e30);
+//! let probs = scores.sub_row(scores.row_max()).exp2();
+//! probs.div_row(probs.row_sum())
+//! # }
+//! ```
 
 use cuda_device::warp;
 
-/// NaN-free float max. The comparison-select lowering is retained for its
-/// established SASS; libdevice-backed `f32::max` is now artifact-safe.
+/// NaN-free float max, as a comparison-select rather than a libdevice call.
 #[inline(always)]
 pub fn fmax(a: f32, b: f32) -> f32 {
     if a > b { a } else { b }
@@ -92,11 +40,19 @@ pub fn fmin(a: f32, b: f32) -> f32 {
     if a < b { a } else { b }
 }
 
-/// `2^x` on FMA units: round-to-nearest split via the 1.5·2²³ shift trick,
-/// exponent-bit insertion for the integer part, and a degree-3 minimax
-/// polynomial (max relative error 7.5e-5 on the reduced range) for the
-/// fraction. The clamp keeps the exponent field in the normal range and
-/// flushes masked-sentinel inputs to a harmless ~2^-125.
+/// `2^x` on FMA units — max relative error 7.5e-5, and what every `exp2` in
+/// the crate resolves to. [`exp2_hw`] is the SFU alternative and rounds
+/// differently.
+///
+/// The input is clamped to ±125, so a masked-score sentinel flushes to a
+/// harmless ~2^-125 instead of overflowing: a fully masked row sums to zero
+/// rather than to `NaN`.
+///
+/// ```
+/// # use kittens::reg::exp2_approx;
+/// assert!((exp2_approx(3.5) / 3.5f32.exp2() - 1.0).abs() < 1.0e-4);
+/// assert!(exp2_approx(-1.0e30) <= 2.0f32.powi(-124));
+/// ```
 #[inline(always)]
 pub fn exp2_approx(x: f32) -> f32 {
     const SHIFT: f32 = 12582912.0; // 1.5 * 2^23
@@ -112,18 +68,18 @@ pub fn exp2_approx(x: f32) -> f32 {
     f32::from_bits((poly.to_bits() as i32).wrapping_add(integer << 23) as u32)
 }
 
-/// `2^x` as one `ex2.approx.f32` SFU instruction — FA4's SFU offload.
-/// Different rounding than [`exp2_approx`]; adopting it in a gated kernel is
-/// a numerics change, not a refactor.
+/// `2^x` as one `ex2.approx.f32` SFU instruction — 2.7× the throughput of
+/// [`exp2_approx`] on `softmax`, and a different rounding. Adopting it in a
+/// gated kernel is a numerics change, not a refactor.
 #[inline(always)]
 pub fn exp2_hw(x: f32) -> f32 {
     cuda_device::float::ex2_approx_f32(x)
 }
 
 /// `log2(x)` for positive normal `x`: exponent extraction, mantissa
-/// renormalized to `[√½, √2]`, then the atanh series in `t = (m-1)/(m+1)`
-/// (four terms; |error| < 5e-8 on the reduced range). The coefficient
-/// literals are bit-exact copies of the validated kernel's.
+/// renormalized to `[√½, √2]`, then a four-term atanh series in
+/// `t = (m-1)/(m+1)`. |error| < 5e-8 on the reduced range. Undefined on zero,
+/// negatives and subnormals.
 #[allow(clippy::excessive_precision)]
 #[inline(always)]
 pub fn log2_approx(x: f32) -> f32 {
@@ -144,36 +100,32 @@ pub fn log2_approx(x: f32) -> f32 {
 }
 
 /// `1/√x` as a correctly-rounded `sqrt.rn.f32` and a divide rather than the SFU
-/// `rsqrt.approx.f32`: two instructions, but the same number on host and device,
-/// which is what lets a normalization kernel's host reference be `==`. Free
-/// beside [`exp2_approx`] because a scalar variance — layernorm's, over a
-/// statistic that is already one `f32` — has no vector to reach [`Rsqrt`] with.
+/// `rsqrt.approx.f32`: two instructions, but the same number on host and
+/// device, which is what lets a normalization kernel's host reference compare
+/// with `==`. Free-standing for the scalar case — layernorm's variance is
+/// already one `f32` and has no vector to reach [`Rsqrt`] through.
 #[inline(always)]
 pub fn rsqrt(x: f32) -> f32 {
     1.0 / x.sqrt()
 }
 
-/// Fold across the 4 lanes of a quad — the lanes differing only in `lane % 4`,
-/// which under [`BaseLdtm`] is the axis one row's columns are spread along
-/// (`row_of` ignores `lane % 4` entirely). So this is the second half of a row
-/// reduction: the first is folding a thread's own `VALUES` registers.
+/// Fold across the 4 lanes of a quad (`shuffle_xor` masks 1 and 2) — under
+/// [`BaseLdtm`] the lanes holding the rest of one row's columns, so this is the
+/// second half of a row reduction; the first is folding a thread's own `VALUES`
+/// registers.
 ///
-/// The result lands in all four lanes, which is what makes a [`RegVec`] a
-/// whole-row statistic rather than a partial one.
-/// `reduction_masks_are_the_ownership_maps_lane_groups` is what pins masks
-/// 1 and 2 to that claim.
+/// All four lanes of the quad must call it, and the result lands in all four:
+/// that is what makes a [`RegVec`] a whole-row statistic rather than a partial.
 #[inline(always)]
 pub fn quad_reduce<Op: ReduceOp>(value: f32) -> f32 {
     let value = Op::apply(value, warp::shuffle_xor_f32(value, 1));
     Op::apply(value, warp::shuffle_xor_f32(value, 2))
 }
 
-/// Fold across the 8 lanes sharing a `lane % 4` — the lanes differing only in
-/// `lane / 4`, which under [`BaseLdtm`] is the axis one column's rows are
-/// spread along (`col_of` ignores `lane / 4`). The second half of a column
-/// reduction, and three shuffles rather than [`quad_reduce`]'s two: this is
-/// the concrete sense in which a column reduction is a different shuffle
-/// rather than a reparameterization of the row one.
+/// Fold across the 8 lanes sharing a `lane % 4` (masks 4, 8 and 16) — under
+/// [`BaseLdtm`] the lanes holding the rest of one column's rows, so this is the
+/// second half of a column reduction. All 8 must call it; three shuffles rather
+/// than [`quad_reduce`]'s two.
 #[inline(always)]
 pub fn column_group_reduce<Op: ReduceOp>(value: f32) -> f32 {
     let value = Op::apply(value, warp::shuffle_xor_f32(value, 4));
@@ -181,61 +133,64 @@ pub fn column_group_reduce<Op: ReduceOp>(value: f32) -> f32 {
     Op::apply(value, warp::shuffle_xor_f32(value, 16))
 }
 
-/// Fold across all 32 lanes — both axes, the full butterfly, leaving the
-/// result warp-uniform.
+/// Fold across all 32 lanes — the full butterfly, leaving the result
+/// warp-uniform. Every lane of the warp must call it.
 #[inline(always)]
 pub fn warp_reduce<Op: ReduceOp>(value: f32) -> f32 {
     column_group_reduce::<Op>(quad_reduce::<Op>(value))
 }
 
-/// Max across the 4 lanes of a quad — how a fragment row's statistic
-/// becomes whole-row (each quad's lanes hold disjoint columns of one row).
+/// Max across the 4 lanes of a quad; see [`quad_reduce`].
 #[inline(always)]
 pub fn quad_max(value: f32) -> f32 {
     quad_reduce::<Max>(value)
 }
 
-/// Sum across the 4 lanes of a quad; see [`quad_max`].
+/// Sum across the 4 lanes of a quad; see [`quad_reduce`].
 #[inline(always)]
 pub fn quad_sum(value: f32) -> f32 {
     quad_reduce::<Add>(value)
 }
 
 /// A scalar function named as a *type*, so one definition instantiates for
-/// every register family through the `unary_map` methods. Unit structs rather
-/// than `fn` pointers or closures: a type parameter can carry no state to
+/// every register family through the `unary_map` methods.
+///
+/// Implementors are unit structs — a type parameter can carry no state to
 /// spill and nothing for the inliner to see through.
+///
+/// ```
+/// # use kittens::reg::{RegVec, BaseLdtm, UnaryOp};
+/// pub struct Square;
+/// impl UnaryOp for Square {
+///     fn apply(x: f32) -> f32 { x * x }
+/// }
+/// let squared = RegVec::<32, BaseLdtm>::splat(3.0).unary_map::<Square>();
+/// assert_eq!(squared.get(0), 9.0);
+/// ```
 pub trait UnaryOp {
     /// The scalar function.
     fn apply(x: f32) -> f32;
 }
 
-/// Two-operand [`UnaryOp`]. Also what the row/column broadcast maps take, with
-/// `b` the per-row or per-column scalar.
+/// Two-operand [`UnaryOp`]. Also what the scalar and row/column broadcast maps
+/// take, with `b` the constant or the per-row/per-column scalar.
 pub trait BinaryOp {
     /// The scalar function.
     fn apply(a: f32, b: f32) -> f32;
 }
 
-/// Three-operand [`UnaryOp`] — the fused multiply-add family, which exists
-/// because a separate multiply and add do not contract on their own.
+/// Three-operand [`UnaryOp`] — the fused multiply-add family. Rust emits no
+/// fast-math flags, so a separate multiply and add never contract on their own.
 pub trait TernaryOp {
     /// The scalar function.
     fn apply(a: f32, b: f32, c: f32) -> f32;
 }
 
-/// A [`BinaryOp`] a reduction may fold with: associative and commutative — the
-/// fragment map hands a fold its operands in the layout's order, not the
-/// tile's — and carrying an identity to seed from. `Sub` and `Div` are
-/// deliberately not members.
+/// A [`BinaryOp`] a reduction may fold with.
 ///
-/// The bound is narrower than [`BinaryOp`] on purpose: `row_reduce::<Sub>` has
-/// no meaning worth giving it a spelling, and the identity lets every fold
-/// start the same way instead of special-casing element zero. It costs one
-/// extra `apply`, which the FMA-seeded forms fold away
-/// (`Max::apply(-inf, x)` is `x` by construction) and the others do not —
-/// measured at no register cost either way, once the fold is written inline
-/// (see the note above the reductions on `RegTile`).
+/// An implementor owes associativity and commutativity — the fragment map hands
+/// a fold its operands in the layout's order, not the tile's — and an identity
+/// every fold can seed from. `Sub` and `Div` are deliberately not members.
 pub trait ReduceOp: BinaryOp {
     /// The value with `apply(IDENTITY, x) == x` for every `x` in the fold.
     const IDENTITY: f32;
@@ -261,24 +216,20 @@ scalar_ops! { UnaryOp:
     /// The SFU instruction ([`exp2_hw`]). Rounds differently from
     /// [`Exp2Approx`]; the choice between them is a numerics decision.
     Exp2Hw(x) = exp2_hw(x);
-    /// `e^x` on [`Exp2Approx`], inheriting that polynomial's error bound and
-    /// its ±125 exponent clamp — so this saturates at `x = ±86.6`, just inside
-    /// where fp32 overflows anyway.
+    /// `e^x` on [`Exp2Approx`], inheriting its error bound and its ±125
+    /// exponent clamp — so this saturates at `x = ±86.6`, just inside where
+    /// fp32 overflows anyway.
     Exp(x) = exp2_approx(x * core::f32::consts::LOG2_E);
     Log2(x) = log2_approx(x);
     /// `ln(x)` on [`log2_approx`]; see [`Exp`].
     Log(x) = log2_approx(x) * core::f32::consts::LN_2;
-    /// Sign-bit clear rather than a libdevice `fabsf` — one `abs.f32`, and it
-    /// keeps the op usable in a pure-PTX artifact whatever becomes of the
-    /// crate-level claim that libdevice math is legal beside tcgen05 in one.
+    /// Sign-bit clear — one `abs.f32`, no libdevice `fabsf`.
     Abs(x) = f32::from_bits(x.to_bits() & 0x7fff_ffff);
     Neg(x) = -x;
     Relu(x) = fmax(x, 0.0);
-    /// `llvm.sqrt.f32`, which NVPTX lowers to the native `sqrt.rn.f32` with no
-    /// libdevice call.
+    /// `llvm.sqrt.f32`, which NVPTX lowers to the native `sqrt.rn.f32`.
     Sqrt(x) = x.sqrt();
-    /// [`rsqrt`] — correctly rounded, not the SFU `rsqrt.approx.f32`, whose
-    /// adoption would be a measured swap like [`Exp2Hw`]'s.
+    /// [`rsqrt`] — correctly rounded, not the SFU `rsqrt.approx.f32`.
     Rsqrt(x) = rsqrt(x);
     Recip(x) = 1.0 / x;
 }
@@ -303,36 +254,25 @@ macro_rules! reduce_ops {
 
 reduce_ops! {
     Add = 0.0;
-    // `1.0` and not `0.0`: a product folded from an additive identity is zero.
     Mul = 1.0;
     Max = f32::NEG_INFINITY;
     Min = f32::INFINITY;
 }
 
 scalar_ops! { TernaryOp:
-    /// `a*b + c` in one `fma.rn.f32`. Rust emits no fast-math flags, so a
-    /// separate multiply and add stay separate — the fusion has to be asked
-    /// for. TK's `fma_AxCtB` is this op with the last two operands swapped at
-    /// the call site; our maps fix no operand to a broadcast vector, so the
-    /// second form buys nothing.
+    /// `a*b + c` in one `fma.rn.f32`; the fusion has to be asked for, since
+    /// Rust emits no fast-math flags.
     Fma(a, b, c) = a.mul_add(b, c);
 }
 
 /// The row half of a fragment ownership map: how a warp's 32 lanes divide the
 /// `M` logical rows of a tile into per-thread *slots*, and where the one
-/// `f32` per owned row lives.
-///
-/// Split out of [`FragmentLayout`] so a [`RegVec`] can name a row count
-/// without inventing a column count, and so `scale_rows` can check a vector
-/// and a tile against the *same* `M`.
+/// `f32` per owned row lives. Separate from the column half so a [`RegVec`] can
+/// name a row count without inventing a column count.
 pub trait RowLayout<const M: usize> {
-    /// Per-thread storage, one `T` per owned row (`[T; SLOTS]`).
-    ///
-    /// Generic in the element, and that is what opens the shape set: a tile's
-    /// storage is this array of a [`ColLayout::Values`], so
-    /// [`FragmentLayout::Storage`] is a *projection* out of the two extents
-    /// rather than an array whose length is `M / 8` — a length no impl can
-    /// compute from a generic `M` without `generic_const_exprs`.
+    /// Per-thread storage, one `T` per owned row (`[T; SLOTS]`). Generic in the
+    /// element because a tile's storage is this array of a
+    /// [`ColLayout::Values`].
     type Slots<T: Copy>: Copy;
 
     /// Rows of the `[M, _]` tile one thread owns.
@@ -356,10 +296,10 @@ pub trait RowLayout<const M: usize> {
 /// `N` logical columns a thread holds per row, and where one `f32` per owned
 /// column lives.
 ///
-/// Unlike a [`RowLayout`] slot, a value is *not* warp-uniform in the same
-/// sense: under [`BaseLdtm`] a column depends only on `lane % 4`, so the 8
-/// lanes of a column group each hold their own copy of the same `N/4` columns.
-/// A [`ColVec`] is that per-lane copy.
+/// Under [`BaseLdtm`] a column depends only on `lane % 4`, so the 8 lanes of a
+/// column group each hold their own copy of the same `N/4` columns. A
+/// [`ColVec`] is that per-lane copy, and the copies agree only once something
+/// has folded across the group.
 pub trait ColLayout<const N: usize> {
     /// Per-thread storage, one `f32` per owned column (`[f32; VALUES]`).
     type Values: Copy;
@@ -370,9 +310,9 @@ pub trait ColLayout<const N: usize> {
     /// How many consecutive values land on consecutive columns, so that a run
     /// of them is one vector memory access rather than that many scalar ones.
     ///
-    /// A run starts at every multiple of the constant, and the contract is
-    /// both halves of what a vector access needs — that the addresses are
-    /// adjacent, and that the first of them is aligned for the width:
+    /// **An impl raising this owes both halves of what a vector access needs:**
+    /// that the addresses are adjacent, and that the first is aligned for the
+    /// width. A run starts at every multiple of the constant.
     ///
     /// ```text
     /// run % CONTIGUOUS_VALUES == 0  ⟹  col_of(lane, run + i) == col_of(lane, run) + i
@@ -381,13 +321,9 @@ pub trait ColLayout<const N: usize> {
     ///                                   col_of(lane, run) and VALUES.
     /// ```
     ///
-    /// The default is `1` — no two values adjacent — because that is the
-    /// answer that is true of every map, so a layout written later gets scalar
-    /// accesses until it claims otherwise rather than silently inheriting
-    /// [`BaseLdtm`]'s arithmetic (#23, #91). Raising it is a claim about the
-    /// map that [`crate::global::store_rows`] and
-    /// [`crate::global::load_rows`] act on; `base_ldtm_pairs_every_other_value`
-    /// is what checks it for the one layout that does.
+    /// [`crate::global::store_rows`] and [`crate::global::load_rows`] act on
+    /// the claim. The default is `1` — the answer true of every map — so a new
+    /// layout gets scalar accesses until it says otherwise.
     const CONTIGUOUS_VALUES: usize = 1;
 
     /// The logical column in `0..N` that `lane` holds in `value`.
@@ -408,12 +344,8 @@ pub trait ColLayout<const N: usize> {
 /// storage they live in. The two coordinate halves come from [`RowLayout`] and
 /// [`ColLayout`]; what a tile adds is the joint storage.
 ///
-/// The storage is an associated type rather than `[[f32; VALUES]; SLOTS]`
-/// because an array length must be a const expression of the generic
-/// parameters, which would need `generic_const_exprs`. It is nevertheless
-/// *derived*: the blanket impl below projects it as `Slots<Values>`, so no
-/// `(M, N)` needs an impl of its own and the shape set is the product of the
-/// two extent sets rather than a list of pairs (#23).
+/// **Never implemented directly.** The blanket impl below covers every
+/// [`RowLayout`] × [`ColLayout`] pair, in this crate and downstream.
 pub trait FragmentLayout<const M: usize, const N: usize>: RowLayout<M> + ColLayout<N> {
     /// Per-thread storage, `VALUES` values for each of `SLOTS` rows.
     type Storage: Copy;
@@ -429,15 +361,9 @@ pub trait FragmentLayout<const M: usize, const N: usize>: RowLayout<M> + ColLayo
 }
 
 /// Every [`RowLayout`] × [`ColLayout`] pair *is* a tile layout: a thread's rows
-/// of values are its row array of its column array, which is the same
-/// `[[f32; VALUES]; SLOTS]` a per-shape impl would have written and needs no
-/// arithmetic on `M` and `N` to name.
-///
-/// Blanket, so a shape costs no line anywhere: adding a row extent and a column
-/// extent adds every tile between them, and a layout defined *outside* this
-/// crate is a tile layout as soon as it has both halves — which is the part
-/// orphan rules put out of reach for [`BaseLdtm`] (#23). The consequence is
-/// that `FragmentLayout` is never implemented directly, here or downstream.
+/// of values are its row array of its column array, which needs no arithmetic
+/// on `M` and `N` to name. So a shape costs no line anywhere — adding a row
+/// extent and a column extent adds every tile between them.
 impl<const M: usize, const N: usize, L: RowLayout<M> + ColLayout<N>> FragmentLayout<M, N> for L {
     type Storage = L::Slots<L::Values>;
 
@@ -457,8 +383,8 @@ impl<const M: usize, const N: usize, L: RowLayout<M> + ColLayout<N>> FragmentLay
     }
 }
 
-/// The base-LDTM `16x256b` ownership map — the only drain shape the validated
-/// kernels use, and the crate's only layout.
+/// The base-LDTM `16x256b` ownership map — the tcgen05 drain shape the
+/// validated kernels use, and the crate's only layout.
 ///
 /// Within each 16-row block of its warp's 32 TMEM rows a thread owns rows
 /// `lane/4` and `lane/4 + 8`, and columns `2*(lane%4)` and `+1` of each
@@ -471,15 +397,21 @@ impl<const M: usize, const N: usize, L: RowLayout<M> + ColLayout<N>> FragmentLay
 /// VALUES = N / 4    col_of(lane, value) = 2*(lane%4) + 16*(value/4) + [0,1,8,9][value%4]
 /// ```
 ///
-/// `M` and `N` are per *warp* and both multiples of 16, and across the warp's
-/// 32 lanes the map covers each `(row, column)` of the tile exactly once
-/// (`base_ldtm_covers_each_coordinate_once`). Note that slots count the rows a
-/// thread owns, not a warpgroup's rows: the flash output accumulator is
-/// `RegTile<32, 128, BaseLdtm>` — one warp's 32 TMEM rows by 128 columns, four
-/// slots of 32 values in each thread.
+/// **`M` and `N` are per warp**, both multiples of 16 and at most 512, and the
+/// warp's 32 lanes cover each `(row, column)` exactly once. Slots count the
+/// rows a *thread* owns, not a warpgroup's rows: the flash output accumulator
+/// is `RegTile<32, 128, BaseLdtm>` — one warp's 32 TMEM rows by 128 columns,
+/// four slots of 32 values in each thread.
 ///
-/// Row statistics live once per owned row, replicated across the 4 lanes of a
-/// quad by shuffle reductions ([`quad_max`], [`quad_sum`]).
+/// ```
+/// # use kittens::reg::{BaseLdtm, RegTile};
+/// let (rows, values) = (
+///     RegTile::<32, 128, BaseLdtm>::SLOTS,
+///     RegTile::<32, 128, BaseLdtm>::VALUES,
+/// );
+/// assert_eq!((rows, values), (4, 32));
+/// assert_eq!(RegTile::<32, 128, BaseLdtm>::coordinate(5, 1, 2), (9, 10));
+/// ```
 pub struct BaseLdtm;
 
 impl BaseLdtm {
@@ -492,8 +424,7 @@ impl BaseLdtm {
 
     /// The logical column `lane` holds in `value`: fours at offsets
     /// `{0, 1, 8, 9}` of successive 16-column blocks, from the lane's own
-    /// column pair. The coordinate a masking or per-column-statistic pass
-    /// needs, and the inverse of the packing
+    /// column pair — the inverse of the packing
     /// [`crate::ldst::store_fragment`] undoes.
     #[inline(always)]
     pub const fn column(lane: u32, value: usize) -> u32 {
@@ -543,9 +474,8 @@ macro_rules! base_ldtm_cols {
         impl ColLayout<$n> for BaseLdtm {
             type Values = [f32; $n / 4];
             const VALUES: usize = $n / 4;
-            // `{0, 1, 8, 9}` is two adjacent pairs, from an even base
-            // (`2*(lane%4) + 16*(value/4)`). Two and not four: the run breaks
-            // at the `1 -> 8` step.
+            // `{0, 1, 8, 9}` is two adjacent pairs from an even base. Two and
+            // not four: the run breaks at the `1 -> 8` step.
             const CONTIGUOUS_VALUES: usize = 2;
 
             #[inline(always)]
@@ -572,14 +502,9 @@ macro_rules! base_ldtm_cols {
 }
 
 // Every multiple of 16 up to 512, in both extents — 1024 tile shapes out of 64
-// impls, since `FragmentLayout` is the product of the two.
-//
-// The bound is the register file, not a guess at what kernels want: a thread
-// holds `M * N / 32` fp32 values of an `[M, N]` warp tile, so with the other
-// extent at its 16 minimum, 512 is already 256 registers a thread — one past
-// what the hardware has. No shape outside this grid fits in registers at all,
-// which is the sense in which the set is open rather than merely bigger.
-// Unused extents cost nothing: a trait impl no tile names emits no code.
+// impls, since `FragmentLayout` is the product of the two. The bound is the
+// register file: at the other extent's 16 minimum, 512 is already 256
+// registers a thread, one past what the hardware has.
 base_ldtm_rows!(
     16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 272, 288, 304, 320,
     336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512,
@@ -591,7 +516,7 @@ base_ldtm_cols!(
 
 /// The named half of the op set: one line per exposed name, so a new op costs
 /// a [`scalar_ops`] line and one of these. `should_implement_trait` is allowed
-/// wholesale because every op the device code takes must stay a direct
+/// wholesale because every op device code takes must stay a direct
 /// `#[inline(always)]` call, not an operator impl.
 macro_rules! op_methods {
     (unary $($(#[$meta:meta])* $name:ident = $op:ty;)*) => {$(
@@ -704,10 +629,9 @@ macro_rules! unary_op_methods {
     };
 }
 
-/// The scalar-operand names every register family carries. The generic
-/// [`RegTile::scalar_map`] already reaches every [`BinaryOp`] — `Div`, `Sub`
-/// and the rest need no wrapper to be callable — so this table holds only the
-/// spellings a kernel would otherwise invent a worse name for.
+/// The scalar-operand names every register family carries. [`RegTile::scalar_map`]
+/// already reaches every [`BinaryOp`], so this table holds only the spellings a
+/// kernel would otherwise invent a worse name for.
 macro_rules! scalar_op_methods {
     () => {
         op_methods! { scalar
@@ -726,9 +650,7 @@ macro_rules! scalar_op_methods {
     };
 }
 
-/// The in-place twin of [`scalar_op_methods`], name for name. A separate table
-/// rather than a second name generated by the first, so that adding a scalar op
-/// is still one line and the two tables can be read against each other.
+/// The in-place twin of [`scalar_op_methods`], name for name.
 macro_rules! scalar_assign_op_methods {
     () => {
         op_methods! { scalar_assign
@@ -748,11 +670,20 @@ macro_rules! scalar_assign_op_methods {
 /// per owned row (slot), replicated across each quad. A 32-row warp tile is 4
 /// slots (2 per 16-row block × 2 blocks per warp).
 ///
-/// Every op is a compile-time-length loop over the slot array — plain
-/// straight-line FMA/select code after inlining. `max`/`sub`/`exp2`/
-/// `mul_assign`/`add_assign` were hand-written copies of exactly that loop
-/// until `modal_app.py::regcount` showed the generic maps assemble to the same
-/// registers and spills at both probe shapes; they are the maps now.
+/// What [`RegTile::row_reduce`] returns and what [`RegTile::row_map`] takes.
+/// Every op is a compile-time-length loop over the slot array — straight-line
+/// code after inlining.
+///
+/// ```no_run
+/// # use kittens::lane;
+/// # use kittens::reg::{BaseLdtm, RegTile, RegVec};
+/// # unsafe fn demo(scores: RegTile<32, 64, BaseLdtm>) {
+/// let row_max: RegVec<32, BaseLdtm> = scores.row_max();
+/// let probs = scores.sub_row(row_max).exp2();
+/// let mut running_sum = probs.row_sum();
+/// running_sum.mul_assign(RegVec::splat(0.5));
+/// # }
+/// ```
 pub struct RegVec<const M: usize, L: RowLayout<M>>(pub L::Slots<f32>);
 
 impl<const M: usize, L: RowLayout<M>> Clone for RegVec<M, L> {
@@ -766,8 +697,7 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     /// Rows of the tile this thread owns.
     pub const SLOTS: usize = L::SLOTS;
 
-    /// Wrap this thread's slots. Named rather than the tuple constructor
-    /// because a type alias (`Fragment`-style) can't spell one.
+    /// Wrap this thread's slots.
     #[inline(always)]
     pub fn from_slots(slots: L::Slots<f32>) -> Self {
         Self(slots)
@@ -798,8 +728,10 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     }
 
     /// True if any slot exceeds `reference + slack` — the correction-vote
-    /// predicate (this lane's vote only; the warp/warpgroup OR is the
-    /// caller's collective step).
+    /// predicate.
+    ///
+    /// **This lane's vote only.** Combining the votes across the warp or
+    /// warpgroup is the caller's collective step.
     #[inline(always)]
     pub fn any_exceeds(self, reference: Self, slack: f32) -> bool {
         let mut exceed = false;
@@ -812,9 +744,9 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     }
 
     /// Complete each slot's lane-local partial into a whole-row statistic by
-    /// folding across the quad ([`quad_reduce`]) — the second half of
-    /// [`RegTile::row_reduce`], and the half a caller holding its own
-    /// partials (a running softmax sum, say) is the one that needs.
+    /// folding across the quad — the second half of [`RegTile::row_reduce`],
+    /// exposed for a caller that formed its own partials (a running softmax
+    /// sum, say). All four lanes of each quad must call it.
     #[inline(always)]
     pub fn quad_reduce<Op: ReduceOp>(self) -> Self {
         let mut out = self;
@@ -840,14 +772,13 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
 
     /// Fold every row's statistic into one warp-uniform scalar: this thread's
     /// slots, then [`column_group_reduce`] across the 8 lanes holding the
-    /// tile's other rows.
+    /// tile's other rows. Warp-collective.
     ///
-    /// Only meaningful on a vector that is already a *whole*-row statistic —
-    /// one replicated across each quad, which is what
-    /// [`RegTile::row_reduce`] returns and what a lane-local partial is not.
+    /// **Only meaningful on a whole-row statistic** — one replicated across
+    /// each quad, which is what [`RegTile::row_reduce`] returns and what a
+    /// lane-local partial is not. Starting from a tile,
     /// [`RegTile::tile_reduce`] gets the same answer in five shuffles instead
-    /// of `2 * SLOTS + 3`; this exists for the case where the row vector is
-    /// wanted anyway.
+    /// of `2 * SLOTS + 3`.
     #[inline(always)]
     pub fn reduce<Op: ReduceOp>(self) -> f32 {
         let mut folded = Op::IDENTITY;
@@ -859,8 +790,7 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
         column_group_reduce::<Op>(folded)
     }
 
-    /// `Op` on every slot, rewriting this vector; see
-    /// [`RegTile::unary_map_assign`].
+    /// `Op` on every slot, rewriting this vector.
     #[inline(always)]
     pub fn unary_map_assign<Op: UnaryOp>(&mut self) {
         let mut slot = 0;
@@ -914,7 +844,8 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
         }
     }
 
-    /// `Op` slotwise against one scalar; see [`RegTile::scalar_map`].
+    /// `Op` slotwise against one scalar — `scalar_map::<Div>(k)` for a divide,
+    /// `scalar_map::<Max>(k)` for a floor; see [`RegTile::scalar_map`].
     #[inline(always)]
     pub fn scalar_map<Op: BinaryOp>(self, k: f32) -> Self {
         let mut out = self;
@@ -936,7 +867,7 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
         }
     }
 
-    /// `Op` slotwise across three vectors — [`Fma`] and nothing else so far.
+    /// `Op` slotwise across three vectors; [`Fma`] is the only such op today.
     #[inline(always)]
     pub fn ternary_map<Op: TernaryOp>(self, b: Self, c: Self) -> Self {
         let mut out = self;
@@ -977,7 +908,7 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
         /// Slotwise `self += other`.
         add_assign = Add;
         sub_assign = Sub;
-        /// Slotwise `self *= other` — the running sum's rescale.
+        /// Slotwise `self *= other`.
         mul_assign = Mul;
         div_assign = Div;
         max_assign = Max;
@@ -986,17 +917,22 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
 }
 
 /// Per-thread column statistics of a `[_, N]` fragment-mapped tile: one `f32`
-/// per owned column (value). The mirror of [`RegVec`] across the transpose,
-/// and TK's `row_vec` — see the module docs on that inversion.
+/// per owned column (value). The mirror of [`RegVec`] across the transpose.
 ///
 /// Under [`BaseLdtm`] a lane's columns depend only on `lane % 4`, so the 8
-/// lanes of a column group hold 8 copies of the same `N/4` entries; a
-/// whole-warp column statistic is consistent only once those copies agree.
-/// [`RegTile::col_reduce`] is what makes them agree — it folds across those 8
-/// lanes ([`column_group_reduce`]) and so returns a vector every lane of the
-/// group reads the same way. A vector built any other way (splatted, or from
-/// [`Self::column`]) is a legitimate `col_map` operand but carries no such
+/// lanes of a column group hold 8 copies of the same `N/4` entries. Those
+/// copies agree only after a fold across the group, which is what
+/// [`RegTile::col_reduce`] does. A vector built any other way (splatted, or
+/// from [`Self::column`]) is a legitimate `col_map` operand but carries no such
 /// guarantee, and [`Self::reduce`] is only meaningful on one that does.
+///
+/// ```no_run
+/// # use kittens::reg::{BaseLdtm, ColVec, RegTile};
+/// # unsafe fn demo(tile: RegTile<32, 64, BaseLdtm>) {
+/// let means: ColVec<64, BaseLdtm> = tile.col_sum().scale(1.0 / 32.0);
+/// let centered = tile.sub_col(means);
+/// # }
+/// ```
 pub struct ColVec<const N: usize, L: ColLayout<N>>(pub L::Values);
 
 impl<const N: usize, L: ColLayout<N>> Clone for ColVec<N, L> {
@@ -1010,7 +946,7 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
     /// Columns of the tile this thread owns.
     pub const VALUES: usize = L::VALUES;
 
-    /// Wrap this thread's values; see [`RegVec::from_slots`].
+    /// Wrap this thread's values.
     #[inline(always)]
     pub fn from_values(values: L::Values) -> Self {
         Self(values)
@@ -1042,10 +978,10 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
 
     /// Fold every column's statistic into one warp-uniform scalar: this
     /// thread's values, then [`quad_reduce`] across the 4 lanes holding the
-    /// tile's other columns. The mirror of [`RegVec::reduce`], and subject to
-    /// the same precondition — the vector must already hold whole-column
-    /// statistics, i.e. the 8 copies must agree, which is what
-    /// [`RegTile::col_reduce`] establishes.
+    /// tile's other columns. Warp-collective.
+    ///
+    /// **Only meaningful once the 8 copies agree** — i.e. on a vector
+    /// [`RegTile::col_reduce`] produced. The mirror of [`RegVec::reduce`].
     #[inline(always)]
     pub fn reduce<Op: ReduceOp>(self) -> f32 {
         let mut folded = Op::IDENTITY;
@@ -1058,9 +994,8 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
     }
 
     /// Complete each value's lane-local partial into a whole-column statistic
-    /// by folding across the column group ([`column_group_reduce`]) — the
-    /// mirror of [`RegVec::quad_reduce`], and the step that makes the 8 copies
-    /// of a [`ColVec`] agree.
+    /// by folding across the column group — the step that makes the 8 copies of
+    /// a [`ColVec`] agree. All 8 lanes of the group must call it.
     #[inline(always)]
     pub fn column_group_reduce<Op: ReduceOp>(self) -> Self {
         let mut out = self;
@@ -1165,6 +1100,21 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
 /// the ownership map `L`: `L::SLOTS` owned rows × `L::VALUES` owned values per
 /// row. `L` maps `(lane, slot, value)` back to the logical `(row, column)`, so
 /// nothing here has to know how the fragment is scattered.
+///
+/// `M` and `N` are one warp's extents. Elementwise ops are lane-local;
+/// reductions are warp-collective and every lane must reach them.
+///
+/// ```no_run
+/// # use kittens::lane;
+/// # use kittens::reg::{BaseLdtm, RegTile};
+/// # unsafe fn demo(scores: RegTile<32, 64, BaseLdtm>) -> RegTile<32, 64, BaseLdtm> {
+/// let mut acc = RegTile::<32, 64, BaseLdtm>::zero();
+/// let mut band = scores.scale(0.125);
+/// band.right_fill(lane(), 48, f32::NEG_INFINITY);
+/// acc.add_assign(band.exp2());
+/// acc
+/// # }
+/// ```
 pub struct RegTile<const M: usize, const N: usize, L: FragmentLayout<M, N>>(pub L::Storage);
 
 impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> Clone for RegTile<M, N, L> {
@@ -1174,10 +1124,9 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> Clone for RegTile<
 }
 impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> Copy for RegTile<M, N, L> {}
 
-/// The `[16, 16]` tile one [`crate::tmem::TmemTile`] drain returns: the two
-/// rows a thread owns in a 16-row block, times the four values it owns in a
-/// 16-column block. Every register pass over a TMEM accumulator is a loop over
-/// these.
+/// The `[16, 16]` tile one [`crate::tmem::TmemTile`] drain returns: 2 slots ×
+/// 4 values per thread. Block `(row_block, column_block)`'s `(slot, value)`
+/// sits at `(2*row_block + slot, 4*column_block + value)` of a bigger tile.
 pub type Fragment = RegTile<16, 16, BaseLdtm>;
 
 impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
@@ -1186,8 +1135,7 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     /// Values this thread owns per row.
     pub const VALUES: usize = L::VALUES;
 
-    /// Wrap this thread's values, slot-major. Named rather than the tuple
-    /// constructor because a type alias ([`Fragment`]) can't spell one.
+    /// Wrap this thread's values, slot-major.
     #[inline(always)]
     pub fn from_values(values: L::Storage) -> Self {
         Self(values)
@@ -1199,8 +1147,7 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
         Self(L::splat(0.0))
     }
 
-    /// Every value set to `value`. TK's nullary `one`/`pos_infty`/`neg_infty`
-    /// ops are this with the constant written out.
+    /// Every value set to `value`.
     #[inline(always)]
     pub fn splat(value: f32) -> Self {
         Self(L::splat(value))
@@ -1261,18 +1208,26 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     /// Replace every value whose logical coordinate `keep` rejects with
     /// `fill`, in place — the mechanism under the masks and fills below.
     ///
-    /// Lane-local: the map hands a thread whole `(row, column)` pairs, so a
-    /// mask is a select on registers it already holds and no lane learns
-    /// anything from another. In place because a mask is the innermost thing
-    /// in an attention loop and its input is dead the instant it returns; the
-    /// by-value spelling would put a second band beside the score band at
-    /// exactly the width #5 and #38 measured that to cost.
+    /// `keep` sees the **logical** `(row, column)` in `0..M × 0..N`, not the
+    /// storage position, and must be pure: it runs once per owned value.
+    /// Lane-local — no lane learns anything from another — so `lane` must be
+    /// the calling thread's own.
     ///
-    /// Coordinates are `i32`, not `u32`: a tiled kernel's bounds are
-    /// differences of block origins and leave `0..M × 0..N` in both
-    /// directions. That is not an edge case — it is how a band wholly above
-    /// the diagonal takes `keep` false everywhere and one wholly below takes
-    /// it true everywhere, which is most of the bands in a causal kernel.
+    /// Coordinates are `i32`, not `u32`, because a tiled kernel's bounds are
+    /// differences of block origins and land outside `0..M × 0..N` in both
+    /// directions. That is the common case, not the edge one: a band wholly
+    /// above the diagonal takes `keep` false everywhere.
+    ///
+    /// ```no_run
+    /// # use kittens::lane;
+    /// # use kittens::reg::{BaseLdtm, RegTile};
+    /// # unsafe fn demo(scores: &mut RegTile<32, 64, BaseLdtm>) {
+    /// // A sliding window of 16 keys, in this band's own coordinates.
+    /// scores.mask(lane(), -1.0e30, |row, column| {
+    ///     column <= row && column > row - 16
+    /// });
+    /// # }
+    /// ```
     #[inline(always)]
     pub fn mask(&mut self, lane: u32, fill: f32, keep: impl Fn(i32, i32) -> bool) {
         let mut slot = 0;
@@ -1293,12 +1248,11 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     /// Keep the lower triangle — `column - row <= diagonal` — and fill the
     /// rest.
     ///
-    /// `diagonal` is where the boundary crosses this tile's own `(0, 0)`, so
-    /// a tile that is a sub-block of a larger matrix passes the difference of
-    /// its origins and gets the larger matrix's diagonal. TK's `tril` has no
-    /// such parameter because it masks a tile against itself, which is right
-    /// for exactly one block of a tiled kernel and silently wrong for the
-    /// rest; see [`Self::make_causal_at`].
+    /// `diagonal` is where the boundary crosses this tile's own `(0, 0)`, so a
+    /// tile that is a sub-block of a larger matrix passes the difference of its
+    /// origins and gets the larger matrix's diagonal. Passing `0` masks the
+    /// tile against itself, which is right for exactly one block of a tiled
+    /// kernel; see [`Self::make_causal_at`].
     #[inline(always)]
     pub fn tril(&mut self, lane: u32, diagonal: i32, fill: f32) {
         self.mask(lane, fill, |row, column| column - row <= diagonal);
@@ -1328,15 +1282,23 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     }
 
     /// [`Self::make_causal`] taking the two block origins a flash kernel
-    /// already holds instead of their difference: the band covers queries
-    /// `query_base..query_base + M` against keys `key_base..key_base + N`, and
-    /// its diagonal sits at `query_base - key_base`.
+    /// already holds: the band covers queries `query_base..query_base + M`
+    /// against keys `key_base..key_base + N`, and its diagonal sits at
+    /// `query_base - key_base`.
     ///
-    /// Taking them separately is not sugar. The difference is negative for
-    /// every band above the diagonal — the fully-masked ones — and both
-    /// origins are `u32` at the call site, so `query_base - key_base` written
-    /// there wraps to a huge positive number and masks nothing. This subtracts
-    /// in `i32`.
+    /// **Prefer this to computing the difference at the call site.** Both
+    /// origins are `u32` there, and the difference is negative for every band
+    /// above the diagonal — the fully-masked ones — so a `u32` subtraction
+    /// wraps to a huge positive number and masks nothing. This subtracts in
+    /// `i32`.
+    ///
+    /// ```no_run
+    /// # use kittens::lane;
+    /// # use kittens::reg::{BaseLdtm, RegTile};
+    /// # unsafe fn demo(scores: &mut RegTile<32, 64, BaseLdtm>, key_block: u32) {
+    /// scores.make_causal_at(lane(), 32 * kittens::warp_id(), 64 * key_block, -1.0e30);
+    /// # }
+    /// ```
     #[inline(always)]
     pub fn make_causal_at(&mut self, lane: u32, query_base: u32, key_base: u32, fill: f32) {
         self.make_causal(lane, query_base as i32 - key_base as i32, fill);
@@ -1373,16 +1335,9 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     /// Scale every value in row-slot `s` by `factors` slot `s` — the
     /// running-max rescale of an online-softmax accumulator.
     ///
-    /// A wrapper as of #31, and it was hand-written until then for a reason
-    /// worth keeping. It is `mul_row` by definition
-    /// (`scale_rows_is_the_multiply_row_map`), but the *by-value* `mul_row`
-    /// builds a second tile and leaves the allocator to prove the first one
-    /// dead, and at the flash accumulator's width that proof does not land:
-    /// `softmax_probe_128` goes 168 → 255 registers/thread on that swap
-    /// (`modal_app.py::regcount`). What it may safely become is the *in-place*
-    /// map, which measures identically to this loop — 64 registers at 32
-    /// columns and 168 at 128, same spills, same stack frame — which is the
-    /// bar #31 set for deleting the hand-written body.
+    /// The same arithmetic as [`Self::mul_row`], but in place: at the flash
+    /// accumulator's width the by-value spelling costs 255 registers/thread
+    /// against this one's 168.
     #[inline(always)]
     pub fn scale_rows(&mut self, factors: RegVec<M, L>) {
         self.row_map_assign::<Mul>(factors);
@@ -1390,10 +1345,9 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
 
     /// `Op` on every owned value, rewriting this tile.
     ///
-    /// The in-place half of the map mechanism (#31). Each by-value map below
-    /// computes exactly this into a fresh copy — the copy is the whole of the
-    /// difference, and it is the difference that costs. See
-    /// [`Self::bin_map_assign`] for when a call site should prefer which.
+    /// Each by-value map below computes exactly this into a fresh copy; the
+    /// copy is the whole of the difference, and it is the difference that
+    /// costs. [`Self::bin_map_assign`] carries the rule for choosing.
     #[inline(always)]
     pub fn unary_map_assign<Op: UnaryOp>(&mut self) {
         let mut slot = 0;
@@ -1407,19 +1361,20 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
         }
     }
 
+    // This loop is written out rather than delegating to `unary_map_assign` on
+    // a copy, as is every by-value map below. The delegating form is the
+    // obvious factoring and it moves register counts in both directions:
+    // 71 -> 32 on one probe, 64 -> 80 on another, 168 -> 128 with a 512-byte
+    // stack frame on a third.
+
     /// `Op` on every owned value.
     ///
-    /// The loop is written out rather than delegating to
-    /// [`Self::unary_map_assign`] on a copy, and the same goes for every
-    /// by-value map below. The two spell the same arithmetic and the
-    /// delegating form is the obvious factoring, but it is not free: routing
-    /// the by-value maps through their in-place twins moved *every* probe in
-    /// `regcount` that uses a map, in both directions — `mask_probe_128_causal`
-    /// 71 → 32 registers, `softmax_probe_32_hand_written` 64 → 80, and
-    /// `lane_probe_128_hoisted` 168 → 128 registers while its stack frame grew
-    /// 512 bytes. Same reason the reductions below spell their folds out; the
-    /// duplication is held honest by
-    /// `in_place_tile_maps_are_their_by_value_twins`, not by sharing a body.
+    /// ```no_run
+    /// # use kittens::reg::{BaseLdtm, Relu, RegTile};
+    /// # unsafe fn demo(tile: RegTile<32, 64, BaseLdtm>) -> RegTile<32, 64, BaseLdtm> {
+    /// tile.unary_map::<Relu>()
+    /// # }
+    /// ```
     #[inline(always)]
     pub fn unary_map<Op: UnaryOp>(self) -> Self {
         let mut out = self;
@@ -1438,28 +1393,22 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     /// `Op` against `other` at the same logical coordinate, rewriting this
     /// tile.
     ///
-    /// **When this is worth writing instead of [`Self::bin_map`].** Not
-    /// always, and the reason is not the one #31 was filed under. Measured on
-    /// `scalar_map_probe_128` and `softmax_probe_128` (`regcount`, sm_100a),
-    /// what orders the spellings of one `[32, 128]` step is how many whole
-    /// bands have to be *materialized between statements* — which the calling
-    /// convention only correlates with:
+    /// **When to write this instead of [`Self::bin_map`].** What costs
+    /// registers is a whole band materialized *between statements*, so the rule
+    /// at a call site is: say the whole step in one expression if you can,
+    /// write it in place if you cannot. That is where the input is the output —
+    /// an accumulator, or a rescale of one — and at `[32, 128]` the difference
+    /// is 168 registers against 255 plus a spill. Where a by-value spelling
+    /// already rebinds a dead input it costs nothing.
     ///
-    /// ```text
-    /// out_acc = out_acc.scale(k).add(block.scale(k))   168 regs, no spill
-    /// out_acc.scale_assign(k); out_acc.add_assign(b)   252 regs, no spill
-    /// out_acc = out_acc.scale(k); .. = ..add(block)    255 regs,  60 B
-    /// out_acc = out_acc.add(block.scale(k))            255 regs, 108 B
+    /// ```no_run
+    /// # use kittens::reg::{Add, BaseLdtm, RegTile};
+    /// # unsafe fn demo(mut acc: RegTile<32, 128, BaseLdtm>, block: RegTile<32, 128, BaseLdtm>) {
+    /// acc.bin_map_assign::<Add>(block);
+    /// # }
     /// ```
     ///
-    /// So the rule at a call site is: *say the whole step in one expression if
-    /// you can; write it in place if you cannot.* An in-place form is worth
-    /// reaching for where the input is the output — an accumulator, or a
-    /// rescale of one — which is where a single expression cannot be written
-    /// and where a by-value map would otherwise cost a whole band
-    /// (`row_map::<Mul>` against [`Self::mul_row_assign`]: 255 against 168).
-    /// Where the by-value spelling already rebinds a dead input, it costs
-    /// nothing and needs no conversion.
+    /// `docs/library/reg.md` has the table these come off.
     #[inline(always)]
     pub fn bin_map_assign<Op: BinaryOp>(&mut self, other: Self) {
         let mut slot = 0;
@@ -1498,17 +1447,20 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
         out
     }
 
-    /// `Op` against one scalar broadcast over every owned value — `k` in a
-    /// register, not a tile, so the operand costs one register rather than
-    /// `SLOTS * VALUES` and no [`Self::splat`] runs.
+    /// `Op` against one warp-uniform scalar broadcast over every owned value —
+    /// `k` in a register, not a tile, so the operand costs one register rather
+    /// than `SLOTS * VALUES` and no [`Self::splat`] runs.
     ///
-    /// A [`BinaryOp`] and not a stateful op trait: `UnaryOp::apply` is an
-    /// associated function on a unit struct, so a scaling factor has nowhere to
-    /// live, and making it live somewhere would put a value in a type
-    /// parameter's shadow where the inliner has to rediscover it. Treating the
-    /// scalar as the second operand instead means the whole existing op set —
-    /// `Div` for a divide by a constant, `Max`/`Min` for a bound, `Sub` — is
-    /// reachable the day it is written.
+    /// The scalar is the op's *second* operand, so every [`BinaryOp`] is
+    /// reachable this way — the named wrappers ([`Self::scale`],
+    /// [`Self::shift`], the clamps) are only the common spellings.
+    ///
+    /// ```no_run
+    /// # use kittens::reg::{BaseLdtm, Div, RegTile};
+    /// # unsafe fn demo(tile: RegTile<32, 64, BaseLdtm>, n: f32) -> RegTile<32, 64, BaseLdtm> {
+    /// tile.scalar_map::<Div>(n)
+    /// # }
+    /// ```
     #[inline(always)]
     pub fn scalar_map<Op: BinaryOp>(self, k: f32) -> Self {
         let mut out = self;
@@ -1525,8 +1477,8 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     }
 
     /// `Op` against one scalar, rewriting this tile — [`Self::scalar_map`]'s
-    /// in-place form, and the one #38 measured a hand-written loop of at 252
-    /// registers and no spill where the by-value spelling spilled 60 bytes.
+    /// in-place form. At `[32, 128]` it holds 252 registers and no spill where
+    /// the by-value spelling spills 60 bytes.
     #[inline(always)]
     pub fn scalar_map_assign<Op: BinaryOp>(&mut self, k: f32) {
         let mut slot = 0;
@@ -1540,9 +1492,8 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
         }
     }
 
-    /// `Op` across `self`, `b` and `c`, rewriting this tile. Unmeasured: no
-    /// probe monomorphizes a ternary map at 128 columns, so what it saves over
-    /// [`Self::ternary_map`] there is a guess and not a number.
+    /// `Op` across `self`, `b` and `c`, rewriting this tile. What it saves over
+    /// [`Self::ternary_map`] at 128 columns is unmeasured.
     #[inline(always)]
     pub fn ternary_map_assign<Op: TernaryOp>(&mut self, b: Self, c: Self) {
         let mut slot = 0;
@@ -1601,12 +1552,10 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     }
 
     /// `Op` against a per-row scalar broadcast along that row, rewriting this
-    /// tile — the form [`Self::scale_rows`] is `Mul` of, and the one #31 was
-    /// filed to get.
+    /// tile — what [`Self::scale_rows`] is `Mul` of.
     ///
-    /// One row's factor is read once and spent before the next row's is
-    /// formed, exactly as in the hand-written loop, so a `RegVec` operand
-    /// costs one live register rather than a second band.
+    /// One row's factor is read once and spent before the next row's is formed,
+    /// so a `RegVec` operand costs one live register rather than a second band.
     #[inline(always)]
     pub fn row_map_assign<Op: BinaryOp>(&mut self, rows: RegVec<M, L>) {
         let mut slot = 0;
@@ -1624,6 +1573,13 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     /// `Op` against a per-row scalar broadcast along that row: every value of
     /// row-slot `s` sees `rows` slot `s`. No shuffle — the map already gives a
     /// thread every one of its rows' values, so the operand is lane-local.
+    ///
+    /// ```no_run
+    /// # use kittens::reg::{BaseLdtm, RegTile, Sub};
+    /// # unsafe fn demo(scores: RegTile<32, 64, BaseLdtm>) -> RegTile<32, 64, BaseLdtm> {
+    /// scores.row_map::<Sub>(scores.row_max()).exp2()
+    /// # }
+    /// ```
     #[inline(always)]
     pub fn row_map<Op: BinaryOp>(self, rows: RegVec<M, L>) -> Self {
         let mut out = self;
@@ -1642,9 +1598,8 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
 
     /// `Op` against a per-column scalar broadcast down that column: the value
     /// at `(slot, value)` sees `cols` value `value`, i.e. the scalar for
-    /// logical column [`ColVec::column`]`(lane, value)`. Also shuffle-free,
-    /// for the mirror reason — but see [`ColVec`] on where the operand can
-    /// legitimately come from today.
+    /// logical column [`ColVec::column`]`(lane, value)`. Also shuffle-free —
+    /// but see [`ColVec`] on which operands carry a whole-column meaning.
     #[inline(always)]
     pub fn col_map<Op: BinaryOp>(self, cols: ColVec<N, L>) -> Self {
         let mut out = self;
@@ -1684,24 +1639,27 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     }
 
     // The three reductions below each spell their lane-local fold out rather
-    // than sharing one `fold(self, slot)` helper. The helper is the obvious
-    // factoring and it costs a whole tile: even `#[inline(always)]`, taking
-    // `self` by value materializes a second copy of the storage, and
-    // `softmax_probe_32` measures 94 registers/thread against 64 for the
-    // written-out loop, with `softmax_probe_128_row_map` picking up 456 bytes
-    // of spill stores on the same change (`modal_app.py::regcount`). Same
-    // reason `scale_rows` is `row_map_assign::<Mul>` and not `row_map::<Mul>`:
-    // what costs is the copy the shared body is reached through, not the
-    // sharing.
+    // than sharing one `fold(self, slot)` helper. Taking `self` by value
+    // materializes a second copy of the storage even at `#[inline(always)]`:
+    // 94 registers/thread against 64 for the written-out loop, and 456 bytes
+    // of spill stores at 128 columns.
 
     /// Fold each row across all `N` columns: this thread's columns of the row,
     /// then [`quad_reduce`] over the quad that holds the rest of them. Two
-    /// shuffles per owned row.
+    /// shuffles per owned row, so **every lane of the warp must call it**.
     ///
     /// `Op` is applied in the *layout's* order, not left to right along the
-    /// row, so a non-associative one gets a well-defined but unhelpful answer.
-    /// The result is a whole-row statistic replicated across each quad, which
-    /// is exactly the operand [`Self::row_map`] wants.
+    /// row. The result is a whole-row statistic replicated across each quad,
+    /// which is exactly the operand [`Self::row_map`] wants.
+    ///
+    /// ```no_run
+    /// # use kittens::reg::{Add, BaseLdtm, Max, RegTile};
+    /// # unsafe fn demo(scores: RegTile<32, 64, BaseLdtm>) {
+    /// let row_max = scores.row_reduce::<Max>();
+    /// let probs = scores.sub_row(row_max).exp2();
+    /// let denominator = probs.row_reduce::<Add>();
+    /// # }
+    /// ```
     #[inline(always)]
     pub fn row_reduce<Op: ReduceOp>(self) -> RegVec<M, L> {
         let mut partials = RegVec::<M, L>::splat(Op::IDENTITY);
@@ -1721,9 +1679,10 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
 
     /// Fold each column across all `M` rows: this thread's rows of the column,
     /// then [`column_group_reduce`] over the 8 lanes that hold the rest of
-    /// them. Three shuffles per owned column, and the op that makes a
-    /// [`ColVec`] whole — before it, the 8 lanes of a column group hold 8
-    /// independent partials of the same column.
+    /// them. Every lane of the warp must call it.
+    ///
+    /// The op that makes a [`ColVec`] whole — before it, the 8 lanes of a
+    /// column group hold 8 independent partials of the same column.
     #[inline(always)]
     pub fn col_reduce<Op: ReduceOp>(self) -> ColVec<N, L> {
         let mut partials = ColVec::<N, L>::splat(Op::IDENTITY);
@@ -1744,12 +1703,11 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     /// Fold the whole tile to one warp-uniform scalar: every register this
     /// thread owns, then [`warp_reduce`] over all 32 lanes. Five shuffles
     /// total, against the `2 * SLOTS + 3` of routing through
-    /// [`Self::row_reduce`] and [`RegVec::reduce`].
+    /// [`Self::row_reduce`] and [`RegVec::reduce`]. Every lane must call it.
     ///
-    /// Warp scope. A tile that several warps own — layernorm's group-norm
-    /// statistic over four warps' bands — needs those warps to agree, which is
-    /// a shared-memory staging step this returns no help with; see the crate's
-    /// #3/#13 discussion.
+    /// **Warp scope.** A statistic over a tile several warps own — layernorm's
+    /// group norm across four warps' bands — needs a shared-memory staging
+    /// step this gives no help with.
     #[inline(always)]
     pub fn tile_reduce<Op: ReduceOp>(self) -> f32 {
         let mut folded = Op::IDENTITY;
@@ -1779,8 +1737,8 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     }
 
     op_methods! { assign
-        /// `self += other` — flash's output accumulator taking one key
-        /// block's contribution, and the name that example was blocked on.
+        /// `self += other` — an output accumulator taking one block's
+        /// contribution.
         add_assign = Add;
         sub_assign = Sub;
         mul_assign = Mul;
@@ -1793,8 +1751,7 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
         row_max = Max;
         row_min = Min;
         row_sum = Add;
-        /// The product of each row. [`Mul`] *is* the product op — a separate
-        /// `Prod` would be the same `a * b` under a second name.
+        /// The product of each row.
         row_prod = Mul;
     }
 
@@ -1808,8 +1765,7 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
 
     op_methods! { tile_reduce
         /// Prefixed `tile_` because [`Self::max`] is already the elementwise
-        /// binary op; TK distinguishes the two by C++ overloading, which Rust
-        /// has no equivalent of.
+        /// binary op.
         tile_max = Max;
         tile_min = Min;
         tile_sum = Add;
@@ -1827,8 +1783,8 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     op_methods! { row_assign
         add_row_assign = Add;
         sub_row_assign = Sub;
-        /// The in-place form of [`Self::mul_row`], and the op
-        /// [`Self::scale_rows`] had to be hand-written to avoid.
+        /// The in-place form of [`Self::mul_row`]; [`Self::scale_rows`] is its
+        /// name at an online-softmax accumulator.
         mul_row_assign = Mul;
         div_row_assign = Div;
     }
@@ -1848,21 +1804,28 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     }
 }
 
-/// One correction step of the online softmax, in the exact per-slot order of
-/// the hand-written kernels: advance `m_ref` to cover `row_max`, and rescale
-/// `running_sum` and `out_acc` into the new reference. Fused on purpose —
-/// one scalar `next`/`factor` live at a time, each row's values rescaled
-/// before the next row's factor is formed. The unfused form (`max`/`sub`/
-/// `exp2`/`scale_rows`) keeps two full vectors live across the accumulator
-/// scaling and measurably costs registers in register-tight kernels
-/// (persistent forward: 206 → 212 regs/thread on B200).
+/// One correction step of the online softmax: advance `m_ref` to cover
+/// `row_max`, then rescale `running_sum` and `out_acc` into the new reference.
 ///
-/// `softmax_probe_32` reproduces that direction at 56 vs 64 regs/thread and
-/// `softmax_probe_128` does not reproduce it at all (168 either way) — the
-/// probe holds its accumulator in registers, where the real kernel holds it in
-/// TMEM and drains, so the probe bounds the fusion's worth but does not
-/// license undoing it. The 206 → 212 number stands until a kernel of that
-/// shape says otherwise.
+/// Lane-local — `row_max` must already be a whole-row statistic
+/// ([`RegTile::row_reduce`]) — and all three operands are rewritten in place.
+///
+/// Fused on purpose: one `next`/`factor` scalar live at a time. Writing the
+/// four steps separately (`max` / `sub` / `exp2` / `scale_rows`) keeps two full
+/// vectors live across the accumulator scaling and costs 206 → 212
+/// registers/thread in the persistent forward kernel on B200.
+///
+/// ```no_run
+/// # use kittens::reg::{BaseLdtm, RegTile, RegVec, online_rescale};
+/// # unsafe fn demo(
+/// #     scores: RegTile<32, 64, BaseLdtm>,
+/// #     m_ref: &mut RegVec<32, BaseLdtm>,
+/// #     running_sum: &mut RegVec<32, BaseLdtm>,
+/// #     out_acc: &mut RegTile<32, 64, BaseLdtm>,
+/// # ) {
+/// online_rescale(m_ref, scores.row_max(), running_sum, out_acc);
+/// # }
+/// ```
 #[inline(always)]
 pub fn online_rescale<const M: usize, const N: usize, L: FragmentLayout<M, N>>(
     m_ref: &mut RegVec<M, L>,
@@ -1897,7 +1860,7 @@ mod tests {
     /// Its column statistics.
     type Cols = ColVec<32, BaseLdtm>;
 
-    /// The flash score band, and the shape #23 was filed about.
+    /// The flash score band.
     type Band = RegTile<32, 64, BaseLdtm>;
 
     /// A tile whose value at `(row, column)` names that coordinate exactly, so
@@ -2045,11 +2008,9 @@ mod tests {
 
     #[test]
     fn the_shape_set_is_the_product_of_the_extents() {
-        // #23. `FragmentLayout` is a blanket impl over `RowLayout × ColLayout`
-        // now, so a shape costs no line of its own — and the storage it
-        // projects is still exactly the `[[f32; N/4]; M/8]` the per-shape
-        // impls named, which is what says the change is a spelling and not a
-        // representation.
+        // A shape costs no line of its own, and the storage the blanket impl
+        // projects is exactly the `[[f32; N/4]; M/8]` a per-shape impl would
+        // name — a spelling, not a representation.
         assert_eq!(size_of::<Band>(), 32 * 64 / 32 * 4);
         assert_eq!(size_of::<RegTile<16, 512, BaseLdtm>>(), 16 * 512 / 32 * 4);
         assert_eq!(size_of::<RegTile<512, 16, BaseLdtm>>(), 512 * 16 / 32 * 4);
@@ -2075,9 +2036,8 @@ mod tests {
     /// The claim [`ColLayout::CONTIGUOUS_VALUES`] makes, checked as stated
     /// rather than by re-deriving `{0, 1, 8, 9}`: every run of that many
     /// values, from a run-aligned start, is a run of consecutive columns from
-    /// a run-aligned column. That is exactly what `store_rows` and `load_rows`
-    /// turn into a vector access, and the reason the constant is a property of
-    /// the map and not of the mover (#91).
+    /// a run-aligned column. That is what `store_rows` and `load_rows` turn
+    /// into a vector access.
     #[test]
     fn base_ldtm_pairs_every_other_value() {
         fn values_run_in_column_order<const N: usize, L: ColLayout<N>>() {
@@ -2120,12 +2080,10 @@ mod tests {
 
     #[test]
     fn fragment_blocks_tile_the_bigger_shapes() {
-        // A TMEM drain only ever returns `Fragment`s, so every tile wider or
-        // taller than [16, 16] is assembled by placing block (row_block,
-        // column_block)'s (slot, value) at (2*row_block + slot, 4*column_block
-        // + value). That composition is spelled by hand in kernel drain loops
-        // and by the device harness; this is the assertion that it is the same
-        // map the bigger shape's own `coordinate` gives.
+        // A TMEM drain only ever returns `Fragment`s, so kernel drain loops
+        // assemble a bigger tile by placing block (row_block, column_block)'s
+        // (slot, value) at (2*row_block + slot, 4*column_block + value). That
+        // must be the same map the bigger shape's own `coordinate` gives.
         fn composes<const M: usize, const N: usize, L: FragmentLayout<M, N>>() {
             for lane in 0..32 {
                 for row_block in 0..M / 16 {
@@ -2499,9 +2457,7 @@ mod tests {
             .unwrap()
     }
 
-    /// One lane's own registers of a row-slot, folded. The reductions spell
-    /// this out inline rather than share it — see the note in `RegTile` on
-    /// what the shared helper cost — so the host test carries its own copy.
+    /// One lane's own registers of a row-slot, folded.
     fn lane_row_partial<Op: ReduceOp>(tile: Scores, slot: usize) -> f32 {
         (0..Scores::VALUES).fold(Op::IDENTITY, |folded, value| {
             Op::apply(folded, tile.get(slot, value))
@@ -2597,11 +2553,9 @@ mod tests {
 
     #[test]
     fn scale_rows_is_the_multiply_row_map() {
-        // `scale_rows` is `mul_row_assign` now and the assertion is trivial on
-        // that pair — it is kept against the *by-value* `row_map`, which is
-        // the one it is still not, and which costs 87 registers/thread at the
-        // flash width for being a different program rather than a different
-        // spelling.
+        // `scale_rows` is `mul_row_assign`, so that half is trivial. It is
+        // kept against the *by-value* `row_map` — the one it is not, and the
+        // one that costs 87 registers/thread more at the flash width.
         for lane in 0..32 {
             let tile = coordinate_tile(lane);
             let factors = row_indices(lane);
@@ -2663,12 +2617,10 @@ mod tests {
 
     #[test]
     fn in_place_tile_maps_are_their_by_value_twins() {
-        // #31. The in-place forms exist for register pressure and a kernel
-        // picks between the two spellings on that basis alone, so the one
-        // thing that must never differ is the number. Every generated name is
-        // here, not a sample: a transposed line in an `op_methods!` table is a
-        // wrong kernel, and the by-value tables are only pinned to their ops
-        // one test above.
+        // A kernel picks between the two spellings on register pressure alone,
+        // so the one thing that must never differ is the number. Every
+        // generated name is here, not a sample: a transposed line in an
+        // `op_methods!` table is a wrong kernel.
         let k = -0.75f32;
         for lane in 0..32 {
             let tile = coordinate_tile(lane);
@@ -2778,11 +2730,10 @@ mod tests {
 
     #[test]
     fn causal_masks_against_the_bands_global_origin() {
-        // The whole of #7's correction. The band is a [32, 64] sub-block of a
-        // much larger score matrix, so what decides an element is whether its
-        // *global* key index is at or before its global query index — and the
-        // origin-free mask agrees with that only when the two bases are equal,
-        // which is one block of a tiled kernel and no others.
+        // The band is a [32, 64] sub-block of a much larger score matrix, so
+        // what decides an element is whether its *global* key index is at or
+        // before its global query index. An origin-free mask agrees with that
+        // only when the two bases are equal.
         for (query_base, key_base) in [(0u32, 0u32), (32, 0), (0, 32), (128, 64), (64, 128)] {
             for lane in 0..32 {
                 let unmasked: Band = indexed(lane);

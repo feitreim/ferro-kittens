@@ -1,45 +1,24 @@
 //! The launch envelope: what a kernel's shared plan has to be admitted for.
 //!
-//! A CUDA block gets 48 KiB of dynamic shared memory without asking. Every
-//! plan past that is *opt-in* — `cuFuncSetAttribute` with
-//! `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`, per function, before the
-//! launch — and a launch that skips it is not slow, it is inadmissible. This
-//! library's whole point is tiles big enough to keep tcgen05 fed, so the
-//! kernels here cross 48 KiB as a matter of course: `gemm` at 72 KiB,
-//! `flash_forward` at 144 KiB.
+//! A CUDA block gets 48 KiB of dynamic shared memory without asking; anything
+//! past that is opt-in, per function, before the launch. Kernels written
+//! against this library cross 48 KiB as a matter of course, so a launch that
+//! skips the opt-in is not slow, it is inadmissible.
 //!
-//! # Why this exists when cuda-oxide already has one
+//! [`admit_shared_plan`] is that opt-in for kernels that do not go through a
+//! `#[launch_contract]`'s generated `prepare_*` — which issues it already. It
+//! also separates the two things a zero from
+//! `cuOccupancyMaxActiveBlocksPerMultiprocessor` can mean: a plan nobody opted
+//! into, and a plan the device cannot fit.
 //!
-//! `PreparedLaunch::__prepare` issues the opt-in, and `CudaFunction`'s setter
-//! is `pub(crate)` so that it is the only thing that can. That is the right
-//! default — it validates the plan against the device before mutating the
-//! function — but it is reachable only from a `#[launch_contract]` kernel's
-//! generated `prepare_*`, and a contract is a claim about the whole launch:
-//! its domain, its block shape, and the index space each output slice is
-//! partitioned by. A kernel that partitions its output some other way (warp
-//! bands through a raw cursor, which is what [`crate::global::store_rows`] is
-//! for) cannot state that claim honestly, and should not have to invent one to
-//! get 144 KiB of shared memory.
-//!
-//! So this is the same opt-in with the same check in front of it, on the path
-//! that does not go through a contract. Nothing here replaces `prepare_*`: a
-//! kernel that *can* state a contract should, and gets this for free.
-//!
-//! # Reading a zero
-//!
-//! `cuOccupancyMaxActiveBlocksPerMultiprocessor` answers **0** both for a plan
-//! the device cannot fit and for a plan nobody opted into, and those want
-//! opposite fixes — shrink the tiles, or call this. #70 was an hour of the
-//! wrong one. [`admit_shared_plan`] separates them: it returns
-//! [`SharedPlanTooLarge`] with the device's own ceiling beside the ask, so a
-//! plan that genuinely does not fit says so in bytes rather than in a zero.
+//! Design notes: `docs/library/launch.md`.
 
 use cuda_core::{CudaFunction, DriverError, IntoResult, sys};
 
 /// A shared plan past what this device will admit even with the opt-in.
 ///
-/// Distinct from a [`DriverError`] on purpose: the driver is working fine and
-/// the answer is that the tiles are too big.
+/// Not a [`DriverError`]: the driver is working fine and the answer is that the
+/// tiles are too big.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SharedPlanTooLarge {
     /// Dynamic shared memory the launch asked for.
@@ -60,8 +39,7 @@ impl core::fmt::Display for SharedPlanTooLarge {
 
 impl std::error::Error for SharedPlanTooLarge {}
 
-/// Either reason a large plan is not admitted, kept apart so a caller can tell
-/// them apart.
+/// Either reason a large plan is not admitted.
 #[derive(Debug)]
 pub enum AdmitError {
     /// The plan does not fit this device.
@@ -90,7 +68,7 @@ impl From<DriverError> for AdmitError {
 /// Opt `function` into `bytes` of dynamic shared memory, so that a launch at
 /// that size — and an occupancy query about one — is admissible.
 ///
-/// Idempotent, and monotonic: a function already admitted for at least `bytes`
+/// Idempotent and monotonic: a function already admitted for at least `bytes`
 /// is left alone, so two callers preparing the same kernel cannot lower the
 /// ceiling underneath each other. Under 48 KiB this is a no-op.
 ///
@@ -106,6 +84,27 @@ impl From<DriverError> for AdmitError {
 /// # ) -> Result<u32, Box<dyn std::error::Error>> {
 /// kittens::launch::admit_shared_plan(function, 147_536)?;
 /// Ok(function.max_active_blocks_per_multiprocessor(128, 147_536)?)
+/// # }
+/// ```
+///
+/// A plan the device will not take names both numbers, where an occupancy
+/// query would only have answered zero:
+///
+/// ```no_run
+/// use kittens::launch::{AdmitError, admit_shared_plan};
+///
+/// # fn admit(
+/// #     function: &cuda_core::CudaFunction,
+/// #     bytes: u32,
+/// # ) -> Result<(), Box<dyn std::error::Error>> {
+/// match admit_shared_plan(function, bytes) {
+///     Ok(()) => Ok(()),
+///     // Shrink the tiles: this device has no more to give.
+///     Err(AdmitError::TooLarge(plan)) => {
+///         Err(format!("{} B asked, {} B available", plan.bytes, plan.limit).into())
+///     }
+///     Err(driver) => Err(driver.into()),
+/// }
 /// # }
 /// ```
 pub fn admit_shared_plan(function: &CudaFunction, bytes: u32) -> Result<(), AdmitError> {

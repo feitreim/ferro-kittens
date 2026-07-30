@@ -1,124 +1,36 @@
 //! Semaphores over mbarrier intrinsics — the phase-parity idiom, first-class.
 //!
 //! cuda-oxide exposes no named barriers, so every cross-warp handoff in a
-//! warp-specialized kernel is an mbarrier phase-parity spin (FA4 does the
-//! same). The soundness rule these types encode: parity arithmetic works
-//! because every barrier's completions lead its waiter by at most one phase —
-//! each producer's next completion transitively requires the previous
-//! consumer wait.
+//! warp-specialized kernel is an mbarrier phase-parity spin. [`Semaphore`] is a
+//! stateless handle over one mbarrier word, [`SemaphoreRing`] owns the
+//! `index → (stage, parity)` arithmetic of an `N`-deep ring, and
+//! [`TransactionBytes`] is a stage's byte charge — obtainable only by issuing
+//! the loads that deliver it, so a charge is a receipt and not a claim.
 //!
-//! A [`Semaphore`] is a stateless handle over one mbarrier word; a
-//! [`SemaphoreRing`] owns the `index → (stage, parity)` arithmetic for the
-//! `N`-deep producer/consumer rings that today thread parity bits by hand.
+//! **The soundness rule**: parity arithmetic works because every barrier's
+//! completions lead its waiter by at most one phase. Nothing here checks that;
+//! [`handoff`] is what establishing it for a real kernel costs. See
+//! `docs/library/sync.md` for cluster-scope charging and the measured depths.
 //!
-//! # Cluster scope, and who charges the bytes
-//!
-//! A [`Semaphore`] is *one CTA's* barrier. A cta_group::2 MMA consumes an
-//! operand stage of four tiles staged by two CTAs, so its issuer needs one
-//! barrier saying the whole stage is present — which means a CTA has to be
-//! able to name its peer's copy. [`Semaphore::at_rank`] does that, and it
-//! hands back a [`ClusterSemaphore`] rather than another [`Semaphore`],
-//! because a barrier that is not yours is not a barrier you may do everything
-//! to.
-//!
-//! That restriction is the ISA's and not ours.
-//! `mbarrier.arrive.expect_tx` takes `.shared::cta` only, and
-//! `mbarrier.arrive … .shared::cluster` carries no transaction count: remote
-//! addressing and byte accounting sit in different instructions and do not
-//! compose. So a CTA may charge exactly one barrier — its own — and may
-//! arrive at any rank's. [`ClusterSemaphore`] offers exactly that pair:
-//! arrive, or hand the address to an engine that will complete transactions
-//! on it. It has no `wait` and no `expect_tx` because there is no instruction
-//! for either, and a type that admitted them would be promising something the
-//! hardware does not do.
-//!
-//! What is left to decide is which CTA's barrier a cluster stage completes on,
-//! and there are only two shapes:
-//!
-//! 1. **The waiter charges the whole stage.** One barrier, in the CTA that
-//!    waits on it. Every rank's TMA completes there — the peers name it
-//!    through [`Semaphore::at_rank`] — and that CTA charges every byte the
-//!    stage will bring in, including the bytes it does not issue itself.
-//! 2. **Every rank charges its own.** Each producer charges the bytes it
-//!    issues against its own barrier, and forwards a
-//!    [`ClusterSemaphore::arrive`] to the waiter once that barrier flips.
-//!
-//! This library takes (1). What (2) has going for it is that the sum stays
-//! local — a CTA charges exactly what it issued, which is the property #29
-//! wants — and that is all it has. It costs a barrier per rank per stage, a
-//! thread per rank spinning on that barrier, and a second hop on the critical
-//! path carrying no information: when a producer's own barrier flips it knows
-//! nothing the TMA engine could not have told the waiter directly.
-//!
-//! The locality is recoverable under (1) anyway, which is what settles it. A
-//! cluster stage is symmetric by construction — every rank stages the same
-//! tile types at the same shared offsets, which is exactly what lets one MMA
-//! descriptor read across the pair — so the whole-stage charge is the local
-//! charge times the number of ranks staging into it, and the rank count is a
-//! launch constant. A charge derived from the loads a producer issued is
-//! still derivable; it is derived once and multiplied.
-//!
-//! One thing (1) looks like it should need and does not: ordering between the
-//! charge and the peers' loads. An mbarrier's transaction count is a signed
-//! accumulator, so completions may land before the `expect_tx` that expects
-//! them — only the totals have to agree. No sync sits between them in the
-//! GEMM and none is owed.
-//!
-//! # Where the transaction count comes from
-//!
-//! [`Semaphore::expect_tx`] takes a [`TransactionBytes`] and nothing else, and
-//! the only way to obtain one is to issue the load that will deliver it. A
-//! stage's charge is the sum of the calls that were made:
-//!
-//! ```ignore
+//! ```no_run
+//! # use cuda_device::tma::TmaDescriptor;
+//! # use kittens::shared::{Bf16, SharedTileRing, Swizzle128B};
+//! # use kittens::sync::SemaphoreRing;
+//! # unsafe fn stage(
+//! #     k_ring: SharedTileRing<Bf16, 128, 64, Swizzle128B, 3>,
+//! #     v_ring: SharedTileRing<Bf16, 128, 64, Swizzle128B, 3>,
+//! #     load: SemaphoreRing<3>,
+//! #     k_map: *const TmaDescriptor,
+//! #     v_map: *const TmaDescriptor,
+//! #     i: u32,
+//! #     base: i32,
+//! #     head: i32,
+//! # ) { unsafe {
 //! let stage = k_ring.tile(i).tma_load(k_map, base, head, load.sem(i))
 //!     + v_ring.tile(i).tma_load(v_map, base, head, load.sem(i));
 //! load.sem(i).expect_tx(stage);
+//! # } }
 //! ```
-//!
-//! Every producer used to write that total by hand — `(KTile::BYTES +
-//! VTile::BYTES) as u32` — and keep it in step with the loads above it by
-//! reading both. Under-charging flips the barrier before the last bytes land
-//! and the consumer reads a half-written tile, with no fault and no
-//! diagnostic; over-charging hangs the block. Adding a load and forgetting the
-//! sum is one edit, and nothing was watching for it.
-//!
-//! The lighter fix — an `expect_tiles(&[…])` taking the tile types — was
-//! rejected because it is the same fact stated twice with nicer syntax. A list
-//! can omit a tile exactly as a sum can omit a term. What has to agree with
-//! the charge is the *set of loads issued*, so the charge has to come from
-//! them and not from anything that restates them.
-//!
-//! Two things that fall out, and are the point:
-//!
-//! - **Writing a wrong number is not expressible.** [`TransactionBytes`] has
-//!   no public constructor and is not an integer, so there is nothing to
-//!   mistype.
-//! - **Issuing a load and dropping its charge is a compile error.** The type
-//!   is `#[must_use]`, so `tile.tma_load(…);` as a statement fails under
-//!   `-D warnings`, and a charge bound to a name that never reaches an
-//!   `expect_tx` fails as an unused binding. It is also not `Copy`, so
-//!   charging the same bytes to two barriers is a use of a moved value.
-//!
-//! What the type does not catch, stated plainly: it says how many bytes, never
-//! which barrier. A load aimed at one semaphore whose charge is paid to
-//! another still type-checks — and has to, because that is exactly what a
-//! cluster stage does. The peers aim their loads at the leader through
-//! [`Semaphore::at_rank`] and the leader charges its own barrier for all of
-//! them, which is [`TransactionBytes::across_ranks`]: the local charge, from
-//! each of the ranks staging into the barrier. It is the `RANKS *` of the
-//! shape-(1) argument above, and it is derived from the loads this CTA issued
-//! rather than written down, because a cluster stage is symmetric — that is
-//! the same symmetry the MMA descriptor reads across the pair on.
-//!
-//! [`block_reduce`] is the other thing a kernel needs the block to agree on,
-//! and it is not a barrier idiom but a *collective*: warps cannot shuffle to
-//! each other, so a statistic spanning them is staged through shared memory
-//! and folded, with `sync_threads` on both sides. It lives here rather than in
-//! [`crate::reg`] because what it is made of is the barrier and the staging
-//! buffer; the register half of the same fold —
-//! [`crate::reg::RegTile::tile_reduce`] and the `shuffle_xor` butterflies — is
-//! warp scope and stops at 32 lanes.
 
 use cuda_device::barrier::{
     Barrier, mbarrier_arrive, mbarrier_arrive_cluster, mbarrier_arrive_expect_tx, mbarrier_init,
@@ -134,13 +46,14 @@ use crate::shared::{F32, SharedVec};
 /// [`Semaphore::expect_tx`] will take.
 ///
 /// Handed back by every TMA load in [`crate::shared`] and constructible no
-/// other way, so a charge is a receipt for transfers that were issued rather
-/// than a claim about them. `+` sums the loads of one stage;
-/// [`Self::across_ranks`] scales a symmetric cluster stage. The module docs
-/// carry the argument for why this is a type and not a `u32`.
+/// other way. `+` sums the loads of one stage; [`Self::across_ranks`] scales a
+/// symmetric cluster stage.
 ///
-/// Deliberately neither `Copy` nor droppable-in-silence: the lints are half of
-/// what it is for.
+/// Deliberately neither `Copy` nor droppable-in-silence: dropping a charge is
+/// an unused-binding error, and paying the same charge to two barriers is a use
+/// of a moved value. It says how many bytes and never *which* barrier — a load
+/// aimed at one semaphore whose charge is paid to another type-checks, and has
+/// to, because that is exactly what a cluster stage does.
 #[must_use = "a load's transaction bytes must reach an expect_tx or its barrier never completes"]
 pub struct TransactionBytes(u32);
 
@@ -158,8 +71,27 @@ impl TransactionBytes {
     ///
     /// Derived and not restated: every rank of a cluster stages the same tile
     /// types at the same shared offsets, so the stage's total is the local
-    /// total scaled by the rank count. See the module docs for who charges and
-    /// why it cannot be the CTA that issued the bytes.
+    /// total scaled by the rank count.
+    ///
+    /// ```no_run
+    /// # use cuda_device::tma::TmaDescriptor;
+    /// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+    /// # use kittens::sync::Semaphore;
+    /// # const RANKS: u32 = 2;
+    /// # unsafe fn stage(
+    /// #     a: SharedTile<Bf16, 128, 64, Swizzle128B>,
+    /// #     map: *const TmaDescriptor,
+    /// #     leader: Semaphore,
+    /// #     rank: u32,
+    /// # ) { unsafe {
+    /// // Every rank aims its own half at the leader's barrier ...
+    /// let mine = a.tma_load_2d_arriving_at(map, 0, 0, leader.at_rank(0));
+    /// // ... and the leader alone charges for all of them.
+    /// if rank == 0 {
+    ///     leader.expect_tx(mine.across_ranks(RANKS));
+    /// }
+    /// # } }
+    /// ```
     #[inline(always)]
     pub const fn across_ranks(self, ranks: u32) -> Self {
         Self(self.0 * ranks)
@@ -246,16 +178,21 @@ impl Semaphore {
     ///
     /// `bytes` is every byte that will complete *against this barrier*, which
     /// under a cluster is not the set the calling CTA issued: a peer's loads
-    /// aimed here through [`Semaphore::at_rank`] are counted here, which is
-    /// what [`TransactionBytes::across_ranks`] states and the module docs say
-    /// why the charge cannot travel with them.
+    /// aimed here through [`Semaphore::at_rank`] are counted here, which is what
+    /// [`TransactionBytes::across_ranks`] states.
+    ///
+    /// Nothing orders this against the loads and nothing has to: the
+    /// transaction count is a signed accumulator, so a completion that lands
+    /// before the charge expecting it leaves the same total.
     ///
     /// # Safety
     ///
-    /// Same contract as [`Semaphore::arrive`]. The charges summed here must be
-    /// exactly those of the loads completing on this barrier — the type makes
-    /// them derived rather than written down, but it does not know which
-    /// barrier a load was aimed at.
+    /// - Same contract as [`Semaphore::arrive`].
+    /// - The charges summed here are exactly those of the loads completing on
+    ///   *this* barrier. The type makes them derived rather than written down,
+    ///   but it does not know which barrier a load was aimed at. Under-charging
+    ///   flips the barrier before the last bytes land; over-charging hangs the
+    ///   block.
     #[inline(always)]
     pub unsafe fn expect_tx(self, bytes: TransactionBytes) {
         unsafe {
@@ -277,8 +214,8 @@ impl Semaphore {
     /// [`Self::wait`] with a deadline: `false` is `ticks` of the SM clock spent
     /// on a phase that did not complete.
     ///
-    /// This is the diagnostic for the failure mode [`Self::wait`] cannot report.
-    /// A parity spin on a phase whose producer has already left is
+    /// The diagnostic for the failure mode [`Self::wait`] cannot report. A
+    /// parity spin on a phase whose producer has already left is
     /// indistinguishable, from outside the launch, from a kernel that is merely
     /// slow — the launch never returns and every warp's position is lost. Bound
     /// each spin and the same launch terminates carrying where each warp was.
@@ -290,10 +227,10 @@ impl Semaphore {
     ///
     /// # Safety
     ///
-    /// As [`Self::wait`], with one clause relaxed and one added: the
-    /// one-phase-lead rule may be *violated*, since that is what this exists to
-    /// catch, and a caller that takes `false` and reads on anyway is reading
-    /// memory no barrier has published.
+    /// - As [`Self::wait`], except that the one-phase-lead rule may be
+    ///   *violated* — catching that is what this is for.
+    /// - A caller that takes `false` and reads on anyway is reading memory no
+    ///   barrier has published.
     #[inline(always)]
     pub unsafe fn wait_before(self, parity: u32, ticks: u64) -> bool {
         unsafe {
@@ -315,9 +252,9 @@ impl Semaphore {
     }
 
     /// This barrier as the CTA at `rank` holds it: the same shared offset, in
-    /// another member of the cluster, addressed through `mapa`. The only thing
-    /// one CTA of a cluster may hand another, and see the module docs for why
-    /// what comes back can be arrived at but neither waited on nor charged.
+    /// another member of the cluster, addressed through `mapa`. What comes back
+    /// can be arrived at but neither waited on nor charged, because the ISA has
+    /// no remote form of either.
     ///
     /// # Safety
     ///
@@ -348,20 +285,13 @@ pub struct ClusterSemaphore {
 impl ClusterSemaphore {
     /// Count one arrival on the remote barrier — the peer-progress signal
     /// [`Semaphore::arrive`] cannot send, being `.shared::cta`. It carries no
-    /// transaction bytes, which is the half of the split the module docs are
-    /// about.
+    /// transaction bytes.
     ///
-    /// Still nothing in this repo calls it, and #51 is worth recording as the
-    /// case that looked like it would and did not. A persistent cluster
-    /// pipeline needs the CTAs of a pair to agree at each work-item boundary,
-    /// which is a *rendezvous*: every rank arriving at every rank. Built out of
-    /// this it is a barrier per rank and a spin per rank, hand-rolling
-    /// `barrier.cluster.arrive`/`wait` — which is one instruction, is what
-    /// [`cuda_device::cluster::cluster_sync`] issues, and is what
-    /// [`crate::pipeline::run`] takes. What is left for this is the signal a
+    /// Nothing in this repo calls it yet. What it is for is the signal a
     /// cluster barrier is the wrong shape for: one named rank telling another
     /// that a specific thing has happened, while the rest of the cluster keeps
-    /// going.
+    /// going. A whole-cluster rendezvous wants
+    /// [`cuda_device::cluster::cluster_sync`] instead.
     ///
     /// # Safety
     ///
@@ -381,11 +311,22 @@ impl ClusterSemaphore {
 
 /// A semaphore that owns its phase counter: [`Self::wait_next`] spins out the
 /// barrier's next completion and advances the parity, so a block-synchronous
-/// kernel never spells `phase & 1` — the `tma_phase`/`mma_phase` locals the
-/// backward kernels used to thread by hand. Every thread keeps its own copy in
-/// registers and they advance in lockstep, which is exactly why those locals
-/// worked; a kernel whose warps wait different numbers of times wants
-/// [`SemaphoreRing`] (or explicit parities) instead.
+/// kernel never spells `phase & 1`.
+///
+/// Every thread keeps its own copy in registers and they advance in lockstep,
+/// which is what makes that sound. A kernel whose warps wait different numbers
+/// of times wants [`SemaphoreRing`] — or explicit parities — instead.
+///
+/// ```no_run
+/// # use kittens::sync::PhasedSemaphore;
+/// # use cuda_device::barrier::Barrier;
+/// # unsafe fn demo(bar: *mut Barrier) { unsafe {
+/// let mut mma = PhasedSemaphore::attach(bar);
+/// for _ in 0..4 {
+///     mma.wait_next();
+/// }
+/// # } }
+/// ```
 #[derive(Clone, Copy)]
 pub struct PhasedSemaphore {
     sem: Semaphore,
@@ -430,6 +371,35 @@ impl PhasedSemaphore {
 /// `index → (stage, parity)` arithmetic in one place: tile `i` uses stage
 /// `i % N`, whose barrier completes once per `N` tiles, so tile `i`'s
 /// completion carries parity `(i / N) & 1`.
+///
+/// The producer and consumer sides of one stage, spelled without a parity bit
+/// in sight:
+///
+/// ```no_run
+/// # use cuda_device::tma::TmaDescriptor;
+/// # use kittens::shared::{Bf16, SharedTileRing, Swizzle128B};
+/// # use kittens::sync::SemaphoreRing;
+/// # unsafe fn produce(
+/// #     tiles: SharedTileRing<Bf16, 128, 64, Swizzle128B, 3>,
+/// #     full: SemaphoreRing<3>,
+/// #     empty: SemaphoreRing<3>,
+/// #     map: *const TmaDescriptor,
+/// #     blocks: u32,
+/// # ) { unsafe {
+/// for i in 0..blocks {
+///     empty.wait_recycled(i);
+///     let bytes = tiles.tile(i).tma_load(map, i as i32 * 64, 0, full.sem(i));
+///     full.sem(i).expect_tx(bytes);
+/// }
+/// # } }
+/// # unsafe fn consume(full: SemaphoreRing<3>, empty: SemaphoreRing<3>, blocks: u32) { unsafe {
+/// for i in 0..blocks {
+///     full.wait(i);
+///     // ... read stage `i % 3` ...
+///     empty.sem(i).arrive();
+/// }
+/// # } }
+/// ```
 #[derive(Clone, Copy)]
 pub struct SemaphoreRing<const N: usize> {
     base: *mut Barrier,
@@ -556,21 +526,24 @@ impl<const N: usize> SemaphoreRing<N> {
 /// overtake the first's readers. Calling it twice in a row — mean, then
 /// variance — needs nothing at the call site.
 ///
-/// `WARPS` is free: any block width from one warp up. It was briefly a
-/// multiple of four, because [`SharedVec`] forced its TMA box rules at
-/// construction and four fp32 is the narrowest legal box — a rule about a
-/// descriptor, binding a vector that never becomes one. Those asserts now sit
-/// on the four transfer methods, so a two-warp block's 8-byte scratch is a
-/// handle like any other. A one-warp block is legal too, and degenerate: the
-/// fold is over a single slot and [`crate::reg::warp_reduce`] is the same
-/// answer without the barriers.
+/// `WARPS` is any block width from one warp up. [`ReduceOp`] rather than
+/// [`crate::reg::BinaryOp`] because the partials arrive in slot order, which is
+/// not an order the caller chose: the fold has to be associative and
+/// commutative to mean anything, and needs an identity to start the same way
+/// whatever `WARPS` is.
 ///
-/// The bound is [`ReduceOp`] rather than [`crate::reg::BinaryOp`] for the
-/// reason `row_reduce` takes one: the warps' partials arrive in slot order,
-/// which is not an order the caller chose, so a fold over them has to be
-/// associative and commutative to mean anything. `Sub` and `Div` are not
-/// members, and the identity is what lets the fold start the same way whatever
-/// `WARPS` is.
+/// ```no_run
+/// # use kittens::reg::{Add, Max};
+/// # use kittens::shared::{F32, SharedVec};
+/// # use kittens::sync::block_reduce;
+/// # use kittens::{BaseLdtm, RegTile};
+/// # unsafe fn demo(scratch: SharedVec<F32, 4>, band: RegTile<32, 64, BaseLdtm>) { unsafe {
+/// let total = block_reduce::<Add, 4>(scratch, band.tile_reduce::<Add>());
+/// // The trailing barrier is what lets a second fold reuse the same scratch.
+/// let peak = block_reduce::<Max, 4>(scratch, band.tile_reduce::<Max>());
+/// # let _ = (total, peak);
+/// # } }
+/// ```
 ///
 /// # Safety
 ///
@@ -619,9 +592,9 @@ pub unsafe fn block_reduce<Op: ReduceOp, const WARPS: usize>(
 
 /// Every element of `scratch`, folded from [`ReduceOp::IDENTITY`] in index
 /// order. The half of [`block_reduce`] with no barrier and no thread identity
-/// in it, and therefore the half a host test can run: every thread executes
-/// exactly this, over exactly these slots, in exactly this order, which is what
-/// makes the result block-uniform bit for bit rather than merely equal.
+/// in it: every thread executes exactly this, over exactly these slots, in
+/// exactly this order, which is what makes the result block-uniform bit for bit
+/// rather than merely equal.
 ///
 /// # Safety
 ///
@@ -653,23 +626,27 @@ pub unsafe fn block_reduce_sum<const WARPS: usize>(
     unsafe { block_reduce::<Add, WARPS>(scratch, value) }
 }
 
-/// How deep a mailbox ring the module's one-phase-lead rule needs, worked out by
-/// exhaustive search over a persistent GEMM's own chain of back-pressure.
+/// How deep a mailbox ring the module's one-phase-lead rule needs, by exhaustive
+/// search over a persistent GEMM's own chain of back-pressure.
 ///
-/// The rule at the top of this module — *every barrier's completions lead its
-/// waiter by at most one phase* — is what makes parity arithmetic sound, and it is
-/// a claim about a kernel's protocol that this crate's types cannot check. #149 is
-/// what it costs when the claim is false: `examples/src/gemm_sol.rs` handed work
-/// items across warps through **one** barrier and **one** cell, its producer could
-/// lead the epilogue by four publications, and `4096x4096x1024` stopped returning.
-/// The lead is not a divisibility property and not a `k` threshold — it is what a
-/// chain of independent throttles permits, and the only honest way to get it is to
-/// enumerate the interleavings.
+/// The lead is not a divisibility property and not a `k` threshold — it is what
+/// a chain of independent throttles permits, so the only honest way to get it is
+/// to enumerate the interleavings. This is a model and it says so; it is `pub`
+/// because a kernel's shape contract is where its handoff depth is decided, and
+/// deciding one should be an assertion rather than an argument. Feed it the trip
+/// counts and it hands back the depth [`SemaphoreRing`] and
+/// [`crate::shared::SharedCellRing`] must be built at.
 ///
-/// So this is a model and it says so. It is `pub` because a kernel's shape
-/// contract is where its handoff depth is decided, and deciding one should be an
-/// assertion rather than an argument: give it the trip count and it gives back the
-/// depth [`SemaphoreRing`] and [`crate::shared::SharedCellRing`] must be built at.
+/// ```
+/// # use kittens::sync::handoff::depth_needed;
+/// // Four operand stages over a two-deep accumulator, five items: the
+/// // *shallowest* `k` is the deepest lead.
+/// assert_eq!(depth_needed(4, 5, 4, 2), 4);
+/// assert_eq!(depth_needed(16, 5, 4, 2), 3);
+/// ```
+///
+/// The measured depths, and why a shallow `k` is the worst case, are in
+/// `docs/library/sync.md`.
 pub mod handoff {
     use std::collections::HashSet;
 
@@ -706,6 +683,15 @@ pub mod handoff {
     /// anything shallower loses one, and loses it as an overwritten cell or as a
     /// parity that no longer flips — the second of which is a launch that never
     /// returns.
+    ///
+    /// ```
+    /// # use kittens::sync::handoff::depth_needed;
+    /// // A one-deep accumulator makes the chain one step tighter.
+    /// assert_eq!(depth_needed(4, 5, 4, 1), 3);
+    /// // Even one item per cluster needs two: nothing interlocks the producer's
+    /// // `has_work = false` sentinel against the epilogue's first read.
+    /// assert_eq!(depth_needed(4, 1, 4, 2), 2);
+    /// ```
     pub fn depth_needed(k_blocks: u32, items: u32, stages: u32, accumulators: u32) -> u32 {
         let start = State {
             published: 0,
@@ -823,23 +809,17 @@ pub mod handoff {
 mod tests {
     use super::*;
 
-    /// The depth `gemm_sol`'s item handoff needs, and the shape it is worst at.
-    ///
-    /// This is the test that would have caught #149 and the reason the fix is
-    /// four and not two: **the deepest lead is at the *shallowest* `k`**, which is
-    /// the opposite of what a divisibility story predicts and is why every theory
-    /// of the form "`k_blocks % X == 0` breaks it" was wrong. At
-    /// `k_blocks == STAGES` the producer's own throttle only reaches back into the
-    /// item before last, so the MMA warp is a whole item further ahead of the
-    /// epilogue than it is at any deeper `k`, and one more publication is
-    /// outstanding.
+    /// The depth `gemm_sol`'s item handoff needs, and the shape it is worst at:
+    /// **the deepest lead is at the *shallowest* `k`**. At `k_blocks == STAGES`
+    /// the producer's own throttle only reaches back into the item before last,
+    /// so the MMA warp is a whole item further ahead of the epilogue than it is
+    /// at any deeper `k`, and one more publication is outstanding.
     #[test]
     fn the_item_handoff_needs_four_cells_and_the_shallowest_k_is_why() {
         // `k = 256`, the shallowest the shape contract admits.
         assert_eq!(handoff::depth_needed(4, 5, 4, 2), 4);
         // Every deeper `k` needs three, so a depth-two handoff was never sound
-        // either and a depth-one handoff — the spelling #149 is about — was two
-        // short of it at every legal shape.
+        // either and a depth-one handoff was two short at every legal shape.
         for k_blocks in [8, 12, 16, 20] {
             assert_eq!(handoff::depth_needed(k_blocks, 5, 4, 2), 3);
         }
@@ -854,18 +834,11 @@ mod tests {
         assert_eq!(handoff::depth_needed(16, 5, 4, 1), 2);
     }
 
-    /// One item per cluster is what every correctness gate ran before #149 — and
-    /// it needs a depth of **two**, so the one-deep handoff was unsound at the
-    /// gate's own shape as well.
-    ///
-    /// That is the part worth keeping: the producer's second publication is the
-    /// `has_work = false` sentinel and nothing at all interlocks it against the
-    /// epilogue's first read, so `1024x1024x512` was winning a race rather than
-    /// being correct. What made it win by a mile is that the epilogue's first poll
-    /// is a few dozen cycles after the cluster's launch barrier while the
-    /// producer's sentinel is a whole item's TMA behind it. Shortening `k`
-    /// shortens exactly that margin, which is the shape of a cliff at one value
-    /// and not of a degradation.
+    /// One item per cluster — the shape every correctness gate ran — still needs
+    /// a depth of **two**: the producer's second publication is the
+    /// `has_work = false` sentinel and nothing interlocks it against the
+    /// epilogue's first read, so a one-deep handoff was winning a race rather
+    /// than being correct.
     #[test]
     fn one_item_per_cluster_still_needs_two() {
         assert_eq!(handoff::depth_needed(4, 1, 4, 2), 2);
@@ -886,9 +859,7 @@ mod tests {
 
     /// `block_reduce`'s fold over a real four-element buffer. The barriers and
     /// [`crate::warp_id`] are device-only, so this is as far as the host reaches
-    /// — but it is the half that decides the *number*, and the device case is
-    /// what says the staging under it lands each warp's partial in its own
-    /// slot.
+    /// — but it is the half that decides the *number*.
     fn fold<Op: ReduceOp, const WARPS: usize>(partials: [f32; WARPS]) -> f32 {
         let scratch = unsafe { SharedVec::<F32, WARPS>::from_raw(partials.as_ptr() as *mut u8) };
         unsafe { fold_partials::<Op, WARPS>(scratch) }
@@ -921,11 +892,10 @@ mod tests {
 
     #[test]
     fn every_warp_count_is_a_scratch_this_can_use() {
-        // These four instantiations are the test. Two of them — one warp at 4
-        // bytes and two at 8 — were codegen failures until `SharedVec`'s box
-        // asserts moved off `from_raw` onto the transfers, and the rule that
-        // rejected them is about a TMA descriptor a block reduction's scratch
-        // never builds. Nothing about the fold ever cared.
+        // These four instantiations are the test. The narrow two — one warp at
+        // 4 bytes and two at 8 — are legal because `SharedVec`'s TMA box rules
+        // sit on the transfer methods, and a block reduction's scratch never
+        // becomes a descriptor.
         assert_eq!(SharedVec::<F32, 1>::BYTES, 4);
         assert_eq!(SharedVec::<F32, 2>::BYTES, 8);
         assert_eq!(SharedVec::<F32, 4>::BYTES, 16);

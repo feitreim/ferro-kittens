@@ -1,28 +1,20 @@
 //! Warp-scope register↔shared tile movers.
 //!
-//! Both directions of the swizzled-fragment path. Storing, a thread packs fp32
-//! fragment values to the tile's element ([`Element::pack`]) and writes them
-//! through `stmatrix`; loading, `ldmatrix` reads the same words back and
-//! [`Element::unpack`] widens them. Addresses come from
-//! [`crate::shared::SharedTile::swizzled_chunk`] in both cases, so an
-//! accumulating MMA reads a stored operand exactly like a TMA-loaded tile, and
-//! a load sees a TMA-loaded tile exactly like a drained accumulator.
+//! Storing, a thread packs fp32 fragment values to the tile's element
+//! ([`Element::pack`]) and writes them through `stmatrix`; loading, `ldmatrix`
+//! reads the same words back and [`Element::unpack`] widens them. Both
+//! directions address through [`crate::shared::SharedTile::swizzled_chunk`], so
+//! a stored operand and a TMA-loaded tile are the same tile to either side.
 //!
-//! `ldmatrix` and `stmatrix` share an address convention — the 16 addresses
-//! come from lanes 0..15 while the data is spread over all 32 — so the two
-//! directions are one derivation ([`fragment_address`]) with the data flowing
-//! opposite ways, and cannot drift apart.
+//! One instruction moves one `[16, 16]` block. [`load_tile`] and [`store_tile`]
+//! compose those blocks into an `[M, N]` band — the same composition
+//! [`crate::tmem::TmemTile::tile`] does over the drain.
 //!
-//! Each instruction moves one `[16, 16]` block, so [`load_tile`] and
-//! [`store_tile`] compose them into a whole `[M, N]` band — the same
-//! composition [`crate::tmem::TmemTile::tile`] does over the drain, and out of
-//! the same helpers, so a band cannot mean one thing in TMEM and another in
-//! shared memory.
+//! [`load_vec`] and [`store_vec`] are the vector pair, and are plain scalar
+//! accesses rather than a matrix instruction: a [`ColVec`]'s values are one
+//! element each at columns no `ldmatrix` shape describes.
 //!
-//! [`load_vec`] and [`store_vec`] are the vector pair, and they are plain
-//! scalar loads rather than a matrix instruction: a [`ColVec`]'s values are
-//! one element each at columns no `ldmatrix` shape describes, and the lanes of
-//! a column group all want the same address, which shared memory broadcasts.
+//! Design notes and measurements: `docs/library/ldst.md`.
 
 use cuda_device::ptx_asm;
 use cuda_device::wmma::ldmatrix_x2;
@@ -34,22 +26,15 @@ use crate::tmem::{place_block, take_block};
 /// The `(row, chunk)` that `lane` supplies as slot `slot`'s `m8n8.x2` address,
 /// for a fragment at `(row, column)` of a swizzled tile.
 ///
-/// The chunk index is the column's, counted across the tile's whole logical
-/// row — which is the index [`SwizzledChunks::at`] takes, so a column past the
-/// first stacked subtile needs nothing extra here.
-///
 /// `ldmatrix`/`stmatrix` take their 16 addresses from lanes 0..15 only — lanes
-/// 0..7 the first 8x8 matrix, 8..15 the second — a different lane set than the
-/// one holding the data. So the 16-byte chunk is the column's own chunk index
-/// plus one for the upper half-warp (the second matrix is the 8-column half at
-/// `column + 8`, which [`BaseLdtm::column`](crate::reg::BaseLdtm::column) puts
-/// values `{2, 3}` in), and the row is `lane % 8` into the block: address lane
-/// `l` supplies the row that data lanes `4*(l%8)..+4` own in this slot.
+/// 0..7 the first 8x8 matrix, 8..15 the second at `column + 8` — a different
+/// lane set than the one holding the data: address lane `l` supplies the row
+/// that data lanes `4*(l%8)..+4` own in this slot. Chunks count across the
+/// tile's whole logical row (the index [`SwizzledChunks::at`] takes), so a
+/// column past the first stacked subtile needs nothing extra here.
 ///
-/// Lanes 16..31 land back on the first matrix's addresses. The instruction
-/// ignores them on sm_100a, but they stay inside the tile, which is what makes
-/// the safety contract below a statement about the tile rather than about
-/// which lanes the hardware happens to read.
+/// Lanes 16..31 land back on the first matrix's addresses; the instruction
+/// ignores them on sm_100a, and they stay inside the tile either way.
 #[inline(always)]
 pub const fn fragment_address(row: u32, column: u32, lane: u32, slot: usize) -> (usize, usize) {
     let chunk = (column / 8) as usize + (lane >= 8 && lane < 16) as usize;
@@ -57,34 +42,25 @@ pub const fn fragment_address(row: u32, column: u32, lane: u32, slot: usize) -> 
 }
 
 /// Pack one thread's [`Fragment`] to `E` and store it into a swizzled tile —
-/// the store twin of
-/// [`crate::tmem::TmemTile::fragment_tile`], addressed by the same
-/// `(row, column)` the drain used.
+/// the store twin of [`crate::tmem::TmemTile::fragment_tile`], addressed by the
+/// same `(row, column)` the drain used.
 ///
-/// `stmatrix.m8n8.x2` moves two *b16* matrices, so this path holds only for
-/// elements that pack two fp32 per word. That is a bound
-/// (`Element<Unpacked = [f32; 2]>`) rather than an assertion: a 4-per-word
-/// element does not typecheck here and gets the store its own instruction
-/// shape needs, instead of quietly writing half the bytes.
-///
-/// One `stmatrix.m8n8.x2` write per slot covers the fragment's two owned rows,
-/// each write pairing the two values of one 8-column half:
-/// [`BaseLdtm::column`](crate::reg::BaseLdtm::column) puts values `{0, 1}` in
-/// the half at `column` and `{2, 3}` in the half at `column + 8`, so those are
-/// the two matrices of one `.x2`.
+/// One `stmatrix.m8n8.x2` per slot covers the fragment's two owned rows, each
+/// write pairing the two values of one 8-column half. `.x2` moves two *b16*
+/// matrices, hence the `Element<Unpacked = [f32; 2]>` bound: a 4-per-word
+/// element fails to typecheck here rather than quietly writing half its bytes.
 ///
 /// # Safety
 ///
-/// All 32 lanes of the warp holding the fragment must call this together —
-/// `stmatrix` takes its addresses from lanes 0..15 and its data from all 32, so
-/// a lane that skips it makes the instruction ill-formed rather than leaving
-/// its own values unwritten. `row` and `column` are the *shared tile's*
-/// coordinates and nothing here reads tensor memory: `chunks` must belong to a
-/// tile at least `row + 16` rows tall into which `column + 16` fits. The caller
-/// owes a `fence.proxy.async.shared::cta` before any MMA or TMA reads the tile
-/// — [`crate::shared::publish_to_async_proxy`] is that fence, and a barrier
-/// after it is what carries this thread's ordering to whichever thread issues
-/// the read.
+/// - All 32 lanes of the warp holding the fragment must call this together;
+///   `stmatrix` takes addresses from lanes 0..15 and data from all 32, so a lane
+///   that skips it makes the instruction ill-formed.
+/// - `row` and `column` are the *shared tile's* coordinates: `chunks` must
+///   belong to a tile at least `row + 16` rows tall into which `column + 16`
+///   fits.
+/// - The caller owes a [`crate::shared::publish_to_async_proxy`] before any MMA
+///   or TMA reads the tile, and a barrier after it to carry this thread's
+///   ordering to whichever thread issues the read.
 #[inline(always)]
 pub unsafe fn store_fragment<E: Element<Unpacked = [f32; 2]>>(
     chunks: SwizzledChunks<E>,
@@ -111,28 +87,21 @@ pub unsafe fn store_fragment<E: Element<Unpacked = [f32; 2]>>(
 /// `.x2`s a slot apart.
 ///
 /// A fragment is exactly four `8x8` b16 matrices — two slots by the two
-/// 8-column halves — which is the shape `stmatrix.m8n8.x4` takes. The `.x2`
-/// form has to be issued per slot because it names two matrices and a
-/// fragment's are four; that is the only reason [`store_fragment`] loops at
-/// all, so naming all four at once removes the loop rather than unrolling it.
-///
-/// **The addressing is [`fragment_address`] with one substitution and no new
-/// derivation.** `.x2` takes its 16 addresses from lanes 0..15 and is issued
-/// twice, once per slot; `.x4` takes 32 from all lanes, eight per matrix, and
-/// its four matrices are the two slots' two halves in that order. So lane `l`
-/// supplies what lane `l % 16` supplied for slot `l / 16` — the identity
-/// `stmatrix_x4_addresses_are_the_x2_addresses_restacked` pins. A second
-/// address derivation for the wider instruction is exactly the thing that
-/// could drift from the load side, and there isn't one.
+/// 8-column halves — which is the shape `stmatrix.m8n8.x4` takes, so naming all
+/// four at once removes [`store_fragment`]'s loop rather than unrolling it.
+/// The addressing is still [`fragment_address`]: lane `l` supplies here what
+/// lane `l % 16` supplied for slot `l / 16`.
 ///
 /// # Safety
 ///
-/// As [`store_fragment`]: all 32 lanes of the warp holding the fragment must
-/// call this together — all 32 of them supply addresses here, not just the
-/// first 16 — `chunks` must belong to a tile at least `row + 16` rows tall into
-/// which `column + 16` fits, and the caller owes a
-/// [`crate::shared::publish_to_async_proxy`] before any MMA or TMA reads the
-/// tile.
+/// As [`store_fragment`], except that all 32 lanes supply addresses here rather
+/// than only the first 16:
+///
+/// - All 32 lanes of the warp holding the fragment must call this together.
+/// - `chunks` must belong to a tile at least `row + 16` rows tall into which
+///   `column + 16` fits.
+/// - The caller owes a [`crate::shared::publish_to_async_proxy`] before any MMA
+///   or TMA reads the tile.
 #[inline(always)]
 pub unsafe fn store_fragment_x4<E: Element<Unpacked = [f32; 2]>>(
     chunks: SwizzledChunks<E>,
@@ -156,16 +125,12 @@ pub unsafe fn store_fragment_x4<E: Element<Unpacked = [f32; 2]>>(
 /// [`store_fragment_x4`] taking words that are **already packed**, so the
 /// `stmatrix` runs with no `cvt` in front of it.
 ///
-/// The addressing is [`store_fragment_x4`]'s, unchanged and undivided — this is
-/// that function with the four `E::pack` calls removed and the four words passed
-/// in. There is no other difference, which is what makes the pair an ablation of
-/// the convert rather than a second store path.
+/// The addressing is [`store_fragment_x4`]'s, unchanged: this is that function
+/// with the four `E::pack` calls removed and the four words passed in.
 ///
-/// **Nothing in tree computes a right answer with this**, and it is not a defect:
-/// the only producer of pre-packed b16 out of an fp32 accumulator would be a
-/// convert, and if a convert ran then [`store_fragment_x4`] is the function that
-/// wanted it. It exists so `experiments/`' `pack16` rung can hold every other
-/// instruction in a drain fixed and take the `cvt` column to zero — see
+/// **Nothing in tree computes a right answer with this.** It exists so
+/// `experiments/`' `pack16` rung can hold every other instruction in a drain
+/// fixed and take the `cvt` column to zero — see
 /// [`crate::tmem::TmemTile::fragments_pack16_x8`].
 ///
 /// # Safety
@@ -230,26 +195,33 @@ pub unsafe fn store_tile_x4<E: Element<Unpacked = [f32; 2]>, const M: usize, con
 }
 
 /// Read a `[16, 16]` block at `(row, column)` of a swizzled tile into one
-/// thread's [`Fragment`] — the inverse of [`store_fragment`], and the
-/// way a kernel whose input is not an MMA operand gets its data into registers
-/// at all.
+/// thread's [`Fragment`] — the inverse of [`store_fragment`].
 ///
-/// `ldmatrix.m8n8.x2` moves two b16 matrices, so this carries the same
-/// `Element<Unpacked = [f32; 2]>` bound as the store for the same reason: a
-/// 4-per-word element wants its own instruction shape and should fail to
-/// typecheck rather than read half the bytes it was asked for.
-///
-/// The two returned words are the two matrices of the `.x2`, so they land in
-/// the fragment as the value pairs `{0, 1}` and `{2, 3}` — exactly the halves
+/// `ldmatrix.m8n8.x2` moves two b16 matrices, hence the same
+/// `Element<Unpacked = [f32; 2]>` bound the store carries. The two words are
+/// the `.x2`'s two matrices and land in the fragment as the value pairs
+/// `{0, 1}` and `{2, 3}` — the halves
 /// [`BaseLdtm::column`](crate::reg::BaseLdtm::column) places at `column` and
 /// `column + 8`.
 ///
+/// ```no_run
+/// # use kittens::ldst::load_fragment;
+/// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+/// # use kittens::{lane, warp_id};
+/// # unsafe fn demo(tile: SharedTile<Bf16, 128, 64, Swizzle128B>) {
+/// let block = unsafe { load_fragment(tile.chunk_writer(), 32 * warp_id(), 16, lane()) };
+/// let sum = block.get(0, 0) + block.get(1, 3);
+/// # }
+/// ```
+///
 /// # Safety
 ///
-/// All 32 lanes of the warp must call this together, `chunks` must belong to a
-/// tile at least `row + 16` rows tall whose bytes are already visible to the
-/// generic proxy (a TMA load needs its barrier waited on, a `stmatrix` needs
-/// `fence.proxy.async.shared::cta`), and `column + 16` must fit the tile.
+/// - All 32 lanes of the warp must call this together.
+/// - `chunks` must belong to a tile at least `row + 16` rows tall into which
+///   `column + 16` fits.
+/// - Its bytes must already be visible to the generic proxy: a TMA load needs
+///   its barrier waited on, a `stmatrix` needs
+///   `fence.proxy.async.shared::cta`.
 #[inline(always)]
 pub unsafe fn load_fragment<E: Element<Unpacked = [f32; 2]>>(
     chunks: SwizzledChunks<E>,
@@ -277,19 +249,31 @@ pub unsafe fn load_fragment<E: Element<Unpacked = [f32; 2]>>(
 
 /// A whole `[M, N]` band of a swizzled tile at `(row, column)`, composed out of
 /// the `M/16 × N/16` blocks [`load_fragment`] returns — the shared-side twin of
-/// [`crate::tmem::TmemTile::tile`], and what a kernel whose input is not an MMA
-/// operand reads its band with.
+/// [`crate::tmem::TmemTile::tile`].
 ///
 /// The blocks compose along both axes because chunk indices count across the
-/// tile's whole logical row: a column past the first stacked subtile is the
-/// cursor's problem ([`SwizzledChunks::at`]) and not this loop's.
+/// tile's whole logical row: a column past the first stacked subtile is
+/// [`SwizzledChunks::at`]'s problem and not this loop's.
+///
+/// ```no_run
+/// # use kittens::ldst::load_tile;
+/// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+/// # use kittens::{BaseLdtm, RegTile, lane, warp_id};
+/// # unsafe fn demo(tile: SharedTile<Bf16, 128, 64, Swizzle128B>) {
+/// let band: RegTile<32, 64, BaseLdtm> =
+///     unsafe { load_tile(tile.chunk_writer(), 32 * warp_id(), 0, lane()) };
+/// let row_maxima = band.row_max();
+/// # }
+/// ```
 ///
 /// # Safety
 ///
-/// As [`load_fragment`], for every block of the band: all 32 lanes of the warp
-/// must call this together, `chunks` must belong to a tile at least `row + M`
-/// rows tall into which `column + N` fits, and its bytes must already be
-/// visible to the generic proxy.
+/// As [`load_fragment`], for every block of the band:
+///
+/// - All 32 lanes of the warp must call this together.
+/// - `chunks` must belong to a tile at least `row + M` rows tall into which
+///   `column + N` fits.
+/// - Its bytes must already be visible to the generic proxy.
 #[inline(always)]
 pub unsafe fn load_tile<E: Element<Unpacked = [f32; 2]>, const M: usize, const N: usize>(
     chunks: SwizzledChunks<E>,
@@ -328,6 +312,16 @@ where
 /// The inverse of [`load_tile`]: a whole `[M, N]` band packed to `E` and
 /// written back block by block through [`store_fragment`].
 ///
+/// ```no_run
+/// # use kittens::ldst::store_tile;
+/// # use kittens::shared::{Bf16, SharedTile, Swizzle128B, publish_to_async_proxy};
+/// # use kittens::{BaseLdtm, RegTile, lane, warp_id};
+/// # unsafe fn demo(tile: SharedTile<Bf16, 128, 64, Swizzle128B>, band: RegTile<32, 64, BaseLdtm>) {
+/// unsafe { store_tile(tile.chunk_writer(), 32 * warp_id(), 0, lane(), band) };
+/// unsafe { publish_to_async_proxy() };
+/// # }
+/// ```
+///
 /// # Safety
 ///
 /// As [`store_fragment`], for every block of the band — including the
@@ -365,12 +359,20 @@ pub unsafe fn store_tile<E: Element<Unpacked = [f32; 2]>, const M: usize, const 
 /// Broadcast a [`SharedVec`] into the [`ColVec`] a per-column op consumes:
 /// each lane reads the `L::VALUES` columns [`ColLayout::col_of`] says it holds.
 ///
-/// The shared-memory twin of [`load_tile`] for the vector shape, and the way a
-/// parameter loaded once per CTA — layernorm's `gamma`, an attention bias —
-/// reaches the registers that multiply by it. Under [`BaseLdtm`] a column
-/// depends only on `lane % 4`, so the 8 lanes of a column group issue the same
-/// address and shared memory answers all of them from one bank read; there is
-/// no shuffle here and nothing for a swizzle to spread.
+/// The way a parameter loaded once per CTA — layernorm's `gamma`, an attention
+/// bias — reaches the registers that multiply by it. Under [`BaseLdtm`] a
+/// column depends only on `lane % 4`, so the 8 lanes of a column group issue
+/// the same address and shared memory answers all of them from one bank read.
+///
+/// ```no_run
+/// # use kittens::ldst::load_vec;
+/// # use kittens::shared::{Bf16, SharedVec};
+/// # use kittens::{BaseLdtm, ColVec, RegTile, lane};
+/// # unsafe fn demo(gamma: SharedVec<Bf16, 64>, band: RegTile<32, 64, BaseLdtm>) {
+/// let scale: ColVec<64, BaseLdtm> = unsafe { load_vec(gamma, lane()) };
+/// let scaled = band.mul_col(scale);
+/// # }
+/// ```
 ///
 /// # Safety
 ///
@@ -396,11 +398,9 @@ pub unsafe fn load_vec<E: Element, const N: usize, L: ColLayout<N>>(
 
 /// The inverse of [`load_vec`]: each lane writes back the columns it holds.
 ///
-/// Every column of the vector is written by the four lanes of one quad rather
-/// than by one lane, and they write the same value — a [`ColVec`] is
-/// replicated across the lanes of a column group, so the redundancy is the
-/// layout's and not this loop's. That makes the write idempotent, which is
-/// what keeps it a plain store instead of a lane-masked one.
+/// A [`ColVec`] is replicated across the lanes of a column group, so every
+/// column is written by four lanes with the same value. The write is idempotent
+/// for that reason, and needs no lane mask.
 ///
 /// # Safety
 ///
@@ -422,17 +422,13 @@ pub unsafe fn store_vec<E: Element, const N: usize, L: ColLayout<N>>(
     }
 }
 
-/// Store two packed b16 matrix fragments (`stmatrix.sync.aligned.m8n8.x2`)
-/// without routing through the unresolved LLVM stmatrix declaration emitted
-/// by cuda-oxide. Observed at `b099f64` and **still present at the pinned
-/// `20a5616`** — same `.extern .func`, same `ptxas` line — so this is not a
-/// workaround waiting to be dropped at the next bump.
+/// Store two packed b16 matrix fragments (`stmatrix.sync.aligned.m8n8.x2`),
+/// written as inline PTX because cuda-oxide's stmatrix declaration does not
+/// resolve for `sm_100a`.
 ///
 /// The load direction needs no such workaround:
-/// [`cuda_device::wmma::ldmatrix_x2`] lowers cleanly for `sm_100a`, so
-/// [`load_fragment`] calls it directly. That it lives in a `wmma` module is a
-/// filing accident — `ldmatrix` is a plain shared-memory read and has nothing
-/// to do with the wmma MMA path this crate does not use.
+/// [`cuda_device::wmma::ldmatrix_x2`] lowers cleanly, so [`load_fragment`]
+/// calls it directly.
 ///
 /// # Safety
 ///
@@ -452,9 +448,7 @@ pub unsafe fn stmatrix_m8n8_x2(smem_ptr: *mut u8, r0: u32, r1: u32) {
 }
 
 /// [`stmatrix_m8n8_x2`]'s four-matrix form, through the same `ptx_asm!`
-/// workaround and for the same reason: cuda-oxide `20a5616` ships
-/// `stmatrix_m8n8_x4` in `generated/stmatrix.rs`, and its LLVM declaration
-/// does not resolve for `sm_100a` any more than the `.x2` one does.
+/// workaround and for the same reason.
 ///
 /// # Safety
 ///
@@ -537,10 +531,8 @@ mod tests {
         }
     }
 
-    /// The `.x4`'s 32 addresses are the `.x2`'s two sets of 16, stacked in
-    /// slot order — which is the whole of why [`store_fragment_x4`] needs no
-    /// address derivation of its own, and the thing that would have to break
-    /// for the wide store to disagree with the narrow one.
+    /// The `.x4`'s 32 addresses are the `.x2`'s two sets of 16, stacked in slot
+    /// order — why [`store_fragment_x4`] needs no derivation of its own.
     #[test]
     fn stmatrix_x4_addresses_are_the_x2_addresses_restacked() {
         for row in [0u32, 16, 48] {
