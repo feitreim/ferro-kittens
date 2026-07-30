@@ -7,72 +7,22 @@ intrinsics and hand-threaded index math.
 
 The MMA layer is tcgen05 — no wmma/wgmma backends, no arch dispatch.
 
-## Zero-cost by construction
-
-Everything here is a plain `#[inline(always)]` function or a `Copy` struct of
-pointers and const generics. The crate ships no kernels and no `#[cuda_module]`;
-device code monomorphizes into the *calling* crate's artifact the same way
-`cuda-device` does, so a kernel crate pays nothing for the abstraction unless
-ptxas says otherwise.
-
-Asking ptxas is `modal run modal_app.py::regcount`: it builds the device-test
-harness, runs `ptxas -v -arch=sm_100a` over the emitted PTX, and prints a
-sorted registers/spills/shared table. `ptxas` is a host compiler, so this needs
-no GPU. Run it either side of a change and diff. Only kernels that are actually
-monomorphized appear, so a library function with no caller gets a codegen probe
-in `device-tests` to put it on the table.
-
-It also prints a **register ladder**: the same step in five spellings across
-fourteen tile shapes, from 16 fp32 a thread to 256 — one past the file — with
-the spill cliff located per spelling. A rung is one line of `ladder!` in
-`device-tests`, which is the point: the number that decides a design here is a
-function of tile *shape*, and it is not a smooth one. `--determinism` measures
-the same tree twice and asserts an identical table, which is what makes a diff
-of two runs evidence.
-
-One thing there does fail the run, and only one: the **occupancy step**. For
-each kernel that states an exact block shape and the CTAs per SM its grid is
-sized for, `regcount` derives the most registers a thread may use and still
-hold that many — from the launch and the 64 K register file, checked against the
-toolkit's own `cuda_occupancy.h` on every run — and goes red when `ptxas` went
-over. At 128 threads and three CTAs an SM that number is **168**, not the 170
-the naive `file / threads / CTAs` gives: registers are allocated per warp in
-units of 256, across four sub-partitions.
-
-The gate watches three kernels and none of them is at that step any more.
-`gemm_cg2` gave up the third CTA in #87 — `[256, 256]` is 256 accumulator
-columns, so `512 / 256` fixes it at two before shared memory is consulted — and
-two CTAs at 128 threads admits the whole 255-register file. Measured:
-`gemm_cg2` 166, `gemm_cg2_staged` 42, and `gemm_cg2_staged_x8x4` — the epilogue
-the crate ships since #119 — **80**, all with zero spill. It is a gate on
-*occupancy* and nothing else — see below for why a register count is not a
-ranking.
-
-**And read that table as allocation, not as a ranking.** `modal run
-modal_app.py::ladder_bench` puts a clock on four of those rungs — the first
-timed register claim in this repo, on a B200 — and none of registers, stack
-frame or occupancy orders the resulting times. On that probe the spelling that
-leaves the whole band in local memory at 32 registers is the *fastest* at all
-four shapes, and the one shape where the static counters favour the fused
-expression is a shape where it loses. On `softmax`, #47 timed the same
-phenomenon and it cost **2.6×**. Both are right: a streamed band costs real
-time, and whether it is worth paying turns on whether the registers it frees are
-the resource actually binding that kernel — shared memory caps `softmax` either
-way, where the probe has none. So a register count is half an argument and
-occupancy is the other half. `experiments/README.md` § "in-place versus by-value"
-carries both tables and reads them against each other.
+Right now GEMM performance is at about ~90% of cublasLT and/or the upstream cuda-oxide example.
+There are examples in `/examples/`
 
 ## Modules
 
 | Module | What it holds |
 | --- | --- |
 | `shared` | Shared-memory tiles with the SWIZZLE_128B layout in the type |
+| `plan` | One `const` walk over the shared block, handing back the total a launch contract needs |
 | `reg` | Register vectors/tiles over a parameterized fragment ownership map |
 | `tmem` | TMEM accumulator views (`base + (row << 16) + column`) |
 | `mma` | Chained tcgen05 MMA walks over shared-tile operands |
 | `ldst` | Warp-scope register↔shared movers (`stmatrix` on swizzled chunks) |
 | `sync` | Semaphores over mbarrier intrinsics, and the block-scope fold warps cannot shuffle |
 | `pipeline` | Persistent-grid harness (ThunderKittens' `prototype::lcf` shape) |
+| `epilogue` | The staging ring a drained accumulator crosses on its way to the TMA engine |
 | `global` | Global layouts and their TMA tensor maps (host-only) |
 | `launch` | The >48 KiB shared-memory opt-in a large tile plan needs (host-only) |
 
@@ -97,15 +47,18 @@ triggers. `CI.md` has the policy, the costs, and how to ask for a GPU run.
 
 ## Examples, and experiments
 
-`examples/` holds real kernels — a cluster GEMM, flash-attention forward,
-softmax, layernorm — written the way we want them to read, each with a header
-saying whether it **runs** against a CPU reference or only **compiles**. All
-four compile as of #3, the crate has no cargo features left, and
-`cargo oxide build kittens-examples --arch sm_100a` therefore codegens every one
-of them. It ships **one** GEMM: the kernel the library ships, in about six
-hundred lines.
+`examples/` holds real kernels — two GEMMs, flash-attention forward, softmax,
+layernorm — written the way we want them to read, each with a header saying
+whether it **runs** against a CPU reference or only **compiles**. All five
+compile, the crate has no cargo features left, and `cargo oxide build
+kittens-examples --arch sm_100a` therefore codegens every one of them.
 
-`experiments/` is where that one was chosen. Every tile rung, every scheduler,
+The two GEMMs are not variants of each other. `gemm.rs` is the library's own, a
+two-CTA cluster kernel in about six hundred lines; `gemm_sol.rs` is cuda-oxide's
+canonical `gemm_sol_final` ported through this API, which is how the abstraction
+gets held to a kernel it did not get to design.
+
+`experiments/` is where `gemm.rs` was chosen. Every tile rung, every scheduler,
 the ablation cube, the four epilogue families, the doubling probes that compute
 a deliberately wrong `C` to isolate one term, the warp-specialized variant, the
 benchmark harness and the cuBLASLt denominator — thirty GEMM entry points, all
@@ -114,3 +67,18 @@ still launchable and all still on the same correctness gate.
 and the missing library surface the four kernels demanded while they were still
 asking for it, mapped to issues, with the part no issue covered called out
 separately.
+
+## Design notes
+
+Source carries what a *caller* needs — what a thing does, the contract it owes,
+and an example of calling it. The measurement a decision rests on lives in
+`docs/`: `docs/library/` one file per module, `docs/kernels/` one per kernel.
+A one-line conclusion stays behind wherever the number changes what a caller
+would write, so `softmax.rs` says `CHUNK = 16` and that 32 is 4.4× slower,
+while `docs/kernels/softmax.md` has the ladder that came off, the `exp2`
+ablation beside it, and why a control taken under one bottleneck expires when
+the bottleneck moves.
+
+The library's own examples are doctests rather than prose, which is the point:
+`cargo test --doc` compiles all 74 of them against the real signatures, so an
+example that drifts fails a gate instead of misleading a reader.
