@@ -1,30 +1,33 @@
 //! kittens: a ThunderKittens-style tile library for cuda-oxide, tcgen05-only.
 //!
-//! New kernels are written against typed shared/register/TMEM tiles with
-//! warp- and warpgroup-scoped ops instead of raw intrinsics and hand-threaded
-//! index math. The library targets Blackwell (`sm_100a`) exclusively: the MMA
-//! layer is tcgen05, with no wmma/wgmma backends and no arch dispatch.
+//! Kernels are written against typed shared, register and TMEM tiles with warp-
+//! and warpgroup-scoped ops instead of raw intrinsics and hand-threaded index
+//! math. The target is Blackwell (`sm_100a`) alone: the MMA layer is tcgen05,
+//! with no wmma/wgmma backends and no arch dispatch.
 //!
-//! Everything here is a plain `#[inline(always)]` function or a Copy struct
-//! of pointers and const generics — the crate ships no kernels and no
-//! `#[cuda_module]`. Device code monomorphizes into the *calling* crate's
-//! artifact the same way `cuda-device` does, so a kernel crate pays nothing
-//! for the abstraction unless ptxas says otherwise.
+//! Everything here is an `#[inline(always)]` function or a `Copy` struct of
+//! pointers and const generics; the crate ships no kernels and no
+//! `#[cuda_module]`, so device code monomorphizes into the *calling* crate.
 //!
-//! Libdevice math is legal beside tcgen05 in the same pure-PTX artifact. That
-//! was established at cuda-oxide `b099f64` and the citation stays there: no gate
-//! re-establishes it at the pin, because **nothing in this tree makes a
-//! libdevice call**. `reg.rs`'s `Abs` clears the sign bit rather than calling
-//! `fabsf`, `fmax`/`fmin` are comparison-selects, `Sqrt` and `rsqrt` lower to
-//! native `sqrt.rn.f32`, and `exp2`/`log2` are FMA polynomials or the `ex2`
-//! SFU. So a green `build` says nothing about it either way, and moving the
-//! hash would assert it at a revision nobody checked. Software approximations
-//! remain where their lowering is a measured kernel optimization rather than an
-//! artifact-path workaround.
+//! A warp reading its band out of a shared tile, scaling it, writing it back:
 //!
-// `global`'s types are all `feature = "host"`, and docs across the crate link
-// to them. Off that feature they are not compiled, so the links have nothing
-// to resolve to; the host build is where they are checked.
+//! ```no_run
+//! # use kittens::ldst::{load_tile, store_tile};
+//! # use kittens::shared::{Bf16, SharedTile, Swizzle128B, publish_to_async_proxy};
+//! # use kittens::{BaseLdtm, RegTile, lane, warp_id};
+//! # unsafe fn kernel_body(tile: SharedTile<Bf16, 128, 64, Swizzle128B>) {
+//! let (lane, row) = (lane(), 32 * warp_id());
+//! let band: RegTile<32, 64, BaseLdtm> =
+//!     unsafe { load_tile(tile.chunk_writer(), row, 0, lane) };
+//! unsafe { store_tile(tile.chunk_writer(), row, 0, lane, band.scale(0.125)) };
+//! unsafe { publish_to_async_proxy() };
+//! # }
+//! ```
+//!
+//! Design notes and measurements live in `docs/library/`.
+//!
+// `global`'s types are `feature = "host"`-gated, so the doc links pointing at
+// them from across the crate resolve only in the host build.
 #![cfg_attr(not(feature = "host"), allow(rustdoc::broken_intra_doc_links))]
 
 pub mod epilogue;
@@ -55,28 +58,26 @@ pub use sync::{
 };
 pub use tmem::TmemTile;
 
-/// The calling thread's lane in its warp — **the `lane` argument**.
+/// The calling thread's lane in its warp — **the `lane` argument** every
+/// warp-scope entry point in the crate takes.
 ///
-/// Every warp-scope entry point in the crate takes one:
-/// [`ldst::load_tile`], [`ldst::store_tile`], [`ldst::load_vec`],
-/// [`global::store_rows`], [`RegTile::mask`], [`RegVec::row`], and the rest of
-/// the register surface. Which lane holds which element of a
-/// [`RegTile<M, N, BaseLdtm>`](RegTile) is the layout's business and not the
-/// caller's; the lane is how a warp-collective op knows which thread it is
-/// running on, and passing another thread's is how a tile ends up transposed
-/// by 32 rows rather than faulting.
+/// Which lane holds which element of a tile is the layout's business, not the
+/// caller's; the lane is only how a warp-collective op knows which thread it is
+/// running on, and passing another thread's shifts a tile rather than faulting.
+/// Read it once in the entry block and thread it through: against reading it
+/// per op that is free at 128 columns and saves 16 registers at 32.
 ///
-/// This wraps `cuda_device::warp::lane_id()` rather than re-exporting it, and
-/// the reason is this paragraph: without it a kernel that calls nothing but
-/// `kittens` still has to reach past the library for its first three lines,
-/// and the argument's meaning is stated only in the six signatures that take
-/// it (#127).
-///
-/// One `%laneid` read per warp is the convention — hoist it into the entry
-/// block and thread it through, which `device-tests`' `lane probe` prices at
-/// 0 registers at 128 columns and +16 at 32 against reading it per op. The
-/// wrapper is `#[inline(always)]` over an `#[inline(never)]` lowering target,
-/// so it is the same instruction either way.
+/// ```no_run
+/// # use kittens::ldst::load_tile;
+/// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+/// # use kittens::{BaseLdtm, RegTile, lane, warp_id};
+/// # unsafe fn demo(tile: SharedTile<Bf16, 128, 64, Swizzle128B>) {
+/// let lane = lane();
+/// let mut band: RegTile<32, 64, BaseLdtm> =
+///     unsafe { load_tile(tile.chunk_writer(), 32 * warp_id(), 0, lane) };
+/// band.mask(lane, f32::NEG_INFINITY, |row, column| column <= row);
+/// # }
+/// ```
 #[inline(always)]
 pub fn lane() -> u32 {
     cuda_device::warp::lane_id()
@@ -85,15 +86,23 @@ pub fn lane() -> u32 {
 /// The calling warp's index in its block, `threadIdx.x / 32`.
 ///
 /// `32 * warp_id()` is a [`BaseLdtm`] **band origin**: the layout gives a warp
-/// 32 consecutive rows, so that product is the first row of this warp's band
-/// in a shared tile, in a TMEM accumulator ([`TmemTile::tile`]), and in the
-/// global rows a drain writes. It is the number every kernel in the repo
-/// open-codes; the `32` is the layout's rows-per-warp, which the library does
-/// not yet name (#126).
+/// 32 consecutive rows, so that product is the first row of this warp's band in
+/// a shared tile, in a TMEM accumulator ([`TmemTile::tile`]), and in the global
+/// rows a drain writes.
 ///
-/// A *derived* value and not a hardware register, so it is only the warp index
-/// for a **1-D block**. A block with a `threadIdx.y` gets the wrong answer
-/// here as it would from the division written out.
+/// A *derived* value and not a hardware register, so it is the warp index only
+/// for a **1-D block**; a block with a `threadIdx.y` gets the wrong answer here
+/// as it would from the division written out.
+///
+/// ```no_run
+/// # use kittens::ldst::load_tile;
+/// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+/// # use kittens::{BaseLdtm, RegTile, lane, warp_id};
+/// # unsafe fn demo(tile: SharedTile<Bf16, 128, 64, Swizzle128B>) {
+/// let band: RegTile<32, 64, BaseLdtm> =
+///     unsafe { load_tile(tile.chunk_writer(), 32 * warp_id(), 0, lane()) };
+/// # }
+/// ```
 #[inline(always)]
 pub fn warp_id() -> u32 {
     cuda_device::warp::warp_id()
