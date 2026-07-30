@@ -312,22 +312,56 @@ pub fn sweep_k(
         "gemm-sol with `k` below `m`, descending. every row is announced on stderr before it\n\
          is launched, so if the run stops the last announced row is the one that did not\n\
          return. the shape contract is `k % 256 == 0` and `k >= 256`, so every row below is\n\
-         inside it, and a row that does not return is a defect rather than a misuse."
+         inside it, and a row that does not return is a defect rather than a misuse.\n\
+         \n\
+         #149's boundary was between 1280 and 1024 and the mechanism was the item handoff's\n\
+         depth, so this walks all the way to `k = 256` — `k_blocks == STAGES`, the shape the\n\
+         depth is tight at — and it walks all three entries, because the same chain of\n\
+         back-pressure runs through all three and nothing about it was `[256, 256]`'s.\n\
+         every row is checked exact at 1024x1024x512 and at its own shape before it is timed."
     );
     heading("entry");
-    for k in [2048usize, 1792, 1536, 1280, 1024, 768, 512, 256] {
+    for variant in [Variant::M256xN256, Variant::M256xN128, Variant::M512xN256] {
+        for k in [2048usize, 1280, 1024, 768, 512, 256] {
+            let shape = Shape {
+                m: 4096,
+                n: 4096,
+                k,
+            };
+            row(
+                context,
+                variant.name(),
+                shape,
+                Plan {
+                    variant,
+                    group: gemm_sol::default_group(4096),
+                },
+                residency,
+                &mut denominators,
+                None,
+            );
+        }
+    }
+    println!(
+        "\nand `m` swept at `k = 1024`, which is the one thing the ladder above cannot vary\n\
+         independently: at 4096² the grid is 256 tiles over 256 clusters at every `k`, so the\n\
+         ladder holds tiles-per-cluster fixed and moves only the trip count. these rows move\n\
+         the grid from 64 clusters to 512 at one trip count, so the two are separated."
+    );
+    heading("entry");
+    for m in [1024usize, 2048, 4096, 8192] {
         let shape = Shape {
-            m: 4096,
+            m,
             n: 4096,
-            k,
+            k: 1024,
         };
         row(
             context,
-            "M256xN256",
+            Variant::M256xN256.name(),
             shape,
             Plan {
                 variant: Variant::M256xN256,
-                group: gemm_sol::default_group(4096),
+                group: gemm_sol::default_group(m),
             },
             residency,
             &mut denominators,

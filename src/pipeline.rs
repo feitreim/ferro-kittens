@@ -483,6 +483,38 @@ impl ClcQueue {
     unsafe fn harvest(self, parity: u32) -> Option<u32> {
         unsafe {
             self.sem.wait(parity);
+            self.harvested()
+        }
+    }
+
+    /// [`Self::harvest`] with a deadline on the response, per
+    /// [`Semaphore::wait_before`].
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::harvest`]. A [`Harvest::Stalled`] leaves the request
+    /// outstanding, so the only sound thing to do with one is stop querying.
+    #[inline(always)]
+    unsafe fn harvest_before(self, parity: u32, ticks: u64) -> Harvest {
+        unsafe {
+            if !self.sem.wait_before(parity, ticks) {
+                return Harvest::Stalled;
+            }
+            match self.harvested() {
+                Some(item) => Harvest::Item(item),
+                None => Harvest::Done,
+            }
+        }
+    }
+
+    /// Decode a response the barrier has already published.
+    ///
+    /// # Safety
+    ///
+    /// The response's phase must have completed.
+    #[inline(always)]
+    unsafe fn harvested(self) -> Option<u32> {
+        unsafe {
             // Written by the async proxy and read generically; the barrier
             // phase is what makes it visible, and `read_volatile` is what stops
             // the two halves being hoisted across the request that refills them.
@@ -507,6 +539,15 @@ impl ClcQueue {
             parity: 0,
         }
     }
+}
+
+/// What a bounded CLC query came back with: another item, an empty queue, or a
+/// response that never arrived within the deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Harvest {
+    Item(u32),
+    Done,
+    Stalled,
 }
 
 /// Producer-owned view of a [`ClcQueue`], including its response phase.
@@ -544,6 +585,31 @@ impl ClcCursor {
             }
             let next = self.queue.harvest(self.parity);
             self.parity ^= 1;
+            next
+        }
+    }
+
+    /// [`Self::next`] with a deadline on the response.
+    ///
+    /// [`ClcQueue`] is the one thing in a stealing item loop whose termination
+    /// is the hardware's rather than the code's, so it is the one a diagnostic
+    /// cannot leave unbounded.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::next`]. A [`Harvest::Stalled`] must end the loop: the parity
+    /// is not advanced and the request is still outstanding.
+    #[inline(always)]
+    pub unsafe fn next_before(&mut self, ticks: u64) -> Harvest {
+        unsafe {
+            self.queue.charge();
+            if cluster::block_rank() == 0 {
+                self.queue.issue();
+            }
+            let next = self.queue.harvest_before(self.parity, ticks);
+            if !matches!(next, Harvest::Stalled) {
+                self.parity ^= 1;
+            }
             next
         }
     }

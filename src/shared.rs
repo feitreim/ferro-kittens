@@ -1428,6 +1428,50 @@ impl<T: Copy> SharedCell<T> {
     }
 }
 
+/// `N` [`SharedCell`]s backing a mailbox ring: message `i` lives in cell
+/// `i % N`, which is [`crate::sync::SemaphoreRing`]'s stage arithmetic on the
+/// payload side of the same handoff.
+///
+/// **The depth is the whole reason this type exists.** A mailbox behind a
+/// parity wait is only sound while the producer leads the consumer by less than
+/// the ring's depth: a shallower ring either overwrites a message before it is
+/// read, or — since parity has period two — lands the consumer's wait on a
+/// phase the producer has already passed and will never flip again. One cell
+/// and one barrier is that ring at `N = 1`, which tolerates a lead of exactly
+/// one and reports nothing when the lead is two. So a kernel handing items
+/// across warps has to *derive* the depth from what its own back-pressure
+/// guarantees rather than assume one, and the two rings have to be built at the
+/// same `N` for the parity to name the cell.
+#[derive(Clone, Copy)]
+pub struct SharedCellRing<T: Copy, const N: usize> {
+    base: *mut u8,
+    _marker: PhantomData<T>,
+}
+
+impl<T: Copy, const N: usize> SharedCellRing<T, N> {
+    pub const BYTES: usize = N * SharedCell::<T>::BYTES;
+    pub const ALIGNMENT: usize = SharedCell::<T>::ALIGNMENT;
+
+    /// Lay a ring over [`Self::BYTES`] of shared memory.
+    ///
+    /// # Safety
+    ///
+    /// As [`SharedCell::attach`], for all `N` cells.
+    #[inline(always)]
+    pub const unsafe fn attach(base: *mut u8) -> Self {
+        Self {
+            base,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Message `index`'s cell.
+    #[inline(always)]
+    pub fn cell(self, index: u32) -> SharedCell<T> {
+        unsafe { SharedCell::attach(self.base.add(index as usize % N * SharedCell::<T>::BYTES)) }
+    }
+}
+
 /// `N` same-shaped tiles backing a pipeline ring: tile `i` lives in stage
 /// `i % N`. The parity arithmetic for the matching barriers lives in
 /// [`crate::sync::SemaphoreRing`].

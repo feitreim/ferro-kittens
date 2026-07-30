@@ -274,6 +274,39 @@ impl Semaphore {
         unsafe { while !mbarrier_try_wait_parity(self.bar, parity) {} }
     }
 
+    /// [`Self::wait`] with a deadline: `false` is `ticks` of the SM clock spent
+    /// on a phase that did not complete.
+    ///
+    /// This is the diagnostic for the failure mode [`Self::wait`] cannot report.
+    /// A parity spin on a phase whose producer has already left is
+    /// indistinguishable, from outside the launch, from a kernel that is merely
+    /// slow — the launch never returns and every warp's position is lost. Bound
+    /// each spin and the same launch terminates carrying where each warp was.
+    ///
+    /// `clock64` is per-SM and monotonic within a launch, and the subtraction
+    /// wraps, so `ticks` is elapsed and never absolute. It is deliberately not a
+    /// wall-clock bound: a caller wanting one should read
+    /// [`cuda_device::debug::globaltimer`] itself and say so.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::wait`], with one clause relaxed and one added: the
+    /// one-phase-lead rule may be *violated*, since that is what this exists to
+    /// catch, and a caller that takes `false` and reads on anyway is reading
+    /// memory no barrier has published.
+    #[inline(always)]
+    pub unsafe fn wait_before(self, parity: u32, ticks: u64) -> bool {
+        unsafe {
+            let start = cuda_device::debug::clock64();
+            while !mbarrier_try_wait_parity(self.bar, parity) {
+                if cuda_device::debug::clock64().wrapping_sub(start) > ticks {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
     /// The raw barrier word, for intrinsics that consume one directly
     /// (`tcgen05_commit_shared_cluster`, TMA loads).
     #[inline(always)]
@@ -449,6 +482,32 @@ impl<const N: usize> SemaphoreRing<N> {
         }
     }
 
+    /// [`Self::wait`] with a deadline, per [`Semaphore::wait_before`].
+    ///
+    /// # Safety
+    ///
+    /// As [`Semaphore::wait_before`].
+    #[inline(always)]
+    pub unsafe fn wait_before(self, index: u32, ticks: u64) -> bool {
+        unsafe { self.sem(index).wait_before((index / N as u32) & 1, ticks) }
+    }
+
+    /// [`Self::wait_recycled`] with a deadline, per [`Semaphore::wait_before`].
+    /// The first `N` tiles skip the wait and so can never report a stall.
+    ///
+    /// # Safety
+    ///
+    /// As [`Semaphore::wait_before`].
+    #[inline(always)]
+    pub unsafe fn wait_recycled_before(self, index: u32, ticks: u64) -> bool {
+        unsafe {
+            (index as usize) < N
+                || self
+                    .sem(index)
+                    .wait_before((index / N as u32).wrapping_sub(1) & 1, ticks)
+        }
+    }
+
     /// Initialize all `N` barriers with the same expected arrival count.
     ///
     /// # Safety
@@ -594,9 +653,224 @@ pub unsafe fn block_reduce_sum<const WARPS: usize>(
     unsafe { block_reduce::<Add, WARPS>(scratch, value) }
 }
 
+/// How deep a mailbox ring the module's one-phase-lead rule needs, worked out by
+/// exhaustive search over a persistent GEMM's own chain of back-pressure.
+///
+/// The rule at the top of this module — *every barrier's completions lead its
+/// waiter by at most one phase* — is what makes parity arithmetic sound, and it is
+/// a claim about a kernel's protocol that this crate's types cannot check. #149 is
+/// what it costs when the claim is false: `examples/src/gemm_sol.rs` handed work
+/// items across warps through **one** barrier and **one** cell, its producer could
+/// lead the epilogue by four publications, and `4096x4096x1024` stopped returning.
+/// The lead is not a divisibility property and not a `k` threshold — it is what a
+/// chain of independent throttles permits, and the only honest way to get it is to
+/// enumerate the interleavings.
+///
+/// So this is a model and it says so. It is `pub` because a kernel's shape
+/// contract is where its handoff depth is decided, and deciding one should be an
+/// assertion rather than an argument: give it the trip count and it gives back the
+/// depth [`SemaphoreRing`] and [`crate::shared::SharedCellRing`] must be built at.
+pub mod handoff {
+    use std::collections::HashSet;
+
+    /// Warp roles in a four-stage operand pipeline over a two-deep accumulator,
+    /// which is `gemm_sol`'s `[256, N]` entry.
+    ///
+    /// - the **producer** publishes item `i`, then issues `k_blocks` loads for it,
+    ///   throttled by the MMA warp's release of an operand stage `STAGES` blocks
+    ///   back, then queries for the next item and publishes it;
+    /// - the **MMA warp** waits for item `i`'s publication and for the epilogue to
+    ///   have drained item `i - ACCUMULATORS`, then multiplies `k_blocks` blocks;
+    /// - the **epilogue** waits for item `i`'s publication and for the MMA warp to
+    ///   have filled it, then drains and releases it.
+    ///
+    /// Nothing else couples them, and the depth is entirely a consequence of that.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    struct State {
+        published: u32,
+        producer_item: u32,
+        producer_block: u32,
+        mma_item: u32,
+        mma_block: u32,
+        mma_seen: u32,
+        epilogue_item: u32,
+        epilogue_seen: u32,
+        released: u32,
+    }
+
+    /// The depth a handoff must have for this chain: the largest number of
+    /// publications that can be outstanding against an index a consumer has not
+    /// read yet.
+    ///
+    /// A ring of that depth holds every message a consumer might still be owed;
+    /// anything shallower loses one, and loses it as an overwritten cell or as a
+    /// parity that no longer flips — the second of which is a launch that never
+    /// returns.
+    pub fn depth_needed(k_blocks: u32, items: u32, stages: u32, accumulators: u32) -> u32 {
+        let start = State {
+            published: 0,
+            producer_item: 0,
+            producer_block: 0,
+            mma_item: 0,
+            mma_block: 0,
+            mma_seen: 0,
+            epilogue_item: 0,
+            epilogue_seen: 0,
+            released: 0,
+        };
+        let mut seen = HashSet::new();
+        let mut frontier = vec![start];
+        seen.insert(start);
+        let mut needed = 1;
+        while let Some(state) = frontier.pop() {
+            // A consumer about to wait for index `i` has `published - i`
+            // publications outstanding against it, and that is the depth.
+            for next in [state.mma_seen, state.epilogue_seen] {
+                if next == state.mma_item || next == state.epilogue_item {
+                    needed = needed.max(state.published.saturating_sub(next));
+                }
+            }
+            for step in steps(state, k_blocks, items, stages, accumulators) {
+                if seen.insert(step) {
+                    frontier.push(step);
+                }
+            }
+        }
+        needed
+    }
+
+    /// Every transition enabled in `state` — one per role per barrier it can get
+    /// past, with no ordering between the roles, which is what makes this a search
+    /// over interleavings rather than a simulation of one.
+    fn steps(
+        state: State,
+        k_blocks: u32,
+        items: u32,
+        stages: u32,
+        accumulators: u32,
+    ) -> Vec<State> {
+        let mut out = Vec::new();
+        let issued = state.producer_item * k_blocks + state.producer_block;
+        let committed = state.mma_item * k_blocks + state.mma_block;
+
+        // The producer publishes item `producer_item` before loading it.
+        if state.published == state.producer_item && state.producer_item < items {
+            out.push(State {
+                published: state.published + 1,
+                ..state
+            });
+        }
+        // ... then issues its loads, one operand stage behind the MMA warp's
+        // release of the stage `stages` blocks back.
+        if state.published == state.producer_item + 1
+            && (issued < stages || committed + stages > issued)
+        {
+            let block = state.producer_block + 1;
+            out.push(State {
+                producer_item: state.producer_item + u32::from(block == k_blocks),
+                producer_block: if block == k_blocks { 0 } else { block },
+                ..state
+            });
+        }
+        // ... and publishes `has_work = false` when the queue is empty.
+        if state.producer_item == items && state.published == items {
+            out.push(State {
+                published: state.published + 1,
+                ..state
+            });
+        }
+
+        if state.mma_seen == state.mma_item && state.published > state.mma_item {
+            out.push(State {
+                mma_seen: state.mma_seen + 1,
+                ..state
+            });
+        }
+        if state.mma_seen > state.mma_item
+            && state.mma_item < items
+            && (state.mma_item < accumulators || state.released + accumulators > state.mma_item)
+            && issued > committed
+        {
+            let block = state.mma_block + 1;
+            out.push(State {
+                mma_item: state.mma_item + u32::from(block == k_blocks),
+                mma_block: if block == k_blocks { 0 } else { block },
+                ..state
+            });
+        }
+
+        if state.epilogue_seen == state.epilogue_item && state.published > state.epilogue_item {
+            out.push(State {
+                epilogue_seen: state.epilogue_seen + 1,
+                ..state
+            });
+        }
+        if state.epilogue_seen > state.epilogue_item
+            && state.epilogue_item < items
+            && state.mma_item > state.epilogue_item
+        {
+            out.push(State {
+                epilogue_item: state.epilogue_item + 1,
+                released: state.released + 1,
+                ..state
+            });
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The depth `gemm_sol`'s item handoff needs, and the shape it is worst at.
+    ///
+    /// This is the test that would have caught #149 and the reason the fix is
+    /// four and not two: **the deepest lead is at the *shallowest* `k`**, which is
+    /// the opposite of what a divisibility story predicts and is why every theory
+    /// of the form "`k_blocks % X == 0` breaks it" was wrong. At
+    /// `k_blocks == STAGES` the producer's own throttle only reaches back into the
+    /// item before last, so the MMA warp is a whole item further ahead of the
+    /// epilogue than it is at any deeper `k`, and one more publication is
+    /// outstanding.
+    #[test]
+    fn the_item_handoff_needs_four_cells_and_the_shallowest_k_is_why() {
+        // `k = 256`, the shallowest the shape contract admits.
+        assert_eq!(handoff::depth_needed(4, 5, 4, 2), 4);
+        // Every deeper `k` needs three, so a depth-two handoff was never sound
+        // either and a depth-one handoff — the spelling #149 is about — was two
+        // short of it at every legal shape.
+        for k_blocks in [8, 12, 16, 20] {
+            assert_eq!(handoff::depth_needed(k_blocks, 5, 4, 2), 3);
+        }
+    }
+
+    /// A one-deep accumulator makes the chain one step tighter, which is
+    /// `gemm_sol`'s `[512, 256]` entry: the same handoff at four cells covers it
+    /// with a cell to spare, and that is why one shared plan serves both.
+    #[test]
+    fn a_shallower_accumulator_needs_a_shallower_handoff() {
+        assert_eq!(handoff::depth_needed(4, 5, 4, 1), 3);
+        assert_eq!(handoff::depth_needed(16, 5, 4, 1), 2);
+    }
+
+    /// One item per cluster is what every correctness gate ran before #149 — and
+    /// it needs a depth of **two**, so the one-deep handoff was unsound at the
+    /// gate's own shape as well.
+    ///
+    /// That is the part worth keeping: the producer's second publication is the
+    /// `has_work = false` sentinel and nothing at all interlocks it against the
+    /// epilogue's first read, so `1024x1024x512` was winning a race rather than
+    /// being correct. What made it win by a mile is that the epilogue's first poll
+    /// is a few dozen cycles after the cluster's launch barrier while the
+    /// producer's sentinel is a whole item's TMA behind it. Shortening `k`
+    /// shortens exactly that margin, which is the shape of a cliff at one value
+    /// and not of a degradation.
+    #[test]
+    fn one_item_per_cluster_still_needs_two() {
+        assert_eq!(handoff::depth_needed(4, 1, 4, 2), 2);
+        assert_eq!(handoff::depth_needed(16, 1, 4, 2), 2);
+    }
 
     #[test]
     fn ring_stage_addressing_wraps() {

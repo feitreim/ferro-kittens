@@ -1309,6 +1309,23 @@ pub fn main() -> ExitCode {
         };
     }
 
+    // `bench sol-watch` is the instrument `sol-k` needed and did not have: the
+    // same device body with a deadline on every spin, so a launch that stops
+    // making progress terminates carrying where all six of its warps were
+    // instead of riding the watchdog to the end of the container. Both handoff
+    // depths, at the shape #149 is about and three below it.
+    if let Some((name, _)) = &selected
+        && name == "sol-watch"
+    {
+        return match crate::sol_watch::sweep(&context) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // Each name in the list has to name a case. A list where one of three is a
     // typo would otherwise run two tables and say nothing about the third,
     // which is the failure mode worth being loud about: the reader gets a

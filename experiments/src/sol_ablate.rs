@@ -212,6 +212,7 @@ pub mod kernels {
                 NO_DRAIN,
                 true,
                 SHIPPED_DRAIN,
+                WATCH_OFF,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -250,6 +251,7 @@ pub mod kernels {
                 ISSUE_ONLY,
                 true,
                 SHIPPED_DRAIN,
+                WATCH_OFF,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -288,6 +290,7 @@ pub mod kernels {
                 FEED_ONLY,
                 true,
                 SHIPPED_DRAIN,
+                WATCH_OFF,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -327,6 +330,7 @@ pub mod kernels {
                 MMA_ONLY,
                 true,
                 SHIPPED_DRAIN,
+                WATCH_OFF,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -367,6 +371,7 @@ pub mod kernels {
                 WHOLE,
                 true,
                 SHIPPED_DRAIN,
+                WATCH_OFF,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -406,6 +411,7 @@ pub mod kernels {
                 FEED_ONLY,
                 true,
                 SHIPPED_DRAIN,
+                WATCH_OFF,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -446,6 +452,7 @@ pub mod kernels {
                 WHOLE,
                 false,
                 SHIPPED_DRAIN,
+                WATCH_OFF,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -485,6 +492,7 @@ pub mod kernels {
                 MMA_ONLY,
                 false,
                 SHIPPED_DRAIN,
+                WATCH_OFF,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -514,7 +522,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, NO_DRAIN, true, SHIPPED_DRAIN>(
+            large_body::<B_BOX, NO_DRAIN, true, SHIPPED_DRAIN, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -545,7 +553,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, ISSUE_ONLY, true, SHIPPED_DRAIN>(
+            large_body::<B_BOX, ISSUE_ONLY, true, SHIPPED_DRAIN, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -576,7 +584,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, FEED_ONLY, true, SHIPPED_DRAIN>(
+            large_body::<B_BOX, FEED_ONLY, true, SHIPPED_DRAIN, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -607,7 +615,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, MMA_ONLY, true, SHIPPED_DRAIN>(
+            large_body::<B_BOX, MMA_ONLY, true, SHIPPED_DRAIN, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -640,7 +648,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<WIDE_B_BOX, WHOLE, true, SHIPPED_DRAIN>(
+            large_body::<WIDE_B_BOX, WHOLE, true, SHIPPED_DRAIN, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -671,7 +679,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<WIDE_B_BOX, FEED_ONLY, true, SHIPPED_DRAIN>(
+            large_body::<WIDE_B_BOX, FEED_ONLY, true, SHIPPED_DRAIN, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -703,7 +711,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, WHOLE, false, SHIPPED_DRAIN>(
+            large_body::<B_BOX, WHOLE, false, SHIPPED_DRAIN, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -734,7 +742,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, MMA_ONLY, false, SHIPPED_DRAIN>(
+            large_body::<B_BOX, MMA_ONLY, false, SHIPPED_DRAIN, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -775,6 +783,7 @@ pub mod kernels {
                 TWICE_GLOBAL,
                 true,
                 DRAIN_PER_ISSUE,
+                WATCH_OFF,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -813,6 +822,7 @@ pub mod kernels {
                 TWICE_SHARED,
                 true,
                 DRAIN_PER_ISSUE,
+                WATCH_OFF,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -851,6 +861,7 @@ pub mod kernels {
                 TWICE_ALL,
                 true,
                 DRAIN_PER_ISSUE,
+                WATCH_OFF,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -881,9 +892,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, WHOLE, true, DRAIN_PAIRED>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            small_body::<
+                BLOCK_N,
+                HALF_N,
+                B_BOX,
+                BLOCK_N,
+                SMALL_RINGS_END,
+                WHOLE,
+                true,
+                DRAIN_PAIRED,
+                WATCH_OFF,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -921,6 +940,7 @@ pub mod kernels {
                 WHOLE,
                 true,
                 DRAIN_PER_ISSUE,
+                WATCH_OFF,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -950,9 +970,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, WHOLE, true, DRAIN_WIDE>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            small_body::<
+                BLOCK_N,
+                HALF_N,
+                B_BOX,
+                BLOCK_N,
+                SMALL_RINGS_END,
+                WHOLE,
+                true,
+                DRAIN_WIDE,
+                WATCH_OFF,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -982,9 +1010,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, WHOLE, true, DRAIN_NOCVT>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            small_body::<
+                BLOCK_N,
+                HALF_N,
+                B_BOX,
+                BLOCK_N,
+                SMALL_RINGS_END,
+                WHOLE,
+                true,
+                DRAIN_NOCVT,
+                WATCH_OFF,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -1014,9 +1050,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, WHOLE, true, DRAIN_PACK16>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            small_body::<
+                BLOCK_N,
+                HALF_N,
+                B_BOX,
+                BLOCK_N,
+                SMALL_RINGS_END,
+                WHOLE,
+                true,
+                DRAIN_PACK16,
+                WATCH_OFF,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -1046,7 +1090,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, TWICE_GLOBAL, true, DRAIN_PER_ISSUE>(
+            large_body::<B_BOX, TWICE_GLOBAL, true, DRAIN_PER_ISSUE, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -1077,7 +1121,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, TWICE_SHARED, true, DRAIN_PER_ISSUE>(
+            large_body::<B_BOX, TWICE_SHARED, true, DRAIN_PER_ISSUE, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -1108,7 +1152,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, TWICE_ALL, true, DRAIN_PER_ISSUE>(
+            large_body::<B_BOX, TWICE_ALL, true, DRAIN_PER_ISSUE, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -1140,7 +1184,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, WHOLE, true, DRAIN_PAIRED>(
+            large_body::<B_BOX, WHOLE, true, DRAIN_PAIRED, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -1171,7 +1215,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, WHOLE, true, DRAIN_PER_ISSUE>(
+            large_body::<B_BOX, WHOLE, true, DRAIN_PER_ISSUE, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -1202,7 +1246,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, WHOLE, true, DRAIN_WIDE>(
+            large_body::<B_BOX, WHOLE, true, DRAIN_WIDE, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -1234,7 +1278,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, WHOLE, true, DRAIN_NOCVT>(
+            large_body::<B_BOX, WHOLE, true, DRAIN_NOCVT, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -1266,7 +1310,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, WHOLE, true, DRAIN_PACK16>(
+            large_body::<B_BOX, WHOLE, true, DRAIN_PACK16, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }

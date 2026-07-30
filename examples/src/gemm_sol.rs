@@ -46,9 +46,11 @@ use std::error::Error;
 use kittens::global::{GlobalLayout, GlobalRows, store_shared_rows};
 use kittens::ldst::{store_packed_x4, store_tile_x4};
 use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
-use kittens::pipeline::{self, ClcCursor, ClcQueue};
+use kittens::pipeline::{self, ClcCursor, ClcQueue, Harvest};
 use kittens::reg::{BaseLdtm, RegTile};
-use kittens::shared::{Bf16, Element, F16, SharedCell, SharedTile, SharedTileRing, Swizzle128B};
+use kittens::shared::{
+    Bf16, Element, F16, SharedCell, SharedCellRing, SharedTile, SharedTileRing, Swizzle128B,
+};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
 
@@ -133,7 +135,14 @@ pub const DRAIN_RUNGS: [(&str, u8); 5] = [
     ("nocvt", DRAIN_NOCVT),
 ];
 
-/// The guard both dials are held to: dense from zero, and no value twice.
+/// [`ABLATE_ARMS`] for the watch dial. Same reasoning, same guard.
+pub const WATCH_RUNGS: [(&str, u8); 3] = [
+    ("off", WATCH_OFF),
+    ("watched", WATCH_DEEP),
+    ("watched one deep", WATCH_ONE_DEEP),
+];
+
+/// The guard every dial is held to: dense from zero, and no value twice.
 const fn dial_is_a_permutation<const N: usize>(dial: [(&str, u8); N]) -> bool {
     let mut seen = [false; N];
     let mut arm = 0usize;
@@ -156,6 +165,7 @@ const fn dial_is_a_permutation<const N: usize>(dial: [(&str, u8); N]) -> bool {
 const _: () = {
     assert!(dial_is_a_permutation(ABLATE_ARMS));
     assert!(dial_is_a_permutation(DRAIN_RUNGS));
+    assert!(dial_is_a_permutation(WATCH_RUNGS));
 };
 
 /// What a dial value is called, off the one list that defines it.
@@ -260,6 +270,48 @@ pub const DRAIN_NOCVT: u8 = 4;
 /// A/B ships by moving this line — which is what [`DRAIN_PAIRED`] did.
 pub const SHIPPED_DRAIN: u8 = DRAIN_PAIRED;
 
+/// **The third dial, and the only one that is not about what the kernel does.**
+///
+/// `ABLATE` says which phase runs and `DRAIN` says how the epilogue issues; this
+/// says whether the launch is allowed to hang. At [`WATCH_OFF`] the kernel is
+/// byte for byte the shipped one. Above it, every spin becomes
+/// [`kittens::sync::Semaphore::wait_before`] and every warp writes a four-word
+/// mark past the end of `C` at each loop head and on each expiry — so a launch
+/// that stops making progress *terminates*, carrying where all six of its warps
+/// were.
+///
+/// #149 is why. A launch that does not return costs a container and says
+/// nothing: the watchdog stops it and every warp's position is lost, which is
+/// how one shape survived three PRs with four candidate mechanisms and no way to
+/// tell them apart. Its own axis rather than an `ABLATE` arm because it removes
+/// no phase and computes the same `C` — the two are orthogonal, and a reader
+/// should be able to watch any arm.
+pub const WATCH_OFF: u8 = 0;
+/// Deadlines and marks on the shipped [`ITEMS`]-deep item handoff.
+pub const WATCH_DEEP: u8 = 1;
+/// [`WATCH_DEEP`] on a **one-deep** item handoff — a single `ready` barrier and a
+/// single `info` cell, which is what the port carried before #149.
+///
+/// This is the arm that reproduces the defect under the instrument instead of
+/// arguing about it. It differs from [`WATCH_DEEP`] in [`items`] and in nothing
+/// else: same body, same barriers, same shared plan, same `C` to compare
+/// against, so the pair is a controlled test of the depth.
+pub const WATCH_ONE_DEEP: u8 = 2;
+
+/// Whether every spin carries a deadline and every warp leaves a mark.
+const fn watches(watch: u8) -> bool {
+    watch != WATCH_OFF
+}
+/// Items the tile handoff holds at once, which is [`ITEMS`] everywhere except the
+/// one arm built to reproduce #149.
+const fn items(watch: u8) -> u32 {
+    if watch == WATCH_ONE_DEEP {
+        1
+    } else {
+        ITEMS as u32
+    }
+}
+
 const BLOCK_M: usize = 128;
 /// Columns of `C` one wide cluster tile owns — `pub` because the ablation arms
 /// instantiate the same device body at the same width.
@@ -269,6 +321,57 @@ pub const HALF_N: usize = BLOCK_N / 2;
 const BLOCK_K: usize = 64;
 const CHUNKS: usize = BLOCK_K / 16;
 const STAGES: usize = 4;
+/// Items the tile handoff holds at once: the depth of the `ready`
+/// [`SemaphoreRing`] and of the `info` [`SharedCellRing`] behind it.
+///
+/// **This is #149's fix, and four is the minimum rather than a margin.** Derive
+/// it from what the back-pressure guarantees, since a mailbox behind a parity
+/// wait is sound only while the producer leads the consumer by less than the
+/// ring's depth:
+///
+/// 1. The producer publishes index `p` only after item `p-1`'s loads have all
+///    been issued, and the last of those passed
+///    `free.wait_recycled(p * k_blocks - 1)`, which is the MMA warp's `free`
+///    commit for K block `p * k_blocks - 1 - STAGES`.
+/// 2. At `k_blocks == STAGES` — `k = 256`, the shallowest `k` the contract
+///    admits — that block belongs to item `p - 2`. So all the producer's own
+///    throttle says is that the MMA warp has *finished item `p - 2`*.
+/// 3. [`Small`]'s accumulator ring is two deep, so the MMA warp finishing item
+///    `p - 2` means the epilogue released `empty(p - 4)` — it has read index
+///    `p - 4` and is about to wait on `p - 3`.
+/// 4. Indices `0..=p` are published against a consumer waiting on `p - 3`: four
+///    outstanding.
+///
+/// A handoff shallower than four therefore either overwrites an item's
+/// coordinates before the epilogue reads them, or lands its wait on a parity the
+/// producer has already passed — and once the producer has published
+/// `has_work = false` and left, on one that will never flip again. The second is
+/// #149: `4096x4096x1024` announced and never returned, while every `k` at and
+/// above 1280 won the same race on timing alone.
+///
+/// [`Large`]'s chain is one step tighter (a one-deep accumulator interlock per
+/// half, so step 3 gives `p - 3`), so four covers it with a margin of one. Both
+/// entries kept the same depth because one shared plan is worth more than the
+/// barrier the large one could save, and — see the offsets below — **the depth
+/// costs no shared memory at all**: four barriers and four `TileInfo` cells fit
+/// inside the padding the 128-byte-aligned staging buffer already left.
+///
+/// The four steps above are an argument, so they are also a test:
+/// [`kittens::sync::handoff::depth_needed`] enumerates every interleaving the
+/// same three throttles admit and answers 4 at `k_blocks == STAGES`, 3 above it,
+/// and — the part the argument missed — **2 at one item per cluster**, which is
+/// the only regime any correctness gate ran before #149. So the one-deep handoff
+/// was never sound at any legal shape; it was winning a race, by a margin that
+/// `k` sets.
+const ITEMS: usize = 4;
+/// Output tiles [`Small`] keeps in flight — the `full`/`empty` rings' depth, and
+/// step 3 of [`ITEMS`]' derivation.
+const ACCUMULATORS: usize = 2;
+const _: () = assert!(ITEMS >= ACCUMULATORS + 2, "steps 3 and 4 above");
+/// Ticks of the SM clock a [`WATCH_DEEP`] spin gives a phase before it calls the
+/// protocol stalled — about 0.6 s at 1.8 GHz, four orders of magnitude past the
+/// ~26 µs an output tile takes at 4096³, so no arm can time out on being slow.
+const DEADLINE: u64 = 1 << 30;
 const NARROW_N: usize = BLOCK_N / 2;
 const HALF_NARROW_N: usize = NARROW_N / 2;
 const EPILOGUE_WARPS: u32 = (BLOCK_M / 32) as u32;
@@ -344,6 +447,54 @@ struct TileInfo {
     has_work: u32,
 }
 
+/// Words a [`Common::mark`] leaves: site, `sequence`, ring index, parity.
+pub const REPORT_FIELDS: u32 = 4;
+/// Slots a CTA gets, which is its six warps rounded to a power of two.
+pub const REPORT_SLOTS: u32 = 8;
+/// Rows of `C` a [`WATCH_DEEP`] arm must allocate past the output for the report.
+/// `ldc >= 2048` at every shape these arms are run at, so four rows hold the 512
+/// CTAs of a 4096² grid; the launcher asserts it rather than trusting it.
+pub const REPORT_ROWS: usize = 4;
+
+/// The report's sites, in the order a healthy launch walks them. `_HEAD` marks
+/// are written at a loop head and are where a warp was; the rest are stalls.
+pub const SITE_FEED: u32 = 1;
+pub const SITE_QUERY: u32 = 2;
+pub const SITE_MULTIPLY: u32 = 3;
+pub const SITE_DRAIN: u32 = 4;
+pub const SITE_EXIT: u32 = 5;
+/// Stalled waiting for the item handoff — #149's site.
+pub const SITE_READY: u32 = 6;
+/// Stalled waiting for an operand stage to be recycled.
+pub const SITE_FREE: u32 = 7;
+/// Stalled waiting for a CLC response.
+pub const SITE_CLC: u32 = 8;
+/// Stalled waiting for an accumulator to be drained.
+pub const SITE_EMPTY: u32 = 9;
+/// Stalled waiting for an accumulator to be filled.
+pub const SITE_FULL: u32 = 10;
+/// Stalled waiting for an operand stage to arrive.
+pub const SITE_LOAD: u32 = 11;
+
+/// What a site number means, for the host side of the report.
+pub const fn site_name(site: u32) -> &'static str {
+    match site {
+        0 => "-",
+        SITE_FEED => "feeding item",
+        SITE_QUERY => "querying clc",
+        SITE_MULTIPLY => "multiplying item",
+        SITE_DRAIN => "draining item",
+        SITE_EXIT => "exited",
+        SITE_READY => "STALL ready",
+        SITE_FREE => "STALL free",
+        SITE_CLC => "STALL clc",
+        SITE_EMPTY => "STALL empty",
+        SITE_FULL => "STALL full",
+        SITE_LOAD => "STALL load",
+        _ => "?",
+    }
+}
+
 const fn align_up(offset: usize, alignment: usize) -> usize {
     offset.next_multiple_of(alignment)
 }
@@ -374,19 +525,30 @@ const fn ready_offset(rings_end: usize) -> usize {
     empty_offset(rings_end) + 2 * 8
 }
 const fn tmem_offset(rings_end: usize) -> usize {
-    align_up(ready_offset(rings_end) + 8, 4)
+    align_up(ready_offset(rings_end) + ITEMS * 8, 4)
 }
 const fn info_offset(rings_end: usize) -> usize {
     align_up(
         tmem_offset(rings_end) + 4,
-        SharedCell::<TileInfo>::ALIGNMENT,
+        SharedCellRing::<TileInfo, ITEMS>::ALIGNMENT,
+    )
+}
+/// The [`WATCH_DEEP`] arms' one-word "somebody has stalled" flag, which every role
+/// polls at its loop head so a warp that gave up takes the other five out with
+/// it and the launch reaches `cluster_sync` instead of hanging on it.
+///
+/// Reserved in every arm, including the shipped ones, because the alternative is
+/// two shared plans for one kernel and the word is free: everything from here to
+/// [`stage_offset`] sits inside the padding the 128-byte-aligned staging buffer
+/// already left, which is why [`ITEMS`] and this cost nothing.
+const fn stop_offset(rings_end: usize) -> usize {
+    align_up(
+        info_offset(rings_end) + SharedCellRing::<TileInfo, ITEMS>::BYTES,
+        4,
     )
 }
 const fn queue_offset(rings_end: usize) -> usize {
-    align_up(
-        info_offset(rings_end) + SharedCell::<TileInfo>::BYTES,
-        ClcQueue::ALIGNMENT,
-    )
+    align_up(stop_offset(rings_end) + 4, ClcQueue::ALIGNMENT)
 }
 const fn stage_offset(rings_end: usize) -> usize {
     align_up(queue_offset(rings_end) + ClcQueue::BYTES, 128)
@@ -409,10 +571,11 @@ const _: () = {
 struct Common {
     load: SemaphoreRing<STAGES>,
     free: SemaphoreRing<STAGES>,
-    full: SemaphoreRing<2>,
-    empty: SemaphoreRing<2>,
-    ready: Semaphore,
-    info: SharedCell<TileInfo>,
+    full: SemaphoreRing<ACCUMULATORS>,
+    empty: SemaphoreRing<ACCUMULATORS>,
+    ready: SemaphoreRing<ITEMS>,
+    info: SharedCellRing<TileInfo, ITEMS>,
+    stop: SharedCell<u32>,
     queue: ClcQueue,
     stage_base: *mut u8,
     c: GlobalRows<Bf16>,
@@ -443,8 +606,9 @@ impl Common {
                 free: SemaphoreRing::attach(smem.add(free_offset(rings_end)).cast::<Barrier>()),
                 full: SemaphoreRing::attach(smem.add(full_offset(rings_end)).cast::<Barrier>()),
                 empty: SemaphoreRing::attach(smem.add(empty_offset(rings_end)).cast::<Barrier>()),
-                ready: Semaphore::attach(smem.add(ready_offset(rings_end)).cast::<Barrier>()),
-                info: SharedCell::attach(smem.add(info_offset(rings_end))),
+                ready: SemaphoreRing::attach(smem.add(ready_offset(rings_end)).cast::<Barrier>()),
+                info: SharedCellRing::attach(smem.add(info_offset(rings_end))),
+                stop: SharedCell::attach(smem.add(stop_offset(rings_end))),
                 queue: ClcQueue::attach(smem.add(queue_offset(rings_end))),
                 stage_base: smem.add(stage_offset(rings_end)),
                 c: GlobalRows::from_slice(c, ldc as usize),
@@ -467,7 +631,8 @@ impl Common {
                 self.free.init_all(free_arrivals);
                 self.full.init_all(1);
                 self.empty.init_all(RANKS * EPILOGUE_WARPS * 32);
-                self.ready.init(1);
+                self.ready.init_all(1);
+                self.stop.write(0);
                 self.queue.cursor().arm();
                 fence_proxy_async_shared_cta();
             }
@@ -487,7 +652,7 @@ impl Common {
                 self.free.inval_all();
                 self.full.inval_all();
                 self.empty.inval_all();
-                self.ready.inval();
+                self.ready.inval_all();
             }
         }
     }
@@ -501,23 +666,164 @@ impl Common {
         }
     }
 
+    /// The `(barrier, parity)` publication `index` lands on, and the cell it
+    /// lands in — one place, so the producer's `arrive` and the consumers' `wait`
+    /// cannot disagree about the ring's depth.
+    ///
+    /// At [`items`] of one this is `(ready.sem(0), index & 1)` and cell zero,
+    /// which is the spelling the port carried and [`WATCH_ONE_DEEP`] keeps.
     #[inline(always)]
-    unsafe fn publish(self, row: u32, column: u32, has_work: bool) {
+    fn handoff<const ABLATE: u8>(self, index: u32) -> (Semaphore, u32, SharedCell<TileInfo>) {
+        let depth = items(WATCH);
+        (
+            self.ready.sem(index % depth),
+            (index / depth) & 1,
+            self.info.cell(index % depth),
+        )
+    }
+
+    #[inline(always)]
+    unsafe fn publish<const ABLATE: u8>(self, index: u32, row: u32, column: u32, has_work: bool) {
         unsafe {
-            self.info.write(TileInfo {
+            let (ready, _, info) = self.handoff::<ABLATE>(index);
+            info.write(TileInfo {
                 row,
                 column,
                 has_work: has_work as u32,
             });
-            self.ready.arrive();
+            ready.arrive();
         }
     }
 
+    /// Item `sequence`'s coordinates, once the producer has published them.
+    ///
+    /// A [`WATCH_DEEP`] arm that gives up here returns `has_work = 0` so the caller
+    /// leaves its loop by the path it already has, having first left the mark
+    /// that says the exit was a stall and not a sentinel.
     #[inline(always)]
-    unsafe fn next_info(self, sequence: u32) -> TileInfo {
+    unsafe fn next_info<const ABLATE: u8>(self, sequence: u32) -> TileInfo {
         unsafe {
-            self.ready.wait(sequence & 1);
-            self.info.read()
+            let (ready, parity, info) = self.handoff::<ABLATE>(sequence);
+            if watches(WATCH) && !ready.wait_before(parity, DEADLINE) {
+                self.stall(SITE_READY, sequence, sequence % items(WATCH), parity);
+                return TileInfo {
+                    row: 0,
+                    column: 0,
+                    has_work: 0,
+                };
+            }
+            if !watches(WATCH) {
+                ready.wait(parity);
+            }
+            info.read()
+        }
+    }
+
+    /// The MMA warp's operand-stage wait, deadline and all.
+    ///
+    /// It reports rather than returning, because the shape of the K loop that
+    /// calls it is somebody else's argument and this must not change it: the
+    /// stall sets [`Self::stop`], the K loop runs its remaining turns against
+    /// operands nobody promised, and the item loop above notices at its head.
+    /// The arm computes a deliberately wrong `C` past that point and is on no
+    /// correctness gate.
+    #[inline(always)]
+    unsafe fn wait_load<const ABLATE: u8>(self, slot: u32, parity: u32) {
+        unsafe {
+            if watches(WATCH) {
+                if !self.load.sem(slot).wait_before(parity, DEADLINE) {
+                    self.stall(SITE_LOAD, 0, slot, parity);
+                }
+            } else {
+                self.load.sem(slot).wait(parity);
+            }
+        }
+    }
+
+    /// [`Self::wait_load`] addressed by K-block index rather than by stage — the
+    /// `global_k` spelling of the same wait.
+    #[inline(always)]
+    unsafe fn wait_load_at<const ABLATE: u8>(self, index: u32) {
+        unsafe {
+            self.wait_load::<WATCH>(index % STAGES as u32, (index / STAGES as u32) & 1);
+        }
+    }
+
+    /// The epilogue's accumulator-full wait, per [`Self::wait_load`]. `false` is
+    /// a stall the caller must leave its loop on.
+    #[inline(always)]
+    unsafe fn wait_full<const ABLATE: u8>(self, sequence: u32) -> bool {
+        unsafe {
+            if watches(WATCH) {
+                let ok = self.full.wait_before(sequence, DEADLINE);
+                if !ok {
+                    self.stall(
+                        SITE_FULL,
+                        sequence,
+                        sequence % ACCUMULATORS as u32,
+                        (sequence / ACCUMULATORS as u32) & 1,
+                    );
+                }
+                ok
+            } else {
+                self.full.wait(sequence);
+                true
+            }
+        }
+    }
+
+    /// Whether some warp of this CTA has given up. Const-false at every shipped
+    /// arm, so the poll is not in the shipped kernel at all.
+    #[inline(always)]
+    unsafe fn stalled<const ABLATE: u8>(self) -> bool {
+        unsafe { watches(WATCH) && self.stop.read() != 0 }
+    }
+
+    /// Leave this warp's position in the rows of `C` past the output and stop the
+    /// rest of the CTA.
+    #[inline(always)]
+    unsafe fn stall(self, site: u32, sequence: u32, index: u32, parity: u32) {
+        unsafe {
+            self.write_mark(site, sequence, index, parity);
+            self.stop.write(1);
+        }
+    }
+
+    /// One warp's four-word position, written where the host can read it: row
+    /// `m` of `C`, which the [`WATCH_DEEP`] arms allocate [`REPORT_ROWS`] of past
+    /// the output for exactly this.
+    ///
+    /// Eight slots a CTA covers the six warps a block has, indexed by
+    /// `blockIdx.x` rather than by cluster so the two ranks of a pair are told
+    /// apart — a handoff defect is a per-CTA fact and the ranks publish
+    /// separately. Written at every loop head as well as on every stall, so the
+    /// last mark a warp left is where it was even when it never stalled at all.
+    #[inline(always)]
+    unsafe fn mark<const ABLATE: u8>(self, site: u32, sequence: u32, index: u32, parity: u32) {
+        if watches(WATCH) {
+            unsafe { self.write_mark(site, sequence, index, parity) }
+        }
+    }
+
+    /// [`Self::mark`] with the arm's const already resolved — the one form
+    /// [`Self::stall`] can call, since a stall is a stall at every watched arm.
+    #[inline(always)]
+    unsafe fn write_mark(self, site: u32, sequence: u32, index: u32, parity: u32) {
+        unsafe {
+            if self.lane != 0 {
+                return;
+            }
+            let slot = REPORT_FIELDS * (REPORT_SLOTS * thread::blockIdx_x() + self.warp_id);
+            let row = self.tiles_m * (2 * BLOCK_M) as u32;
+            let words = [site, sequence, index, parity];
+            let mut field = 0usize;
+            while field < words.len() {
+                self.c
+                    .at(row, slot + field as u32)
+                    .cast::<u16>()
+                    .write_volatile(words[field] as u16);
+                field += 1;
+            }
         }
     }
 
@@ -854,7 +1160,7 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
     Small<N, HALF, BOX, STAGE>
 {
     #[inline(always)]
-    unsafe fn producer<const ABLATE: u8>(self) {
+    unsafe fn producer<const ABLATE: u8, const WATCH: u8>(self) {
         unsafe {
             const {
                 assert!(N == 2 * HALF, "a rank loads exactly half the panel");
@@ -866,11 +1172,12 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
             let mut sequence = 0u32;
             let valid_items = common.tiles_m * common.tiles_n;
 
-            loop {
+            'items: loop {
                 if raw_item < valid_items {
                     let (tile_n, tile_m) =
                         pipeline::grouped(raw_item, common.tiles_n, common.tiles_m, common.group);
-                    common.publish(tile_m, tile_n, true);
+                    common.publish::<WATCH>(sequence, tile_m, tile_n, true);
+                    common.mark::<WATCH>(SITE_FEED, sequence, raw_item, 0);
                     let a_row =
                         (tile_m * (2 * BLOCK_M) as u32 + common.rank * BLOCK_M as u32) as i32;
                     let b_row = (tile_n * N as u32 + common.rank * HALF as u32) as i32;
@@ -878,7 +1185,14 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
                     let mut k = 0u32;
                     while k < common.k_blocks {
                         let global_k = sequence * common.k_blocks + k;
-                        common.free.wait_recycled(global_k);
+                        if watches(WATCH) {
+                            if !common.free.wait_recycled_before(global_k, DEADLINE) {
+                                common.stall(SITE_FREE, sequence, global_k, 0);
+                                break 'items;
+                            }
+                        } else {
+                            common.free.wait_recycled(global_k);
+                        }
                         if loads(ABLATE) {
                             let load = common.load.sem(global_k).at_rank(LEADER);
                             let k_base = (k * BLOCK_K as u32) as i32;
@@ -913,8 +1227,22 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
                     sequence += 1;
                 }
 
-                let Some(next) = cursor.next() else {
-                    common.publish(0, 0, false);
+                common.mark::<WATCH>(SITE_QUERY, sequence, raw_item, 0);
+                let next = if watches(WATCH) {
+                    match cursor.next_before(DEADLINE) {
+                        Harvest::Item(item) => Some(item),
+                        Harvest::Done => None,
+                        Harvest::Stalled => {
+                            common.stall(SITE_CLC, sequence, raw_item, 0);
+                            break;
+                        }
+                    }
+                } else {
+                    cursor.next()
+                };
+                let Some(next) = next else {
+                    common.publish::<WATCH>(sequence, 0, 0, false);
+                    common.mark::<WATCH>(SITE_EXIT, sequence, 0, 0);
                     break;
                 };
                 raw_item = next;
@@ -923,7 +1251,7 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
     }
 
     #[inline(always)]
-    unsafe fn multiply_stage<const ABLATE: u8>(
+    unsafe fn multiply_stage<const ABLATE: u8, const WATCH: u8>(
         self,
         accumulator: TmemTile<BLOCK_M, N>,
         sequence: u32,
@@ -934,7 +1262,7 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
             let global_k = sequence * common.k_blocks + k;
             if common.rank == LEADER {
                 if waits_on_load(ABLATE) {
-                    common.load.wait(global_k);
+                    common.wait_load_at::<WATCH>(global_k);
                 }
                 if multiplies(ABLATE) {
                     mma_walk_cg2::<F16, CHUNKS>(
@@ -969,7 +1297,7 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
     /// spelling reachable from a plain `impl` method; it also does not depend on
     /// an unroll pass firing.
     #[inline(always)]
-    unsafe fn multiply_at<const ABLATE: u8, const SLOT: u32>(
+    unsafe fn multiply_at<const ABLATE: u8, const WATCH: u8, const SLOT: u32>(
         self,
         accumulator: TmemTile<BLOCK_M, N>,
         parity: u32,
@@ -979,7 +1307,7 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
             let common = self.common;
             if common.rank == LEADER {
                 if waits_on_load(ABLATE) {
-                    common.load.sem(SLOT).wait(parity);
+                    common.wait_load::<WATCH>(SLOT, parity);
                 }
                 if multiplies(ABLATE) {
                     mma_walk_cg2::<F16, CHUNKS>(
@@ -1004,7 +1332,7 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
     /// so the difference between them is entirely how much of the MMA warp's
     /// issue stream is scalar arithmetic.
     #[inline(always)]
-    unsafe fn walk_k<const ABLATE: u8, const FOLD: bool>(
+    unsafe fn walk_k<const ABLATE: u8, const FOLD: bool, const WATCH: u8>(
         self,
         accumulator: TmemTile<BLOCK_M, N>,
         sequence: u32,
@@ -1017,19 +1345,19 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
                 let mut turn = 0u32;
                 while turn < turns {
                     let parity = (cycle + turn) & 1;
-                    self.multiply_at::<ABLATE, 0>(accumulator, parity, turn > 0);
-                    self.multiply_at::<ABLATE, 1>(accumulator, parity, true);
-                    self.multiply_at::<ABLATE, 2>(accumulator, parity, true);
-                    self.multiply_at::<ABLATE, 3>(accumulator, parity, true);
+                    self.multiply_at::<ABLATE, WATCH, 0>(accumulator, parity, turn > 0);
+                    self.multiply_at::<ABLATE, WATCH, 1>(accumulator, parity, true);
+                    self.multiply_at::<ABLATE, WATCH, 2>(accumulator, parity, true);
+                    self.multiply_at::<ABLATE, WATCH, 3>(accumulator, parity, true);
                     turn += 1;
                 }
             } else {
                 let mut k = 0u32;
                 while k < common.k_blocks {
-                    self.multiply_stage::<ABLATE>(accumulator, sequence, k);
-                    self.multiply_stage::<ABLATE>(accumulator, sequence, k + 1);
-                    self.multiply_stage::<ABLATE>(accumulator, sequence, k + 2);
-                    self.multiply_stage::<ABLATE>(accumulator, sequence, k + 3);
+                    self.multiply_stage::<ABLATE, WATCH>(accumulator, sequence, k);
+                    self.multiply_stage::<ABLATE, WATCH>(accumulator, sequence, k + 1);
+                    self.multiply_stage::<ABLATE, WATCH>(accumulator, sequence, k + 2);
+                    self.multiply_stage::<ABLATE, WATCH>(accumulator, sequence, k + 3);
                     k += 4;
                 }
             }
@@ -1037,20 +1365,40 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
     }
 
     #[inline(always)]
-    unsafe fn multiply<const ABLATE: u8, const FOLD: bool>(self) {
+    unsafe fn multiply<const ABLATE: u8, const FOLD: bool, const WATCH: u8>(self) {
         unsafe {
             let common = self.common;
             let mut sequence = 0u32;
             loop {
-                if common.next_info(sequence).has_work == 0 {
+                if common.stalled::<WATCH>() {
                     break;
                 }
+                if common.next_info::<WATCH>(sequence).has_work == 0 {
+                    if !common.stalled::<WATCH>() {
+                        common.mark::<WATCH>(SITE_EXIT, sequence, 0, 0);
+                    }
+                    break;
+                }
+                common.mark::<WATCH>(SITE_MULTIPLY, sequence, 0, 0);
                 let accumulator = Common::accumulator(self.accumulator, sequence);
-                if common.rank == LEADER && sequence >= 2 {
-                    common.empty.wait(sequence - 2);
+                if common.rank == LEADER && sequence >= ACCUMULATORS as u32 {
+                    let ahead = sequence - ACCUMULATORS as u32;
+                    if watches(WATCH) {
+                        if !common.empty.wait_before(ahead, DEADLINE) {
+                            common.stall(
+                                SITE_EMPTY,
+                                sequence,
+                                ahead % ACCUMULATORS as u32,
+                                (ahead / ACCUMULATORS as u32) & 1,
+                            );
+                            break;
+                        }
+                    } else {
+                        common.empty.wait(ahead);
+                    }
                 }
 
-                self.walk_k::<ABLATE, FOLD>(accumulator, sequence);
+                self.walk_k::<ABLATE, FOLD, WATCH>(accumulator, sequence);
                 if common.rank == LEADER {
                     commit_multicast_cg2(common.full.sem(sequence), PAIR);
                 }
@@ -1060,23 +1408,32 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
     }
 
     #[inline(always)]
-    unsafe fn epilogue<const ABLATE: u8, const DRAIN: u8>(self) {
+    unsafe fn epilogue<const ABLATE: u8, const DRAIN: u8, const WATCH: u8>(self) {
         unsafe {
             let common = self.common;
             let mut sequence = 0u32;
             let mut again = (0u32, 0u32);
             loop {
-                let info = common.next_info(sequence);
-                if info.has_work == 0 {
+                if common.stalled::<WATCH>() {
                     break;
                 }
+                let info = common.next_info::<WATCH>(sequence);
+                if info.has_work == 0 {
+                    if !common.stalled::<WATCH>() {
+                        common.mark::<WATCH>(SITE_EXIT, sequence, 0, 0);
+                    }
+                    break;
+                }
+                common.mark::<WATCH>(SITE_DRAIN, sequence, info.row, info.column);
                 let (row, column) = (info.row * (2 * BLOCK_M) as u32, info.column * N as u32);
                 // Only the doubling probes have a second destination, and only
                 // they pay for tracking it.
                 if twice(ABLATE) > 0 && sequence == 0 {
                     again = (row, column);
                 }
-                common.full.wait(sequence);
+                if !common.wait_full::<WATCH>(sequence) {
+                    break;
+                }
                 if drains(ABLATE) || DRAIN >= DRAIN_PACK16 {
                     common.drain_dial::<ABLATE, DRAIN, N, STAGE>(
                         Common::accumulator(self.accumulator, sequence),
@@ -1109,7 +1466,7 @@ struct Large<const BOX: usize> {
 
 impl<const BOX: usize> Large<BOX> {
     #[inline(always)]
-    unsafe fn producer<const ABLATE: u8>(self) {
+    unsafe fn producer<const ABLATE: u8, const WATCH: u8>(self) {
         unsafe {
             let common = self.common;
             let mut cursor = common.queue.cursor();
@@ -1118,11 +1475,12 @@ impl<const BOX: usize> Large<BOX> {
             let macro_tiles_m = common.tiles_m / 2;
             let valid_items = macro_tiles_m * common.tiles_n;
 
-            loop {
+            'items: loop {
                 if raw_item < valid_items {
                     let (tile_n, macro_m) =
                         pipeline::grouped(raw_item, common.tiles_n, macro_tiles_m, common.group);
-                    common.publish(macro_m, tile_n, true);
+                    common.publish::<WATCH>(sequence, macro_m, tile_n, true);
+                    common.mark::<WATCH>(SITE_FEED, sequence, raw_item, 0);
                     let a_row0 = (macro_m * 512 + common.rank * BLOCK_M as u32) as i32;
                     let a_row1 = a_row0 + 256;
                     let b_row = (tile_n * BLOCK_N as u32 + common.rank * HALF_N as u32) as i32;
@@ -1130,7 +1488,14 @@ impl<const BOX: usize> Large<BOX> {
                     let mut k = 0u32;
                     while k < common.k_blocks {
                         let global_k = sequence * common.k_blocks + k;
-                        common.free.wait_recycled(global_k);
+                        if watches(WATCH) {
+                            if !common.free.wait_recycled_before(global_k, DEADLINE) {
+                                common.stall(SITE_FREE, sequence, global_k, 0);
+                                break 'items;
+                            }
+                        } else {
+                            common.free.wait_recycled(global_k);
+                        }
                         if loads(ABLATE) {
                             let load = common.load.sem(global_k).at_rank(LEADER);
                             let k_base = (k * BLOCK_K as u32) as i32;
@@ -1169,8 +1534,22 @@ impl<const BOX: usize> Large<BOX> {
                     sequence += 1;
                 }
 
-                let Some(next) = cursor.next() else {
-                    common.publish(0, 0, false);
+                common.mark::<WATCH>(SITE_QUERY, sequence, raw_item, 0);
+                let next = if watches(WATCH) {
+                    match cursor.next_before(DEADLINE) {
+                        Harvest::Item(item) => Some(item),
+                        Harvest::Done => None,
+                        Harvest::Stalled => {
+                            common.stall(SITE_CLC, sequence, raw_item, 0);
+                            break;
+                        }
+                    }
+                } else {
+                    cursor.next()
+                };
+                let Some(next) = next else {
+                    common.publish::<WATCH>(sequence, 0, 0, false);
+                    common.mark::<WATCH>(SITE_EXIT, sequence, 0, 0);
                     break;
                 };
                 raw_item = next;
@@ -1179,13 +1558,13 @@ impl<const BOX: usize> Large<BOX> {
     }
 
     #[inline(always)]
-    unsafe fn multiply_stage<const ABLATE: u8>(self, sequence: u32, k: u32) {
+    unsafe fn multiply_stage<const ABLATE: u8, const WATCH: u8>(self, sequence: u32, k: u32) {
         unsafe {
             let common = self.common;
             let global_k = sequence * common.k_blocks + k;
             if common.rank == LEADER {
                 if waits_on_load(ABLATE) {
-                    common.load.wait(global_k);
+                    common.wait_load_at::<WATCH>(global_k);
                 }
                 if multiplies(ABLATE) {
                     mma_walk_cg2::<F16, CHUNKS>(
@@ -1228,7 +1607,7 @@ impl<const BOX: usize> Large<BOX> {
     /// `full` commit at `k + 1 == k_blocks` — and both are literals at three of
     /// the four positions, so they fold away with the stage.
     #[inline(always)]
-    unsafe fn multiply_at<const ABLATE: u8, const SLOT: u32>(
+    unsafe fn multiply_at<const ABLATE: u8, const WATCH: u8, const SLOT: u32>(
         self,
         sequence: u32,
         parity: u32,
@@ -1240,7 +1619,7 @@ impl<const BOX: usize> Large<BOX> {
             let common = self.common;
             if common.rank == LEADER {
                 if waits_on_load(ABLATE) {
-                    common.load.sem(SLOT).wait(parity);
+                    common.wait_load::<WATCH>(SLOT, parity);
                 }
                 if multiplies(ABLATE) {
                     mma_walk_cg2::<F16, CHUNKS>(
@@ -1278,7 +1657,7 @@ impl<const BOX: usize> Large<BOX> {
 
     /// The K walk, per [`Small::walk_k`].
     #[inline(always)]
-    unsafe fn walk_k<const ABLATE: u8, const FOLD: bool>(self, sequence: u32) {
+    unsafe fn walk_k<const ABLATE: u8, const FOLD: bool, const WATCH: u8>(self, sequence: u32) {
         unsafe {
             let common = self.common;
             if FOLD {
@@ -1288,19 +1667,25 @@ impl<const BOX: usize> Large<BOX> {
                 while turn < turns {
                     let parity = (cycle + turn) & 1;
                     let last = turn + 1 == turns;
-                    self.multiply_at::<ABLATE, 0>(sequence, parity, turn > 0, turn == 0, false);
-                    self.multiply_at::<ABLATE, 1>(sequence, parity, true, false, false);
-                    self.multiply_at::<ABLATE, 2>(sequence, parity, true, false, false);
-                    self.multiply_at::<ABLATE, 3>(sequence, parity, true, false, last);
+                    self.multiply_at::<ABLATE, WATCH, 0>(
+                        sequence,
+                        parity,
+                        turn > 0,
+                        turn == 0,
+                        false,
+                    );
+                    self.multiply_at::<ABLATE, WATCH, 1>(sequence, parity, true, false, false);
+                    self.multiply_at::<ABLATE, WATCH, 2>(sequence, parity, true, false, false);
+                    self.multiply_at::<ABLATE, WATCH, 3>(sequence, parity, true, false, last);
                     turn += 1;
                 }
             } else {
                 let mut k = 0u32;
                 while k < common.k_blocks {
-                    self.multiply_stage::<ABLATE>(sequence, k);
-                    self.multiply_stage::<ABLATE>(sequence, k + 1);
-                    self.multiply_stage::<ABLATE>(sequence, k + 2);
-                    self.multiply_stage::<ABLATE>(sequence, k + 3);
+                    self.multiply_stage::<ABLATE, WATCH>(sequence, k);
+                    self.multiply_stage::<ABLATE, WATCH>(sequence, k + 1);
+                    self.multiply_stage::<ABLATE, WATCH>(sequence, k + 2);
+                    self.multiply_stage::<ABLATE, WATCH>(sequence, k + 3);
                     k += 4;
                 }
             }
@@ -1308,40 +1693,72 @@ impl<const BOX: usize> Large<BOX> {
     }
 
     #[inline(always)]
-    unsafe fn multiply<const ABLATE: u8, const FOLD: bool>(self) {
+    unsafe fn multiply<const ABLATE: u8, const FOLD: bool, const WATCH: u8>(self) {
         unsafe {
             let common = self.common;
             let mut sequence = 0u32;
             loop {
-                if common.next_info(sequence).has_work == 0 {
+                if common.stalled::<WATCH>() {
                     break;
                 }
-                if common.rank == LEADER && sequence > 0 {
-                    common.empty.sem(0).wait((sequence - 1) & 1);
+                if common.next_info::<WATCH>(sequence).has_work == 0 {
+                    if !common.stalled::<WATCH>() {
+                        common.mark::<WATCH>(SITE_EXIT, sequence, 0, 0);
+                    }
+                    break;
                 }
-                self.walk_k::<ABLATE, FOLD>(sequence);
+                common.mark::<WATCH>(SITE_MULTIPLY, sequence, 0, 0);
+                if common.rank == LEADER && sequence > 0 {
+                    if watches(WATCH) {
+                        if !common
+                            .empty
+                            .sem(0)
+                            .wait_before((sequence - 1) & 1, DEADLINE)
+                        {
+                            common.stall(SITE_EMPTY, sequence, 0, (sequence - 1) & 1);
+                            break;
+                        }
+                    } else {
+                        common.empty.sem(0).wait((sequence - 1) & 1);
+                    }
+                }
+                self.walk_k::<ABLATE, FOLD, WATCH>(sequence);
                 sequence += 1;
             }
         }
     }
 
     #[inline(always)]
-    unsafe fn epilogue<const ABLATE: u8, const DRAIN: u8>(self) {
+    unsafe fn epilogue<const ABLATE: u8, const DRAIN: u8, const WATCH: u8>(self) {
         unsafe {
             let common = self.common;
             let mut sequence = 0u32;
             let mut again = (0u32, 0u32);
-            loop {
-                let info = common.next_info(sequence);
-                if info.has_work == 0 {
+            'items: loop {
+                if common.stalled::<WATCH>() {
                     break;
                 }
+                let info = common.next_info::<WATCH>(sequence);
+                if info.has_work == 0 {
+                    if !common.stalled::<WATCH>() {
+                        common.mark::<WATCH>(SITE_EXIT, sequence, 0, 0);
+                    }
+                    break;
+                }
+                common.mark::<WATCH>(SITE_DRAIN, sequence, info.row, info.column);
                 if twice(ABLATE) > 0 && sequence == 0 {
                     again = (info.row * 512, info.column * BLOCK_N as u32);
                 }
                 let mut half = 0u32;
                 while half < 2 {
-                    common.full.sem(half).wait(sequence & 1);
+                    if watches(WATCH) {
+                        if !common.full.sem(half).wait_before(sequence & 1, DEADLINE) {
+                            common.stall(SITE_FULL, sequence, half, sequence & 1);
+                            break 'items;
+                        }
+                    } else {
+                        common.full.sem(half).wait(sequence & 1);
+                    }
                     if drains(ABLATE) || DRAIN >= DRAIN_PACK16 {
                         common.drain_dial::<ABLATE, DRAIN, BLOCK_N, LARGE_STAGE_N>(
                             self.accumulator.columns_right(half * BLOCK_N as u32),
@@ -1385,6 +1802,7 @@ pub unsafe fn small_body<
     const ABLATE: u8,
     const FOLD: bool,
     const DRAIN: u8,
+    const WATCH: u8,
 >(
     a_map: *const TmaDescriptor,
     b_map: *const TmaDescriptor,
@@ -1412,11 +1830,11 @@ pub unsafe fn small_body<
         };
 
         if common.warp_id == TMA_WARP && common.lane == 0 {
-            state.producer::<ABLATE>();
+            state.producer::<ABLATE, WATCH>();
         } else if common.warp_id == MMA_WARP && common.lane == 0 {
-            state.multiply::<ABLATE, FOLD>();
+            state.multiply::<ABLATE, FOLD, WATCH>();
         } else if common.warp_id < EPILOGUE_WARPS {
-            state.epilogue::<ABLATE, DRAIN>();
+            state.epilogue::<ABLATE, DRAIN, WATCH>();
         }
 
         common.retire();
@@ -1431,7 +1849,13 @@ pub unsafe fn small_body<
 /// As [`kernels::gemm_sol_m512`].
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn large_body<const BOX: usize, const ABLATE: u8, const FOLD: bool, const DRAIN: u8>(
+pub unsafe fn large_body<
+    const BOX: usize,
+    const ABLATE: u8,
+    const FOLD: bool,
+    const DRAIN: u8,
+    const WATCH: u8,
+>(
     a_map: *const TmaDescriptor,
     b_map: *const TmaDescriptor,
     tiles_m: u32,
@@ -1468,11 +1892,11 @@ pub unsafe fn large_body<const BOX: usize, const ABLATE: u8, const FOLD: bool, c
         };
 
         if common.warp_id == TMA_WARP && common.lane == 0 {
-            state.producer::<ABLATE>();
+            state.producer::<ABLATE, WATCH>();
         } else if common.warp_id == MMA_WARP && common.lane == 0 {
-            state.multiply::<ABLATE, FOLD>();
+            state.multiply::<ABLATE, FOLD, WATCH>();
         } else if common.warp_id < EPILOGUE_WARPS {
-            state.epilogue::<ABLATE, DRAIN>();
+            state.epilogue::<ABLATE, DRAIN, WATCH>();
         }
 
         common.retire();
@@ -1518,6 +1942,7 @@ pub mod kernels {
                 WHOLE,
                 true,
                 SHIPPED_DRAIN,
+                WATCH_OFF,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c);
         }
     }
@@ -1559,6 +1984,7 @@ pub mod kernels {
                 WHOLE,
                 true,
                 SHIPPED_DRAIN,
+                WATCH_OFF,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c);
         }
     }
@@ -1586,7 +2012,7 @@ pub mod kernels {
     ) {
         unsafe {
             const { assert!(LARGE_SHARED_BYTES == 229_632) };
-            large_body::<B_BOX, WHOLE, true, SHIPPED_DRAIN>(
+            large_body::<B_BOX, WHOLE, true, SHIPPED_DRAIN, WATCH_OFF>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             );
         }
@@ -1913,6 +2339,27 @@ fn nothing_after(
     Ok(())
 }
 
+/// The shallowest `k` the contract admits, at a grid deep enough that a cluster
+/// has to take a second item — one shape per entry, and #149's regression.
+///
+/// `1024x1024x512` alone is why that issue survived. It is 16, 8 and 4 clusters
+/// at the three entries against 74 resident, so **every cluster gets exactly one
+/// item**, its producer publishes once and then the sentinel, and the item
+/// handoff is never asked to hold two. Every timed row in every sweep was at
+/// `k >= 2048`. So the whole of the regime the handoff's depth is about — more
+/// clusters than the device holds, at a `k` short enough that a tile's K loop is
+/// comparable to its drain — was untested at all three entries.
+///
+/// Each of these is above 74 clusters and at `k_blocks == STAGES`, which is the
+/// shape [`ITEMS`]' derivation is tight at. They cost about 20 million output
+/// comparisons between them, which is a fifth of what one `bench` row already
+/// checks.
+const SHALLOW_K_GATE: [(Variant, usize, usize); 3] = [
+    (Variant::M256xN128, 2048, 2048),
+    (Variant::M256xN256, 2560, 2048),
+    (Variant::M512xN256, 5120, 2048),
+];
+
 pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String, Box<dyn Error>> {
     let mut notes = Vec::new();
     for variant in Variant::ALL {
@@ -1921,6 +2368,13 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
             group: default_group(1024),
         };
         notes.push(run(context, 1024, 1024, 512, plan, true, nothing_after)?.0);
+    }
+    for (variant, m, n) in SHALLOW_K_GATE {
+        let plan = Plan {
+            variant,
+            group: default_group(m),
+        };
+        notes.push(run(context, m, n, STAGES * BLOCK_K, plan, true, nothing_after)?.0);
     }
     Ok(notes.join("; "))
 }
