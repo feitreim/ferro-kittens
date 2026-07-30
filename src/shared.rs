@@ -1424,7 +1424,8 @@ impl<T: Copy> SharedCell<T> {
 /// `N`; a shallower ring either overwrites an unread message or lands the
 /// consumer's wait on a phase the producer has already passed. So a kernel
 /// handing items across warps must *derive* `N` from what its own back-pressure
-/// guarantees — [`crate::sync::depth_needed`] does that for a persistent GEMM —
+/// guarantees — [`crate::sync::handoff::depth_needed`] does that for a
+/// persistent GEMM —
 /// and the payload ring and the semaphore ring must be built at the same `N`
 /// for a parity to name a cell.
 #[derive(Clone, Copy)]
