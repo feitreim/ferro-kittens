@@ -5057,11 +5057,34 @@ roughly two points of the residual is in the feed's interaction rather than in t
 epilogue, and it is not the ring index, not the barrier, not the issue rate and
 not the producer's instruction count — all four are now measured at zero.
 
+**The residual against upstream is neither the feed nor the issue stream**, and a
+static diff settled it for no container time. Upstream's producer charges
+`(A_TILE_BYTES + B_TILE_BYTES) * 2` per K block per cluster — **64 KB, identical to
+ours** — as three `cp.async.bulk.tensor` per rank under a `self_mask`, one `A` and
+two 64-row `B` panels, under its own comment *"the fixed host descriptor exposes a
+64x64 B panel"*. Same bytes, same instructions, same mask, same four stages, and
+therefore the same 95.5% duty. And `_print_mma_stream` counts non-`mma`
+instructions between the first and last `tcgen05.mma`: **8.8 per issue before the
+fold, 7.5 for upstream, 2.9 after** — we are 2.6× leaner than upstream and still
+3.5 points behind on the rate. So **instruction count in the MMA warp is not the
+binding constraint**, which also forecloses the tempting next lever: our barriers
+sit at offsets into a dynamic-shared allocation and cost a `mov.b64` plus `add.s64`
+inside every `try_wait` spin and a `cvta.shared.u64` chain around every
+`tcgen05.commit`, where upstream's are static `.shared` symbols — but that is an
+instruction-count argument and the table above refutes the class.
+
 **What this does not separate.** Why the feed in situ costs 24.5% at 95.5% duty
-and 0.0% at 55.7% is a duty-cycle argument, not a mechanism: bank conflicts
-between the TMA's writes and `tcgen05`'s operand reads, and the shared-memory
-write port, are not distinguished from each other here, and no arm in this file can
-distinguish them. The per-tile constants the ladders fit are two-point fits of
+and 0.0% at 55.7% is a duty-cycle argument, not a mechanism: **bank conflicts
+between the TMA's writes and `tcgen05`'s operand reads are not distinguished from
+saturation of the shared-memory write port, and no arm in this file can distinguish
+them** — every arm removes a phase, so each removes both candidates at once, and
+bytes are the only dial. The arm that would separate them changes the *access
+pattern* at constant bytes and constant instruction count: `A` and `B` staged at
+swizzles or pitches that collide differently while the TMA still moves 64 KB a K
+block. Bank conflicts would move; a saturated write port could not. Likewise the
+3.5 points still behind upstream is latency or ordering, and the instrument for
+*that* is a per-warp `%globaltimer` span probe, whose own perturbation would have
+to be measured against `whole` before any of its numbers counted. The per-tile constants the ladders fit are two-point fits of
 small differences between large numbers, so only the large one — the drain's 2.9 µs
 a tile, which reproduces #147's independently measured 2.82 — is quoted.
 

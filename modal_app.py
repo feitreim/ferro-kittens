@@ -397,6 +397,11 @@ def build() -> None:
          cwd=EXPERIMENTS_DIR)
     _run(["ptxas", "-arch=sm_100a", "-o", "/dev/null", "kittens_experiments.ptx"],
          cwd=EXPERIMENTS_DIR)
+    # The MMA warp's K-loop issue stream, ours and upstream's, off the one bundle
+    # that carries both. It lives here rather than in `regcount` because
+    # `regcount` builds without features and so never emits upstream's kernels,
+    # and because this is the only step that already pays for that codegen.
+    _print_mma_stream()
 
 
 # `gaps` lived here until #3, and printed each aspirational kernel's remaining
@@ -1093,6 +1098,12 @@ MMA_STREAM_KERNELS = (
     # arithmetic.
     "gemm_sol_m256_runtime",
     "gemm_sol_m512_runtime",
+    # Upstream's own two entries, when the vendored copy is compiled in. #148
+    # closed the port's K-loop deficit against upstream from 6.0 points of peak
+    # to 3.5 and could not explain the rest; a static diff of the two issue
+    # streams costs no GPU and is the first place to look for it.
+    "gemm_sol_clc_multicast_4_stage_pipeline",
+    "gemm_sol_clc_multicast_4_stage_pipeline_large",
 )
 
 
