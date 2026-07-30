@@ -1,29 +1,21 @@
 //! Shared-memory tiles with the swizzle in the type.
 //!
-//! The layout scheme is the one flash-attention and GEMM kernels validated on
-//! B200: a SWIZZLE_128B tile is stored as stacked 128-byte-row *subtiles* (64
-//! bf16 columns each), so the swizzle phase inside each subtile equals the row
-//! index — the coincidence a 64-wide panel gives for free, kept by
-//! construction at every width. A `[R, 128]` bf16 operand is two stacked
-//! `[R, 64]` subtiles a subtile-stride apart; `[R, 64]` operands (P/dS) are a
-//! single subtile. Widths that are not a whole number of subtiles are a
-//! compile error, not a differently-swizzled layout: restrict honestly
-//! rather than pretend generality.
+//! A SWIZZLE_128B tile is stored as stacked 128-byte-row *subtiles* (64 bf16
+//! columns each); a width that is not a whole number of them is a compile
+//! error. Two facts of that layout a caller has to know:
 //!
-//! Two facts of that layout the types keep straight:
-//! - **Absolute phase.** SWIZZLE_128B XORs *physical* address bits `[9:7]`
-//!   into the 16-byte-chunk index, so manual swizzled stores must fold in
-//!   the tile base's own 128-byte row phase ([`SharedTile::swizzle_phase`]).
-//! - **TMA loads a subtile per box.** The tensor maps built by [`crate::global`]
-//!   describe 64-column boxes, so [`SharedTile::tma_load`] issues one
-//!   `cp.async.bulk.tensor` per subtile, lifting the leading coordinate by 64
-//!   per stack level. [`SharedTile::tma_store`] walks the same boxes the other
-//!   way, and completes through a wholly different mechanism —
-//!   [`tma_store_commit`] and the two waits, not a [`Semaphore`].
+//! - **The phase is absolute.** The swizzle XORs *physical* address bits
+//!   `[9:7]`, so a tile's own base position folds into every chunk address —
+//!   [`SharedTile::chunk_writer`] captures it once.
+//! - **A load completes on a [`Semaphore`] and a store does not.**
+//!   [`SharedTile::tma_load`] hands back the charge for its barrier;
+//!   [`SharedTile::tma_store`] completes through [`tma_store_commit`] and one
+//!   of the two waits, and the obligations that buys outlive the call.
 //!
-//! [`SharedVec`] is the other shape shared memory holds, and it deliberately
-//! shares none of that machinery: a vector is one flat run of elements, no
-//! swizzle, one box. The reasoning is on the type.
+//! [`SharedVec`] is the other shape and shares none of that machinery: one flat
+//! run of elements, no swizzle, one box.
+//!
+//! Design notes and rejected alternatives: `docs/library/shared.md`.
 
 use core::marker::PhantomData;
 
@@ -53,11 +45,8 @@ pub trait Element {
     /// The fp32 values that fill one 32-bit packed word: `[f32; 2]` for a
     /// 2-byte element, `[f32; 4]` for an 8-bit one.
     ///
-    /// An associated type rather than `[f32; PER_WORD]` because an array
-    /// length must be a const expression of the parameters, which would need
-    /// `generic_const_exprs` — the same dodge [`crate::reg::FragmentLayout`]
-    /// takes for its storage. It also gives store paths a way to state their
-    /// arity: the `stmatrix` path moves b16 matrices, so it bounds
+    /// This is also how a path states its arity: `ldst`'s `stmatrix`/`ldmatrix`
+    /// paths move b16 matrices, so they bound
     /// `E: Element<Unpacked = [f32; 2]>` and a 4-per-word element fails to
     /// typecheck there instead of packing silently wrong.
     type Unpacked: Copy;
@@ -69,28 +58,23 @@ pub trait Element {
     /// two cannot disagree.
     const PER_WORD: usize = size_of::<Self::Unpacked>() / size_of::<f32>();
 
-    /// Pack one word's worth of fp32 values — the inverse of the unpack a
-    /// TMEM drain does, with the first value in the low half.
+    /// Pack one word's worth of fp32 values, first value in the low half.
     fn pack(values: Self::Unpacked) -> u32;
 
-    /// Split one packed word back into fp32, the exact inverse of
-    /// [`Self::pack`] for every element narrower than fp32 — widening loses
-    /// nothing, so a load path is free of the rounding the store side has.
+    /// Split one packed word back into fp32 — the exact inverse of
+    /// [`Self::pack`] for every element narrower than fp32, since widening
+    /// loses nothing.
     fn unpack(word: u32) -> Self::Unpacked;
 
     /// Read one element of shared memory as the fp32 a register holds.
     ///
-    /// The scalar half of the trait, beside [`Self::pack`]'s word half, and
-    /// what a [`SharedVec`] is addressed with: a vector's consumers index
-    /// *elements* — one column's parameter, one warp's partial — where a
-    /// tile's move whole 32-bit words through `ldmatrix`. [`Self::Unpacked`]
-    /// is an opaque `Copy` type with no way to pick a lane out of it, so the
-    /// word form cannot serve an element index however the caller bounds it.
+    /// The scalar half of the trait, and what a [`SharedVec`] is addressed
+    /// with: a vector's consumers index *elements* where a tile's move whole
+    /// 32-bit words.
     ///
     /// # Safety
     ///
-    /// `at` must point at a live element of `Self`, aligned to
-    /// [`Self::BYTES`].
+    /// - `at` points at a live element of `Self`, aligned to [`Self::BYTES`].
     unsafe fn read(at: *const u8) -> f32;
 
     /// Write one fp32 as a single element, rounding exactly as [`Self::pack`]
@@ -102,28 +86,22 @@ pub trait Element {
     ///
     /// # Safety
     ///
-    /// As [`Self::read`], and writable.
+    /// - As [`Self::read`], and writable.
     unsafe fn write(at: *mut u8, value: f32);
 
     /// Write two *adjacent* elements in one memory access — what
-    /// [`crate::reg::ColLayout::CONTIGUOUS_VALUES`] is spent on, and the only
-    /// thing about a fragment mover that depends on the element.
+    /// [`crate::reg::ColLayout::CONTIGUOUS_VALUES`] is spent on.
     ///
-    /// The default is the two scalar writes it replaces, so an element that
-    /// has no wider spelling is correct without stating one. Both elements
-    /// here do have one and they are different in kind: a 2-byte element packs
-    /// the pair into a single word ([`Self::pack`]), where fp32 needs a vector
-    /// instruction to move two.
-    ///
-    /// **The overrides are global-memory instructions**, which is what the
-    /// contract below says and the reason there is no shared-memory caller: a
-    /// `SharedVec`'s neighbouring elements belong to different lanes, and this
-    /// pairs values one lane owns.
+    /// The default is the two scalar writes it replaces, so an element with no
+    /// wider spelling is correct without stating one. **Every override is a
+    /// global-memory instruction**, which is why there is no shared-memory
+    /// caller: a `SharedVec`'s neighbouring elements belong to different lanes,
+    /// and this pairs values one lane owns.
     ///
     /// # Safety
     ///
-    /// `at` must be aligned to `2 * BYTES` and name two writable elements of a
-    /// global buffer.
+    /// - `at` is aligned to `2 * BYTES`.
+    /// - `at` names two writable elements of a **global** buffer.
     #[inline(always)]
     unsafe fn write_pair(at: *mut u8, first: f32, second: f32) {
         unsafe {
@@ -136,47 +114,32 @@ pub trait Element {
     ///
     /// # Safety
     ///
-    /// As [`Self::write_pair`], reading instead of writing.
+    /// - As [`Self::write_pair`], reading instead of writing.
     #[inline(always)]
     unsafe fn read_pair(at: *const u8) -> (f32, f32) {
         unsafe { (Self::read(at), Self::read(at.add(Self::BYTES))) }
     }
 }
 
-/// `collector::a::discard` — the `COLLECTOR_A` selector every walk here
-/// issues under, and tcgen05's own default: nothing in this crate reuses an
-/// `A` operand across instructions, so no chain has a collector buffer to
-/// keep alive.
+/// `collector::a::discard` — tcgen05's own default, and what every walk here
+/// issues under: nothing in this crate reuses an `A` operand across
+/// instructions, so no chain has a collector buffer to keep alive.
 const COLLECTOR_DISCARD: u32 = 0;
 
 /// Element types a tcgen05 MMA accepts as an operand.
 ///
-/// Split from [`Element`] because operand kind is an MMA property and a tile
-/// that only moves bytes never reaches an MMA — the same split, for the same
-/// reason, as [`crate::reg::RowLayout`] out of [`crate::reg::FragmentLayout`].
-///
-/// The element is also where the *instruction* is selected, not just the
-/// operand format: [`Self::mma`] and [`Self::mma_cg2`] are the whole of
-/// [`crate::mma`]'s routing to silicon (#12). That is deliberate — it is what
-/// makes a new operand type a new impl of this trait rather than a new MMA
-/// layer — and it is why the routing is a *method* and not
-/// `tcgen05_mma_shared::<{ Self::MMA_KIND }, ..>` at the call site: Rust
-/// cannot pass an associated const of a type *parameter* as a const-generic
-/// argument without `generic_const_exprs`. An impl writing `Self::MMA_KIND`
-/// for itself is legal and is what keeps the const and the instruction from
-/// drifting apart.
+/// [`Self::mma`] and [`Self::mma_cg2`] are the whole of [`crate::mma`]'s
+/// routing to silicon, so a new operand type is a new impl of this trait rather
+/// than a new MMA layer.
 pub trait MmaElement: Element {
     /// The operand kind tcgen05's `KIND` const selects: 0 = f16, 1 = tf32,
-    /// 2 = f8f6f4, 3 = i8. A `u32` to match the const-generic parameter of
-    /// `tcgen05_mma_shared`/`tcgen05_mma_tensor` exactly, so an impl's
-    /// [`Self::mma`] is a substitution and not a cast.
+    /// 2 = f8f6f4, 3 = i8.
     const MMA_KIND: u32;
 
     /// The instruction descriptor's `atype`/`btype` field, which settles the
     /// operand's format *within* its [`Self::MMA_KIND`] — f16 and bf16 share
     /// kind 0 and are told apart only here. Reading the same bits under the
-    /// wrong one produces a full accumulator of wrong numbers, so it belongs
-    /// to the element rather than to whoever assembles the descriptor.
+    /// wrong one produces a full accumulator of wrong numbers.
     const ELEMENT_TYPE: Tcgen05ElementType;
 
     /// One `cta_group::1` MMA of this element's kind: accumulate
@@ -185,11 +148,12 @@ pub trait MmaElement: Element {
     ///
     /// # Safety
     ///
-    /// Exactly one thread issues this. `tmem` must name an allocation the
-    /// instruction descriptor's shape fits, both operand descriptors must
-    /// describe committed shared memory of `Self`, and the descriptor's
-    /// `atype`/`btype` must be [`Self::ELEMENT_TYPE`] — reading the bytes
-    /// under another element's format faults nothing and computes garbage.
+    /// - Exactly one thread issues this.
+    /// - `tmem` names an allocation the instruction descriptor's shape fits.
+    /// - Both operand descriptors describe committed shared memory of `Self`.
+    /// - The descriptor's `atype`/`btype` is [`Self::ELEMENT_TYPE`] — reading
+    ///   the bytes under another element's format faults nothing and computes
+    ///   garbage.
     unsafe fn mma(tmem: u32, a_desc: u64, b_desc: u64, instruction: u32, enable_d: bool);
 
     /// [`Self::mma`] under `cta_group::2`: one instruction from the leader
@@ -198,16 +162,15 @@ pub trait MmaElement: Element {
     ///
     /// # Safety
     ///
-    /// As [`Self::mma`], from the leader CTA's issuing thread only, with the
-    /// cluster's peer holding its halves at those offsets.
+    /// - As [`Self::mma`], issued from the leader CTA only.
+    /// - The cluster's peer holds its operand halves at those same offsets.
     unsafe fn mma_cg2(tmem: u32, a_desc: u64, b_desc: u64, instruction: u32, enable_d: bool);
 }
 
-/// IEEE fp16 staged operands.
+/// IEEE fp16 staged operands — the other tcgen05 kind-0 format beside [`Bf16`].
 ///
-/// This is the other tcgen05 kind-0 format beside [`Bf16`]. Keeping it as its
-/// own element makes the tensor map, shared tile, operand descriptor, and MMA
-/// instruction agree on FP16 without a format flag at any call site.
+/// Its own element so that the tensor map, shared tile, operand descriptor and
+/// MMA instruction agree on FP16 without a format flag at any call site.
 pub struct F16;
 
 impl Element for F16 {
@@ -296,9 +259,8 @@ impl Element for Bf16 {
     }
 
     /// bf16 is fp32's leading 16 bits, so widening is a shift and no
-    /// instruction — `cuda-device` exposes conversions in the narrowing
-    /// direction only, and there is nothing here for one to do. Unlike
-    /// [`Self::pack`] this is ordinary bit math, so it holds on the host too.
+    /// instruction. Unlike [`Self::pack`] this is ordinary bit math, so it
+    /// holds on the host too.
     #[inline(always)]
     fn unpack(word: u32) -> [f32; 2] {
         [
@@ -323,8 +285,7 @@ impl Element for Bf16 {
 
     /// Two adjacent bf16 **are** one packed word, so the pair is a plain
     /// 4-byte store of [`Self::pack`] and needs no vector instruction: one
-    /// `cvt.rn.bf16x2.f32` and one `st.global.u32` where the fp32 element
-    /// needs a `st.global.v2.f32` carrying twice the bytes.
+    /// `cvt.rn.bf16x2.f32` and one `st.global.u32`.
     #[inline(always)]
     unsafe fn write_pair(at: *mut u8, first: f32, second: f32) {
         unsafe { *(at as *mut u32) = Self::pack([first, second]) }
@@ -338,8 +299,8 @@ impl Element for Bf16 {
 }
 
 impl MmaElement for Bf16 {
-    /// bf16 rides the f16 operand kind; bf16-vs-f16 is settled by the
-    /// instruction descriptor's element-type field, not by `KIND`.
+    /// bf16 rides the f16 operand kind; bf16-vs-f16 is settled by
+    /// [`Self::ELEMENT_TYPE`], not by `KIND`.
     const MMA_KIND: u32 = 0;
     const ELEMENT_TYPE: Tcgen05ElementType = Tcgen05ElementType::BF16;
 
@@ -372,26 +333,20 @@ impl MmaElement for Bf16 {
 
 /// fp32 — the element a *statistic* is held at, not one an MMA reads.
 ///
-/// The register side of this crate is fp32 throughout, so this is the element
-/// whose [`Element::pack`] and [`Element::unpack`] are the identity and whose
-/// [`Element::read`]/[`Element::write`] are a plain load and store. It carries
-/// no rounding, which is exactly why a [`SharedVec<F32, N>`] is what a block
-/// reduction stages its per-warp partials in
-/// ([`crate::sync::block_reduce`]): a partial that went through shared memory
-/// as bf16 would come back with eight bits of the sum gone, and the second of
-/// two chained statistics would inherit the error of the first.
+/// It carries no rounding, which is why [`crate::sync::block_reduce`] stages
+/// its per-warp partials in a [`SharedVec<F32, N>`]: a partial that went
+/// through shared memory as bf16 would come back with eight bits of the sum
+/// gone.
 ///
-/// Deliberately not an [`MmaElement`]: tcgen05 reads fp32 operands as tf32,
-/// which is a different element with a different mantissa, and giving this one
-/// an `MMA_KIND` would let a `[R, C]` fp32 tile be staged as an operand it is
-/// not the bits of.
+/// Deliberately **not** an [`MmaElement`]: tcgen05 reads fp32 operands as tf32,
+/// a different element with a different mantissa, so an `MMA_KIND` here would
+/// let a `[R, C]` fp32 tile be staged as an operand it is not the bits of.
 pub struct F32;
 
 impl Element for F32 {
     /// One value a word, where bf16's is two — the packed word *is* the value.
     /// The `Element<Unpacked = [f32; 2]>` bound `ldst`'s `stmatrix`/`ldmatrix`
-    /// paths carry is what stops this element reaching them, since a b16
-    /// matrix instruction has nothing to do with a 4-byte element.
+    /// paths carry is what stops this element reaching them.
     type Unpacked = [f32; 1];
     const BYTES: usize = 4;
 
@@ -406,8 +361,8 @@ impl Element for F32 {
     }
 
     /// A plain 4-byte load. Unlike [`Bf16::read`] there is no widening to do,
-    /// and unlike [`Bf16::write`] the store side is exact — so both halves hold
-    /// on the host and the pair is host-testable end to end.
+    /// and unlike [`Bf16::write`] the store side is exact, so both halves hold
+    /// on the host.
     #[inline(always)]
     unsafe fn read(at: *const u8) -> f32 {
         unsafe { *(at as *const f32) }
@@ -421,15 +376,12 @@ impl Element for F32 {
     /// `st.global.v2.f32` — the two fp32 at `at` and `at + 4` in one
     /// instruction.
     ///
-    /// Inline PTX for the reason [`crate::ldst::stmatrix_m8n8_x2`] is: the
-    /// instruction has to be *asked for*. Widening a pair of adjacent stores is
-    /// a transformation ptxas may only make when the address is provably
-    /// aligned, and an address built from a runtime leading dimension never is
-    /// — so the caller that has actually checked
+    /// Inline PTX because the instruction has to be *asked for*: widening a
+    /// pair of adjacent stores is a transformation ptxas may only make when the
+    /// address is provably aligned, and an address built from a runtime leading
+    /// dimension never is. The caller that has actually checked
     /// ([`crate::global::GlobalRows::runs_aligned`]) is the only one in a
-    /// position to spell it. Where [`Bf16::write_pair`] moves a pair in four
-    /// bytes, this one moves it in eight; the instruction count is the same and
-    /// that is the whole of what a narrower `C` changes here (#108).
+    /// position to spell it.
     #[inline(always)]
     unsafe fn write_pair(at: *mut u8, first: f32, second: f32) {
         unsafe {
@@ -482,6 +434,23 @@ impl Swizzle for Swizzle128B {
 /// as `C / (ATOM_BYTES / E::BYTES)` stacked `[R, subtile]` panels. The handle
 /// is a base pointer plus compile-time shape — Copy, register-resident, and
 /// free once inlined.
+///
+/// Carve one out of a [`crate::plan::SharedPlan`] rather than building it from
+/// a raw base; read and write it through [`Self::chunk_writer`], which folds
+/// the swizzle in.
+///
+/// ```no_run
+/// # use kittens::ldst::{load_tile, store_tile};
+/// # use kittens::shared::{Bf16, SharedTile, Swizzle128B, publish_to_async_proxy};
+/// # use kittens::{BaseLdtm, RegTile, lane, warp_id};
+/// # unsafe fn demo(tile: SharedTile<Bf16, 128, 64, Swizzle128B>) {
+/// let chunks = tile.chunk_writer();
+/// let band: RegTile<32, 64, BaseLdtm> =
+///     unsafe { load_tile(chunks, 32 * warp_id(), 0, lane()) };
+/// unsafe { store_tile(chunks, 32 * warp_id(), 0, lane(), band) };
+/// unsafe { publish_to_async_proxy() };
+/// # }
+/// ```
 pub struct SharedTile<E: Element, const R: usize, const C: usize, S: Swizzle> {
     base: *mut u8,
     _marker: PhantomData<(E, S)>,
@@ -510,7 +479,8 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     /// Equal to [`Self::BYTES`], counted the way the load loop issues it.
     ///
     /// Crate-private, because a kernel able to name a charge without issuing
-    /// the load is back to writing the number down.
+    /// the load is back to writing the number down: the transfer methods hand
+    /// it back instead.
     pub(crate) const CHARGE: TransactionBytes =
         TransactionBytes::new(Self::SUBTILES * R * S::ATOM_BYTES);
 
@@ -524,8 +494,9 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     ///
     /// # Safety
     ///
-    /// `base` must point to at least `Self::BYTES` bytes of shared memory,
-    /// 128-byte aligned, living as long as every use of the tile.
+    /// - `base` points to at least [`Self::BYTES`] bytes of shared memory.
+    /// - It is 128-byte aligned.
+    /// - That memory outlives every use of the tile.
     #[inline(always)]
     pub const unsafe fn from_raw(base: *mut u8) -> Self {
         #[allow(clippy::let_unit_value)]
@@ -546,7 +517,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     ///
     /// # Safety
     ///
-    /// `i < Self::SUBTILES`.
+    /// - `i < Self::SUBTILES`.
     #[inline(always)]
     pub unsafe fn subtile(self, i: usize) -> *mut u8 {
         unsafe { self.base.add(i * Self::SUBTILE_BYTES) }
@@ -559,10 +530,26 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     /// once per tile, however many boxes — to be summed into that barrier's
     /// [`Semaphore::expect_tx`].
     ///
+    /// ```no_run
+    /// # use cuda_device::tma::TmaDescriptor;
+    /// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+    /// # use kittens::sync::Semaphore;
+    /// # unsafe fn demo(
+    /// #     tile: SharedTile<Bf16, 128, 64, Swizzle128B>,
+    /// #     map: *const TmaDescriptor,
+    /// #     filled: Semaphore,
+    /// # ) {
+    /// let charge = unsafe { tile.tma_load(map, 0, 0, filled) };
+    /// unsafe { filled.expect_tx(charge) };
+    /// unsafe { filled.wait(0) };
+    /// # }
+    /// ```
+    ///
     /// # Safety
     ///
-    /// `map` must describe a live global buffer whose box shape matches
-    /// `[R, SUBTILE_COLS]`, and `sem` must be an initialized TMA barrier.
+    /// - `map` describes a live global buffer whose box shape is
+    ///   `[R, SUBTILE_COLS]`.
+    /// - `sem` is an initialized TMA barrier.
     #[inline(always)]
     pub unsafe fn tma_load(
         self,
@@ -579,23 +566,31 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     /// row ranges (the backward kernels stack two adjacent 64-row tiles into
     /// one 128-row operand, `dst_row = 0` then `dst_row = 64`).
     ///
-    /// The stacking is layout-free precisely because a box height is a whole
-    /// number of swizzle periods (8 rows of 128 bytes): landing a box at row
-    /// 64 of a subtile reproduces exactly the swizzle rows 64.. of one tall
-    /// tile would have had.
+    /// `BOX_ROWS` is the *map's* box height, not this tile's, which is why it
+    /// is a parameter rather than `R`. The charge handed back is derived from
+    /// it: this call brings in `SUBTILES` boxes of `BOX_ROWS` rows, not a whole
+    /// [`Self::BYTES`].
     ///
-    /// `BOX_ROWS` is the *map's* box height and so cannot be read off this
-    /// tile — a 128-row operand built this way is paired with a 64-row map —
-    /// which is why it is a parameter rather than `R`. It is a const one
-    /// because the charge handed back is derived from it: this call brings in
-    /// `SUBTILES` boxes of `BOX_ROWS` rows, not a whole [`Self::BYTES`], and
-    /// that used to be a sentence asking the caller to do the multiplication.
+    /// ```no_run
+    /// # use cuda_device::tma::TmaDescriptor;
+    /// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+    /// # use kittens::sync::Semaphore;
+    /// # unsafe fn demo(
+    /// #     tall: SharedTile<Bf16, 128, 64, Swizzle128B>,
+    /// #     map: *const TmaDescriptor,
+    /// #     filled: Semaphore,
+    /// # ) {
+    /// let top = unsafe { tall.tma_load_at::<64>(map, 0, 0, 0, filled) };
+    /// let bottom = unsafe { tall.tma_load_at::<64>(map, 64, 64, 0, filled) };
+    /// unsafe { filled.expect_tx(top + bottom) };
+    /// # }
+    /// ```
     ///
     /// # Safety
     ///
-    /// As [`Self::tma_load`], plus `map`'s box being `BOX_ROWS` tall,
-    /// `dst_row + BOX_ROWS <= R`, and `dst_row` a multiple of the 8-row
-    /// swizzle period.
+    /// - As [`Self::tma_load`].
+    /// - `map`'s box is `BOX_ROWS` tall and `dst_row + BOX_ROWS <= R`.
+    /// - `dst_row` is a multiple of the 8-row swizzle period.
     #[inline(always)]
     pub unsafe fn tma_load_at<const BOX_ROWS: usize>(
         self,
@@ -629,16 +624,14 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     }
 
     /// TMA the tile from a 2d tensor map: one box per subtile, the leading
-    /// coordinate lifted by `SUBTILE_COLS` per stack level. A K-major operand
-    /// (`[R, K]`, one subtile per swizzle atom of K) is a single box at
-    /// `(k, row)`; an MN-major operand (`[K, MN]`) is one box per 64-wide MN
-    /// subtile at `(mn + 64 * i, k)` — the coordinate order the map's fast
-    /// axis dictates, which is why both coordinates are the caller's.
+    /// coordinate lifted by `SUBTILE_COLS` per stack level. Both coordinates
+    /// are the caller's because the map's fast axis dictates their order — a
+    /// K-major operand is a single box at `(k, row)`, an MN-major one is a box
+    /// per 64-wide subtile at `(mn + 64 * i, k)`.
     ///
     /// # Safety
     ///
-    /// `map` must describe a live global buffer whose box shape matches
-    /// `[R, SUBTILE_COLS]`, and `sem` must be an initialized TMA barrier.
+    /// - As [`Self::tma_load`], for a 2-D map.
     #[inline(always)]
     pub unsafe fn tma_load_2d(
         self,
@@ -668,20 +661,32 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     /// counted at `sem` — any rank's copy of a stage barrier, named by
     /// [`Semaphore::at_rank`].
     ///
-    /// It is a cta_group::2 multicast whose mask is the calling CTA's own bit
-    /// and nothing else, which looks like a contradiction and is not. Nothing
-    /// is replicated: one bit, one destination. What the multicast form
-    /// supplies that the plain one cannot is the `.shared::cluster` barrier
-    /// operand. A plain `cp.async.bulk.tensor` completes on a barrier in the
-    /// *issuing* CTA's own shared memory, so a peer staging its half of a
-    /// cluster operand has no way to say "my bytes, the leader's barrier", and
-    /// the leader waits forever for a count it charged and nobody paid. That
-    /// deadlock is the whole reason this exists.
+    /// This is what a peer staging its half of a cluster operand needs and a
+    /// plain `cp.async.bulk.tensor` cannot express: a plain load completes on a
+    /// barrier in the *issuing* CTA's own shared memory, so the leader waits
+    /// forever for a count it charged and nobody paid. Nothing is replicated
+    /// here — the mask is one bit, and the multicast form is only how the
+    /// `.shared::cluster` barrier operand is reached.
+    ///
+    /// ```no_run
+    /// # use cuda_device::tma::TmaDescriptor;
+    /// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+    /// # use kittens::sync::Semaphore;
+    /// # unsafe fn demo(
+    /// #     half: SharedTile<Bf16, 128, 64, Swizzle128B>,
+    /// #     map: *const TmaDescriptor,
+    /// #     filled: Semaphore,
+    /// # ) {
+    /// let leader = unsafe { filled.at_rank(0) };
+    /// let charge = unsafe { half.tma_load_2d_arriving_at(map, 0, 0, leader) };
+    /// # let _ = charge;
+    /// # }
+    /// ```
     ///
     /// # Safety
     ///
-    /// As [`Self::tma_load_2d_multicast_cg2`], with `cta_mask` this CTA's own
-    /// bit.
+    /// - As [`Self::tma_load_2d_multicast_cg2`], with `cta_mask` this CTA's own
+    ///   bit.
     #[inline(always)]
     pub unsafe fn tma_load_2d_arriving_at(
         self,
@@ -699,9 +704,9 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     ///
     /// # Safety
     ///
-    /// As [`Self::tma_load_2d_arriving_at`], plus the map box being
-    /// `BOX_ROWS` tall, `dst_row + BOX_ROWS <= R`, and `dst_row` being aligned
-    /// to the swizzle's eight-row period.
+    /// - As [`Self::tma_load_2d_arriving_at`].
+    /// - The map's box is `BOX_ROWS` tall and `dst_row + BOX_ROWS <= R`.
+    /// - `dst_row` is a multiple of the 8-row swizzle period.
     #[inline(always)]
     pub unsafe fn tma_load_2d_at_arriving_at<const BOX_ROWS: usize>(
         self,
@@ -736,23 +741,21 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
 
     /// [`Self::tma_load_2d`] as a cta_group::2 multicast: every box lands in
     /// the CTAs of `cta_mask`, completing on the cluster-addressed barrier
-    /// behind `sem`. The replication form — one fetch delivered to several
-    /// CTAs — which is why the mask is the caller's; a load that replicates
-    /// nothing and only wants the barrier's address space is
+    /// behind `sem`. The genuine replication form — one fetch delivered to
+    /// several CTAs — which is why the mask is the caller's; a load that
+    /// replicates nothing and only wants the barrier's address space is
     /// [`Self::tma_load_2d_arriving_at`].
     ///
-    /// The charge handed back is one tile — what a single destination
-    /// receives, which is the whole of it for the own-bit mask that
-    /// [`Self::tma_load_2d_arriving_at`] passes and the only mask any kernel
-    /// here uses. A caller replicating into several CTAs owns the question of
-    /// whether the one barrier it named sees that once or once per
-    /// destination, and #49 is where that gets answered against hardware
-    /// rather than guessed at here.
+    /// The charge handed back is **one tile** — what a single destination
+    /// receives. A caller replicating into several CTAs owns the question of
+    /// whether the one barrier it named sees that once or once per destination;
+    /// it has not been answered against hardware.
     ///
     /// # Safety
     ///
-    /// As [`Self::tma_load_2d`], and the block must run as a cluster whose
-    /// every masked CTA holds this tile's shared range and can receive it.
+    /// - As [`Self::tma_load_2d`].
+    /// - The block runs as a cluster, and every masked CTA holds this tile's
+    ///   shared range and can receive it.
     #[inline(always)]
     pub unsafe fn tma_load_2d_multicast_cg2(
         self,
@@ -783,36 +786,40 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     /// the same coordinates [`Self::tma_load`] reads them from, the bytes
     /// going the other way.
     ///
-    /// Completion does not land on a [`Semaphore`], and the difference is not
-    /// cosmetic. A load's destination is shared memory, where an mbarrier can
-    /// live and count the arriving bytes; a store's destination is global
-    /// memory, where none can. So a bulk store completes through
-    /// [`tma_store_commit`] and [`tma_store_wait`] — the issuing thread's
-    /// outstanding stores committed as one group, waited on by counting
-    /// groups, with no barrier to arrive on and no byte accounting anywhere.
-    /// The obligations that buys the caller are in the safety section, and
-    /// they outlive the call.
+    /// Completion does **not** land on a [`Semaphore`]: a store's destination
+    /// is global memory, where no mbarrier can live to count the bytes. It
+    /// completes through [`tma_store_commit`] plus one of the two waits
+    /// instead, and the obligations that buys outlive the call.
+    ///
+    /// ```no_run
+    /// # use cuda_device::tma::TmaDescriptor;
+    /// # use kittens::shared::{
+    /// #     Bf16, SharedTile, Swizzle128B, publish_to_async_proxy, tma_store_commit,
+    /// #     tma_store_wait,
+    /// # };
+    /// # unsafe fn demo(tile: SharedTile<Bf16, 128, 64, Swizzle128B>, map: *const TmaDescriptor) {
+    /// unsafe { publish_to_async_proxy() };
+    /// cuda_device::thread::sync_threads();
+    /// unsafe { tile.tma_store(map, 0, 0) };
+    /// tma_store_commit();
+    /// tma_store_wait::<0>();
+    /// # }
+    /// ```
     ///
     /// # Safety
     ///
-    /// `map` must describe a live global buffer whose box shape matches
-    /// `[R, SUBTILE_COLS]`. Beyond the call itself:
-    ///
-    /// - The tile must stay allocated and unwritten until the issuing thread
-    ///   has waited on the group covering this store —
-    ///   [`tma_store_wait_read`] to overwrite it, [`tma_store_wait`] for the
-    ///   bytes to be readable in global memory. Nothing else republishes the
-    ///   shared memory: dropping the handle, a `sync_threads`, or the kernel
+    /// - `map` describes a live global buffer whose box shape is
+    ///   `[R, SUBTILE_COLS]`.
+    /// - The tile stays allocated and unwritten until the issuing thread has
+    ///   waited on the group covering this store — [`tma_store_wait_read`] to
+    ///   overwrite it, [`tma_store_wait`] for the bytes to be readable in
+    ///   global memory. Dropping the handle, a `sync_threads` and the kernel
     ///   ending are all silent here.
-    /// - If the tile's contents arrived through the generic proxy — anything
-    ///   written by `stmatrix` or a plain store, including
-    ///   [`crate::ldst::store_fragment`], which states the same obligation for
-    ///   an MMA reading the tile — the caller owes a
-    ///   [`publish_to_async_proxy`] before this call. The TMA engine
-    ///   reads through the async proxy and would otherwise be free to see
-    ///   stale bytes. A tile that got here by [`Self::tma_load`] needs no
-    ///   fence: that is the async proxy on both sides, ordered by the load's
-    ///   own barrier.
+    /// - Contents that arrived through the *generic* proxy — `stmatrix`, a
+    ///   plain store, [`crate::ldst::store_fragment`] — owe a
+    ///   [`publish_to_async_proxy`] before this call, since the TMA engine
+    ///   reads through the async proxy. A tile that got here by
+    ///   [`Self::tma_load`] owes no fence.
     #[inline(always)]
     pub unsafe fn tma_store(self, map: *const TmaDescriptor, row: i32, plane: i32) {
         unsafe {
@@ -835,7 +842,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     ///
     /// # Safety
     ///
-    /// As [`Self::tma_store`], every clause.
+    /// - As [`Self::tma_store`], every clause.
     #[inline(always)]
     pub unsafe fn tma_store_2d(self, map: *const TmaDescriptor, leading: i32, minor: i32) {
         unsafe {
@@ -852,10 +859,9 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
         }
     }
 
-    /// The tile base's absolute position in the 8-row swizzle period.
-    /// SWIZZLE_128B XORs *physical* address bits `[9:7]` into the chunk index,
-    /// so a tile whose base is not 1024-byte aligned starts mid-period and
-    /// every manual swizzled store must fold this phase in.
+    /// The tile base's absolute position in the 8-row swizzle period — what a
+    /// tile not 1024-byte aligned starts mid-period at, and what every manual
+    /// swizzled store folds in. [`Self::chunk_writer`] captures it for you.
     #[inline(always)]
     pub fn swizzle_phase(self) -> usize {
         (self.base as usize >> 7) & 7
@@ -869,16 +875,15 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     ///
     /// # Safety
     ///
-    /// `row < R` and `chunk < C * E::BYTES / 16`.
+    /// - `row < R` and `chunk < C * E::BYTES / 16`.
     #[inline(always)]
     pub unsafe fn swizzled_chunk(self, row: usize, chunk: usize) -> *mut u8 {
         unsafe { self.chunk_writer().at(row, chunk) }
     }
 
-    /// The tile's swizzled-access handle with the base's absolute phase and
-    /// the subtile stride captured once — hoist it outside a fragment loop
-    /// exactly like the hand-written kernels hoisted their `p_phase`
-    /// variables.
+    /// The tile's swizzled-access handle, with the base's absolute phase and
+    /// the subtile stride captured once. Hoist it outside a fragment loop; it
+    /// is what [`crate::ldst::load_tile`] and `store_tile` take.
     #[inline(always)]
     pub fn chunk_writer(self) -> SwizzledChunks<E> {
         SwizzledChunks {
@@ -891,10 +896,10 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     }
 
     /// tcgen05 shared-memory operand descriptor for the K-major operand at
-    /// `byte_offset` into the tile — same encoding as gemm's: 16-byte leading
-    /// offset (the second core matrix sits eight bf16 columns along the row),
-    /// 1024-byte stride, the swizzle mode in bits `[63:61]`. Pure bit math on
-    /// the address; the MMA that consumes it carries the safety obligations.
+    /// `byte_offset` into the tile: 16-byte leading offset (the second core
+    /// matrix sits eight bf16 columns along the row), 1024-byte stride, the
+    /// swizzle mode in bits `[63:61]`. Pure bit math on the address; the MMA
+    /// that consumes it carries the safety obligations.
     #[inline(always)]
     pub fn operand_descriptor(self, byte_offset: usize) -> u64 {
         self.descriptor(byte_offset, 16)
@@ -910,9 +915,22 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     }
 
     /// This tile as a K-major [`OperandWalk`]: one K=16 chunk every 32 bytes
-    /// along the swizzled rows, 16-byte leading offset. Restricted to tiles
-    /// whose K spans exactly one swizzle atom per row (gemm's `[128, 64]`
-    /// stage) — a linear step cannot cross stacked subtiles.
+    /// along the swizzled rows, 16-byte leading offset. A compile error unless
+    /// K spans exactly one swizzle atom per row (gemm's `[128, 64]` stage) — a
+    /// linear step cannot cross stacked subtiles.
+    ///
+    /// ```no_run
+    /// # use kittens::mma::{MmaShape, mma_walk_cg2};
+    /// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+    /// # unsafe fn demo(
+    /// #     a: SharedTile<Bf16, 128, 64, Swizzle128B>,
+    /// #     b: SharedTile<Bf16, 128, 64, Swizzle128B>,
+    /// #     acc: u32,
+    /// # ) {
+    /// let (a, b) = (a.k_walk(), b.k_walk());
+    /// unsafe { mma_walk_cg2::<Bf16, 4>(acc, a, b, MmaShape::M128_N128, false) };
+    /// # }
+    /// ```
     #[inline(always)]
     pub fn k_walk(self) -> OperandWalk {
         const {
@@ -951,40 +969,37 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
 /// async proxy — `fence.proxy.async.shared::cta`, and **the fence half of
 /// every "the caller owes a fence" contract in the crate.**
 ///
-/// Shared memory is written two ways and read two ways. `stmatrix`, a plain
-/// store, [`crate::ldst::store_tile`], [`crate::ldst::store_fragment`] and an
-/// mbarrier's `init` all go through the *generic* proxy; the TMA engine and a
-/// tcgen05 MMA read through the *async* one. The two proxies are not coherent
-/// on their own and no barrier makes them so: `sync_threads` orders threads,
-/// not proxies, so a `bar.sync` between the write and the engine's read is a
-/// fence that was never issued.
+/// `stmatrix`, a plain store, [`crate::ldst::store_tile`],
+/// [`crate::ldst::store_fragment`] and an mbarrier's `init` write through the
+/// *generic* proxy; the TMA engine and a tcgen05 MMA read through the *async*
+/// one. The two are not coherent on their own and no barrier makes them so —
+/// `sync_threads` orders threads, not proxies.
 ///
-/// This orders the writes of **the thread that executes it**, which is why it
-/// is not a collective and why every thread that wrote a row has to call it.
-/// A barrier afterwards is what carries that ordering to whichever thread
-/// issues the store or the MMA — the pairing
-/// [`crate::epilogue::StoreRing`] performs internally and three kernels write
-/// out as `publish_to_async_proxy(); sync_threads();`.
+/// It orders the writes of **the thread that executes it**, so it is not a
+/// collective: every thread that wrote a row calls it, and a barrier afterwards
+/// carries that ordering to whichever thread issues the store or the MMA.
 ///
-/// Both directions of "which proxy" have to be true for the fence to be owed,
-/// and the two cases where it is not are worth stating because they look
-/// alike:
+/// ```no_run
+/// # use kittens::ldst::store_tile;
+/// # use kittens::shared::{Bf16, SharedTile, Swizzle128B, publish_to_async_proxy};
+/// # use kittens::{BaseLdtm, RegTile, lane, warp_id};
+/// # unsafe fn demo(tile: SharedTile<Bf16, 128, 64, Swizzle128B>, band: RegTile<32, 64, BaseLdtm>) {
+/// unsafe { store_tile(tile.chunk_writer(), 32 * warp_id(), 0, lane(), band) };
+/// unsafe { publish_to_async_proxy() };
+/// cuda_device::thread::sync_threads();
+/// # }
+/// ```
 ///
-/// - A tile that arrived by [`SharedTile::tma_load`] and leaves by
-///   [`SharedTile::tma_store`] is the async proxy on both sides, ordered by
-///   the load's own barrier.
-/// - A staged value written and read by ordinary threads —
-///   [`crate::sync::block_reduce`]'s scratch — is the generic proxy on both
-///   sides, ordered by its barriers.
-///
-/// It was private until #127: the crate stated the obligation in six safety
-/// contracts and exported nothing that discharged it, so three kernels
-/// imported `cuda_device::barrier` for the one instruction.
+/// No fence is owed when *both* sides use the same proxy: a tile that arrives
+/// by [`SharedTile::tma_load`] and leaves by [`SharedTile::tma_store`] is the
+/// async proxy throughout, and [`crate::sync::block_reduce`]'s scratch is the
+/// generic proxy throughout.
 ///
 /// # Safety
 ///
-/// A memory fence has no precondition of its own. What it does *not* do is
-/// the hazard: it orders this thread's writes only, and it is not a barrier.
+/// - None of its own — a memory fence has no precondition. The hazard is what
+///   it does *not* do: it orders this thread's writes only, and it is not a
+///   barrier.
 #[inline(always)]
 pub unsafe fn publish_to_async_proxy() {
     unsafe { fence_proxy_async_shared_cta() }
@@ -993,10 +1008,10 @@ pub unsafe fn publish_to_async_proxy() {
 /// Commit this thread's outstanding bulk stores as one group.
 ///
 /// Groups are per *thread* and age in issue order: everything issued since the
-/// last commit becomes the youngest group, and every earlier group's index
-/// goes up by one. A tile's store is one instruction per stacked subtile, so
-/// committing per tile is what makes "wait for that tile" expressible at all —
-/// the waits below count groups and cannot name an instruction.
+/// last commit becomes the youngest group, and every earlier group's index goes
+/// up by one. A tile's store is one instruction per stacked subtile, so
+/// committing **per tile** is what makes "wait for that tile" expressible at
+/// all — the waits below count groups and cannot name an instruction.
 #[inline(always)]
 pub fn tma_store_commit() {
     cp_async_bulk_commit_group();
@@ -1006,17 +1021,19 @@ pub fn tma_store_commit() {
 /// flight, *complete* meaning the bytes are in global memory and visible to
 /// anything that reads them there — a following kernel, the host, another CTA.
 ///
-/// `N = 0` drains every group this thread has committed and is the last thing
-/// a kernel that wrote its result owes; nothing else makes a bulk store
-/// visible, and a kernel that simply ends has not waited.
+/// `N = 0` drains every group this thread committed and is the last thing a
+/// kernel that wrote its result owes: nothing else makes a bulk store visible,
+/// and a kernel that simply ends has not waited. `N` is a const parameter
+/// because the instruction's group count is an immediate.
 ///
-/// A pipelined epilogue wants [`tma_store_wait_read`] instead: reusing the
-/// shared tile needs only the engine's *reads* to be done, and blocking on
-/// global visibility to recycle a buffer serializes the overlap the pipeline
-/// exists for.
-///
-/// `N` is a const parameter because the instruction's group count is an
-/// immediate — a runtime depth is not a thing the hardware can be asked for.
+/// ```no_run
+/// # use kittens::shared::{tma_store_commit, tma_store_wait, tma_store_wait_read};
+/// # fn demo() {
+/// tma_store_commit();
+/// tma_store_wait_read::<1>(); // stage i - 1's buffer is free to refill
+/// tma_store_wait::<0>(); // and, at the end of the kernel, it is in memory
+/// # }
+/// ```
 #[inline(always)]
 pub fn tma_store_wait<const N: u32>() {
     cp_async_bulk_wait_group(N);
@@ -1028,11 +1045,9 @@ pub fn tma_store_wait<const N: u32>() {
 /// memory.
 ///
 /// The cheaper of the two waits, and the one a pipelined epilogue is written
-/// around — store stage `i`, recycle its buffer for stage `i + 1`, and let the
-/// global writes retire behind the next tile's work. It says nothing about
-/// what any other thread, CTA or the host can see, so it is never the last
-/// wait in a kernel: a result that has only been read out of shared memory has
-/// not arrived anywhere.
+/// around — store stage `i`, recycle its buffer for stage `i + 1`. It says
+/// nothing about what any other thread, CTA or the host can see, so it is never
+/// the last wait in a kernel.
 #[inline(always)]
 pub fn tma_store_wait_read<const N: u32>() {
     cp_async_bulk_wait_group_read(N);
@@ -1050,12 +1065,12 @@ fn encode_descriptor(address: u64, leading_bytes: u32, mode: u8) -> u64 {
 
 /// One MMA operand's chunk walk with the layout erased to values: the chunk
 /// step and descriptor leading offset that distinguish a K-major from an
-/// MN-major operand, as runtime data instead of a type. This exists for
-/// kernels that select the layout at runtime (gemm's `transposed` launch
-/// parameter): a value-level walk keeps the issue loop *single* — one
-/// select feeding one chain — matching the hand-written kernel's schedule,
-/// where a typed two-arm branch would duplicate the MMA chain per layout
-/// and hand ptxas a different instruction stream to allocate against.
+/// MN-major operand, built by [`SharedTile::k_walk`] or
+/// [`SharedTile::mn_walk`].
+///
+/// Values and not types so that a kernel selecting its layout at runtime keeps
+/// **one** issue loop — one select feeding one chain — rather than a typed
+/// two-arm branch that duplicates the MMA chain per layout.
 #[derive(Clone, Copy)]
 pub struct OperandWalk {
     base: *mut u8,
@@ -1076,10 +1091,10 @@ impl OperandWalk {
         )
     }
 
-    /// Whether the MMA must read this operand transposed — an MN-major walk
-    /// supplies K along rows, which is the same fact as its chunk step and
-    /// leading offset. Carried here so the instruction descriptor is built
-    /// from the walk it is issued with rather than beside it.
+    /// Whether the MMA must read this operand transposed — the same fact as
+    /// the walk's chunk step and leading offset, since an MN-major walk
+    /// supplies K along rows. Carried here so the instruction descriptor is
+    /// built from the walk it is issued with rather than beside it.
     #[inline(always)]
     pub fn transposed(self) -> bool {
         self.transpose
@@ -1087,22 +1102,17 @@ impl OperandWalk {
 }
 
 /// A tile's swizzled cursor: the tile as one flat stack of 128-byte rows,
-/// eight 16-byte chunks each, chunk index XORed with the row's own position in
-/// the swizzle period — `(row + phase) & 7`, `phase` being the tile base's
-/// absolute position in it (captured once at construction).
+/// eight 16-byte chunks each, chunk index XORed with `(row + phase) & 7` —
+/// `phase` being the tile base's own position in the swizzle period, captured
+/// once at construction.
 ///
 /// Stacked subtiles need no term of their own because they *are* further rows
-/// of that stack: subtile `i` starts [`SharedTile::SUBTILE_BYTES`] =
-/// `rows * 128` bytes along, and SWIZZLE_128B keys off *physical* address bits
-/// `[9:7]`, so subtile `i`'s row `r` is the tile's 128-byte row `i * rows + r`
-/// and takes that row's phase. A logical chunk index therefore splits into
-/// `(subtile, chunk)` and the two row terms simply add; the phase is never
-/// re-derived per subtile, and no relation between `rows` and the 8-row
-/// swizzle period is assumed.
+/// of that stack: subtile `i`'s row `r` is the tile's 128-byte row
+/// `i * rows + r` and takes that row's phase. Nothing here assumes a relation
+/// between `rows` and the 8-row swizzle period.
 ///
-/// The chunk arithmetic is element-independent — a 16-byte chunk is 16 bytes
-/// whatever it holds — but the cursor still carries its tile's `E` so a store
-/// through it packs to the element the tile is actually made of, without the
+/// The chunk arithmetic is element-independent, but the cursor carries its
+/// tile's `E` so a store through it packs to the right element without the
 /// caller naming it a second time.
 pub struct SwizzledChunks<E: Element> {
     base: *mut u8,
@@ -1132,7 +1142,7 @@ impl<E: Element> SwizzledChunks<E> {
     ///
     /// # Safety
     ///
-    /// `row` inside the tile, `chunk < self.chunks()`.
+    /// - `row` is inside the tile and `chunk < self.chunks()`.
     #[inline(always)]
     pub unsafe fn at(self, row: usize, chunk: usize) -> *mut u8 {
         let (subtile, chunk) = (chunk / 8, chunk % 8);
@@ -1149,40 +1159,29 @@ impl<E: Element> SwizzledChunks<E> {
 /// partials has. Like [`SharedTile`] the handle is a base pointer plus a
 /// compile-time length, and like it the shared plan belongs to the kernel.
 ///
-/// # Why this does not go through [`Swizzle`]
+/// It deliberately does not go through [`Swizzle`]: the XOR is over a row
+/// index and a vector has one row, and [`Swizzle::ATOM_BYTES`] is a box width
+/// as well as a swizzle period, where a vector's box is `N` wide. See
+/// `docs/library/shared.md`.
 ///
-/// Swizzling exists to keep a *2-D* tile's 16-byte chunks off the same banks
-/// when successive rows are read together; the XOR is over the row index, and
-/// a vector has one row for the phase to come from. So the layout question is
-/// not "which mode" but "an atom is the wrong unit here at all", and the two
-/// jobs [`Swizzle::ATOM_BYTES`] does make that concrete. It is the swizzle
-/// period *and* the width of a TMA box, and an unswizzled vector wants
-/// neither: its box is `N` wide, a number no mode marker can carry, and any
-/// atom small enough to divide a short vector splits it into stacked subtiles
-/// the engine would then fetch one instruction each. A 128-byte atom is worse
-/// still — the narrowest bf16 tile it admits is 64 columns, which is the
-/// padding per row this type exists to avoid.
+/// **The engine is optional.** A vector need not be TMA'd at all —
+/// [`crate::sync::block_reduce`]'s scratch is written by [`Self::set`] and read
+/// by [`Self::get`] and never touches a descriptor — so `N` may be any length
+/// as a handle, and the shape rules an unswizzled box obeys are enforced by the
+/// four transfer methods rather than by [`Self::from_raw`].
 ///
-/// Adding a `SwizzleNone` mode is therefore not the same job and is left to
-/// #14, which owns *tiles* under narrower and absent swizzles: an unswizzled
-/// `[R, C]` staging tile does need a `Swizzle` impl, and it needs `ATOM_BYTES`
-/// to stop meaning "box width" first. A vector needs none of that, and
-/// borrowing the mode marker to get one would have decided #14's question by
-/// accident.
-///
-/// The TMA still delivers it: the box is `[N]` (or `[N, 1]` at higher rank)
-/// with `CU_TENSOR_MAP_SWIZZLE_NONE`, which the engine writes contiguously —
-/// the same bytes [`Self::at`] addresses. That agreement is what the
-/// [`crate::global::TileBox`] impl states.
-///
-/// # The engine is optional
-///
-/// A vector need not be TMA'd at all — [`crate::sync::block_reduce`]'s scratch
-/// is written by [`Self::set`] and read by [`Self::get`] and never touches a
-/// descriptor — so the shape rules an unswizzled box obeys are enforced by the
-/// four transfer methods rather than by [`Self::from_raw`]. `N` may be any
-/// length as a handle; it must make a legal box only where one is built. See
-/// `Self::TMA_OK`.
+/// ```no_run
+/// # use kittens::shared::{F32, SharedVec, publish_to_async_proxy};
+/// # use kittens::{lane, warp_id};
+/// # unsafe fn demo(partials: SharedVec<F32, 4>, mine: f32) {
+/// if lane() == 0 {
+///     unsafe { partials.set(warp_id() as usize, mine) };
+/// }
+/// cuda_device::thread::sync_threads();
+/// let total: f32 = (0..4).map(|w| unsafe { partials.get(w) }).sum();
+/// # let _ = total;
+/// # }
+/// ```
 pub struct SharedVec<E: Element, const N: usize> {
     base: *mut u8,
     _marker: PhantomData<E>,
@@ -1217,23 +1216,13 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     const LENGTH_OK: () = assert!(N <= 256, "a TMA box dimension is at most 256 elements");
 
     /// Both box rules, forced at each of the four calls that hand the vector to
-    /// the engine — and nowhere else.
+    /// the engine — and nowhere else, because both are statements about a
+    /// *descriptor's box* and a vector need not have one.
     ///
-    /// They used to be forced by [`Self::from_raw`], which read as "a
-    /// `SharedVec` is a thing the TMA can deliver" and is a stronger claim than
-    /// either assert makes. Both are statements about a *descriptor's box*, and
-    /// [`crate::sync::block_reduce`]'s scratch is the one use of this type that
-    /// never meets a descriptor: a four-warp block's partials are 16 bytes, a
-    /// two-warp block's are 8, and only the first could be constructed under
-    /// the old placement. So the rules moved to the calls they are about,
-    /// where they still fire at codegen for every caller they genuinely bind,
-    /// and a vector that is only ever written by [`Self::set`] and read by
-    /// [`Self::get`] pays nothing for a box it does not have.
-    ///
-    /// The host side is unchanged and is the other half of this: building a
-    /// tensor map runs `GlobalLayout::check_driver_requirements`, which rejects
-    /// the same shapes at map-construction time with a message naming the field
-    /// and the byte count.
+    /// The host side is the other half: building a tensor map runs
+    /// `GlobalLayout::check_driver_requirements`, which rejects the same shapes
+    /// at map-construction time with a message naming the field and the byte
+    /// count.
     const TMA_OK: () = {
         #[allow(clippy::let_unit_value)]
         let _ = (Self::BOX_OK, Self::LENGTH_OK);
@@ -1242,16 +1231,15 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     /// Wrap a raw shared-memory base (a `DynamicSharedArray` offset or a
     /// `SharedArray` static).
     ///
-    /// Asserts nothing about the length: see `Self::TMA_OK` for why the box
-    /// rules live on the transfers rather than here.
+    /// Asserts nothing about the length — the box rules live on the transfers.
     ///
     /// # Safety
     ///
-    /// `base` must point to at least `Self::BYTES` bytes of shared memory,
-    /// living as long as every use of the vector. A vector this crate's TMA
-    /// paths will touch must also be 128-byte aligned, which is the engine's
-    /// destination alignment; one used only through [`Self::get`] and
-    /// [`Self::set`] needs no more than `E`'s own alignment.
+    /// - `base` points to at least [`Self::BYTES`] bytes of shared memory,
+    ///   outliving every use of the vector.
+    /// - If any TMA path will touch it, `base` is 128-byte aligned (the
+    ///   engine's destination alignment). A vector used only through
+    ///   [`Self::get`] and [`Self::set`] needs only `E`'s own alignment.
     #[inline(always)]
     pub const unsafe fn from_raw(base: *mut u8) -> Self {
         Self {
@@ -1270,7 +1258,7 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     ///
     /// # Safety
     ///
-    /// `index < N`.
+    /// - `index < N`.
     #[inline(always)]
     pub const unsafe fn at(self, index: usize) -> *mut u8 {
         unsafe { self.base.add(index * E::BYTES) }
@@ -1280,9 +1268,10 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     ///
     /// # Safety
     ///
-    /// `index < N`, and the bytes must already be visible to the generic
-    /// proxy — a TMA load needs its barrier waited on, another thread's
-    /// [`Self::set`] needs a barrier between the write and this read.
+    /// - `index < N`.
+    /// - The bytes are already visible to the generic proxy: a TMA load needs
+    ///   its barrier waited on, another thread's [`Self::set`] needs a barrier
+    ///   between that write and this read.
     #[inline(always)]
     pub unsafe fn get(self, index: usize) -> f32 {
         unsafe { E::read(self.at(index)) }
@@ -1296,9 +1285,10 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     ///
     /// # Safety
     ///
-    /// `index < N`, no other thread writes the same index concurrently, and
-    /// the caller owes a [`publish_to_async_proxy`] before the TMA engine or an
-    /// MMA reads the vector.
+    /// - `index < N`.
+    /// - No other thread writes the same index concurrently.
+    /// - A [`publish_to_async_proxy`] is owed before the TMA engine or an MMA
+    ///   reads the vector.
     #[inline(always)]
     pub unsafe fn set(self, index: usize, value: f32) {
         unsafe { E::write(self.at(index), value) }
@@ -1309,17 +1299,16 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     /// `sem`, and the call hands back the charge for it, to be summed into
     /// that barrier's [`Semaphore::expect_tx`].
     ///
-    /// One instruction, unlike [`SharedTile::tma_load`]'s one per subtile —
-    /// an unswizzled box has no atom to be cut into.
-    ///
-    /// This is one of the four calls `Self::TMA_OK` binds: `N` must make a
-    /// legal box here, where it need not to merely exist.
+    /// One instruction, unlike [`SharedTile::tma_load`]'s one per subtile — an
+    /// unswizzled box has no atom to be cut into. `N * E::BYTES` must be a
+    /// multiple of 16 and `N <= 256` to make a legal box, checked here rather
+    /// than at construction.
     ///
     /// # Safety
     ///
-    /// `map` must describe a live global buffer whose box shape matches `[N]`,
-    /// `sem` must be an initialized TMA barrier, and the vector must be
-    /// 128-byte aligned.
+    /// - `map` describes a live global buffer whose box shape is `[N]`.
+    /// - `sem` is an initialized TMA barrier.
+    /// - The vector is 128-byte aligned.
     #[inline(always)]
     pub unsafe fn tma_load(
         self,
@@ -1340,7 +1329,7 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     ///
     /// # Safety
     ///
-    /// As [`Self::tma_load`], for a box shape of `[N, 1]`.
+    /// - As [`Self::tma_load`], for a box shape of `[N, 1]`.
     #[inline(always)]
     pub unsafe fn tma_load_2d(
         self,
@@ -1360,11 +1349,10 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     ///
     /// # Safety
     ///
-    /// As [`SharedTile::tma_store`], every clause — completion is
-    /// [`tma_store_commit`] plus a wait and never a [`Semaphore`], the vector
-    /// must stay unwritten until that wait, and contents that arrived through
-    /// the generic proxy ([`Self::set`]) owe a [`publish_to_async_proxy`]
-    /// first.
+    /// - As [`SharedTile::tma_store`], every clause: completion is
+    ///   [`tma_store_commit`] plus a wait and never a [`Semaphore`], the vector
+    ///   stays unwritten until that wait, and contents that arrived through the
+    ///   generic proxy ([`Self::set`]) owe a [`publish_to_async_proxy`] first.
     #[inline(always)]
     pub unsafe fn tma_store(self, map: *const TmaDescriptor, start: i32) {
         #[allow(clippy::let_unit_value)]
@@ -1376,7 +1364,7 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
     ///
     /// # Safety
     ///
-    /// As [`Self::tma_store`], for a box shape of `[N, 1]`.
+    /// - As [`Self::tma_store`], for a box shape of `[N, 1]`.
     #[inline(always)]
     pub unsafe fn tma_store_2d(self, map: *const TmaDescriptor, start: i32, minor: i32) {
         #[allow(clippy::let_unit_value)]
@@ -1400,8 +1388,7 @@ impl<T: Copy> SharedCell<T> {
     ///
     /// # Safety
     ///
-    /// `base` must name exclusive shared storage for a `T` for the lifetime of
-    /// the returned handle.
+    /// - `base` names exclusive shared storage for a `T`, outliving the handle.
     #[inline(always)]
     pub const unsafe fn attach(base: *mut u8) -> Self {
         Self { base: base.cast() }
@@ -1411,7 +1398,7 @@ impl<T: Copy> SharedCell<T> {
     ///
     /// # Safety
     ///
-    /// The caller must order readers with a barrier or semaphore.
+    /// - The caller orders readers with a barrier or semaphore.
     #[inline(always)]
     pub unsafe fn write(self, value: T) {
         unsafe { self.base.write_volatile(value) }
@@ -1421,7 +1408,7 @@ impl<T: Copy> SharedCell<T> {
     ///
     /// # Safety
     ///
-    /// The caller must have observed the synchronization event publishing it.
+    /// - The caller has observed the synchronization event publishing it.
     #[inline(always)]
     pub unsafe fn read(self) -> T {
         unsafe { self.base.read_volatile() }
@@ -1433,15 +1420,13 @@ impl<T: Copy> SharedCell<T> {
 /// payload side of the same handoff.
 ///
 /// **The depth is the whole reason this type exists.** A mailbox behind a
-/// parity wait is only sound while the producer leads the consumer by less than
-/// the ring's depth: a shallower ring either overwrites a message before it is
-/// read, or — since parity has period two — lands the consumer's wait on a
-/// phase the producer has already passed and will never flip again. One cell
-/// and one barrier is that ring at `N = 1`, which tolerates a lead of exactly
-/// one and reports nothing when the lead is two. So a kernel handing items
-/// across warps has to *derive* the depth from what its own back-pressure
-/// guarantees rather than assume one, and the two rings have to be built at the
-/// same `N` for the parity to name the cell.
+/// parity wait is sound only while the producer leads the consumer by less than
+/// `N`; a shallower ring either overwrites an unread message or lands the
+/// consumer's wait on a phase the producer has already passed. So a kernel
+/// handing items across warps must *derive* `N` from what its own back-pressure
+/// guarantees — [`crate::sync::depth_needed`] does that for a persistent GEMM —
+/// and the payload ring and the semaphore ring must be built at the same `N`
+/// for a parity to name a cell.
 #[derive(Clone, Copy)]
 pub struct SharedCellRing<T: Copy, const N: usize> {
     base: *mut u8,
@@ -1456,7 +1441,7 @@ impl<T: Copy, const N: usize> SharedCellRing<T, N> {
     ///
     /// # Safety
     ///
-    /// As [`SharedCell::attach`], for all `N` cells.
+    /// - As [`SharedCell::attach`], for all `N` cells.
     #[inline(always)]
     pub const unsafe fn attach(base: *mut u8) -> Self {
         Self {
@@ -1474,7 +1459,24 @@ impl<T: Copy, const N: usize> SharedCellRing<T, N> {
 
 /// `N` same-shaped tiles backing a pipeline ring: tile `i` lives in stage
 /// `i % N`. The parity arithmetic for the matching barriers lives in
-/// [`crate::sync::SemaphoreRing`].
+/// [`crate::sync::SemaphoreRing`], which is indexed by the same `i`.
+///
+/// ```no_run
+/// # use cuda_device::tma::TmaDescriptor;
+/// # use kittens::shared::{Bf16, SharedTileRing, Swizzle128B};
+/// # use kittens::sync::SemaphoreRing;
+/// # unsafe fn demo(
+/// #     stages: SharedTileRing<Bf16, 128, 64, Swizzle128B, 3>,
+/// #     filled: SemaphoreRing<3>,
+/// #     map: *const TmaDescriptor,
+/// # ) {
+/// for k in 0..3u32 {
+///     let sem = filled.sem(k);
+///     let charge = unsafe { stages.tile(k).tma_load(map, k as i32, 0, sem) };
+///     unsafe { sem.expect_tx(charge) };
+/// }
+/// # }
+/// ```
 pub struct SharedTileRing<E: Element, const R: usize, const C: usize, S: Swizzle, const N: usize> {
     base: *mut u8,
     _marker: PhantomData<(E, S)>,
@@ -1502,7 +1504,7 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle, const N: usize>
     ///
     /// # Safety
     ///
-    /// Same contract as [`SharedTile::from_raw`], for `Self::BYTES` bytes.
+    /// - As [`SharedTile::from_raw`], for [`Self::BYTES`] bytes.
     #[inline(always)]
     pub const unsafe fn attach(base: *mut u8) -> Self {
         Self {
@@ -1552,13 +1554,13 @@ mod tests {
     #[test]
     fn bf16_matches_the_tcgen05_operand_tables() {
         assert_eq!(Bf16::BYTES, 2);
-        // KIND 0 is f16, which bf16 shares (see MmaElement::MMA_KIND).
+        // KIND 0 is f16, which bf16 shares.
         assert_eq!(Bf16::MMA_KIND, 0);
         // Derived from Unpacked = [f32; 2] rather than written down twice.
         assert_eq!(Bf16::PER_WORD, 2);
         // `Bf16::pack` is `cvt_f32x2_bf16x2`, a device intrinsic whose host
-        // body is `unreachable!()` — its bit layout is only checkable on a GPU.
-        // `Bf16::unpack` is not: widening needs no instruction (below).
+        // body is `unreachable!()`, so its bit layout is only checkable on a
+        // GPU. `Bf16::unpack` is not: widening needs no instruction (below).
     }
 
     #[test]
@@ -1580,13 +1582,11 @@ mod tests {
     #[test]
     fn f32_packs_one_value_a_word_and_rounds_nothing() {
         assert_eq!(F32::BYTES, 4);
-        // One, where bf16's is two — the number `SharedVec::at`'s stride and
-        // every `Element` consumer that assumed a pair has to survive.
+        // One, where bf16's is two.
         assert_eq!(F32::PER_WORD, 1);
-        // Unlike bf16's, *both* halves of this element are ordinary bit math,
-        // so the round trip is checkable here rather than only on a GPU. It is
-        // the identity on the bits, which is the property a partial staged
-        // through shared memory needs: nothing of the sum is lost on the way.
+        // Both halves are ordinary bit math, so the round trip is checkable
+        // here rather than only on a GPU. It is the identity on the bits, which
+        // is the property a partial staged through shared memory needs.
         for value in [0.0f32, 1.0, -1.0, 1e-30, 3.402_823_5e38, 585.0, 0.1] {
             assert_eq!(F32::unpack(F32::pack([value])), [value]);
             assert_eq!(F32::pack([value]), value.to_bits());
@@ -1611,11 +1611,8 @@ mod tests {
         // assertion rather than luck.
         assert_eq!(SharedVec::<F32, 4>::BYTES, 16);
         assert_eq!(SharedVec::<F32, 8>::BYTES, 32);
-        // Constructing it forces nothing, which is the point of moving the box
-        // rules onto the transfers: `from_raw` is a pointer and a shape, and
-        // the shapes an unswizzled *box* may have are a fact about the four
-        // calls that build one. So the same length that must be a whole number
-        // of 16-byte lines to be TMA'd is free to be a block's scratch.
+        // Constructing it forces neither box rule: `from_raw` is a pointer and
+        // a shape.
         let partials = [0.0f32; 4];
         let vec = unsafe { SharedVec::<F32, 4>::from_raw(partials.as_ptr() as *mut u8) };
         for index in 0..4usize {
@@ -1629,11 +1626,9 @@ mod tests {
     #[test]
     fn a_scratch_vector_shorter_than_a_box_still_constructs() {
         // One and two warps: 4 and 8 bytes, neither a whole 16-byte line, and
-        // both illegal as a TMA box. Under the old placement of `BOX_OK` on
-        // `from_raw` these failed at codegen and a 1- or 2-warp block simply
-        // could not hold a block reduction's partials — an arbitrary
-        // restriction, since that scratch never becomes a box. The addressing
-        // is the same flat stride at every length.
+        // both illegal as a TMA box — but legal as a block reduction's
+        // scratch, which never becomes a box. The addressing is the same flat
+        // stride at every length.
         let one = [7.0f32];
         let vec = unsafe { SharedVec::<F32, 1>::from_raw(one.as_ptr() as *mut u8) };
         assert_eq!(unsafe { vec.get(0) }, 7.0);
@@ -1647,16 +1642,9 @@ mod tests {
 
         // And a bf16 vector of 4, the shape `global`'s own test uses to show
         // `check_driver_requirements` rejecting an 8-byte box: illegal as a
-        // box, legal as a handle, and the two facts now live in the two places
-        // they belong to.
-        //
-        // The other direction is not expressible here — `tma_store` on this
-        // same vector is a *compile* error, not a failing assertion, so no test
-        // can call it. Checked by hand against this exact shape, and the error
-        // names the instantiation: "evaluation of `SharedVec::<Bf16, 4>::
-        // BOX_OK` failed ... while instantiating `SharedVec::<Bf16, 4>::
-        // tma_store`". Making it a permanent case needs `trybuild`, which the
-        // crate does not depend on.
+        // box, legal as a handle. The other direction is not expressible here —
+        // `tma_store` on this vector is a *compile* error, not a failing
+        // assertion, so no test can call it. See `docs/library/shared.md`.
         assert_eq!(SharedVec::<Bf16, 4>::BYTES, 8);
         let narrow = [0u16; 4];
         let _ = unsafe { SharedVec::<Bf16, 4>::from_raw(narrow.as_ptr() as *mut u8) };
@@ -1664,7 +1652,6 @@ mod tests {
 
     #[test]
     fn shape_math_matches_the_flash_layout() {
-        // The constants tcgen05.rs derives by hand: TILE_BYTES / SUBTILE_BYTES.
         assert_eq!(Panel::SUBTILES, 2);
         assert_eq!(Panel::SUBTILE_BYTES, 64 * 128);
         assert_eq!(Panel::BYTES, 64 * 128 * 2);
@@ -1681,7 +1668,7 @@ mod tests {
         let base = 0x1080usize;
         let tile = unsafe { PTile::from_raw(base as *mut u8) };
         assert_eq!(tile.swizzle_phase(), (base >> 7) & 7);
-        // tcgen05.rs formula: base + row*128 + (chunk ^ ((row + phase) & 7))*16.
+        // base + row*128 + (chunk ^ ((row + phase) & 7))*16.
         let phase = tile.swizzle_phase();
         for row in [0usize, 2, 7, 63] {
             for chunk in 0usize..8 {
@@ -1696,11 +1683,10 @@ mod tests {
 
     #[test]
     fn swizzled_chunks_permute_each_row_within_itself() {
-        // The property the device harness checks against the TMA engine: over
-        // a whole tile the chunk map is a bijection onto the tile's 16-byte
-        // slots, and no row's chunks escape that row's 128 bytes. Swept over
-        // every base phase, since the XOR folds in the base's own position in
-        // the 8-row swizzle period.
+        // Over a whole tile the chunk map is a bijection onto the tile's
+        // 16-byte slots, and no row's chunks escape that row's 128 bytes.
+        // Swept over every base phase, since the XOR folds in the base's own
+        // position in the 8-row swizzle period.
         for phase in 0..8usize {
             let base = 0x2000 + phase * 128;
             let tile = unsafe { PTile::from_raw(base as *mut u8) };
@@ -1725,9 +1711,8 @@ mod tests {
     #[test]
     fn a_wide_tiles_chunks_walk_the_stacked_subtiles() {
         // Chunk 8*i + c is chunk c of subtile i: the same one-subtile formula
-        // applied at the subtile's own base, which is what a reader who knows
-        // `tma_load` expects. R = 64 here, a whole number of swizzle periods,
-        // so subtile 1 lands back at subtile 0's phase.
+        // applied at the subtile's own base. R = 64 here, a whole number of
+        // swizzle periods, so subtile 1 lands back at subtile 0's phase.
         let base = 0x2000usize;
         let tile = unsafe { Panel::from_raw(base as *mut u8) };
         let chunks = tile.chunk_writer();
@@ -1751,12 +1736,11 @@ mod tests {
 
     #[test]
     fn a_subtiles_phase_is_its_absolute_row_not_its_own_row() {
-        // The part of the derivation that only shows up when the subtile
-        // height is *not* a whole number of swizzle periods: SWIZZLE_128B XORs
-        // physical address bits [9:7], so subtile 1 of a 4-row tile begins 4
-        // 128-byte rows down and starts at phase 4, not at phase 0. Written
-        // down because at every shape the crate ships (R = 64, 128) the two
-        // readings coincide and a wrong one would never be noticed.
+        // Only shows up when the subtile height is *not* a whole number of
+        // swizzle periods: SWIZZLE_128B XORs physical address bits [9:7], so
+        // subtile 1 of a 4-row tile begins 4 128-byte rows down and starts at
+        // phase 4, not at phase 0. At every shape the crate ships (R = 64, 128)
+        // the two readings coincide and a wrong one would never be noticed.
         type Short = SharedTile<Bf16, 4, 128, Swizzle128B>;
         let base = 0x2000usize;
         let chunks = unsafe { Short::from_raw(base as *mut u8) }.chunk_writer();
@@ -1803,8 +1787,7 @@ mod tests {
 
     #[test]
     fn subtiles_stack_by_subtile_bytes() {
-        // What tma_load's per-box destination arithmetic rests on: stacked
-        // subtiles are contiguous, one SUBTILE_BYTES apart, covering the tile.
+        // What tma_load's per-box destination arithmetic rests on.
         let base = 0x8000usize;
         let tile = unsafe { Panel::from_raw(base as *mut u8) };
         for i in 0..Panel::SUBTILES {
@@ -1818,8 +1801,8 @@ mod tests {
 
     #[test]
     fn operand_descriptor_encodes_like_gemm() {
-        // Same encoding smem_descriptor() produced: address bits, 16-byte
-        // leading offset, 1024-byte stride, mode 2 in bits [63:61].
+        // Address bits, 16-byte leading offset, 1024-byte stride, mode 2 in
+        // bits [63:61].
         let base = 0x4000usize;
         let tile = unsafe { PTile::from_raw(base as *mut u8) };
         let descriptor = tile.operand_descriptor(32);
@@ -1830,9 +1813,9 @@ mod tests {
 
     #[test]
     fn walks_reproduce_gemm_consume_stage_descriptors() {
-        // gemm's consume_stage built build_smem_descriptor(smem + offset,
-        // leading, 1024, 2) with (offset, leading) = (chunk * 32, 16) for
-        // K-major and (chunk * 16 * 128, SUBTILE_BYTES = 8192) for MN-major.
+        // build_smem_descriptor(smem + offset, leading, 1024, 2) with
+        // (offset, leading) = (chunk * 32, 16) for K-major and
+        // (chunk * 16 * 128, SUBTILE_BYTES = 8192) for MN-major.
         type KStage = SharedTile<Bf16, 128, 64, Swizzle128B>;
         type MnStage = SharedTile<Bf16, 64, 128, Swizzle128B>;
         assert_eq!(MnStage::SUBTILE_BYTES, 8192);
@@ -1860,8 +1843,6 @@ mod tests {
     #[test]
     fn a_vectors_elements_are_flat_and_disjoint() {
         // The whole of the layout: element i at i * BYTES, no phase, no atom.
-        // A collision or an escape here is a wrong stride, and there is
-        // nothing else the addressing could get wrong.
         let base = 0x3000usize;
         let vec = unsafe { Params::from_raw(base as *mut u8) };
         let mut seen = [false; 128];
@@ -1878,10 +1859,9 @@ mod tests {
 
     #[test]
     fn a_vector_costs_no_padding_where_a_tile_would() {
-        // The reason this is not a one-row SharedTile. A 32-column bf16 tile
-        // is not even expressible (WIDTH_OK wants a whole 64-column subtile),
-        // and the narrowest one that is spends a 128-byte atom on its single
-        // row; the vector spends its elements and nothing else.
+        // The reason this is not a one-row SharedTile. A 32-column bf16 tile is
+        // not even expressible (WIDTH_OK wants a whole 64-column subtile), and
+        // the narrowest one that is spends a 128-byte atom on its single row.
         assert_eq!(SharedVec::<Bf16, 32>::BYTES, 64);
         assert_eq!(SharedTile::<Bf16, 1, 64, Swizzle128B>::BYTES, 128);
         assert_eq!(SharedVec::<Bf16, 64>::BYTES, 128);
@@ -1889,9 +1869,9 @@ mod tests {
 
     #[test]
     fn reading_a_vector_widens_the_element_at_that_index() {
-        // Bf16::read against real bytes — the one half of the scalar pair that
-        // holds on the host, since widening needs no instruction. Each element
-        // names its own index, so a wrong stride reads a neighbour.
+        // Bf16::read against real bytes — the half of the scalar pair that
+        // holds on the host. Each element names its own index, so a wrong
+        // stride reads a neighbour.
         let elements: Vec<u16> = (0..128u16).map(|index| 0x4000 | index).collect();
         let vec = unsafe { Params::from_raw(elements.as_ptr() as *mut u8) };
         for index in 0..128usize {
@@ -1902,19 +1882,16 @@ mod tests {
 
     #[test]
     fn a_tiles_charge_is_the_boxes_its_load_issues() {
-        // `CHARGE` counts what the load loop actually does — one box per
+        // `CHARGE` counts what the load loop actually issues — one box per
         // subtile, `R` rows of one swizzle atom each — and `BYTES` counts the
-        // tile. They are the same number for every shape, and that identity is
-        // the whole reason a derived charge can replace a hand-written one. A
-        // width that stopped being a whole number of subtiles would break it,
-        // and `WIDTH_OK` rejects those first.
+        // tile. That they agree at every legal shape is the whole reason a
+        // derived charge can replace a hand-written one.
         assert_eq!(Panel::CHARGE.bytes(), Panel::BYTES as u32);
         assert_eq!(PTile::CHARGE.bytes(), PTile::BYTES as u32);
         assert_eq!(Paired::CHARGE.bytes(), Paired::BYTES as u32);
         assert_eq!(Params::CHARGE.bytes(), Params::BYTES as u32);
         // A partial load — `tma_load_at::<BOX_ROWS>` — charges its boxes and
-        // not the tile, which is the case the old prose asked callers to do by
-        // hand. Half the rows, half the bytes.
+        // not the tile. Half the rows, half the bytes.
         let half = || TransactionBytes::new(Paired::SUBTILES * 64 * Swizzle128B::ATOM_BYTES);
         assert_eq!(half().bytes(), Paired::BYTES as u32 / 2);
         assert_eq!((half() + half()).bytes(), Paired::CHARGE.bytes());
@@ -1929,8 +1906,8 @@ mod tests {
         // testing nothing.
         type GemmA = SharedTile<Bf16, 128, 64, Swizzle128B>;
         type GemmB = SharedTile<Bf16, 64, 64, Swizzle128B>;
-        // gemm — `RANKS * (ATile::BYTES + BTile::BYTES)`, the one charge that
-        // covers bytes the charging CTA does not issue.
+        // gemm — the one charge that covers bytes the charging CTA does not
+        // issue.
         let stage = GemmA::CHARGE + GemmB::CHARGE;
         assert_eq!(stage.bytes(), 24576);
         assert_eq!(stage.across_ranks(2).bytes(), 49152);
@@ -1946,10 +1923,9 @@ mod tests {
         type Rows = SharedTile<Bf16, 128, 128, Swizzle128B>;
         assert_eq!(Rows::CHARGE.bytes(), 32768);
 
-        // layernorm — `Tile::BYTES + 2 * Parameters::BYTES`, the producer
-        // whose sum mixes a tile with two vectors and so was the easiest to
-        // get wrong: a missed `2 *` under-charges by 256 bytes and the tile is
-        // read while beta is still in flight.
+        // layernorm — the producer whose sum mixes a tile with two vectors and
+        // so was the easiest to get wrong: a missed `2 *` under-charges by 256
+        // bytes and the tile is read while beta is still in flight.
         type Gamma = SharedVec<Bf16, 128>;
         assert_eq!(Gamma::CHARGE.bytes(), 256);
         assert_eq!(
