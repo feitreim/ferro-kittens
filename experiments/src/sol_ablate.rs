@@ -86,10 +86,10 @@ use kittens::shared::F16;
 
 use crate::bench::{Shape, Timings, time};
 use crate::gemm_sol::{
-    ATile, B_BOX, BLOCK_N, BPanel, DRAIN_PACK16, DRAIN_PAIRED, DRAIN_PER_ISSUE, DRAIN_WIDE,
-    FEED_ONLY, HALF_N, ISSUE_ONLY, MMA_ONLY, NO_DRAIN, SHIPPED_DRAIN, SMALL_RINGS_END, THREADS,
-    TWICE_ALL, TWICE_GLOBAL, TWICE_SHARED, Variant, WHOLE, WIDE_B_BOX, WideBPanel, clusters,
-    default_group, large_body, small_body,
+    ATile, B_BOX, BLOCK_N, BPanel, DRAIN_NOCVT, DRAIN_PACK16, DRAIN_PAIRED, DRAIN_PER_ISSUE,
+    DRAIN_WIDE, FEED_ONLY, HALF_N, ISSUE_ONLY, MMA_ONLY, NO_DRAIN, SHIPPED_DRAIN, SMALL_RINGS_END,
+    THREADS, TWICE_ALL, TWICE_GLOBAL, TWICE_SHARED, Variant, WHOLE, WIDE_B_BOX, WideBPanel,
+    clusters, default_group, large_body, small_body,
 };
 
 /// SMs on the B200 this file's arithmetic is for, and CTAs one of them holds at
@@ -950,6 +950,68 @@ pub mod kernels {
             )
         }
     }
+
+    /// The shipped drain with the `cvt` pass removed and nothing else — the oracle
+    /// that prices the convert. It computes a wrong `C` by construction.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m256`]. Computes a wrong `C`.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 196_864,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m256_nocvt(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, WHOLE, DRAIN_NOCVT>(
+                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
+            )
+        }
+    }
+
+    /// The shipped drain with the `cvt` pass removed and nothing else — the oracle
+    /// that prices the convert. It computes a wrong `C` by construction.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m512`]. Computes a wrong `C`.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 229_632,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m512_nocvt(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            large_body::<B_BOX, WHOLE, DRAIN_NOCVT>(
+                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
+            )
+        }
+    }
 }
 
 /// One phase kept or removed, and the `B` box it is asked at.
@@ -970,7 +1032,12 @@ pub enum Arm {
     Paired,
     PerIssue,
     Wide,
+    /// **Never launched.** `.pack::16b` faults on the device against an fp32
+    /// accumulator — `Xid 13, Out Of Range Address` on every SM — so this arm
+    /// exists for its opcode census and has no timed row. See
+    /// [`crate::gemm_sol::DRAIN_PACK16`].
     Pack16,
+    NoCvt,
 }
 
 impl Arm {
@@ -997,7 +1064,7 @@ impl Arm {
     /// The drain rungs, all at [`crate::gemm_sol::WHOLE`], all on the same shared
     /// plan and all compiled in this crate, so one `no drain` control serves every
     /// one of them and no comparison crosses a crate boundary.
-    const DRAINS: [Arm; 4] = [Arm::Paired, Arm::PerIssue, Arm::Wide, Arm::Pack16];
+    const DRAINS: [Arm; 4] = [Arm::Paired, Arm::PerIssue, Arm::Wide, Arm::NoCvt];
     /// The drain rungs that compute a right `C` and are therefore on
     /// [`check`]. `Pack16` is not one of them and cannot be.
     const EXACT_DRAINS: [Arm; 3] = [Arm::Paired, Arm::PerIssue, Arm::Wide];
@@ -1018,6 +1085,7 @@ impl Arm {
             Arm::PerIssue => "per issue",
             Arm::Wide => "wide",
             Arm::Pack16 => "pack16",
+            Arm::NoCvt => "nocvt",
         }
     }
 
@@ -1036,7 +1104,8 @@ impl Arm {
             Arm::Paired => "the shipped drain, this crate: 2 LDTM, 1 wait",
             Arm::PerIssue => "the drain #144 shipped: a wait per LDTM issue",
             Arm::Wide => "128-column bands, 4 LDTM in flight, 1 wait",
-            Arm::Pack16 => ".pack::16b and no cvt at all; WRONG C",
+            Arm::Pack16 => ".pack::16b; FAULTS ON THE DEVICE, never launched",
+            Arm::NoCvt => "the shipped drain minus the cvt; WRONG C",
         }
     }
 
@@ -1150,6 +1219,12 @@ pub fn measure(
     }
 
     let launch_once = match (variant, arm) {
+        (Variant::M256xN256, Arm::NoCvt) => {
+            launcher!(&ablated, prepare_gemm_sol_m256_nocvt, gemm_sol_m256_nocvt)
+        }
+        (Variant::M512xN256, Arm::NoCvt) => {
+            launcher!(&ablated, prepare_gemm_sol_m512_nocvt, gemm_sol_m512_nocvt)
+        }
         (Variant::M256xN256, Arm::TwiceGlobal) => {
             launcher!(
                 &ablated,
@@ -1558,7 +1633,7 @@ fn chain_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
         println!("\n  {shape} — {}", variant.name());
         let minima = arm_rows(context, shape, variant, &Arm::LADDER, Arm::PerIssue)?;
         let no_drain = measure(context, shape, variant, Arm::NoDrain)?.min();
-        let pack16 = measure(context, shape, variant, Arm::Pack16)?.min();
+        let nocvt = measure(context, shape, variant, Arm::NoCvt)?.min();
         let paired = measure(context, shape, variant, Arm::Paired)?.min();
 
         let (base, twice_all) = (minima[0], minima[3]);
@@ -1585,9 +1660,9 @@ fn chain_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
         println!(
             "  {:<26}{:>8.2}{:>9.0}%  of the serial drain, and with no write-after-write on\n\
              {:>36}its own staging tile, which the rung above pays",
-            "cvt alone, `paired - pack16`",
-            per_tile(paired - pack16),
-            100.0 * per_tile(paired - pack16) / serial,
+            "cvt alone, `paired - nocvt`",
+            per_tile(paired - nocvt),
+            100.0 * per_tile(paired - nocvt) / serial,
             "",
         );
         println!(

@@ -115,11 +115,12 @@ pub const ABLATE_ARMS: [(&str, u8); 8] = [
 ];
 
 /// [`ABLATE_ARMS`] for the drain dial. Same reasoning, same guard.
-pub const DRAIN_RUNGS: [(&str, u8); 4] = [
+pub const DRAIN_RUNGS: [(&str, u8); 5] = [
     ("per issue", DRAIN_PER_ISSUE),
     ("paired", DRAIN_PAIRED),
     ("wide", DRAIN_WIDE),
     ("pack16", DRAIN_PACK16),
+    ("nocvt", DRAIN_NOCVT),
 ];
 
 /// The guard both dials are held to: dense from zero, and no value twice.
@@ -212,7 +213,31 @@ pub const DRAIN_WIDE: u8 = 2;
 /// plan — and the `cvt.rn.bf16x2` column goes to **zero**. `whole − pack16` is
 /// therefore the `cvt` pass's cost with none of the write-after-write the
 /// [`TWICE_SHARED`] rung pays on its own staging tile.
+/// **It faults on the device and nothing launches it.** `bench sol-ablate` took
+/// it once and every SM raised `Xid 13, Out Of Range Address` — 148 SMs of
+/// warp exceptions and `DriverError(700)`. So `.pack::16b` against an fp32
+/// accumulator is not merely the wrong *values*, it is not addressable: the
+/// qualifier reads the segment as 16-bit-typed and the addressing that follows
+/// from that does not land inside a `[128, N]` fp32 allocation. The kernel stays
+/// because its **census** is the finding — `cvt.bf16x2` goes from 8 to 0 while
+/// `stmatrix` and every store column hold, which is the question #117's register
+/// count could not answer — and [`DRAIN_NOCVT`] is the oracle that can be timed.
 pub const DRAIN_PACK16: u8 = 3;
+/// The oracle that prices the convert: the ordinary batched `.x8` load, and the
+/// band's words handed to `stmatrix` **without the `cvt`**.
+///
+/// **It computes a wrong `C` by construction** — fp32 bit patterns are not bf16
+/// pairs — and is on no correctness gate. What it is, is the shipped drain with
+/// exactly one thing removed: same LDTM count, same wait count, same `stmatrix`
+/// count, same `ld.shared`, same `st.global`, same shared plan, and `cvt` zero.
+/// `paired − nocvt` is therefore the convert's own cost, with none of the
+/// write-after-write on its own staging tile that [`TWICE_SHARED`] pays and none
+/// of [`DRAIN_PACK16`]'s addressing.
+///
+/// Half the band's words go unused, which is what keeps the `stmatrix` count
+/// equal: a `[32, BAND_N]` band is 64 f32 a lane and 32 packed words, so a drain
+/// that skips the pack has twice the words it needs and writes the first half.
+pub const DRAIN_NOCVT: u8 = 4;
 /// The drain every shipped entry takes, named once here so a rung that wins its
 /// A/B ships by moving this line — which is what [`DRAIN_PAIRED`] did.
 pub const SHIPPED_DRAIN: u8 = DRAIN_PAIRED;
@@ -691,6 +716,68 @@ impl Common {
         }
     }
 
+    /// [`DRAIN_NOCVT`]: the shipped drain with the `cvt` pass removed and
+    /// nothing else, so `paired − nocvt` is what the convert costs.
+    ///
+    /// The band arrives exactly as [`Self::drain_batched`] takes it — two `.x8`
+    /// issues behind one wait — and then its raw f32 words go to `stmatrix`
+    /// unpacked, four to a block, eight blocks to a band. That writes the same
+    /// bytes to the same addresses with the same instruction at the same count;
+    /// only the 32 `cvt.rn.bf16x2` a band are gone, and so is any relation
+    /// between what is written and `C`.
+    #[inline(always)]
+    unsafe fn drain_nocvt<const N: usize, const STAGE_N: usize>(
+        self,
+        accumulator: TmemTile<BLOCK_M, N>,
+        tile_row: u32,
+        tile_column: u32,
+    ) {
+        unsafe {
+            const {
+                assert!(STAGE_N.is_multiple_of(BAND_N));
+                assert!(N.is_multiple_of(STAGE_N));
+            };
+            let stage = self.staging::<STAGE_N>();
+            let row = self.drain_row(tile_row);
+            let mut column = 0u32;
+            while column < N as u32 {
+                let mut band_column = 0u32;
+                while band_column < STAGE_N as u32 {
+                    let band: StageBand = accumulator
+                        .tile_x8_batched::<32, BAND_N, 2>(32 * self.warp_id, column + band_column);
+                    let mut block = 0usize;
+                    while block < 8 {
+                        let slot = block / 4;
+                        store_packed_x4(
+                            stage.chunk_writer(),
+                            16 * slot as u32,
+                            band_column + 16 * (block as u32 % 4),
+                            self.lane,
+                            [
+                                band.get(slot, 4 * (block % 4)).to_bits(),
+                                band.get(slot, 4 * (block % 4) + 1).to_bits(),
+                                band.get(slot, 4 * (block % 4) + 2).to_bits(),
+                                band.get(slot, 4 * (block % 4) + 3).to_bits(),
+                            ],
+                        );
+                        block += 1;
+                    }
+                    band_column += BAND_N as u32;
+                }
+                warp::sync_mask(u32::MAX);
+                store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
+                    self.c,
+                    row,
+                    tile_column + column,
+                    self.lane,
+                    stage,
+                );
+                warp::sync_mask(u32::MAX);
+                column += STAGE_N as u32;
+            }
+        }
+    }
+
     /// Which drain a `DRAIN` value names. The dead arms fold away: `DRAIN` is a
     /// const and every arm is instantiated with literal widths.
     #[inline(always)]
@@ -715,6 +802,7 @@ impl Common {
                     self.drain_batched::<N, STAGE_N, 128, 4>(accumulator, tile_row, tile_column)
                 }
                 DRAIN_PACK16 => self.drain_packed::<N, STAGE_N>(accumulator, tile_row, tile_column),
+                DRAIN_NOCVT => self.drain_nocvt::<N, STAGE_N>(accumulator, tile_row, tile_column),
                 _ => self.drain::<ABLATE, N, STAGE_N>(accumulator, tile_row, tile_column, again),
             }
         }
@@ -887,7 +975,7 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
                     again = (row, column);
                 }
                 common.full.wait(sequence);
-                if drains(ABLATE) || DRAIN == DRAIN_PACK16 {
+                if drains(ABLATE) || DRAIN >= DRAIN_PACK16 {
                     common.drain_dial::<ABLATE, DRAIN, N, STAGE>(
                         Common::accumulator(self.accumulator, sequence),
                         row,
@@ -1074,7 +1162,7 @@ impl<const BOX: usize> Large<BOX> {
                 let mut half = 0u32;
                 while half < 2 {
                     common.full.sem(half).wait(sequence & 1);
-                    if drains(ABLATE) || DRAIN == DRAIN_PACK16 {
+                    if drains(ABLATE) || DRAIN >= DRAIN_PACK16 {
                         common.drain_dial::<ABLATE, DRAIN, BLOCK_N, LARGE_STAGE_N>(
                             self.accumulator.columns_right(half * BLOCK_N as u32),
                             info.row * 512 + half * 256,
