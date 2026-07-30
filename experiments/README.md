@@ -3677,21 +3677,47 @@ gap to the library. Three levers were scoped. **One of them does not exist, one
 of them is worth nothing, and one of them is worth more than anything measured
 in this file since the port.**
 
-**`.pack::16b` is not a lever, and the pin says so before any device time is
-spent on it.** The scoping read it as folding the fp32→bf16 convert into the
-load — eliminating the `cvt` and halving the registers reaching `stmatrix`. At
-`b099f64c1a32869b74be99f4f88242fb68655b51`, `intrinsics/abi-v1.toml` gives
-`tcgen05_ld_16x256b_x8_pack16` the result type `[u32; 32]`, **the same 32
-registers as `_x8_raw`**, and `intrinsics/generated-reference.md` validates it
-as `tcgen05.ld.sync.aligned.16x256b.x8.pack::16b.b32 <register-list:32>`. The
-count does not fall, so nothing is being packed two-into-one for the same span.
+**`.pack::16b` is not a lever — but the register count was the wrong reason, and
+#147 closed it properly.** The scoping read it as folding the fp32→bf16 convert
+into the load: eliminating the `cvt` and halving the registers reaching
+`stmatrix`. At `b099f64c1a32869b74be99f4f88242fb68655b51`,
+`intrinsics/abi-v1.toml` gives `tcgen05_ld_16x256b_x8_pack16` the result type
+`[u32; 32]`, **the same 32 registers as `_x8_raw`**, and
+`intrinsics/generated-reference.md` validates it as
+`tcgen05.ld.sync.aligned.16x256b.x8.pack::16b.b32 <register-list:32>`.
 `.pack::16b` is the load-side twin of `tcgen05.st`'s `.unpack::16b` — it moves
 **16-bit-typed** tensor memory, pairing adjacent columns' half-words. Against an
-fp32 accumulator it is not a rounding mode, it is the wrong instruction. No rung
-was built and no GPU time was spent. (And the rounding question it was flagged
-for is moot twice over: `check_c` compares bf16 words with `==` and **no
-tolerance at all**, so a lever that cost a mantissa bit fails the gate rather
-than passing a loose one.)
+fp32 accumulator it is not a rounding mode, it is the wrong instruction.
+
+That last sentence is the sound half. **"The register count does not fall, so
+nothing is packed" is not**, and it answered a question nobody had asked: equal
+register counts are consistent with equal *bits* moved, which is exactly why no
+convert was performed — it does not establish that the `cvt` instructions
+survive. Register count alone is the reasoning this file has been burned by at
+#47, #63, #67, #76 and #81, and this was a sixth. #147 asked the two questions
+separately and got two answers, both from the census rather than from the ABI:
+
+- **Does it remove the `cvt`? Yes.** `gemm_sol_m512_pack16` censuses
+  `cvt.rn.bf16x2` at **0** against the shipped drain's 8, with `stmatrix`,
+  `ld.shared.v4`, `st.global.v4` and `st.global.b32` all unmoved. So the convert
+  *is* folded away, and the ABI table could never have said otherwise.
+- **Is it usable? No, and not for a values reason.** The arm **faults**: one
+  launch raised `Xid 13, Out Of Range Address` on every SM and returned
+  `DriverError(700)`. Read as 16-bit-typed, the addressing the qualifier implies
+  does not land inside a `[128, N]` fp32 allocation at all.
+- **Would removing the `cvt` have helped anyway? No.** #147's `nocvt` rung is the
+  shipped drain with the same LDTM count, the same wait count, the same eight
+  `stmatrix` a band and `cvt` at zero — and it is **0.0 to −1.4% slower**, in two
+  round-robin passes at both shapes. The convert is free. The 69% of the drain
+  that `twice shared − twice global` prices is the **`stmatrix`** pass and the
+  write-after-write a doubled one owes its own staging tile, not the convert
+  beside it.
+
+So the conclusion stands and the argument for it is now an instruction census and
+a timed oracle. (The rounding question it was originally flagged for is moot
+twice over: `check_c` compares bf16 words with `==` and **no tolerance at all**,
+so a lever that cost a mantissa bit fails the gate rather than passing a loose
+one.)
 
 **The `.x8` hazard is stale history, not a live warning.**
 `crates/cuda-device/src/tcgen05.rs` says `tcgen05_ld_16x256b_x4/x8/x16/x32` were

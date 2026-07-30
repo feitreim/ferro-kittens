@@ -20,6 +20,19 @@
 //! | `issue only` | arrives on `load`, no TMA | wait, `tcgen05.mma`, commit | handshake only |
 //! | `feed only` | TMA | wait and commit, no MMA | handshake only |
 //! | `mma only` | arrives on `load`, no TMA | `tcgen05.mma`, commit, **no wait** | handshake only |
+//! | `twice global` | TMA | wait, `tcgen05.mma`, commit | + a second `ld.shared` + `st.global` |
+//! | `twice shared` | TMA | wait, `tcgen05.mma`, commit | + a second `cvt` + `stmatrix` too |
+//! | `twice all` | TMA | wait, `tcgen05.mma`, commit | + a second LDTM: the drain twice |
+//!
+//! and four rungs of the drain itself, on a second dial:
+//!
+//! | rung | LDTM a `[32, 64]` band | waits | `cvt` a band | `C` |
+//! | --- | --- | ---: | ---: | --- |
+//! | `per issue` | two `.x8` | 2 | 32 | right |
+//! | `paired` (ships) | two `.x8` | **1** | 32 | right |
+//! | `wide` | four `.x8`, 128-column band | 1 | 64 | right |
+//! | `nocvt` | two `.x8` | 1 | **0** | **wrong** |
+//! | `pack16` | one `.x8.pack::16b` | 1 | **0** | **faults** |
 //!
 //! **Every barrier survives every arm but the last, which drops exactly one.**
 //! `mma only` is #144's missing fifth arm: it names the thing #144 listed as
@@ -37,6 +50,67 @@
 //! `no drain` zero across `ldtm`, `stmatrix` and the store columns while keeping
 //! both of the others, and every arm the same `mbar.arrive`. An arm whose census
 //! does not read that way did not remove what it names, and its number is void.
+//!
+//! # The epilogue: what the drain is made of, and what it costs the launch
+//!
+//! #144 measured the epilogue at 19.7% of the launch at 4096³ and 11.9% at 8192³
+//! and listed first among the things it could not separate *"the epilogue's own
+//! cost from its failure to overlap."* The `twice` arms are that separation, and
+//! they are a **doubling ladder** rather than an ablation: each rung repeats one
+//! more pass of the drain per band, with the extra global stores aimed at the
+//! cluster's own first output tile so they stay in L2. An extra pass has nothing
+//! left to hide behind, so it is paid **serially by construction** — which makes
+//! `twice all − per issue` the drain's own occupancy cost `D`, against which
+//! `E = paired − no drain` is what the launch pays.
+//!
+//! One container, µs per tile per cluster:
+//!
+//! | | 4096³ `[256,256]` | 8192³ `[512,256]` |
+//! | --- | ---: | ---: |
+//! | `ld.shared` + `st.global` | 0.97 (36%) | 3.59 (42%) |
+//! | `stmatrix` and its own write-after-write | 1.59 (59%) | 5.86 (69%) |
+//! | **`cvt`, `paired − nocvt`** | **−0.18 (0%)** | **−1.13 (0%)** |
+//! | **LDTM and its wait** | **0.14 (5%)** | **−0.95 (0%)** |
+//! | `D`, the whole chain serially | 2.70 | 8.50 |
+//! | `E`, what the launch pays | **5.35 (198% of `D`)** | **9.40 (111% of `D`)** |
+//!
+//! **`E > D` at both shapes, so there is no overlap to fail.** Not
+//! "incompletely overlapped" — *negatively* overlapped: the first drain costs the
+//! launch more than a whole extra one does, which is only possible if the drain
+//! slows the phase it runs beside. At 4096³, where the accumulator **is**
+//! double-buffered across output tiles and the structure permits overlap, it is
+//! nearly twice as bad. Buffering is demonstrably not sufficient.
+//!
+//! **Two of the four terms are zero, and both were expected to be levers.**
+//!
+//! - *The LDTM half.* Doubling `tcgen05.ld` and its waits — census `ldtm` 2 → 4,
+//!   `ldtm.wait` 2 → 4 — costs nothing. #117 took eight issues and eight waits a
+//!   band down to one and one and was worth +23.6/+8.6/+3.6%; from there the
+//!   remaining waits are already covered by the other three epilogue warps. The
+//!   `paired` rung takes the last two to one and is worth +0.7% at 8192³ and
+//!   nothing at 4096³, which is what a term measured at zero predicts.
+//! - *The convert.* `nocvt` is the shipped drain with the same LDTM count, the
+//!   same wait count, the same eight `stmatrix` a band and `cvt` at **zero**, and
+//!   it is 0.0 to 1.4% **slower**. So the 69% that `twice shared − twice global`
+//!   prices is the `stmatrix` pass and the write-after-write a doubled one owes
+//!   its own staging tile — not the `cvt` beside it. This is what closes
+//!   `.pack::16b`: the instruction does fold the convert away (census `cvt` 0),
+//!   and folding the convert away is worth nothing.
+//!
+//! What is left is `stmatrix` into the swizzled staging tile at ~5.9 µs a tile,
+//! and it is not bandwidth — 262 144 B into shared per cluster per tile in ~6 µs
+//! is 3.5 TB/s device-wide against an SM's ~230 GB/s of shared write bandwidth,
+//! under 10% of it. It is not bank conflicts either: `Swizzle128B` maps the eight
+//! rows of one `stmatrix.m8n8` matrix onto eight distinct 16-byte chunks whose
+//! banks tile all 32 exactly once, at both staging pitches, because both row
+//! pitches are whole multiples of 128 B and the row term drops out of the bank
+//! index. And it is not width: `stmatrix.m8n8.x4` is the widest b16 form there is.
+//!
+//! **So the drain is latency-bound in four warps, and there cannot be a fifth**:
+//! TMEM lane ownership gives a warp the 32 lanes of its own sub-partition, so
+//! `EPILOGUE_WARPS = BLOCK_M / 32` is the hardware's arithmetic and not a knob.
+//! The two routes left are both concurrency, and both are named with their
+//! arithmetic on [`crate::gemm_sol::DRAIN_PAIRED`]'s neighbours and in #147.
 //!
 //! # The wide-`B` arms, which are not ablations
 //!
@@ -1697,9 +1771,9 @@ fn drain_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
     println!(
         "\n4. the drains — the same epilogue at four issue structures, one `no drain`\n\
          control serving all of them. `epilogue` is `arm - no drain` in µs per tile per\n\
-         cluster, which is the term this table exists to shrink. `pack16` is an oracle and\n\
+         cluster, which is the term this table exists to shrink. `nocvt` is an oracle and\n\
          not a candidate: it computes a wrong `C` and is here for what its time says about\n\
-         the convert."
+         the convert, which is that the convert is free."
     );
     let baseline = crate::bench::CUBLASLT_F16;
     for (shape, variant) in HEADLINE {

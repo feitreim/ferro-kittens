@@ -237,6 +237,14 @@ pub const DRAIN_PACK16: u8 = 3;
 /// Half the band's words go unused, which is what keeps the `stmatrix` count
 /// equal: a `[32, BAND_N]` band is 64 f32 a lane and 32 packed words, so a drain
 /// that skips the pack has twice the words it needs and writes the first half.
+///
+/// **The convert is free.** This rung is 0.0 to 1.4% *slower* than
+/// [`DRAIN_PAIRED`], in two round-robin passes at both shapes, so removing 32
+/// `cvt.rn.bf16x2` a band buys nothing — and the 69% of the drain that the
+/// `twice shared` rung prices is the `stmatrix` pass and the write-after-write a
+/// doubled one owes its own staging tile, not the `cvt` beside it. That is also
+/// what closes [`DRAIN_PACK16`] for good: it folds the convert into the load, and
+/// folding the convert away is worth nothing.
 pub const DRAIN_NOCVT: u8 = 4;
 /// The drain every shipped entry takes, named once here so a rung that wins its
 /// A/B ships by moving this line — which is what [`DRAIN_PAIRED`] did.
