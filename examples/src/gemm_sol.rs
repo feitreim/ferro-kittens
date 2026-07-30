@@ -155,6 +155,27 @@ pub const WATCH_RUNGS: [(&str, u8); 3] = [
 ];
 
 /// The guard every dial is held to: dense from zero, and no value twice.
+///
+/// # The other half of the rule, which no assert can state
+///
+/// A dial value that collides fails to build here. A dial value that is **legal on
+/// its own and illegal in combination** does not, and it fails somewhere much less
+/// obvious: at monomorphization, *including in match arms that cannot be reached*.
+/// `DRAIN_WIDE` drains a 128-column band, a band has to divide the per-warp staging
+/// tile, and at [`TWO_WARPGROUPS`] that tile is 64 wide — so a literal `128` inside
+/// [`Common::drain_dial`]'s `DRAIN_WIDE` arm breaks the *two-warpgroup* build even
+/// though two warpgroups never take that arm. Rust monomorphizes both sides of a
+/// `match` on a const before anything folds it away.
+///
+/// So the convention these dials are held to has two halves:
+///
+/// 1. **Values are a permutation of `0..len`** — this function, checked at compile
+///    time, because a collision otherwise silently remaps one arm onto another.
+/// 2. **Every *combination* of dials must be legal, not just the reachable ones.**
+///    A shape a dial implies has to come from whoever knows all the dials — the
+///    entry — rather than being written as a literal where one dial can see it and
+///    the others cannot. That is why the band and its issue count are parameters
+///    ([`Common::drain_dial`]'s `WIDE_BAND`/`WIDE_ISSUES`) and not constants.
 const fn dial_is_a_permutation<const N: usize>(dial: [(&str, u8); N]) -> bool {
     let mut seen = [false; N];
     let mut arm = 0usize;
@@ -386,14 +407,78 @@ const _: () = assert!(ITEMS >= ACCUMULATORS + 2, "steps 3 and 4 above");
 const DEADLINE: u64 = 1 << 30;
 const NARROW_N: usize = BLOCK_N / 2;
 const HALF_NARROW_N: usize = NARROW_N / 2;
-const EPILOGUE_WARPS: u32 = (BLOCK_M / 32) as u32;
-const TMA_WARP: u32 = EPILOGUE_WARPS;
-const MMA_WARP: u32 = TMA_WARP + 1;
-pub const THREADS: u32 = (MMA_WARP + 1) * 32;
+/// TMEM rows one warp owns, and therefore how many epilogue warps **one
+/// warpgroup** can have.
+///
+/// `tcgen05.ld` reaches the 32 tensor-memory lanes of the issuing warp's own
+/// sub-partition, and which sub-partition that is comes from the warp's index
+/// *within its warpgroup*. A `[128, N]` accumulator is 128 lanes, so four warps
+/// tile its rows exactly and **a fifth warp of the same warpgroup has no rows
+/// left to own.** That is hardware arithmetic, not a tuning knob, and it is why
+/// the epilogue cannot be widened along the row axis at all.
+const EPILOGUE_ROWS: u32 = (BLOCK_M / 32) as u32;
+/// Warpgroups the epilogue runs across, which is the axis that *is* open.
+///
+/// Warp 4 is warpgroup 1's warp 0 and owns the **same** rows 0-31 warp 0 owns, so
+/// a second warpgroup cannot split the accumulator's rows any finer than
+/// [`EPILOGUE_ROWS`] already does — what it can split is the accumulator's
+/// **columns**. Warp `w` then drains rows `32 · (w % EPILOGUE_ROWS)` of column
+/// half `w / EPILOGUE_ROWS`, and every warp still reads only the lanes its
+/// sub-partition index entitles it to: lane ownership is satisfied twice over
+/// rather than relaxed.
+///
+/// It is free in the resource that binds. Residency is one CTA/SM on shared
+/// memory, and doubling the warps halves each one's staging width, so
+/// [`shared_plan`] is **byte-identical** at every entry — which is also what lets
+/// one `no drain` control serve both spellings.
+pub const ONE_WARPGROUP: u32 = 1;
+/// [`ONE_WARPGROUP`]'s twin: eight epilogue warps splitting the columns.
+///
+/// **It does not pay, and the reason closes the direction.** Two round-robin
+/// passes each: −1.4% and −1.8% of the launch at 4096³, +0.3% and +0.4% at 8192³,
+/// against a `no drain` control at *its own* 320 threads that is identical to the
+/// 192-thread one — so the two extra warps are free when they do nothing and the
+/// loss is the drain being slower once it is split. The drain itself moves by −9%
+/// at 4096³ and +3% at 8192³ for **twice the warps at the same total work**.
+///
+/// So the drain's latency is not warp-parallelizable, and the mechanism is the
+/// same resource that fixed [`EPILOGUE_ROWS`]: warps 0 and 4 own the *same* 32
+/// tensor-memory lanes, so a column split does not spread the LDTM traffic over
+/// more sub-partitions — it puts **two requesters on each of the same four**. The
+/// axis that is free to split is not the axis the hardware parallelizes, and
+/// there is no third axis: rows are tiled out at four warps by lane ownership and
+/// columns are shared with the warp that already owns those lanes.
+///
+/// Kept as a rung. It is exact at both entries over 1 048 576 BF16 outputs, which
+/// is what says the split itself is right and the null is about the hardware
+/// rather than about the code.
+pub const TWO_WARPGROUPS: u32 = 2;
+/// The warpgroup count both shipped entries take.
+pub const SHIPPED_GROUPS: u32 = ONE_WARPGROUP;
+
+const fn epilogue_warps(groups: u32) -> u32 {
+    EPILOGUE_ROWS * groups
+}
+const fn tma_warp(groups: u32) -> u32 {
+    epilogue_warps(groups)
+}
+const fn mma_warp(groups: u32) -> u32 {
+    tma_warp(groups) + 1
+}
+/// Threads a launch of this kernel takes at `groups` epilogue warpgroups — 192 at
+/// one, 320 at two. It is a `const fn` and not a constant because the two
+/// spellings are launched side by side.
+pub const fn threads(groups: u32) -> u32 {
+    (mma_warp(groups) + 1) * 32
+}
+/// The thread count the shipped entries are launched with.
+pub const THREADS: u32 = threads(SHIPPED_GROUPS);
 const RANKS: u32 = 2;
 const LEADER: u32 = 0;
 const PAIR: u16 = 0b11;
-const BAND_N: usize = 64;
+/// Columns of the accumulator a warp lifts into registers in one pass — `pub`
+/// because the warpgroup-split arms name it as their widest legal band.
+pub const BAND_N: usize = 64;
 /// The TMA box `B` arrives in, and therefore the step the load loop takes
 /// through the half-panel a rank owns — the shipped value, which every entry
 /// carried unconditionally until it became [`Small`]'s and [`Large`]'s `BOX`
@@ -414,10 +499,33 @@ const BAND_N: usize = 64;
 pub const B_BOX: usize = 64;
 /// The box the two 256-wide entries' half-panel would arrive in whole.
 pub const WIDE_B_BOX: usize = HALF_N;
-const LARGE_STAGE_N: usize = HALF_N;
+/// The `[512, 256]` entry's staging width — `pub` because `experiments/`'
+/// warpgroup-split arms halve it for their own per-warp tile.
+pub const LARGE_STAGE_N: usize = HALF_N;
 
 const _: () = {
     assert!(THREADS == 192);
+    assert!(threads(TWO_WARPGROUPS) == 320);
+    // The claim that makes the warpgroup split's `no drain` control clean, as an
+    // assert rather than as prose: twice the warps staging half the columns each is
+    // the same number of bytes, at every entry.
+    assert!(
+        epilogue_warps(ONE_WARPGROUP) as usize * BLOCK_N
+            == epilogue_warps(TWO_WARPGROUPS) as usize * (BLOCK_N / 2)
+    );
+    assert!(
+        epilogue_warps(ONE_WARPGROUP) as usize * NARROW_N
+            == epilogue_warps(TWO_WARPGROUPS) as usize * (NARROW_N / 2)
+    );
+    assert!(
+        epilogue_warps(ONE_WARPGROUP) as usize * LARGE_STAGE_N
+            == epilogue_warps(TWO_WARPGROUPS) as usize * (LARGE_STAGE_N / 2)
+    );
+    // The column split has to divide the columns, and each half has to still be a
+    // whole number of staging passes. `LARGE_STAGE_N` is the tightest.
+    assert!(BLOCK_N.is_multiple_of(2 * BAND_N));
+    assert!(NARROW_N.is_multiple_of(2 * BAND_N));
+    assert!(LARGE_STAGE_N.is_multiple_of(2 * BAND_N));
     assert!(CHUNKS == 4);
     assert!(HALF_N.is_multiple_of(B_BOX));
     assert!(HALF_NARROW_N.is_multiple_of(B_BOX));
@@ -565,8 +673,11 @@ const fn queue_offset(rings_end: usize) -> usize {
 const fn stage_offset(rings_end: usize) -> usize {
     align_up(queue_offset(rings_end) + ClcQueue::BYTES, 128)
 }
+/// `stage_n` is the **entry's** staging width, not a warp's: at two warpgroups
+/// there are twice as many warps staging half as many columns each, so this total
+/// is the same either way and every `dynamic_shared` figure below is unmoved.
 const fn shared_plan(rings_end: usize, stage_n: usize) -> usize {
-    stage_offset(rings_end) + EPILOGUE_WARPS as usize * 32 * stage_n * Bf16::BYTES
+    stage_offset(rings_end) + EPILOGUE_ROWS as usize * 32 * stage_n * Bf16::BYTES
 }
 
 pub const SMALL_SHARED_BYTES: usize = shared_plan(SMALL_RINGS_END, BLOCK_N);
@@ -636,13 +747,13 @@ impl Common {
     }
 
     #[inline(always)]
-    unsafe fn initialize(self, free_arrivals: u32) {
+    unsafe fn initialize(self, free_arrivals: u32, empty_arrivals: u32) {
         unsafe {
             if thread::threadIdx_x() == 0 {
                 self.load.init_all(1);
                 self.free.init_all(free_arrivals);
                 self.full.init_all(1);
-                self.empty.init_all(RANKS * EPILOGUE_WARPS * 32);
+                self.empty.init_all(empty_arrivals);
                 self.ready.init_all(1);
                 self.stop.write(0);
                 self.queue.cursor().arm();
@@ -880,10 +991,36 @@ impl Common {
         }
     }
 
+    /// Which of the accumulator's [`EPILOGUE_ROWS`] row blocks this warp owns.
+    ///
+    /// `warp_id % EPILOGUE_ROWS`, which is `warp_id` at one warpgroup and wraps at
+    /// two — warp 4 owns row block 0 again, because it is warpgroup 1's warp 0 and
+    /// therefore the same tensor-memory sub-partition warp 0 is.
+    #[inline(always)]
+    fn row_block(self) -> u32 {
+        self.warp_id % EPILOGUE_ROWS
+    }
+
+    /// Which column half this warp drains: 0 at one warpgroup, 0 or 1 at two.
+    #[inline(always)]
+    fn column_group(self) -> u32 {
+        self.warp_id / EPILOGUE_ROWS
+    }
+
     /// This warp's first row of `C` in the output tile at `tile_row`.
     #[inline(always)]
     fn drain_row(self, tile_row: u32) -> u32 {
-        tile_row + self.rank * BLOCK_M as u32 + self.warp_id * 32
+        tile_row + self.rank * BLOCK_M as u32 + self.row_block() * 32
+    }
+
+    /// This warp's first column of the accumulator, and how many it drains.
+    ///
+    /// At `GROUPS = 1` this is `(0, N)` and every expression below folds back to
+    /// what shipped; at 2 it is `(N/2 · group, N/2)`.
+    #[inline(always)]
+    fn drain_columns<const N: usize, const GROUPS: u32>(self) -> (u32, u32) {
+        let span = N as u32 / GROUPS;
+        (self.column_group() * span, span)
     }
 
     /// The shipped drain, and the doubling ladder that prices it.
@@ -896,7 +1033,7 @@ impl Common {
     /// the extra bytes stay in L2 and the probe prices instructions rather than a
     /// doubled HBM stream.
     #[inline(always)]
-    unsafe fn drain<const ABLATE: u8, const N: usize, const STAGE_N: usize>(
+    unsafe fn drain<const ABLATE: u8, const N: usize, const STAGE_N: usize, const GROUPS: u32>(
         self,
         accumulator: TmemTile<BLOCK_M, N>,
         tile_row: u32,
@@ -906,16 +1043,17 @@ impl Common {
         unsafe {
             const {
                 assert!(STAGE_N.is_multiple_of(BAND_N));
-                assert!(N.is_multiple_of(STAGE_N));
+                assert!(N.is_multiple_of(STAGE_N * GROUPS as usize));
             };
             let stage = self.staging::<STAGE_N>();
             let row = self.drain_row(tile_row);
+            let (base, span) = self.drain_columns::<N, GROUPS>();
             let mut column = 0u32;
-            while column < N as u32 {
+            while column < span {
                 let mut band_column = 0u32;
                 while band_column < STAGE_N as u32 {
                     let band: StageBand =
-                        accumulator.tile_x8(32 * self.warp_id, column + band_column);
+                        accumulator.tile_x8(32 * self.row_block(), base + column + band_column);
                     store_tile_x4(stage.chunk_writer(), 0, band_column, self.lane, band);
                     if twice(ABLATE) >= 2 {
                         // The band is still live here, so rung 2 doubles the
@@ -924,7 +1062,7 @@ impl Common {
                         // nothing has read yet, so no rung owes an extra
                         // `sync_mask` and the ladder holds the syncs fixed.
                         let restaged: StageBand = if twice(ABLATE) >= 3 {
-                            accumulator.tile_x8(32 * self.warp_id, column + band_column)
+                            accumulator.tile_x8(32 * self.row_block(), base + column + band_column)
                         } else {
                             band
                         };
@@ -936,7 +1074,7 @@ impl Common {
                 store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
                     self.c,
                     row,
-                    tile_column + column,
+                    tile_column + base + column,
                     self.lane,
                     stage,
                 );
@@ -944,7 +1082,7 @@ impl Common {
                     store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
                         self.c,
                         self.drain_row(again.0),
-                        again.1 + column,
+                        again.1 + base + column,
                         self.lane,
                         stage,
                     );
@@ -970,6 +1108,7 @@ impl Common {
         const STAGE_N: usize,
         const BAND: usize,
         const ISSUES: usize,
+        const GROUPS: u32,
     >(
         self,
         accumulator: TmemTile<BLOCK_M, N>,
@@ -981,19 +1120,21 @@ impl Common {
         unsafe {
             const {
                 assert!(STAGE_N.is_multiple_of(BAND));
-                assert!(N.is_multiple_of(STAGE_N));
+                assert!(N.is_multiple_of(STAGE_N * GROUPS as usize));
                 assert!(ISSUES == BAND / 32);
+                assert!(ISSUES <= kittens::tmem::ISSUE_LIMIT);
             };
             let stage = self.staging::<STAGE_N>();
             let row = self.drain_row(tile_row);
+            let (base, span) = self.drain_columns::<N, GROUPS>();
             let mut column = 0u32;
-            while column < N as u32 {
+            while column < span {
                 let mut band_column = 0u32;
                 while band_column < STAGE_N as u32 {
                     let band: RegTile<32, BAND, BaseLdtm> = accumulator
                         .tile_x8_batched::<32, BAND, ISSUES>(
-                            32 * self.warp_id,
-                            column + band_column,
+                            32 * self.row_block(),
+                            base + column + band_column,
                         );
                     store_tile_x4(stage.chunk_writer(), 0, band_column, self.lane, band);
                     band_column += BAND as u32;
@@ -1002,7 +1143,7 @@ impl Common {
                 store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
                     self.c,
                     row,
-                    tile_column + column,
+                    tile_column + base + column,
                     self.lane,
                     stage,
                 );
@@ -1022,7 +1163,7 @@ impl Common {
     /// band's eight `[16, 16]` blocks four at a time — a mapping this cannot get
     /// right, because the bits are not bf16 in the first place.
     #[inline(always)]
-    unsafe fn drain_packed<const N: usize, const STAGE_N: usize>(
+    unsafe fn drain_packed<const N: usize, const STAGE_N: usize, const GROUPS: u32>(
         self,
         accumulator: TmemTile<BLOCK_M, N>,
         tile_row: u32,
@@ -1031,16 +1172,17 @@ impl Common {
         unsafe {
             const {
                 assert!(STAGE_N.is_multiple_of(BAND_N));
-                assert!(N.is_multiple_of(STAGE_N));
+                assert!(N.is_multiple_of(STAGE_N * GROUPS as usize));
             };
             let stage = self.staging::<STAGE_N>();
             let row = self.drain_row(tile_row);
+            let (base, span) = self.drain_columns::<N, GROUPS>();
             let mut column = 0u32;
-            while column < N as u32 {
+            while column < span {
                 let mut band_column = 0u32;
                 while band_column < STAGE_N as u32 {
-                    let packed =
-                        accumulator.fragments_pack16_x8(32 * self.warp_id, column + band_column);
+                    let packed = accumulator
+                        .fragments_pack16_x8(32 * self.row_block(), base + column + band_column);
                     let mut block = 0usize;
                     while block < 8 {
                         store_packed_x4(
@@ -1063,7 +1205,7 @@ impl Common {
                 store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
                     self.c,
                     row,
-                    tile_column + column,
+                    tile_column + base + column,
                     self.lane,
                     stage,
                 );
@@ -1083,7 +1225,7 @@ impl Common {
     /// only the 32 `cvt.rn.bf16x2` a band are gone, and so is any relation
     /// between what is written and `C`.
     #[inline(always)]
-    unsafe fn drain_nocvt<const N: usize, const STAGE_N: usize>(
+    unsafe fn drain_nocvt<const N: usize, const STAGE_N: usize, const GROUPS: u32>(
         self,
         accumulator: TmemTile<BLOCK_M, N>,
         tile_row: u32,
@@ -1092,16 +1234,19 @@ impl Common {
         unsafe {
             const {
                 assert!(STAGE_N.is_multiple_of(BAND_N));
-                assert!(N.is_multiple_of(STAGE_N));
+                assert!(N.is_multiple_of(STAGE_N * GROUPS as usize));
             };
             let stage = self.staging::<STAGE_N>();
             let row = self.drain_row(tile_row);
+            let (base, span) = self.drain_columns::<N, GROUPS>();
             let mut column = 0u32;
-            while column < N as u32 {
+            while column < span {
                 let mut band_column = 0u32;
                 while band_column < STAGE_N as u32 {
-                    let band: StageBand = accumulator
-                        .tile_x8_batched::<32, BAND_N, 2>(32 * self.warp_id, column + band_column);
+                    let band: StageBand = accumulator.tile_x8_batched::<32, BAND_N, 2>(
+                        32 * self.row_block(),
+                        base + column + band_column,
+                    );
                     let mut block = 0usize;
                     while block < 8 {
                         let slot = block / 4;
@@ -1125,7 +1270,7 @@ impl Common {
                 store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
                     self.c,
                     row,
-                    tile_column + column,
+                    tile_column + base + column,
                     self.lane,
                     stage,
                 );
@@ -1143,24 +1288,42 @@ impl Common {
         const DRAIN: u8,
         const N: usize,
         const STAGE_N: usize,
+        const GROUPS: u32,
+        const WIDE_BAND: usize,
+        const WIDE_ISSUES: usize,
     >(
         self,
         accumulator: TmemTile<BLOCK_M, N>,
         tile_row: u32,
         tile_column: u32,
         again: (u32, u32),
-    ) {
+    ) where
+        BaseLdtm: kittens::reg::FragmentLayout<32, WIDE_BAND>,
+    {
         unsafe {
             match DRAIN {
-                DRAIN_PAIRED => {
-                    self.drain_batched::<N, STAGE_N, BAND_N, 2>(accumulator, tile_row, tile_column)
+                DRAIN_PAIRED => self.drain_batched::<N, STAGE_N, BAND_N, 2, GROUPS>(
+                    accumulator,
+                    tile_row,
+                    tile_column,
+                ),
+                DRAIN_WIDE => self.drain_batched::<N, STAGE_N, WIDE_BAND, WIDE_ISSUES, GROUPS>(
+                    accumulator,
+                    tile_row,
+                    tile_column,
+                ),
+                DRAIN_PACK16 => {
+                    self.drain_packed::<N, STAGE_N, GROUPS>(accumulator, tile_row, tile_column)
                 }
-                DRAIN_WIDE => {
-                    self.drain_batched::<N, STAGE_N, 128, 4>(accumulator, tile_row, tile_column)
+                DRAIN_NOCVT => {
+                    self.drain_nocvt::<N, STAGE_N, GROUPS>(accumulator, tile_row, tile_column)
                 }
-                DRAIN_PACK16 => self.drain_packed::<N, STAGE_N>(accumulator, tile_row, tile_column),
-                DRAIN_NOCVT => self.drain_nocvt::<N, STAGE_N>(accumulator, tile_row, tile_column),
-                _ => self.drain::<ABLATE, N, STAGE_N>(accumulator, tile_row, tile_column, again),
+                _ => self.drain::<ABLATE, N, STAGE_N, GROUPS>(
+                    accumulator,
+                    tile_row,
+                    tile_column,
+                    again,
+                ),
             }
         }
     }
@@ -1175,6 +1338,11 @@ impl Common {
 /// what makes the pair a controlled comparison of tile quantization against
 /// operand traffic.
 #[derive(Clone, Copy)]
+/// `STAGE` is **a warp's** staging columns, not the entry's: at two epilogue
+/// warpgroups there are twice as many warps staging half as many columns each, so
+/// the entry passes `entry width / GROUPS` here and [`shared_plan`] keeps taking
+/// the entry width. That is what makes the two spellings byte-identical in shared
+/// memory.
 struct Small<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize> {
     common: Common,
     a: ARing,
@@ -1436,7 +1604,18 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
     }
 
     #[inline(always)]
-    unsafe fn epilogue<const ABLATE: u8, const DRAIN: u8, const WATCH: u8>(self) {
+    unsafe fn epilogue<
+        const ABLATE: u8,
+        const DRAIN: u8,
+        const WATCH: u8,
+        const GROUPS: u32,
+        const WIDE_BAND: usize,
+        const WIDE_ISSUES: usize,
+    >(
+        self,
+    ) where
+        BaseLdtm: kittens::reg::FragmentLayout<32, WIDE_BAND>,
+    {
         unsafe {
             let common = self.common;
             let mut sequence = 0u32;
@@ -1463,7 +1642,7 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
                     break;
                 }
                 if drains(ABLATE) || DRAIN >= DRAIN_PACK16 {
-                    common.drain_dial::<ABLATE, DRAIN, N, STAGE>(
+                    common.drain_dial::<ABLATE, DRAIN, N, STAGE, GROUPS, WIDE_BAND, WIDE_ISSUES>(
                         Common::accumulator(self.accumulator, sequence),
                         row,
                         column,
@@ -1757,7 +1936,19 @@ impl<const BOX: usize> Large<BOX> {
     }
 
     #[inline(always)]
-    unsafe fn epilogue<const ABLATE: u8, const DRAIN: u8, const WATCH: u8>(self) {
+    unsafe fn epilogue<
+        const ABLATE: u8,
+        const DRAIN: u8,
+        const WATCH: u8,
+        const GROUPS: u32,
+        const WARP_STAGE: usize,
+        const WIDE_BAND: usize,
+        const WIDE_ISSUES: usize,
+    >(
+        self,
+    ) where
+        BaseLdtm: kittens::reg::FragmentLayout<32, WIDE_BAND>,
+    {
         unsafe {
             let common = self.common;
             let mut sequence = 0u32;
@@ -1788,7 +1979,7 @@ impl<const BOX: usize> Large<BOX> {
                         common.full.sem(half).wait(sequence & 1);
                     }
                     if drains(ABLATE) || DRAIN >= DRAIN_PACK16 {
-                        common.drain_dial::<ABLATE, DRAIN, BLOCK_N, LARGE_STAGE_N>(
+                        common.drain_dial::<ABLATE, DRAIN, BLOCK_N, WARP_STAGE, GROUPS, WIDE_BAND, WIDE_ISSUES>(
                             self.accumulator.columns_right(half * BLOCK_N as u32),
                             info.row * 512 + half * 256,
                             info.column * BLOCK_N as u32,
@@ -1831,6 +2022,9 @@ pub unsafe fn small_body<
     const FOLD: bool,
     const DRAIN: u8,
     const WATCH: u8,
+    const GROUPS: u32,
+    const WIDE_BAND: usize,
+    const WIDE_ISSUES: usize,
 >(
     a_map: *const TmaDescriptor,
     b_map: *const TmaDescriptor,
@@ -1840,11 +2034,13 @@ pub unsafe fn small_body<
     group: u32,
     ldc: u32,
     c: &mut DisjointSlice<u16>,
-) {
+) where
+    BaseLdtm: kittens::reg::FragmentLayout<32, WIDE_BAND>,
+{
     unsafe {
         let smem = DynamicSharedArray::<u8, 128>::get_raw();
         let common = Common::attach(smem, RINGS_END, tiles_m, tiles_n, k_blocks, group, ldc, c);
-        common.initialize(1);
+        common.initialize(1, RANKS * epilogue_warps(GROUPS) * 32);
         let state = Small::<N, HALF, BOX, STAGE> {
             common,
             a: ARing::attach(smem.add(A0_OFFSET)),
@@ -1857,12 +2053,12 @@ pub unsafe fn small_body<
             b_map,
         };
 
-        if common.warp_id == TMA_WARP && common.lane == 0 {
+        if common.warp_id == tma_warp(GROUPS) && common.lane == 0 {
             state.producer::<ABLATE, WATCH>();
-        } else if common.warp_id == MMA_WARP && common.lane == 0 {
+        } else if common.warp_id == mma_warp(GROUPS) && common.lane == 0 {
             state.multiply::<ABLATE, FOLD, WATCH>();
-        } else if common.warp_id < EPILOGUE_WARPS {
-            state.epilogue::<ABLATE, DRAIN, WATCH>();
+        } else if common.warp_id < epilogue_warps(GROUPS) {
+            state.epilogue::<ABLATE, DRAIN, WATCH, GROUPS, WIDE_BAND, WIDE_ISSUES>();
         }
 
         common.retire();
@@ -1883,6 +2079,10 @@ pub unsafe fn large_body<
     const FOLD: bool,
     const DRAIN: u8,
     const WATCH: u8,
+    const GROUPS: u32,
+    const WARP_STAGE: usize,
+    const WIDE_BAND: usize,
+    const WIDE_ISSUES: usize,
 >(
     a_map: *const TmaDescriptor,
     b_map: *const TmaDescriptor,
@@ -1892,7 +2092,9 @@ pub unsafe fn large_body<
     group: u32,
     ldc: u32,
     c: &mut DisjointSlice<u16>,
-) {
+) where
+    BaseLdtm: kittens::reg::FragmentLayout<32, WIDE_BAND>,
+{
     unsafe {
         let smem = DynamicSharedArray::<u8, 128>::get_raw();
         let common = Common::attach(
@@ -1905,7 +2107,7 @@ pub unsafe fn large_body<
             ldc,
             c,
         );
-        common.initialize(2);
+        common.initialize(2, RANKS * epilogue_warps(GROUPS) * 32);
         let state = Large::<BOX> {
             common,
             a0: ARing::attach(smem.add(A0_OFFSET)),
@@ -1919,12 +2121,12 @@ pub unsafe fn large_body<
             b_map,
         };
 
-        if common.warp_id == TMA_WARP && common.lane == 0 {
+        if common.warp_id == tma_warp(GROUPS) && common.lane == 0 {
             state.producer::<ABLATE, WATCH>();
-        } else if common.warp_id == MMA_WARP && common.lane == 0 {
+        } else if common.warp_id == mma_warp(GROUPS) && common.lane == 0 {
             state.multiply::<ABLATE, FOLD, WATCH>();
-        } else if common.warp_id < EPILOGUE_WARPS {
-            state.epilogue::<ABLATE, DRAIN, WATCH>();
+        } else if common.warp_id < epilogue_warps(GROUPS) {
+            state.epilogue::<ABLATE, DRAIN, WATCH, GROUPS, WARP_STAGE, WIDE_BAND, WIDE_ISSUES>();
         }
 
         common.retire();
@@ -1971,6 +2173,9 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c);
         }
     }
@@ -2013,6 +2218,9 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c);
         }
     }
@@ -2040,9 +2248,17 @@ pub mod kernels {
     ) {
         unsafe {
             const { assert!(LARGE_SHARED_BYTES == 229_632) };
-            large_body::<B_BOX, WHOLE, true, SHIPPED_DRAIN, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            );
+            large_body::<
+                B_BOX,
+                WHOLE,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c);
         }
     }
 }
