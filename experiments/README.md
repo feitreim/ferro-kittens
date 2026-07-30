@@ -5082,14 +5082,41 @@ count between issues can see the iterations. Counted directly, the poll body is
 **7 instructions pre-fold, 7 for upstream, 8 shipped** — ours needs an `add.s64`
 upstream does not, because upstream gives each mbarrier its own static `.shared`
 symbol (`__shared_mem_27..29`) where ours are const offsets into one dynamic
-allocation. The lever is alive and **its sign is unestablished**: the pre-fold
-spelling had upstream's 7-instruction body and was 4% *slower*, so poll-body length
-is dominated by something else here. It is reachable — `cuda_device` at the pin
-admits static `.shared` mbarriers, and upstream's vendored copy declares eight of
-them in this tree and runs — and it is a **library-level** change, because
-`src/sync.rs`'s `Semaphore` takes a pointer derived from a dynamic base and the
-`*_offset` consts are that base's layout (#137's one walk). It would pay every
-kernel with a pipeline, which raises its priority and also keeps it out of this PR.
+allocation. **The lever's sign is positive, and the pre-fold
+spelling is not the counter-example it looks like.** That spelling had upstream's
+7-instruction poll body and was 4% slower — but the fold changed *two* things with
+opposite signs: it added one instruction to the poll body and removed many from the
+inter-stage path. It is a two-variable change and therefore not a controlled
+experiment on poll-body length at all. Removing the per-poll `add.s64` is the
+single-variable version, and it is **additive with the fold rather than opposed to
+it**.
+
+The magnitude is worth stating in advance because it is large enough to matter. The
+MMA warp's time in the poll loop is `whole − issue only` = 0.3503 − 0.2758 =
+**0.0745 µs a K block, 21% of it**. If that loop is issue-bound, one instruction of
+eight is an eighth of it — **0.0093 µs, 2.7% of the K-block rate** — which would
+take the K loop from 78.8% to about 81.0% against upstream's 82.3% and close most of
+the residual. The named failure mode: if `mbarrier.try_wait.parity` is instead
+latency-bound on its shared read, the body's instruction count is a small fraction
+of each iteration and the win is much smaller. That is the prediction and its
+falsifier, and it is what a container should be spent against.
+
+**Feasibility is settled and the cost is structural rather than budgetary.**
+Upstream declares `static mut TMA_BAR0: Barrier = Barrier::UNINIT;` — eight of
+them — *inside* its `#[kernel]` body, and cuda-oxide at the pin places those in
+`.shared` as `__shared_mem_27..29`. So the mechanism exists and is proven in this
+tree. Two costs, neither of them residency: the barriers are ~104 B moving from the
+dynamic allocation to static shared out of the same 233472 B, so `dynamic_shared`
+in each launch contract drops by that much and nothing crosses an occupancy step;
+and **it is unproven from where this kernel would need it.** Upstream declares its
+statics inside the `#[kernel]`, while `small_body` and `large_body` are deliberately
+*outside* `#[cuda_module]` so the shipped kernels and the arms can be one text —
+and whether a `static mut Barrier` in a plain `fn` still lands in `.shared` is the
+macro's business, not the type's. If it does not, the statics have to be declared
+per `#[kernel]` and threaded in, which is the design cost. Either way it is a
+**library-level** change — `src/sync.rs`'s `Semaphore` takes a pointer derived from
+a dynamic base and the `*_offset` consts are that base's layout, which #137 made
+one walk — so it pays every kernel with a pipeline and does not belong in this PR.
 
 One thing the poll body says that is new: **five of its seven or eight
 instructions are not addressing at all** — `selp.b32`, `and.b32`, `setp.ne.b32`,
