@@ -5279,6 +5279,168 @@ legal `nocvt` control that removed the same converts measured 0.0–1.4% *slower
 the convert was never the cost the count implied. Two independent instruments, one
 conclusion about the instrument set.
 
+##### and the pin bump moved 46 of 272 register counts, one of them a shipped kernel
+
+The move from cuda-oxide `b099f64` to `20a5616` is a compiler-backend change, so
+it was measured rather than assumed: `regcount` on `aaadcc2` and on the same tree
+with the pin moved. **46 of 272 rows moved.** The kernel set is identical on both
+sides, and `regcount --determinism` passes on the new pin (*"identical: 270
+kernels, every counter, across two builds"*), which is what makes the diff a
+function of the revision and not of the build. That control is not ceremony here:
+#31 attributed a 71 → 32 swing to its own refactor on exactly this question.
+
+**This census was taken twice, against two different baselines, and the answer
+changed.** Read against `336e3d7` it was 44 of 270 rows, with `gemm_sol_m512_mma`
+among the newly-spilling four. #154 landed in between and moves registers on its
+own, and against `aaadcc2` that kernel goes 80 → **79 with no spill at all**. The
+first reading was not wrong about the tree it measured; it was the wrong tree. A
+dependency diff has to be taken against the commit it will land on, and the
+newly-spilling set is not stable under that choice.
+
+What did *not* change is the interesting half of the setup. `rust-toolchain.toml`
+is byte-identical between the two revisions and both validate against the same
+`rust-llvm-22.1.2-1cb4e383`, so this is not an LLVM bump. Inside
+`rustc-codegen-cuda/src` exactly two files differ — `collector.rs` and
+`generated_intrinsics.rs` — beside `cargo-oxide`'s own `backend.rs`. A register
+allocator nobody changed still allocated differently, which is the shape of a
+change in what reaches it.
+
+**Most of the movement is downward and one row is dramatic**:
+`gemm_256x256_k128_s1` goes 246 → 168 and `gemm_cg2_staged_x8x4_hot` 104 → 80,
+both ablation arms. Two of the six **gated** rows moved — `gemm_cg2` 166 → 168 and
+`experiments`' `gemm_cg2_staged_x8x4` 96 → 80 — and both stay inside their
+occupancy step, so the #95 gate is green on both sides.
+
+**Four rows started spilling, and every one of them looks like a win by register
+count alone.** This is the file's oldest error arriving from the toolchain instead
+of from a diff:
+
+| kernel | crate | regs | spill store/load, **bytes** |
+| --- | --- | ---: | ---: |
+| `gemm_sol_m256_n128` | **both** | 86 → **80** | 0,0 → **4,8** |
+| `gemm_ws_staged` | experiments | 43 → **40** | 0,0 → **16,20** |
+| `gemm_ws_staged_x8` | experiments | 90 → **80** | 0,0 → **8,12** |
+| `gemm_ws_staged_x8x4` | experiments | 90 → **80** | 0,0 → **8,12** |
+
+Each **falls** in register count while spill traffic appears. That is `ptxas` taking
+a lower register target and paying for it in local memory — the thing `regcount`'s
+own header warns about, and the reason that table carries spill columns beside the
+register one. Read on registers alone, all four say the bump improved them. None
+did. **No row stopped spilling**, so the trade only went one way, and
+`groupnorm_tile`'s 8/8 in `examples/` is unmoved and pre-existing rather than new.
+
+**Those two columns are bytes, and the distinction is worth 20×.** `ptxas -v`
+reports *"N bytes spill stores, M bytes spill loads"*, so `4,8` is **one 32-bit
+register** — stored once, reloaded twice — and not four stores and eight loads.
+`gemm_ws_staged`'s `16,20` is four or five. A reader who takes these for
+instruction counts over-reads the whole table by more than an order of magnitude,
+which is a second way this row can mislead on top of the falling register count.
+
+`gemm_sol_m256_n128` is the one that matters, because unlike the `gemm_ws` arms it
+is **a shipped launch variant** — `Variant::M256xN128`, what `select_variant` picks
+for a shape too narrow to fill a wave of the wider tile — and it spills in *both*
+crates.
+
+**The opcode census barely moved**: 3 of 80 kernels, all in the `selp` column,
+`gemm_sol_m256_twice_{all,global,shared}` going 19 → 17. No memory, MMA,
+`stmatrix` or `cvt` column changed anywhere, so no rung's phase claim is disturbed
+and every ablation in this file still removes what it says it removes.
+
+###### and the decomposition survives it, laddered on both pins
+
+The K-loop decomposition is what a moved register count could invalidate, so it was
+re-run on both pins rather than argued about. Laddered in `K` — never off a launch,
+which is #148's correction — each arm twice, as % of peak:
+
+| arm | old pin | new pin |
+| --- | ---: | ---: |
+| `feed only` | 103.2 / 104.2% | 104.2 / 103.8% |
+| **`mma only`** | **99.5 / 99.6%** | **99.7 / 99.6%** |
+| `issue only` | 99.6 / 99.5% | 99.8 / 99.7% |
+| `no drain` | 80.4 / 80.4% | 80.2 / 80.9% |
+| `whole` | 78.5 / 79.0% | 79.0 / 78.7% |
+| `runtime stage` | 76.4 / 76.3% | 76.9 / 77.1% |
+
+At `[256, 256]`, 4096². Every arm agrees across the pin to **0.2 points or
+better**, inside its own two-pass spread, and `[512, 256]` is the same story at
+99.3–99.7% on both. **`mma only` is still at peak, so "there is no `tcgen05`
+issue-rate deficit" stands and no row of the published decomposition needs
+amending.** Upstream's own ladder reads 82.3% on the old pin and 81.9% on the new,
+which is the same null.
+
+One number here does not reproduce, and it is not the pin's: `mma only` is
+published at **100.6%** and reads **99.5–99.6% on the old pin at `aaadcc2`**. Old
+and new pin agree to 0.1 point, so whatever moved it is #154 or the session rather
+than the bump. Flagged rather than silently restated.
+
+###### and the shipped spill does not resolve as a time
+
+`gemm_sol_m256_n128`'s 4/8 spill is real in the PTX and **does not show up as a
+consistent slowdown** in `bench sol-small`, the sweep that exercises it. Both rungs
+twice round-robin, min ms, and the N128/N256 ratio beside them because the two pins
+cannot share a container and this table's absolute rates do not survive being
+compared across two:
+
+| shape | N128 old → new | N256 old → new | ratio old → new |
+| --- | ---: | ---: | ---: |
+| 1024³ | 0.0144 → 0.0147 | 0.0179 → 0.0187 | 0.807 → 0.786 (**−2.6%**) |
+| 1536³ | 0.0160 → 0.0171 | 0.0211 → 0.0212 | 0.758 → 0.807 (+6.4%) |
+| 2048³ | 0.0249 → 0.0260 | 0.0241 → 0.0242 | 1.035 → 1.074 (+3.8%) |
+| 3072³ | 0.0560 → 0.0572 | 0.0452 → 0.0469 | 1.238 → 1.221 (**−1.4%**) |
+
+The ratio moves **±6.4% with inconsistent sign**, and `M256xN256` — whose register
+count did *not* move — reads 0.5–4.8% slower too. A change that hits the unmoved
+kernel as hard as the moved one is the container, not the diff. This table's own
+spread column runs **4–87%** at these shapes, so it cannot resolve the question and
+says so itself.
+
+###### and the disassembly settles it, for the price of a CPU container
+
+A timing at that spread was never going to separate the two answers that matter,
+because **a spill's cost is almost entirely whether it sits in the hot loop.** In
+the prologue it is a per-tile constant of a few instructions; in the K loop it is a
+rate. `nvdisasm -c` distinguishes them for free, and `_print_sass_loops`' machinery
+— loops found by backward branch, not by mnemonic — already knows how to ask.
+
+Local-memory instructions (`LDL`/`STL`) in `gemm_sol_m256_n128`, both pins, with
+the two unspilled entries as controls:
+
+| kernel | old pin | new pin | spill bytes |
+| --- | ---: | ---: | ---: |
+| `gemm_sol_m256_n128` | 64 | **67** | 0,0 → 4,8 |
+| `gemm_sol_m256` (control) | 64 | 64 | 0,0 → 0,0 |
+| `gemm_sol_m512` (control) | 64 | 64 | 0,0 → 0,0 |
+
+The pin adds **exactly three instructions**, only to the kernel that spills, and
+they are one `STL` and two `LDL` at one address — `[R1+0x100]` — which is the 4
+bytes stored and 8 bytes loaded, arrived at independently. **Every one of these
+kernels already carries 64 local accesses on both pins**, from its own 256-byte
+frame, so the presence of `LDL`/`STL` was never the spill and counting them without
+a control would have proved nothing.
+
+**And the three are not in the hot loop.** Where each sits, by the tightest loop
+that contains it:
+
+| access | count | tightest containing loop |
+| --- | ---: | ---: |
+| the 64 pre-existing, both pins | 64 | **216** insns/iter |
+| `STL [R1+0x100]` — new | 1 | 727 insns/iter |
+| `LDL [R1+0x100]` — new | 2 | 510 insns/iter |
+
+The innermost 216-instruction loop — the one the 64 frame accesses live in and the
+tightest structure in this kernel — **contains none of the new traffic.** The spill
+is one register saved and restored around a 510–727 instruction region, which bounds
+its cost at **three instructions per 510, ≤0.6% of issue in that region and zero in
+the inner loop.**
+
+So the answer is **below the noise floor, and here is the noise floor**: the
+predicted effect is ≤0.6% of issue in one outer loop, and the instrument that would
+have to see it reproduces to 4–87% at these shapes — an order of magnitude coarser.
+The spill is real, localized, one register wide, outside the hot loop, and cannot
+matter at any shape this entry serves. **No same-container GPU A/B is needed, and
+#152 is not blocked by it.** What settled it was a CPU disassembly and two controls,
+which is the cheaper instrument the timing should have deferred to first.
+
 #### 8. Multicast has no geometry to live in
 
 `tma_load_2d_multicast_cg2`, `commit_multicast_cg2` and `mma_walk_cg2` all
