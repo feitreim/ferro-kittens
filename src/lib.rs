@@ -40,8 +40,8 @@ pub use reg::{
     RowLayout, TernaryOp, UnaryOp,
 };
 pub use shared::{
-    Bf16, Element, F32, MmaElement, OperandWalk, SharedTile, SharedTileRing, SharedVec, Swizzle,
-    Swizzle128B,
+    Bf16, Element, F16, F32, MmaElement, OperandWalk, SharedCell, SharedTile, SharedTileRing,
+    SharedVec, Swizzle, Swizzle128B,
 };
 pub use sync::{
     PhasedSemaphore, Semaphore, SemaphoreRing, TransactionBytes, block_reduce, block_reduce_sum,

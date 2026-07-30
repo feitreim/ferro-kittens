@@ -96,8 +96,8 @@
 use cuda_device::cusimd::{CuSimd, TmemRegs4};
 use cuda_device::tcgen05::{
     tcgen05_alloc, tcgen05_alloc_cg2, tcgen05_dealloc, tcgen05_dealloc_cg2,
-    tcgen05_ld_16x256b_pure, tcgen05_ld_16x256b_x8_pure, tcgen05_load_wait,
-    tcgen05_relinquish_alloc_permit, tcgen05_relinquish_alloc_permit_cg2,
+    tcgen05_ld_16x256b_pure, tcgen05_ld_16x256b_x8_pack16, tcgen05_ld_16x256b_x8_pure,
+    tcgen05_load_wait, tcgen05_relinquish_alloc_permit, tcgen05_relinquish_alloc_permit_cg2,
     tcgen05_st_16x256b_x1_raw, tcgen05_store_wait,
 };
 use cuda_device::{cluster, thread};
@@ -323,6 +323,37 @@ fn interleave_x8(regs: CuSimd<f32, 32>) -> [Fragment; 4] {
         block += 1;
     }
     blocks
+}
+
+/// `.x8` loads [`TmemTile::tile_x8_batched`] will hold in flight at once.
+///
+/// Four, and the bound is the register file: each one is 32 f32 a thread, so
+/// four is 128 — the widest band a warp can drain in one pass at all, which is
+/// the same 128-column limit `examples/`' GEMMs derive for themselves from the
+/// 255-register architectural ceiling.
+pub const ISSUE_LIMIT: usize = 4;
+
+/// One `.x8` arrival into its four `[16, 16]` blocks of a band, at the block
+/// coordinates issue number `issue` covers.
+///
+/// Split out of [`TmemTile::tile_x8_batched`] so the batch can name its issues
+/// at literal indices — see that method on why a loop is not equivalent.
+#[inline(always)]
+fn place_x8_group<const M: usize, const N: usize>(
+    tile: &mut RegTile<M, N, BaseLdtm>,
+    issue: usize,
+    arrival: CuSimd<f32, 32>,
+) where
+    BaseLdtm: FragmentLayout<M, N>,
+{
+    let groups = N / 64;
+    let (row_block, group) = (issue / groups, issue % groups);
+    let blocks = interleave_x8(arrival);
+    let mut block = 0usize;
+    while block < 4 {
+        place_block(tile, row_block, 4 * group + block, blocks[block]);
+        block += 1;
+    }
 }
 
 /// The inverse of [`interleave`] — a fragment back into the two collective
@@ -639,6 +670,41 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
         }
     }
 
+    /// One `.x8.pack::16b` arrival: 32 registers of **already-packed 16-bit
+    /// pairs**, drained through one [`tcgen05_load_wait`].
+    ///
+    /// `.pack::16b` packs the 16-bit elements of two consecutive tensor-memory
+    /// columns into one 32-bit register, so it returns the same 32 registers
+    /// [`Self::fragments_x8`] does off **twice** the columns — 64 b16 a thread
+    /// rather than 32 f32, out of the same 1024 bits of TMEM. That is the whole
+    /// of what it is: a *reinterpretation*, not a conversion.
+    ///
+    /// **So it is not a cheaper epilogue and there is no reading of it that is.**
+    /// An fp32 accumulator's columns hold floats; packing two of their low halves
+    /// yields the mantissa halves of two numbers, which is not a narrowed value of
+    /// anything. #117 said this and then argued it from the register count, which
+    /// is the weaker claim — the register count is equal because the *bits* are
+    /// equal, and equal bits is exactly why no convert was performed.
+    ///
+    /// What it is good for is **pricing** the convert. Substituted into a drain it
+    /// holds the TMEM traffic, the register count, the `stmatrix` count and the
+    /// stores, and takes the `cvt` column to zero; the launch difference is then
+    /// the convert's cost and nothing else. `experiments/`' `pack16` rung is that
+    /// substitution, and it is on no correctness gate because it cannot be.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::fragments_x8`], and the values are meaningful only if the
+    /// segment holds 16-bit data.
+    #[inline(always)]
+    pub unsafe fn fragments_pack16_x8(self, row: u32, column: u32) -> CuSimd<u32, 32> {
+        unsafe {
+            let regs = tcgen05_ld_16x256b_x8_pack16(self.at(row, column));
+            tcgen05_load_wait();
+            regs
+        }
+    }
+
     /// [`Self::tile`] over [`Self::fragments_x8`] — the same `[M, N]` band,
     /// drained 64 columns at a time instead of 16.
     ///
@@ -681,6 +747,113 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
                     group += 1;
                 }
                 row_block += 1;
+            }
+            tile
+        }
+    }
+
+    /// [`Self::tile_x8`] with **every issue of the band in flight before the
+    /// one wait**, rather than a wait per issue. At most [`ISSUE_LIMIT`] of
+    /// them, which is the register file and not a convenience.
+    ///
+    /// `.x8` removed seven eighths of the waits a `[16, 64]` group used to pay
+    /// (#117) and left the last one where it was: [`Self::fragments_x8`] waits
+    /// immediately, because the registers it waits on are its return value, so
+    /// a band of `ISSUES` groups still pays `ISSUES` full TMEM latencies with
+    /// never more than one load outstanding. This issues all of them first and
+    /// waits once — `tcgen05.wait::ld` waits for *prior* loads, plural, so one
+    /// wait retires the band however many issues it took.
+    ///
+    /// **It costs no registers at two issues.** The band it returns holds all
+    /// `32 * ISSUES` f32 a thread simultaneously either way, so batching only
+    /// moves where the wait sits — `gemm_sol`'s M256 drain censuses at 96
+    /// registers and a 256-byte frame both ways. At four it does cost: 176
+    /// registers and 512 bytes of frame. What it needs is register *file*, and
+    /// at one CTA per SM there is a lot of it: 192 threads at 255 registers is
+    /// 48 960 of an SM's 65 536.
+    ///
+    /// **What it is worth is small, and the reason is worth knowing.** Two
+    /// issues behind one wait is +0.9% of `gemm_sol`'s launch at 8192³ and
+    /// nothing at 4096³; four is a loss. `gemm_sol_ablate`'s doubling ladder says
+    /// why: *doubling* the LDTM count and its waits in that drain costs zero, so
+    /// the waits #117 was paid for removing are, at `.x8`, already covered by the
+    /// other three epilogue warps. This is the tail of that lever and not a new
+    /// one.
+    ///
+    /// `ISSUES` is stated rather than derived — `(M / 16) * (N / 64)` is a
+    /// generic const expression and this crate is on stable — and the const
+    /// assert below is what keeps a caller from stating it wrong.
+    ///
+    /// **The issues are spelled out rather than looped over**, and that is not
+    /// style. Written as a loop over an `[_; ISSUES]` array, LLVM unrolls it at
+    /// two issues and does not at four: the array then needs a runtime index,
+    /// lands in local memory, and the arm censuses as **one** `tcgen05.ld` with
+    /// a 1024-byte stack frame — four loads in flight through L1, which is not
+    /// the thing being measured. Four literal indices cannot do that.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::tile_x8`]: all 32 lanes of a warp owning TMEM rows
+    /// `row..row + M` must call this together after the MMA writing them has
+    /// committed, and `column + N` must fit the allocation.
+    #[inline(always)]
+    pub unsafe fn tile_x8_batched<const M: usize, const N: usize, const ISSUES: usize>(
+        self,
+        row: u32,
+        column: u32,
+    ) -> RegTile<M, N, BaseLdtm>
+    where
+        BaseLdtm: FragmentLayout<M, N>,
+    {
+        const {
+            assert!(
+                N.is_multiple_of(64),
+                "tcgen05.ld.16x256b.x8 covers 64 columns; a band it drains has to be a multiple of that"
+            );
+            assert!(
+                ISSUES == (M / 16) * (N / 64),
+                "ISSUES is the band's `.x8` count: one per 16 rows per 64 columns"
+            );
+            assert!(
+                ISSUES <= ISSUE_LIMIT,
+                "a batch is at most ISSUE_LIMIT x8 loads: more than that is past the register file"
+            );
+        };
+        unsafe {
+            let address = |issue: usize| {
+                let groups = N / 64;
+                self.at(
+                    row + 16 * (issue / groups) as u32,
+                    column + 64 * (issue % groups) as u32,
+                )
+            };
+            let mut arrivals = [CuSimd::<f32, 32>::new([0.0; 32]); ISSUE_LIMIT];
+            if ISSUES > 0 {
+                arrivals[0] = tcgen05_ld_16x256b_x8_pure(address(0));
+            }
+            if ISSUES > 1 {
+                arrivals[1] = tcgen05_ld_16x256b_x8_pure(address(1));
+            }
+            if ISSUES > 2 {
+                arrivals[2] = tcgen05_ld_16x256b_x8_pure(address(2));
+            }
+            if ISSUES > 3 {
+                arrivals[3] = tcgen05_ld_16x256b_x8_pure(address(3));
+            }
+            tcgen05_load_wait();
+
+            let mut tile = RegTile::<M, N, BaseLdtm>::zero();
+            if ISSUES > 0 {
+                place_x8_group(&mut tile, 0, arrivals[0]);
+            }
+            if ISSUES > 1 {
+                place_x8_group(&mut tile, 1, arrivals[1]);
+            }
+            if ISSUES > 2 {
+                place_x8_group(&mut tile, 2, arrivals[2]);
+            }
+            if ISSUES > 3 {
+                place_x8_group(&mut tile, 3, arrivals[3]);
             }
             tile
         }

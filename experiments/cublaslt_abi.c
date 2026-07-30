@@ -32,6 +32,7 @@
 
 /* Element types: bf16 operands, fp32 scales and fp32 output (library_types.h). */
 SAME(0, CUDA_R_32F);
+SAME(2, CUDA_R_16F);
 SAME(14, CUDA_R_16BF);
 
 /* fp32 accumulation over bf16 inputs -- not one of the _FAST_ variants, which

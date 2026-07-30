@@ -18,7 +18,7 @@
 //! scripts/modal-run examples                   # the correctness gate, both crates
 //! scripts/modal-run bench --case gemm-depth    # or tile, staged, widths,
 //! scripts/modal-run clc_bench                  #    residual, swizzle, repro,
-//! scripts/modal-run ws_bench                   #    ablation, epilogue
+//! scripts/modal-run ws_bench                   #    ablation, epilogue, sol
 //! ```
 //!
 //! **Every rung here is on a correctness gate**, which is [`gemm::check`] and
@@ -47,7 +47,21 @@ pub mod bench;
 #[cfg(feature = "cublas")]
 pub mod cublaslt;
 pub mod gemm;
+#[path = "../../examples/src/gemm_sol.rs"]
+pub mod gemm_sol;
+/// The kernel [`gemm_sol`] is a port *of*, unported — upstream's device code
+/// byte for byte, on this crate's clock, so the port's distance from cuBLASLt
+/// can be split into what the port costs and what upstream itself costs.
+///
+/// Behind an off-by-default feature, and not for tidiness: with it on, the
+/// crate's embedded PTX bundle does not load at all unless `opt` is given
+/// `-switch-to-lookup=false`. See the feature's comment in `Cargo.toml` and
+/// `modal_app.py::upstream_bench`.
+#[cfg(feature = "gemm-sol-upstream")]
+pub mod gemm_sol_upstream;
 pub mod gemm_ws;
+pub mod sol;
+pub mod sol_ablate;
 
 /// The teaching crate's kernels, compiled here so [`bench`] can time them
 /// against their own CPU references.
@@ -92,7 +106,8 @@ const COMMANDS: [(&str, &str); 4] = [
 /// `C` on purpose are excluded by `Epilogue::exact` and `Ablation::exact`,
 /// which is stated on each of them rather than assumed here.
 fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> ExitCode {
-    let checks = [
+    #[allow(unused_mut)]
+    let mut checks = vec![
         (
             "gemm",
             gemm::check(context).map_err(|error| error.to_string()),
@@ -101,7 +116,22 @@ fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> ExitCode {
             "gemm_ws",
             gemm_ws::check(context).map_err(|error| error.to_string()),
         ),
+        // The rebuilt `gemm_sol` drains. They are the only arms in
+        // `sol_ablate` that compute a right `C`, and a batched LDTM that
+        // returns its registers in another order is exactly the failure this
+        // catches.
+        (
+            "gemm_sol_drains",
+            sol_ablate::check(context).map_err(|error| error.to_string()),
+        ),
     ];
+    // Only when the vendored upstream copy is compiled in, which is only under
+    // `upstream_bench`'s `opt` wrapper — see that entry point.
+    #[cfg(feature = "gemm-sol-upstream")]
+    checks.push((
+        "gemm_sol_upstream",
+        gemm_sol_upstream::check(context).map_err(|error| error.to_string()),
+    ));
     let mut failures = 0usize;
     for (name, result) in checks {
         match result {

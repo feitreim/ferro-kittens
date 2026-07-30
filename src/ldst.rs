@@ -153,6 +153,45 @@ pub unsafe fn store_fragment_x4<E: Element<Unpacked = [f32; 2]>>(
     }
 }
 
+/// [`store_fragment_x4`] taking words that are **already packed**, so the
+/// `stmatrix` runs with no `cvt` in front of it.
+///
+/// The addressing is [`store_fragment_x4`]'s, unchanged and undivided — this is
+/// that function with the four `E::pack` calls removed and the four words passed
+/// in. There is no other difference, which is what makes the pair an ablation of
+/// the convert rather than a second store path.
+///
+/// **Nothing in tree computes a right answer with this**, and it is not a defect:
+/// the only producer of pre-packed b16 out of an fp32 accumulator would be a
+/// convert, and if a convert ran then [`store_fragment_x4`] is the function that
+/// wanted it. It exists so `experiments/`' `pack16` rung can hold every other
+/// instruction in a drain fixed and take the `cvt` column to zero — see
+/// [`crate::tmem::TmemTile::fragments_pack16_x8`].
+///
+/// # Safety
+///
+/// As [`store_fragment_x4`], and the words must be the b16 pairs the destination
+/// block expects — a caller that hands over something else writes something else.
+#[inline(always)]
+pub unsafe fn store_packed_x4<E: Element>(
+    chunks: SwizzledChunks<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+    words: [u32; 4],
+) {
+    unsafe {
+        let (address_row, chunk) = fragment_address(row, column, lane % 16, (lane / 16) as usize);
+        stmatrix_m8n8_x4(
+            chunks.at(address_row, chunk),
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+        );
+    }
+}
+
 /// [`store_tile`] over [`store_fragment_x4`] — the same band, at one
 /// `stmatrix` per `[16, 16]` block instead of two.
 ///

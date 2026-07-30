@@ -32,6 +32,7 @@ cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1
 # compilation witness, and a kernel with a TMA operand cannot be launched
 # without one.
 kittens = { package = "ferro-kittens", path = "..", features = ["host"] }
+half = "2.7.1"
 
 [profile.release]
 debug = false

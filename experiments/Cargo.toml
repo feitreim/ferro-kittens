@@ -19,12 +19,31 @@ edition = "2024"
 # the binary need `libcublasLt.so` from a *devel* CUDA toolkit, which tier 1 CI
 # does not have and which nobody should need in order to build this crate.
 cublas = []
+# NVLabs' own `gemm_sol_final` device code, vendored verbatim so the port in
+# `gemm_sol.rs` has a control arm (`gemm_sol_upstream.rs`).
+#
+# **Off by default because turning it on breaks every other kernel in the
+# crate**, and that is a fact about the toolchain rather than about this code.
+# `opt -O2` turns upstream's four-way stage selects into lookup tables in
+# `.global` initialized with the addresses of `.shared` arrays, which is
+# illegal PTX; a package's kernels share one embedded bundle, so one such table
+# makes `kernels::load` fail for all 46 entries. The build is the same either
+# way — `cargo oxide build` emits the PTX and never assembles it — so the only
+# gate that sees this is `ptxas`, which is `regcount`'s and `upstream_bench`'s.
+#
+# `modal_app.py::upstream_bench` is the only thing that should turn this on: it
+# points `CUDA_OXIDE_OPT` at an `opt` wrapper carrying
+# `-switch-to-lookup=false`, which is what makes the bundle loadable, and it
+# takes the port's row both with and without that wrapper so the flag's own
+# effect is measured rather than assumed.
+gemm-sol-upstream = []
 
 [dependencies]
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b099f64c1a32869b74be99f4f88242fb68655b51" }
 kittens = { package = "ferro-kittens", path = "..", features = ["host"] }
+half = "2.7.1"
 
 [profile.release]
 debug = false

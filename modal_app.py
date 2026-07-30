@@ -25,6 +25,26 @@ Local usage:
     modal run modal_app.py::bench --case gemm-depth
                                       # one table of that sweep; --m/--n/--k
                                       # narrows it further to a single row
+    modal run modal_app.py::bench --case sol
+                                      # gemm_sol's cluster tile and N band
+                                      # against the wave arithmetic (#138)
+    modal run modal_app.py::bench --case sol-small
+                                      # the same two rungs below 4096^3, taken
+                                      # twice, where the clock is the limit
+    modal run modal_app.py::sol_ablate
+                                      # gemm_sol's phases priced one at a time,
+                                      # with upstream's own K loop as the
+                                      # reference the port is short of
+    modal run modal_app.py::upstream_bench
+                                      # the port, the kernel it is a port of
+                                      # unported, and cuBLASLt beside both --
+                                      # one container, so one device and one
+                                      # day. `--case` takes a comma-separated
+                                      # list for exactly this reason
+    modal run modal_app.py::upstream_ptx
+                                      # why that entry point needs an `opt`
+                                      # wrapper: upstream's own crate does not
+                                      # assemble in this image. No GPU
     modal run modal_app.py::bench --case swizzle
                                       # gemm's item traversal, tile held fixed
     modal run modal_app.py::bench --case tile
@@ -361,6 +381,35 @@ def build() -> None:
           "--features", "cublas"],
          cwd=EXPERIMENTS_DIR)
 
+    # The vendored upstream `gemm_sol_final`, which is 1300 lines of device code
+    # nothing else in this repository compiles. It is the only kernel here whose
+    # gate has to include `ptxas`: `cargo oxide build` emits its PTX happily and
+    # `opt -O2` has put sixteen illegal lookup tables in it, so a build alone
+    # would pass on a bundle that cannot load. So this step asserts both halves
+    # of the workaround at once -- that upstream's code still compiles, and that
+    # `-switch-to-lookup=false` still makes what it compiles to assemble.
+    # `upstream_ptx` is the diagnosis if this goes red; `OPT_NO_LOOKUP_TABLE` is
+    # where the reasoning lives.
+    _run(["sh", "-c", WRITE_OPT_WRAPPER], cwd="/")
+    _run([*STUB_ENV, "env", f"CUDA_OXIDE_OPT={OPT_NO_LOOKUP_TABLE}",
+          "cargo", "oxide", "build", "kittens-experiments", "--arch", "sm_100a",
+          "--features", "cublas,gemm-sol-upstream"],
+         cwd=EXPERIMENTS_DIR)
+    # A real cubin rather than `/dev/null`, because the next two steps read it.
+    # `ptxas` succeeding is still the gate; the disassembly is a report.
+    _run(["ptxas", "-arch=sm_100a", "-o", "kittens_experiments.cubin",
+          "kittens_experiments.ptx"],
+         cwd=EXPERIMENTS_DIR)
+    # The MMA warp's K-loop issue stream, ours and upstream's, off the one bundle
+    # that carries both. It lives here rather than in `regcount` because
+    # `regcount` builds without features and so never emits upstream's kernels,
+    # and because this is the only step that already pays for that codegen.
+    _print_mma_stream()
+    # And the same kernels' loops as the machine runs them, which is the one place
+    # this repo's PTX counts are checked against SASS at all -- see #150 and #151.
+    _print_sass_loops(Path(EXPERIMENTS_DIR, "kittens_experiments.cubin"),
+                      MMA_STREAM_KERNELS)
+
 
 # `gaps` lived here until #3, and printed each aspirational kernel's remaining
 # errors by turning its cargo feature on: the missing API surface *was* the
@@ -626,6 +675,20 @@ def profile(kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192) -
     each holding everything constant but one thing — rather than by counters.
     That is a weaker instrument for attribution and a stronger one for cause.
 
+    **#138 re-derived this and closed the two obvious escapes.** On a fresh
+    B200 container at driver 580.95.05, `ncu` 2025.3.0 fails identically on a
+    four-line `nvcc` kernel that has nothing to do with this repo, so it is not
+    the codegen. `NVIDIA_DRIVER_CAPABILITIES=all` is *already in the container's
+    environment* and the injected set already includes the graphics libraries,
+    so the capability set is not the lever it looks like. And NVIDIA's own
+    component list for the 580 branch names exactly one `pcc` file — `nvidia-pcc`,
+    the VulkanSC pipeline cache compiler — and no performance-counter library at
+    all, so this is not something the runtime withheld from a package that has
+    it. `libnvperf_host.so` and `libnvperf_target.so` are both present and both
+    useless without it; `nsys` is not in the image, and it would trace rather
+    than count. The conclusion is the same and now has a floor under it: there
+    is no counter here, and an ablation is the instrument.
+
     Whenever the library does appear, this is one command. `--clock-control
     none` is deliberate: the default locks the clocks to base so that two runs
     compare, which also means the duration it reports is not the duration
@@ -663,6 +726,143 @@ def profile(kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192) -
 def doctor() -> None:
     _run(["nvidia-smi"], cwd="/")
     _run(["cargo", "oxide", "doctor"], cwd="/opt/warmup")
+
+
+# The `opt` the vendored upstream kernels need, and why they need one.
+#
+# `opt -O2` turns each of upstream's four-way stage selects -- `SMEM_A0..3`,
+# `TMA_BAR0..3`, and six more -- into a lookup table, and emits that table as a
+# `.global` array initialized with the addresses of `.shared` variables. PTX
+# forbids exactly that: *"Variable used as initial value not in .global or
+# .const state space"*, `ptxas` fatal, no code. Sixteen tables in our build of
+# it and sixteen in **upstream's own**, which `upstream_ptx` demonstrates from a
+# clean clone -- so this is a defect of the toolchain and not of the vendoring.
+#
+# `-switch-to-lookup=false` is LLVM's own switch for the transform that makes
+# them, and `CUDA_OXIDE_OPT` is cuda-oxide's own hook for supplying the `opt`
+# binary. Composing the two is a build-environment change and touches no source:
+# with the wrapper, all sixteen tables are gone and every one of the 46 entries
+# assembles for `sm_100a`.
+#
+# It is not free of consequence and is not assumed to be: the flag is global to
+# the compilation, so `upstream_bench` measures the port with it and without it
+# in one container and prints both. A difference there is the flag's, not the
+# kernel's, and belongs in the report.
+OPT_NO_LOOKUP_TABLE = "/tmp/opt-no-lookup-table"
+WRITE_OPT_WRAPPER = (
+    f"printf '#!/bin/sh\\nexec %s -switch-to-lookup=false \"$@\"\\n'"
+    f" \"$(which opt)\" > {OPT_NO_LOOKUP_TABLE}; chmod +x {OPT_NO_LOOKUP_TABLE};"
+    f" {OPT_NO_LOOKUP_TABLE} --version | head -2"
+)
+
+
+@app.function(cpu=8, timeout=CHECKING)
+@completes
+def upstream_ptx() -> None:
+    """Build NVLabs' own `gemm_sol_final`, from a clean clone of the pinned
+    cuda-oxide, and assemble its PTX. No GPU: `ptxas` is the whole question.
+
+    This exists because the first attempt to time upstream's kernel against ours
+    found it does not run, and the obvious suspicion -- that vendoring it into
+    `experiments/` broke it -- had to be ruled out before the finding could be
+    published. It is ruled out here, from upstream's crate, upstream's
+    workspace, upstream's profile, in this image:
+
+        .extern .func llvm.nvvm.stmatrix.sync.aligned.m8n8.x2.b16.p3
+        ptxas gemm_sol_final.ptx, line 10; fatal : Parsing error near '.nvvm'
+
+    and behind that one, sixteen `switch_$_table` arrays of `.shared` addresses.
+    Two independent lowering defects, both fatal, both upstream's own. Ours are
+    the same two, and `kittens::ldst` had already written the workaround for the
+    first one at `b099f64`.
+
+    Run it after a pin bump: if this comes back clean, the two workarounds
+    `gemm_sol_upstream.rs` and `OPT_NO_LOOKUP_TABLE` carry can both be dropped.
+    """
+    _run(["git", "clone", "--filter=blob:none", GIT_REPO, "/tmp/oxide"], cwd="/")
+    _run(["git", "checkout", CUDA_OXIDE_REF], cwd="/tmp/oxide")
+    # The clone's own `.cargo/config.toml` aliases `oxide` to a workspace
+    # member, which shadows the installed subcommand.
+    _run(["rm", "-f", "/tmp/oxide/.cargo/config.toml"], cwd="/")
+    upstream = "/tmp/oxide/crates/rustc-codegen-cuda/examples/gemm_sol_final"
+    _run([*STUB_ENV, "cargo", "oxide", "build", "gemm_sol_final", "--arch", "sm_100a"],
+         cwd=upstream)
+    _run(["sh", "-c",
+          "echo '--- unresolved externs ---'; grep -n '^\\.extern \\.func' gemm_sol_final.ptx;"
+          " echo '--- lookup tables of shared addresses ---';"
+          " grep -c 'switch_\\$_table' gemm_sol_final.ptx || true;"
+          " echo '--- ptxas ---';"
+          " ptxas -arch=sm_100a -o /dev/null gemm_sol_final.ptx 2>&1 | tail -10"],
+         cwd=upstream)
+
+
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
+@completes
+def upstream_bench() -> None:
+    """The port, the kernel it is a port of, and cuBLASLt -- one container, one
+    device, one clock.
+
+    `bench --case gemm-sol` published 0.795 / 0.873 / 0.946 of cuBLASLt at
+    4096³ / 8192³ / 16384³ with nothing to say whether that gap is the port's or
+    the design's. This runs the design too, from upstream's device code
+    unmodified (`experiments/src/gemm_sol_upstream.rs`), staged from the same
+    generators, checked by the same exact-BF16 reference and timed by the same
+    five-warm-up minimum-of-thirty clock, so the only thing left different is
+    the code between the events.
+
+    Two invocations, and the first one is the control. `OPT_NO_LOOKUP_TABLE` is
+    what makes upstream's kernels assemble at all, and it is global to the
+    compilation -- so the port is measured *without* it first, which is exactly
+    what `bench --case gemm-sol` measures on any other day, and then again
+    *with* it beside upstream. If those two port rows disagree, the flag moved
+    the port and every ratio in the second table has to be read against the
+    second port row rather than the published one.
+    """
+    _run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
+          "--format=csv"], cwd="/")
+    _run(["cargo", "oxide", "run", "kittens-experiments", "--features", "cublas",
+          "--", "bench", "gemm-sol"],
+         cwd=EXPERIMENTS_DIR)
+    _run(["sh", "-c", WRITE_OPT_WRAPPER], cwd="/")
+    _run(["env", f"CUDA_OXIDE_OPT={OPT_NO_LOOKUP_TABLE}",
+          "cargo", "oxide", "run", "kittens-experiments",
+          "--features", "cublas,gemm-sol-upstream",
+          "--", "bench", "gemm-sol,gemm-sol-upstream,gemm-sol-upstream-m512"],
+         cwd=EXPERIMENTS_DIR)
+
+
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
+@completes
+def sol_ablate() -> None:
+    """`gemm_sol`'s decomposition with upstream's own kernel as the reference --
+    one container, so one device, one cuBLASLt, one clock.
+
+    `bench sol-ablate` prices each phase of the item, then asks the one question
+    the phases cannot answer on their own: the `[256, 256]` entry's K loop runs
+    at 75.8% of tensor-core peak where `[512, 256]`'s runs at 99.4%, and the two
+    run the same K-loop code. Its last table is the same K-depth ladder on
+    upstream's `gemm_sol_final` at the same tile, which is what splits that
+    deficit into the algorithm's and the port's.
+
+    That table needs `gemm-sol-upstream`, which needs `OPT_NO_LOOKUP_TABLE` to
+    assemble at all, and the flag is global to the compilation -- so this runs
+    the whole sweep *twice*, once without upstream compiled in and once with. The
+    first run is the control: if the port's rows disagree between them, the flag
+    moved the port and the upstream comparison has to be read against the second
+    run's port rows rather than the first's. #145 measured that difference at
+    0.006-0.15%.
+    """
+    _run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
+          "--format=csv"], cwd="/")
+    _run(["cargo", "oxide", "run", "kittens-experiments", "--features", "cublas",
+          "--", "bench", "sol-ablate"],
+         cwd=EXPERIMENTS_DIR)
+    _run(["sh", "-c", WRITE_OPT_WRAPPER], cwd="/")
+    _run(["env", f"CUDA_OXIDE_OPT={OPT_NO_LOOKUP_TABLE}",
+          "cargo", "oxide", "run", "kittens-experiments",
+          "--features", "cublas,gemm-sol-upstream",
+          "--", "bench", "sol-ablate"],
+         cwd=EXPERIMENTS_DIR)
 
 
 @app.function(timeout=ASKING)
@@ -786,6 +986,16 @@ def _measure(arch: str) -> dict[tuple[str, str], dict[str, int]]:
 CENSUS_OPCODES = (
     ("mma", "tcgen05.mma"),
     ("ldtm", "tcgen05.ld"),
+    # The *waits*, which are a separate claim from the issues and the only
+    # column that can see one.
+    #
+    # #117 found that the LDTM half of a staged epilogue is its wait and not its
+    # issue, and `TmemTile::tile_x8_batched` acts on that by putting a band's
+    # issues in flight before a single `tcgen05.wait::ld`. That changes no other
+    # count in this table -- same `tcgen05.ld`, same `stmatrix`, same stores --
+    # so without this column a batched drain and an unbatched one census
+    # identically and the arm cannot be gated at all.
+    ("ldtm.wait", "tcgen05.wait::ld"),
     ("tma", "cp.async.bulk.tensor"),
     ("stmatrix", "stmatrix"),
     ("ld.sh.v4", "ld.shared.v4"),
@@ -877,6 +1087,249 @@ def _print_census() -> None:
                 else "DIFFER — " + ", ".join(disagreed)
             )
         )
+
+
+# The kernels whose MMA warp's issue stream is itself an argument, and the
+# opcode that brackets it.
+#
+# `bench sol-ablate`'s `mma only` arm runs the MMA warp with no barrier wait, no
+# TMA and no drain, and the `[256, 256]` entry still reaches only 88.7% of
+# tensor-core peak where `[512, 256]` reaches 97.6%. Nothing memory-shaped is
+# left in that arm, so what is left is the scalar work the warp does *between*
+# `tcgen05.mma` issues -- ring index, byte multiply, two operand descriptors, an
+# accumulate predicate -- which is the same per K block at both entries while the
+# work per K block is 4 MMA against 8.
+#
+# That is a claim about instructions, and the PTX is where it is either true or
+# not. `mma` counts alone cannot see it: 16 and 32 is exactly what the two
+# entries should carry. What matters is how many non-`mma` instructions sit
+# between them, so this prints the span rather than a count of it.
+MMA_STREAM_KERNELS = (
+    "gemm_sol_m256",
+    "gemm_sol_m512",
+    # The same two with the ring index computed from `global_k` instead of
+    # handed in as a const, which is what the port carried before the two were
+    # measured against each other. Printing both is what makes the fold
+    # visible rather than asserted: the folded stream carries literal barrier
+    # offsets and a constant accumulate predicate where this one carries
+    # arithmetic.
+    "gemm_sol_m256_runtime",
+    "gemm_sol_m512_runtime",
+    # Upstream's own two entries, when the vendored copy is compiled in. #148
+    # closed the port's K-loop deficit against upstream from 6.0 points of peak
+    # to 3.5 and could not explain the rest; a static diff of the two issue
+    # streams costs no GPU and is the first place to look for it.
+    "gemm_sol_clc_multicast_4_stage_pipeline",
+    "gemm_sol_clc_multicast_4_stage_pipeline_large",
+)
+
+
+# Every conclusion in this repo's GEMM work so far is a **PTX** count: `regcount`
+# parses `ptxas -v`, the opcode censuses that validate every ablation arm are PTX,
+# and #148's between-MMA table and its `#[unroll]` fold were both diagnosed and
+# verified in PTX. `ptxas` is a real optimizer sitting between all of that and the
+# machine, and until this nothing here had ever checked one against the other.
+#
+# The immediate question is #150 and #151: two spin-loop costs counted in PTX, both
+# of which `ptxas` has every reason to fold. But the instrument is general on
+# purpose -- point it at a kernel and it prices every tight loop that kernel
+# actually executes -- because "is our PTX count what the machine runs" is a
+# question about the instrument set and not about those two issues.
+#
+# Loops are found by **backward branch** rather than by mnemonic: a branch whose
+# target address is at or below its own closes a loop, and the instructions from
+# that target through the branch are one iteration. That needs no knowledge of how
+# an mbarrier wait is spelled in SASS, which is the part nobody here should be
+# guessing at.
+SASS_LOOP_CEILING = 32
+"""Longest loop body printed. A spin loop is a handful of instructions; a K loop is
+hundreds, and printing it would bury the thing being looked for."""
+
+# Mnemonic fragments that mark a loop as a barrier spin, used only to *label* rows.
+# The loop-finding above does not depend on them, so a Blackwell spelling nobody
+# here predicted still gets found and counted -- it just prints without the label.
+SASS_BARRIER_HINTS = ("BAR", "ARRIVE", "TRYWAIT", "MBAR")
+
+
+def _sass(cubin: Path) -> str | None:
+    """Disassemble `cubin`, or `None` with a reason printed.
+
+    Tried in the order that gives the most readable output. Neither tool is used
+    anywhere else in this file, so a missing one is a fact worth printing rather
+    than an exception worth raising -- this runs inside `build`, which gates
+    everything, and a disassembler that is absent must not take that gate red.
+    """
+    for tool, argv in (
+        ("nvdisasm", ["nvdisasm", "-c", str(cubin)]),
+        ("cuobjdump", ["cuobjdump", "-sass", str(cubin)]),
+    ):
+        found = subprocess.run(["which", tool], capture_output=True, text=True)
+        if found.returncode != 0:
+            print(f"  {tool}: not in the image")
+            continue
+        run = subprocess.run(argv, capture_output=True, text=True)
+        if run.returncode != 0:
+            print(f"  {tool} failed: {run.stderr.strip()[:300]}")
+            continue
+        print(f"  disassembled by {tool}")
+        return run.stdout
+    return None
+
+
+def _sass_functions(text: str) -> dict[str, tuple[list[tuple[int, str, str]], dict[str, int]]]:
+    """Per entry function, its instructions and its label definitions.
+
+    Instructions are `(address, mnemonic, whole line)`; labels map a name to the
+    index of the instruction it precedes. Both are needed because `nvdisasm -c`
+    names branch targets as labels (`` `(.L_x_5) ``) while `cuobjdump -sass` names
+    them as absolute addresses, and a loop finder that understands only one of the
+    two silently reports no loops -- which is exactly how this was first written.
+    """
+    functions: dict[str, tuple[list[tuple[int, str, str]], dict[str, int]]] = {}
+    current: tuple[list[tuple[int, str, str]], dict[str, int]] | None = None
+    pending: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        named = re.search(r"(?:Function : |\.text\.)([A-Za-z_$][\w$]*)", stripped)
+        if named:
+            current = functions.setdefault(named.group(1), ([], {}))
+            pending = []
+            continue
+        if current is None:
+            continue
+        label = re.match(r"^(\.L[\w$.]+):$", stripped)
+        if label:
+            pending.append(label.group(1))
+            continue
+        address = re.match(r"^/\*([0-9a-fA-F]+)\*/\s*(.*)$", stripped)
+        if not address:
+            continue
+        body = address.group(2).strip()
+        if not body:
+            continue
+        mnemonic = re.sub(r"^@!?\S+\s+", "", body).split()
+        if not mnemonic:
+            continue
+        instructions, labels = current
+        for name in pending:
+            labels[name] = len(instructions)
+        pending = []
+        instructions.append((int(address.group(1), 16), mnemonic[0].rstrip(";"), body))
+    return functions
+
+
+def _sass_loops(
+    instructions: list[tuple[int, str, str]], labels: dict[str, int]
+) -> list[tuple[int, int, list[str]]]:
+    """Every backward branch and the iteration it closes, shortest first.
+
+    A branch resolving to an instruction at or before itself closes a loop, and the
+    instructions from there through the branch are one iteration -- the quantity a
+    PTX loop-body count is comparable to. Targets are resolved through both
+    spellings a disassembler uses, label and absolute address.
+    """
+    by_address = {address: index for index, (address, _, _) in enumerate(instructions)}
+    loops = []
+    for index, (address, mnemonic, body) in enumerate(instructions):
+        if not mnemonic.startswith(("BRA", "BRX", "JMP", "CBRA")):
+            continue
+        label = re.search(r"`\((\.L[\w$.]+)\)", body)
+        literal = re.search(r"0x([0-9a-fA-F]+)", body)
+        if label and label.group(1) in labels:
+            start = labels[label.group(1)]
+        elif literal and int(literal.group(1), 16) in by_address:
+            start = by_address[int(literal.group(1), 16)]
+        else:
+            continue
+        if start > index:
+            continue
+        loops.append((instructions[start][0], address, [line for _, _, line in instructions[start : index + 1]]))
+    loops.sort(key=lambda loop: len(loop[2]))
+    return loops
+
+
+def _print_sass_loops(cubin: Path, kernels: tuple[str, ...]) -> None:
+    """Tight loops per kernel, in SASS, with one iteration's instruction count.
+
+    The count is the number to compare against a PTX poll-body count; the body is
+    printed so a reader can see *why* it is that number rather than trusting it.
+    """
+    print(
+        "\nSASS loops -- one iteration per row, found by backward branch and not by\n"
+        "mnemonic. `insns` is instructions executed per iteration, which is the figure a\n"
+        "PTX loop-body count is comparable to; `ptxas` sits between the two and this is\n"
+        "the only place in this repo that checks one against the other. Bodies longer\n"
+        f"than {SASS_LOOP_CEILING} instructions are counted and not printed."
+    )
+    text = _sass(cubin)
+    if text is None:
+        print("  no disassembler in the image; #150 and #151 stay PTX-only claims.")
+        return
+    functions = _sass_functions(text)
+    if not functions:
+        print("  the disassembler's output did not parse into entry functions.")
+        return
+    for name in kernels:
+        if name not in functions:
+            continue
+        instructions, labels = functions[name]
+        loops = _sass_loops(instructions, labels)
+        tight = [loop for loop in loops if len(loop[2]) <= SASS_LOOP_CEILING]
+        print(f"\n  {name}: {len(instructions)} instructions, {len(loops)} loops, "
+              f"{len(tight)} of them tight")
+        print(f"    {'loop at':>10}{'insns':>7}  kind")
+        seen: set[int] = set()
+        for target, branch, body in tight:
+            if target in seen:
+                continue
+            seen.add(target)
+            barrier = any(hint in line.upper() for line in body for hint in SASS_BARRIER_HINTS)
+            print(f"    {hex(target):>10}{len(body):>7}  {'barrier spin' if barrier else 'loop'}"
+                  f"  (closed at {hex(branch)})")
+        for target, _, body in tight:
+            if not any(hint in line.upper() for line in body for hint in SASS_BARRIER_HINTS):
+                continue
+            print(f"\n    {name} spin at {hex(target)} -- {len(body)} instructions an iteration")
+            for line in body:
+                print(f"      {line}")
+            break
+
+
+def _print_mma_stream() -> None:
+    """The instruction span between the first and last `tcgen05.mma` of a kernel.
+
+    Split on `.visible .entry` exactly as `_census` does, for the same reason: the
+    bodies carry `ptx_asm!` verbatim and that text is the thing worth reading.
+    `mma` belongs to one warp in a warp-specialized kernel and each warp's path is
+    a separate branch, so the span between the first and last of them is that
+    warp's K-loop body and nothing else.
+    """
+    seen: set[str] = set()
+    for directory in (EXAMPLES_DIR, EXPERIMENTS_DIR):
+        for ptx in sorted(Path(directory).rglob("*.ptx")):
+            for chunk in ptx.read_text().split(".visible .entry ")[1:]:
+                name = chunk.split("(", 1)[0].strip()
+                if name not in MMA_STREAM_KERNELS or name in seen:
+                    continue
+                lines = [line.strip() for line in chunk.splitlines()]
+                # Substring rather than prefix: a `tcgen05.mma` arrives inside a
+                # braced `ptx_asm!` body with its predicate in front of it.
+                # `_census` counts the same substring, so the two agree by
+                # construction.
+                issues = [i for i, line in enumerate(lines) if "tcgen05.mma" in line]
+                if not issues:
+                    continue
+                seen.add(name)
+                span = lines[issues[0] : issues[-1] + 1]
+                code = [line for line in span if line and not line.startswith("//")]
+                mma = [line for line in code if "tcgen05.mma" in line]
+                between = len(code) - len(mma)
+                print(
+                    f"\n  {name}: {len(mma)} tcgen05.mma over {len(code)} instructions "
+                    f"({between} between them, {between / len(mma):.1f} per issue)"
+                )
+                for line in span:
+                    print(f"    {line}")
 
 
 def _print_kernels(measured: dict[tuple[str, str], dict[str, int]]) -> None:
@@ -1444,6 +1897,7 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     print(f"\nregisters per thread, {arch}" + (f" — {label}" if label else ""))
     _print_kernels(measured)
     _print_census()
+    _print_mma_stream()
     _print_ladder(measured)
     _print_timed_twins(measured)
     _check_occupancy_step(measured)

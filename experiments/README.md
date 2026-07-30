@@ -3677,21 +3677,47 @@ gap to the library. Three levers were scoped. **One of them does not exist, one
 of them is worth nothing, and one of them is worth more than anything measured
 in this file since the port.**
 
-**`.pack::16b` is not a lever, and the pin says so before any device time is
-spent on it.** The scoping read it as folding the fp32→bf16 convert into the
-load — eliminating the `cvt` and halving the registers reaching `stmatrix`. At
-`b099f64c1a32869b74be99f4f88242fb68655b51`, `intrinsics/abi-v1.toml` gives
-`tcgen05_ld_16x256b_x8_pack16` the result type `[u32; 32]`, **the same 32
-registers as `_x8_raw`**, and `intrinsics/generated-reference.md` validates it
-as `tcgen05.ld.sync.aligned.16x256b.x8.pack::16b.b32 <register-list:32>`. The
-count does not fall, so nothing is being packed two-into-one for the same span.
+**`.pack::16b` is not a lever — but the register count was the wrong reason, and
+#147 closed it properly.** The scoping read it as folding the fp32→bf16 convert
+into the load: eliminating the `cvt` and halving the registers reaching
+`stmatrix`. At `b099f64c1a32869b74be99f4f88242fb68655b51`,
+`intrinsics/abi-v1.toml` gives `tcgen05_ld_16x256b_x8_pack16` the result type
+`[u32; 32]`, **the same 32 registers as `_x8_raw`**, and
+`intrinsics/generated-reference.md` validates it as
+`tcgen05.ld.sync.aligned.16x256b.x8.pack::16b.b32 <register-list:32>`.
 `.pack::16b` is the load-side twin of `tcgen05.st`'s `.unpack::16b` — it moves
 **16-bit-typed** tensor memory, pairing adjacent columns' half-words. Against an
-fp32 accumulator it is not a rounding mode, it is the wrong instruction. No rung
-was built and no GPU time was spent. (And the rounding question it was flagged
-for is moot twice over: `check_c` compares bf16 words with `==` and **no
-tolerance at all**, so a lever that cost a mantissa bit fails the gate rather
-than passing a loose one.)
+fp32 accumulator it is not a rounding mode, it is the wrong instruction.
+
+That last sentence is the sound half. **"The register count does not fall, so
+nothing is packed" is not**, and it answered a question nobody had asked: equal
+register counts are consistent with equal *bits* moved, which is exactly why no
+convert was performed — it does not establish that the `cvt` instructions
+survive. Register count alone is the reasoning this file has been burned by at
+#47, #63, #67, #76 and #81, and this was a sixth. #147 asked the two questions
+separately and got two answers, both from the census rather than from the ABI:
+
+- **Does it remove the `cvt`? Yes.** `gemm_sol_m512_pack16` censuses
+  `cvt.rn.bf16x2` at **0** against the shipped drain's 8, with `stmatrix`,
+  `ld.shared.v4`, `st.global.v4` and `st.global.b32` all unmoved. So the convert
+  *is* folded away, and the ABI table could never have said otherwise.
+- **Is it usable? No, and not for a values reason.** The arm **faults**: one
+  launch raised `Xid 13, Out Of Range Address` on every SM and returned
+  `DriverError(700)`. Read as 16-bit-typed, the addressing the qualifier implies
+  does not land inside a `[128, N]` fp32 allocation at all.
+- **Would removing the `cvt` have helped anyway? No.** #147's `nocvt` rung is the
+  shipped drain with the same LDTM count, the same wait count, the same eight
+  `stmatrix` a band and `cvt` at zero — and it is **0.0 to −1.4% slower**, in two
+  round-robin passes at both shapes. The convert is free. The 69% of the drain
+  that `twice shared − twice global` prices is the **`stmatrix`** pass and the
+  write-after-write a doubled one owes its own staging tile, not the convert
+  beside it.
+
+So the conclusion stands and the argument for it is now an instruction census and
+a timed oracle. (The rounding question it was originally flagged for is moot
+twice over: `check_c` compares bf16 words with `==` and **no tolerance at all**,
+so a lever that cost a mantissa bit fails the gate rather than passing a loose
+one.)
 
 **The `.x8` hazard is stale history, not a live warning.**
 `crates/cuda-device/src/tcgen05.rs` says `tcgen05_ld_16x256b_x4/x8/x16/x32` were
@@ -4715,6 +4741,535 @@ half's store — which is the only thing standing between the doubling probe's
 `TmemTile::tile_x8`, whose `.x8` shape is 32, so it is a question about the LDTM
 width and not about shared memory. Until that is built, "depth 1 is why" is a
 mechanism consistent with every number here and not a measured one.
+
+##### and the small end of `gemm_sol` is one wave short, which no tiling fixes — #138
+
+`gemm_sol`'s ratio against a live cuBLASLt FP16 baseline read 0.795 at 4096³,
+0.873 at 8192³ and 0.946 at 16384³, and the obvious reading of that shape is
+tile quantization. `bench sol` and `bench sol-small` are the two tables that
+test it. The arithmetic first, because it is stated before anything is launched
+and every row below is a test of it:
+
+both shared plans declare more than half of the **233472 B** an SM divides, so
+residency is **one CTA an SM**, and a `cta_group::2` MMA needs its pair
+co-resident — **74 clusters** on 148 SMs. A launch is one cluster per output
+tile and takes `ceil(tiles / 74)` waves of them, so
+`tiles / (waves · 74)` is the fraction of it not idling:
+
+| shape | entry | tiles | waves | wave eff |
+| --- | --- | ---: | ---: | ---: |
+| 4096³ | `[256, 256]` | 256 | 4 | **0.865** |
+| 4096³ | `[512, 256]` | 128 | 2 | **0.865** |
+| 4096³ | `[256, 128]` | 512 | 7 | 0.988 |
+| 8192³ | `[256, 256]` | 1024 | 14 | 0.988 |
+| 8192³ | `[512, 256]` | 512 | 7 | 0.988 |
+
+So 4096³ and 8192³ are not the same problem: 8192³ is already wave-perfect and
+13.5% of 4096³'s *grid* is idle. The two 4096³ entries quantizing **identically**
+is what makes that pair a controlled comparison of everything else.
+
+**The model is right, measured directly.** Sweeping `m` in tile steps at
+`n = k = 4096` walks the efficiency up and down a sawtooth with nothing else
+moving:
+
+| shape | tiles | waves | wave eff | TFLOP/s | ÷ wave eff |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4096x4096x4096 | 256 | 4 | 0.865 | 1351.0 | 1562 |
+| 4608x4096x4096 | 288 | 4 | 0.973 | 1469.5 | 1510 |
+| 5120x4096x4096 | 320 | 5 | 0.865 | 1354.4 | 1566 |
+| 5632x4096x4096 | 352 | 5 | 0.951 | 1463.6 | 1539 |
+
+The raw column swings 8.7% and the corrected one is flat to ±2%. **CLC work
+stealing is running throughout**, which settles what it is for: it removes the
+*static* share and cannot remove the integral one, and the sawtooth is the
+integral one surviving it in full.
+
+**And it buys nothing against the baseline, because cuBLASLt pays it too.** The
+heuristic prints its own wave count beside the algorithm it chose, and at these
+four shapes it is **3.46 / 3.89 / 4.32 / 4.76** — our 256/288/320/352 tiles over
+74 clusters, to three digits, on `tile=23` at every row from 2048³ up. cuBLASLt's
+rate divided by the *same* efficiency is 1955 / 1964 / 2018 / 2015, equally flat.
+Two implementations on the same tile with the same sawtooth: **quantization
+divides out of the ratio exactly**, and 0.795 at 4096³ is a rate deficit and not
+a tiling one. What is left is #144's per-tile constant and K-loop cadence.
+
+**Every attempt to buy the quantization back loses.** `[256, 128]` is the tile
+that reaches 0.988 at 4096³ and it is built, checked exact, and slower:
+
+| shape | `[256, 256]` | `[256, 128]` | narrow/wide | wave eff, wide → narrow |
+| --- | ---: | ---: | ---: | --- |
+| 1024³ | 124.7 | 160.9 | **1.29** | 0.216 → 0.432 |
+| 1536³ | 364.7 | 464.1 | **1.27** | 0.486 → 0.973 |
+| 2048³ | 751.9 | 697.2 | 0.93 | 0.865 → 0.865 |
+| 3072³ | 1283.2 | 1034.2 | 0.81 | 0.973 → 0.973 |
+| 4096³ | 1343.0 | 1079.4 | 0.80 | 0.865 → 0.988 |
+| 8192³ | 1682.6 | 1062.1 | 0.63 | 0.988 → 0.988 |
+
+The two rows where efficiency does not move are the price of the tile alone: at
+equal quantization the narrow tile costs 7% at 2048³, 19% at 3072³ and **37% at
+8192³**, which is 1.5× the operand traffic per flop (85.3 against 128 flops per
+operand byte) and twice as many per-tile constants to pay it on. At 4096³ that
+price is larger than the 14% of quantization it is buying, and the tile loses
+20%.
+
+`[512, 256]` at 4096³ is the other direction and is a **dead heat**: 1323.2
+against 1343.0, 0.985, inside a 4% spread. Its 0.75× operand traffic per flop —
+worth 1.12× at 8192³ where quantization is equal — is cancelled at 4096³ by
+half as many tiles to amortize a per-tile constant over. #138's crossover at
+8192 is therefore right, and it is right for a reason.
+
+**Split-K is arithmetically dead here, and the vendor agrees.** Splitting K in
+two at 4096³ takes 256 work units to 512 and the efficiency to 0.988, worth
+about 8% of the launch. It also doubles the number of epilogues, and #144 prices
+the epilogue at **19.7% of that launch** — so the cheapest possible reduction,
+one that adds no traffic at all, still pays 19.7% for an 8% return. Stream-K,
+splitting only enough tiles to level the tail, splits at most 74 of 256 and so
+pays ~5.7% for the same 8%: a ~2% return inside rows that repeat to 3–6%, for a
+k-range per work unit, a partial-tile MMA, a fixup ordering and an fp32
+workspace that the exact-output gate makes mandatory. The reduction instruction
+being reachable does not change either figure. cuBLASLt reports
+`splitk=1 reduction=0 workspace=0 B` at every shape in both tables.
+
+**The N band is worth nothing measurable.** `group` was a rule inside the kernel
+keyed on `tiles_m`; it is a launch parameter now and swept over `{1, 2, 4, 8,
+16}`. At 8192³ on `[512, 256]`: 1880.3, 1877.7, 1876.2, 1878.7, 1877.6 TFLOP/s —
+**flat to 0.2%**, which extends #138's `G=4` against `G=8` to the whole ladder.
+At 4096³ on `[256, 256]` the range is 1311 to 1367 against rows whose own
+launches spread 1.3–3.6%, so nothing there is quotable and the default is
+unchanged.
+
+**What did move: a third rung below 2048.** The narrow tile wins exactly where
+halving `N` doubles the efficiency, which happens only while both tile counts
+fit the same wave count — at or below **half a wave of wide tiles**. Both
+1.27–1.29× rows are there and both losing rows are past it, and the ladder was
+taken **twice round-robin** because a 1024³ launch is 17 µs and spreads 13–21%:
+the two passes put the ratio at 1.273/1.273 at 1024³, 1.273/1.278 at 1536³,
+0.927/0.934 at 2048³ and 0.806/0.811 at 3072³. `select_variant` is that
+sentence. It lifts 1024³ from 0.567 to 0.731 of cuBLASLt and 1536³ from 0.597 to
+0.760, and leaves every shape at and above 2048³ on the entry it already had.
+
+**The ratio was never monotonic.** 1024³ is 0.567, 2048³ is 0.846, 4096³ is
+0.795, 8192³ is 0.868 — 2048³ beats 4096³ because cuBLASLt is *also* one wave
+short there (0.86 waves, 906.8 TFLOP/s, 40% of dense peak). Three points made a
+trend that a fourth removes.
+
+**One shape did not return.** `4096x4096x1024` on `[256, 256]` printed nothing
+for 1200 s and `scripts/modal-run`'s watchdog stopped the container. It is not in
+either table and was not chased; `4096x4096x2048` runs and is (1181.9 wide,
+1004.4 narrow). A `k` shorter than `m` is otherwise unexercised by this kernel,
+so whether that is a shape contract this port does not hold or a one-off is open.
+
+##### the kernel the port is a port of, unported, on the same clock — and it does not reach cuBLASLt either
+
+`gemm_sol` (#138) is a port of NVLabs' canonical `gemm_sol_final`, and it
+measured **0.806 / 0.873 / 0.946** of cuBLASLt at 4096³ / 8192³ / 16384³ with no
+way to read that: either the port dropped something the original has, or the
+original stands there too. Nobody had timed the original on a B200. This is that
+number, and **most of the gap is not the port's**.
+
+The control arm is `experiments/src/gemm_sol_upstream.rs`: upstream's
+`kernels.rs` at `b099f64c1a32869b74be99f4f88242fb68655b51`, copied without a
+character changed and `include!`d as upstream `include!`s it, launched on
+upstream's own grid through upstream's own `cuTensorMapEncodeTiled` descriptors,
+under upstream's own variant selector. What is *not* upstream's is everything
+outside the two CUDA events: `bench::time`'s five warm-ups and minimum of
+thirty, and `gemm_sol`'s own `stage_f16` and `check_output` — the same functions,
+not copies — so both kernels read byte-identical operands and both pass the same
+exact-BF16 comparison before either is timed. `modal_app.py::upstream_bench` is
+one container, so one device, one cuBLASLt, one day.
+
+`gemm_sol_final` is identical at `20a5616`, so none of this turns on the pin.
+
+**Each arm at the variant it should be judged at.** cuBLASLt is the mean of its
+four readings per shape; it repeats to 0.03% at 16384³, 0.15% at 8192³ and
+**1.3% at 4096³**, which is the error bar the 4096³ row carries.
+
+| | 4096³ M256xN256 | 8192³ M512xN256 | 16384³ M512xN256 |
+| --- | ---: | ---: | ---: |
+| cuBLASLt FP16 | 1635.9 | 2146.0 | 2158.8 |
+| **upstream, unported** | 1435.0 | 1955.7 | 2086.2 |
+| **our port** | 1322.7 | 1871.5 | 2041.4 |
+| upstream / cuBLASLt | 0.877 | 0.911 | 0.966 |
+| port / cuBLASLt | 0.809 | 0.872 | 0.946 |
+| port / upstream | 0.922 | 0.957 | 0.979 |
+
+**So the attribution, in TFLOP/s of shortfall against cuBLASLt:**
+
+| | 4096³ | 8192³ | 16384³ |
+| --- | ---: | ---: | ---: |
+| total shortfall | 313.2 | 274.5 | 117.4 |
+| upstream's own | 200.9 — **64%** | 190.3 — **69%** | 72.6 — **62%** |
+| the port's | 112.3 — 36% | 84.2 — 31% | 44.8 — 38% |
+
+Two thirds of it is where `gemm_sol_final` itself lands on this B200, and it
+lands short of cuBLASLt at every one of the three sizes — furthest at the small
+end, exactly as the port does. Whatever closes 4096³ is not a port defect and
+was never going to be found by reading the port against the paper.
+
+**And the row that does not flatter the port's control arm.** Upstream's shipped
+selector takes M256xN256 up to 8192³; #138 moved that crossover to M512xN256
+and this is the price of not having:
+
+| 8192³, upstream's own policy | TFLOP/s | of cuBLASLt |
+| --- | ---: | ---: |
+| upstream, M256xN256 as shipped | 1800.1 | 0.839 |
+| upstream, M512xN256 forced | 1955.7 | 0.911 |
+| our port, M512xN256 | 1871.5 | 0.872 |
+
+At 8192³ **the port beats the kernel it is a port of**, by 4.0%, entirely on the
+crossover. At 4096³ upstream's policy is the better one — M256 1435.0 against
+M512 1407.7 — and both agree at 16384³ to 0.01%, which is the auto selector and
+the forced entry landing on the same kernel.
+
+**Getting there needed two toolchain workarounds, and neither is the
+vendoring's.** `modal_app.py::upstream_ptx` builds upstream's crate from a clean
+clone, in its own workspace, at its own profile, and it does not assemble:
+
+1. `cuda_device::tcgen05::stmatrix_m8n8_x2` reaches the NVPTX back end as
+   `llvm.nvvm.stmatrix.sync.aligned.m8n8.x2.b16.p3`, is selected by nothing, and
+   comes out as a call to an `.extern .func` that does not exist — *"line 10;
+   fatal: Parsing error near '.nvvm'"*. `kittens::ldst` had already written this
+   workaround for itself at `b099f64`, and the vendored copy binds the name to
+   it: same signature, same instruction, upstream's file untouched.
+2. `opt -O2` turns upstream's four-way stage selects into **sixteen** lookup
+   tables emitted as `.global` arrays of `.shared` addresses, which PTX forbids
+   outright. `CUDA_OXIDE_OPT` pointed at an `opt` wrapper carrying
+   `-switch-to-lookup=false` removes all sixteen and the whole bundle assembles.
+
+Sixteen in upstream's own build and sixteen in ours, so this is the toolchain and
+not the copy — and it is worth knowing that **`cargo oxide build` passes on both
+of them**: it emits the PTX and never assembles it, so `build` gained a `ptxas`
+step for this crate rather than trusting the one it had.
+
+The second workaround is global to the compilation, so it is measured rather than
+assumed: the port is timed in the same container without the flag and with it,
+and reads **1320.7 / 1871.4 / 2041.0** against **1322.7 / 1871.5 / 2041.4** —
+0.15%, 0.006% and 0.02% apart. The flag does not move the port, and the port's
+own rows reproduce #138's published 1289.0 / 1867.7 / 2045.5 to 2.5% / 0.2% /
+0.2% across two sessions and two days.
+
+##### and the small entry's K loop is its feed's duty cycle, not its cadence — #144, #146
+
+#144 left `[256, 256]`'s K loop at **75.8% of tensor-core peak** against
+`[512, 256]`'s **99.4%**, on the same K-loop code, and listed two things it could
+not separate. `bench sol-ablate` separates them, and the separation kills three
+hypotheses before it names the term.
+
+**Every arm is laddered in `K`.** That is the methodological point and it is not
+cosmetic: an arm's *launch* fuses its per-K-block cadence with a per-tile constant
+it carries for its own reasons, and at 64 k blocks one microsecond of constant is
+5.7 points of "of peak". The un-laddered launches said the MMA warp reached only
+88.7% of peak; laddered, it reaches 100.0%. One of those two numbers is a
+measurement of the K loop and the other is not.
+
+At 4096² on `[256, 256]`, µs a K block against **0.2759 at peak**:
+
+| arm | µs a K block | of peak | what it says |
+| --- | ---: | ---: | --- |
+| `feed only` | 0.2636 | 104.6% | the feed alone beats the tensor core by 4.6% |
+| `mma only` | 0.2742 | **100.6%** | no barrier wait, no TMA, no drain |
+| `issue only` | 0.2758 | **100.0%** | the same, with the wait back |
+| `no drain` | 0.3433 | 80.4% | the feed in situ costs **24.5%** |
+| `whole` | 0.3503 | 78.8% | the drain costs the rate another 2.0% |
+| `runtime stage` | 0.3615 | 76.3% | the spelling before this PR |
+| **upstream** | **0.3352** | **82.3%** | the same algorithm, unported |
+
+**The answer is one number per entry.** `feed only` is the operand pipeline's own
+time for a K block; peak MMA is the tensor core's. Their ratio is the fraction of
+the tensor core's busy time the feed has to be running:
+
+| entry | feed alone | MMA at peak | **the feed's duty** | feed in situ |
+| --- | ---: | ---: | ---: | ---: |
+| `[256, 256]` | 0.2636 µs | 0.2759 µs | **95.5%** | **+24.5%** |
+| `[512, 256]` | 0.3075 µs | 0.5518 µs | **55.7%** | **+0.0%** |
+
+At 95.5% duty there is no slack for the TMA's writes and the tensor core's
+operand reads to stay out of each other's way, and the cost of them not doing so
+is the whole deficit. At 55.7% there is 44% of slack and it is free. That 1.72×
+in duty is the 1.33× in operand bytes per flop between a `[256, 256]` cluster tile
+and a `[512, 256]` one — #146's "0.75× the operand traffic per flop" read from the
+other end — so **the term is the tile's arithmetic intensity, acting through the
+feed's duty cycle rather than through raw bandwidth.** At `[512, 256]` nothing in
+the K loop moves at all: feed, drain, barriers and ring index are 0.5557, 0.5572,
+0.5570 and 0.5547 µs, every one of them 99.0–99.5% of peak.
+
+**Three hypotheses died on the way, and each was cheap to kill.**
+
+*Not enough arithmetic per barrier round trip* — the leading one, and the one the
+second `A` ring at `[512, 256]` suggests — is dead twice. On arithmetic: both
+entries execute exactly **one** `load.wait` per K block, so the large entry buys a
+second MMA chain per *the same* round-trip count and additionally pays two `free`
+commits where the small entry pays one; a fixed cost `C` of 88 ns from the small
+entry's row would force the large one to 86% of peak against a measured 99.4%. And
+on measurement: `mma only` is `issue only` with the MMA warp's `load.wait` dropped
+and nothing else, and the two agree to **0.6%, with the arm that keeps the wait
+nominally faster**. The barrier round trip is zero. #144's unseparated row is
+closed.
+
+*A `tcgen05` issue-rate ceiling* is dead: `issue only` is 100.0% of peak and
+`mma only` 100.6%. One warp can saturate the tensor core at this tile.
+
+*The producer's instruction count* is dead, and this one needed an experiment
+rather than an argument. A rank's `B` half-panel is `128 x 64` — the same shape as
+`A`, which already arrives in one TMA — and it arrives in two 64-row boxes only
+because one 64-row tensor map served all three entries. Building it per entry
+takes the producer from **3 instructions a K block to 2** at `[256, 256]` and from
+4 to 3 at `[512, 256]`, at byte-for-byte identical traffic. It moves nothing:
+0.998 and 1.014 on the launch over two passes, 0.3484 against 0.3503 µs on the
+rate, and **1.008 and 0.981 on `feed only` itself**, where the feed is alone and
+has nothing to hide behind. So the feed's ceiling is bytes and not instructions,
+and #144's conclusion that the feed is not an instruction-rate problem survives —
+though the comparison it drew for it (the feed's ceiling against the loop's
+*in-situ* rate, which is low because the loop is slow) could not have failed. The
+comparison that can fail is ceiling against what peak MMA demands, and that is the
+duty-cycle table.
+
+**What did pay is a port defect with upstream's own comment as its spec.** The MMA
+warp indexed both operand rings and both stage barriers off
+`global_k = sequence * k_blocks + k`, a runtime value. But `k_blocks` is a multiple
+of `STAGES` — every entry's shape contract is `k % (STAGES · BLOCK_K) == 0` — so
+`global_k % STAGES == k % STAGES`, and the four positions of the four-way unroll
+are always stages 0, 1, 2, 3. Handing each position its stage as a **const** folds
+both barrier addresses to literals, both operand descriptors out of the loop, the
+accumulate predicate to a constant at three of the four positions, and the phase
+parity to one register a turn rather than four. The PTX shows all four:
+`add.s64 %rd199, %rd200, 131080` where the offset used to be computed, one
+`%r158` carrying the parity across all four slots, and `mov.b32 %r130, 1` where
+the predicate used to be a `setp`.
+
+Upstream states the same fact and spells it differently — `#[unroll(4)]` over a
+loop-local `k_idx & 3` with a `match` on it, and the comment *"`k_iters % 4 == 0`,
+so the producer's global stage and this local stage agree at every tile boundary.
+Keeping this expression loop-local lets the unroll pass fold each stage match."*
+That attribute exists at our pin and **nothing in this repo uses it**; it is
+rewritten only inside a `#[kernel]` or `#[device_function]` body, so a const
+parameter is the spelling reachable from a plain `impl` method, and it does not
+depend on an unroll pass firing.
+
+| 4096³, `[256, 256]` | runtime stage | const stage | ratio |
+| --- | ---: | ---: | ---: |
+| container A, pass 1 | 1281.7 | 1333.8 | **1.041** |
+| container A, pass 2 | 1274.5 | 1329.7 | **1.043** |
+| container B, pass 1 | 1289.0 | 1327.2 | **1.030** |
+| container B, pass 2 | 1300.7 | 1328.9 | **1.022** |
+| K-block rate | 0.3615 µs | 0.3503 µs | 76.3% → **78.8%** of peak |
+
+**+2.2% to +4.3%, two containers, four passes** — quoted as a range because each
+row's own launches spread 2.6–5.7% and a ratio inherits that. At 8192³ on
+`[512, 256]` it is 1.001–1.003, which is the predicted null: that K loop had
+nothing to give.
+
+**Its gain is on the inter-stage critical path, which is neither of the two places
+it was expected.** `mma only` against `runtime mma` is 1.018 / 1.001 / 1.005 /
+0.998 — null across four passes — so it is not `tcgen05` issue. And it is not the
+`mbarrier.try_wait.parity` spin body either, which an earlier reading of this
+claimed: the PTX says that body went from **7 instructions to 8**, because folding
+the stage to a literal made LLVM re-materialize `mov.b64` of the dynamic-shared
+symbol plus `add.s64` inside the loop instead of keeping a register live — and the
+kernel got faster anyway. What is left is the scalar work **between one `load.wait`
+returning and the next being entered**: pre-fold each stage computed its own parity
+(`add.s32`, `bfe.u32`), its own ring offsets and its own two operand descriptors on
+that path; post-fold the offsets are literals, the descriptors are hoisted out of
+the K loop, the accumulate predicate is a constant at three of four positions, and
+the parity is computed once a turn rather than four times. That path exists only
+when the waits exist, which is exactly why `whole` gains 4% and `mma only` gains
+nothing — it reconciles all three rows. Stated as the measurement, and corrected
+once when the PTX contradicted the first reading.
+
+**Against the two bars, in one container.** cuBLASLt 1707.7 and upstream 1453.5 at
+4096³; ours 1294.9 before and 1328.1 after (means of the two passes):
+
+| | of cuBLASLt | of upstream |
+| --- | ---: | ---: |
+| before | 0.758 | 0.891 |
+| after | **0.778** | **0.917** |
+
+So the port's K-loop share of the deficit was 6.0 points of peak and is 3.5, and
+**the fold closed 42% of it.** What remains splits two ways: our drain-free K loop
+(80.4%) is still 1.9 points behind upstream's drain-*inclusive* one (82.3%), so
+roughly two points of the residual is in the feed's interaction rather than in the
+epilogue, and it is not the ring index, not the barrier, not the issue rate and
+not the producer's instruction count — all four are now measured at zero.
+
+**The residual against upstream is neither the feed nor the issue stream**, and a
+static diff settled it for no container time. Upstream's producer charges
+`(A_TILE_BYTES + B_TILE_BYTES) * 2` per K block per cluster — **64 KB, identical to
+ours** — as three `cp.async.bulk.tensor` per rank under a `self_mask`, one `A` and
+two 64-row `B` panels, under its own comment *"the fixed host descriptor exposes a
+64x64 B panel"*. Same bytes, same instructions, same mask, same four stages, and
+therefore the same 95.5% duty. And `_print_mma_stream` counts non-`mma`
+instructions between the first and last `tcgen05.mma`: **8.8 per issue before the
+fold, 7.5 for upstream, 2.9 after** — we are 2.6× leaner than upstream and still
+3.5 points behind on the rate. So **static instruction count between MMA issues is
+not the binding constraint.** It does *not* foreclose the barrier-address lever,
+which an earlier reading of this claimed it did: that census counts each
+instruction once, a spin loop costs its body times its iterations, and no static
+count between issues can see the iterations. Counted directly, the poll body is
+**7 instructions pre-fold, 7 for upstream, 8 shipped** — ours needs an `add.s64`
+upstream does not, because upstream gives each mbarrier its own static `.shared`
+symbol (`__shared_mem_27..29`) where ours are const offsets into one dynamic
+allocation. **The lever's sign is positive, and the pre-fold
+spelling is not the counter-example it looks like.** That spelling had upstream's
+7-instruction poll body and was 4% slower — but the fold changed *two* things with
+opposite signs: it added one instruction to the poll body and removed many from the
+inter-stage path. It is a two-variable change and therefore not a controlled
+experiment on poll-body length at all. Removing the per-poll `add.s64` is the
+single-variable version, and it is **additive with the fold rather than opposed to
+it**.
+
+The magnitude is worth stating in advance because it is large enough to matter. The
+MMA warp's time in the poll loop is `whole − issue only` = 0.3503 − 0.2758 =
+**0.0745 µs a K block, 21% of it**. If that loop is issue-bound, one instruction of
+eight is an eighth of it — **0.0093 µs, 2.7% of the K-block rate** — which would
+take the K loop from 78.8% to about 81.0% against upstream's 82.3% and close most of
+the residual. The named failure mode: if `mbarrier.try_wait.parity` is instead
+latency-bound on its shared read, the body's instruction count is a small fraction
+of each iteration and the win is much smaller. That is the prediction and its
+falsifier, and it is what a container should be spent against.
+
+**Feasibility is settled and the cost is structural rather than budgetary.**
+Upstream declares `static mut TMA_BAR0: Barrier = Barrier::UNINIT;` — eight of
+them — *inside* its `#[kernel]` body, and cuda-oxide at the pin places those in
+`.shared` as `__shared_mem_27..29`. So the mechanism exists and is proven in this
+tree. Two costs, neither of them residency: the barriers are ~104 B moving from the
+dynamic allocation to static shared out of the same 233472 B, so `dynamic_shared`
+in each launch contract drops by that much and nothing crosses an occupancy step;
+and **it is unproven from where this kernel would need it.** Upstream declares its
+statics inside the `#[kernel]`, while `small_body` and `large_body` are deliberately
+*outside* `#[cuda_module]` so the shipped kernels and the arms can be one text —
+and whether a `static mut Barrier` in a plain `fn` still lands in `.shared` is the
+macro's business, not the type's. If it does not, the statics have to be declared
+per `#[kernel]` and threaded in, which is the design cost. Either way it is a
+**library-level** change — `src/sync.rs`'s `Semaphore` takes a pointer derived from
+a dynamic base and the `*_offset` consts are that base's layout, which #137 made
+one walk — so it pays every kernel with a pipeline and does not belong in this PR. Filed as **#150** — and **closed**: `ptxas` folds the add, and all three poll bodies are three instructions in SASS. See the SASS section below.
+
+One thing the poll body says that is new: **five of its seven or eight
+instructions are not addressing at all** — `selp.b32`, `and.b32`, `setp.ne.b32`,
+`not.pred`, `bra`, a predicate turned into an `i32`, masked, turned back into a
+predicate and inverted, because `mbarrier_try_wait_parity` returns a Rust `bool`
+and the loop is `while !…`. A tight spin is `try_wait` then `@!p bra`, which is
+two. Upstream pays the same five, so this does not explain the gap against it — but
+it is five of eight instructions in every mbarrier spin in the repo. Filed as
+**#151** — and **closed**: the SASS step below was built, and `ptxas` folds the whole
+round trip. Both were PTX counts of instructions the machine never runs.
+
+**What this does not separate.** Why the feed in situ costs 24.5% at 95.5% duty
+and 0.0% at 55.7% is a duty-cycle argument, not a mechanism: **bank conflicts
+between the TMA's writes and `tcgen05`'s operand reads are not distinguished from
+saturation of the shared-memory write port, and no arm in this file can distinguish
+them** — every arm removes a phase, so each removes both candidates at once, and
+bytes are the only dial. The arm that would separate them changes the *access
+pattern* at constant bytes and constant instruction count: `A` and `B` staged at
+swizzles or pitches that collide differently while the TMA still moves 64 KB a K
+block. Bank conflicts would move; a saturated write port could not. Likewise the
+3.5 points still behind upstream is latency or ordering, and the instrument for
+*that* is a per-warp `%globaltimer` span probe, whose own perturbation would have
+to be measured against `whole` before any of its numbers counted. The per-tile constants the ladders fit are two-point fits of
+small differences between large numbers, so only the large one — the drain's 2.9 µs
+a tile, which reproduces #147's independently measured 2.82 — is quoted.
+
+**The consequence for tiling, which is somebody else's to act on.** The term is the
+tile's operand bytes per flop, so the lever is the tile, and #146 swept it and
+found `[512, 256]` at 4096³ a dead heat (0.985) because it halves the tile count
+and so doubles the per-tile constant each tile must amortize. This file prices that
+constant at 3.4 µs a tile, of which the drain is 2.9. If the drain falls, the
+crossover should move below 8192 — the entry that is already at 99.3% of peak in
+its K loop would then be the right one at 4096³ too.
+
+##### and the PTX this repo counts is not always the machine's — a SASS check, and what it does and does not disturb
+
+Nearly every conclusion in the GEMM work above is a **PTX** count. `regcount`'s
+opcode census is PTX. The censuses that validate every ablation arm are PTX. The
+between-MMA instruction table that foreclosed the instruction-count family is PTX,
+and the `#[unroll]` stage fold was both diagnosed and verified in PTX. `ptxas` is a
+real optimizer sitting between all of that and the machine, and until #148 nothing
+here had ever checked one against the other.
+
+`modal_app.py::_print_sass_loops` is that check, and it is general rather than a
+one-off: point it at a kernel and it prices every tight loop the machine actually
+runs. It is CPU-only — `nvdisasm -c` over the cubin `build` already assembles — and
+**it finds loops by backward branch rather than by mnemonic**, so it needs nobody to
+know how a Blackwell mbarrier wait is spelled in SASS, which is the part nobody here
+should be guessing at. `insns` is instructions per iteration, which is the figure a
+PTX loop-body count is comparable to.
+
+**Its first use killed two levers it was built for.** #150 and #151 counted the
+`mbarrier.try_wait.parity` spin body in PTX: eight instructions, of which one was an
+`add.s64` we paid and upstream did not (our barriers are offsets into one dynamic
+allocation, upstream's are static `.shared` symbols) and five were a predicate
+round-tripped through an `i32` because the intrinsic returns a Rust `bool`. In SASS
+the whole loop is:
+
+```
+YIELD ;
+SYNCS.PHASECHK.TRANS64.TRYWAIT P0, [R5+URZ], R4 ;
+@!P0 BRA `(.L_x_1845) ;
+```
+
+| | PTX poll body | **SASS poll body** |
+| --- | ---: | ---: |
+| upstream `gemm_sol_clc_multicast_4_stage_pipeline` | 7 | **3** |
+| `gemm_sol_m256_runtime` | 7 | **3** |
+| `gemm_sol_m256` as shipped | 8 | **3** |
+
+`ptxas` folds the predicate round-trip to nothing — `TRYWAIT P0` straight to
+`@!P0 BRA` — and holds the barrier address in a register across the loop
+(`[R5+URZ]`), so the `add.s64` and the symbol rematerialization are both gone.
+**All three poll bodies are the same three instructions**, the `YIELD` is `ptxas`
+*adding* a spin hint rather than overhead, and #150's advance prediction (2.7% of
+the K-block rate) is dead — not through its named falsifier but because the
+instruction it was about does not exist. Both issues closed, no container spent.
+
+**It also confirmed the one claim that mattered.** #148 attributes the stage fold's
++2.2–4.3% to the inter-stage critical path and explicitly *not* to the poll body,
+after an earlier reading had it the other way round. The shipped and pre-fold spin
+loops are **identical at 3 instructions**, so the fold's win cannot have come from
+the poll body at any level; and the two kernels' loop tables differ in exactly one
+row — 10 instructions an iteration where the pre-fold spelling has **14** — in a
+loop that is not the poll loop. That is the fold, at the machine level, in the place
+#148 said it was.
+
+**What this disturbs, and what it does not.** Being concrete matters more here than
+being alarmed, and most of what is above survives for a structural reason: **it is
+comparative between two of our own kernels through one toolchain**, and a uniform
+`ptxas` transform applies to both sides of such a comparison.
+
+Safe, and why:
+
+- **Every ablation arm's census.** `feed only` showing 0 in the `mma` column is a
+  presence-or-absence claim about a whole phase, and `ptxas` cannot invent a
+  `tcgen05.mma` that the PTX does not contain. Removal claims are robust in a way
+  cost claims are not.
+- **`regcount`'s registers, spills, stack frames and the occupancy gate.** Those
+  come from `ptxas -v`, which is already the far side of the optimizer.
+- **#125's `selp` count.** That was a claim that a flag folded *at PTX level*, i.e.
+  that LLVM had already done it. Learning that `ptxas` folds more only makes that
+  check conservative: zero in PTX is still zero in SASS.
+- **#148's between-MMA table read as a negative.** The conclusion drawn from it was
+  that we are leaner than upstream and *still* slower, so instruction count between
+  MMA issues is not the binding constraint. If `ptxas` folds even more of both
+  sides, that negative gets stronger rather than weaker.
+
+Not safe:
+
+- **Any absolute "this costs N instructions" from a PTX count.** #150 and #151 were
+  exactly that, and both were zero. The ratios in #148's between-MMA table (2.9
+  against 7.5 per issue) should be read as directional, not as magnitudes: if
+  `ptxas` folds five of eight instructions in a spin body, it plausibly folds a good
+  deal of the scalar chain between MMA issues too, and nobody has counted that in
+  SASS.
+- **PTX counts across *different* code shapes**, where the two sides may not receive
+  the same transform. Comparing our kernel to upstream's is the case to be careful
+  with; comparing our kernel to our own kernel one const apart is the case that is
+  fine.
+
+The pattern worth keeping: **a PTX count is a hypothesis, and a timed arm or SASS is
+the evidence.** The epilogue work reached the same place from the other direction —
+its census showed `.pack::16b` removing `cvt.rn.bf16x2` outright, 8 to 0, and a
+legal `nocvt` control that removed the same converts measured 0.0–1.4% *slower*, so
+the convert was never the cost the count implied. Two independent instruments, one
+conclusion about the instrument set.
 
 #### 8. Multicast has no geometry to live in
 

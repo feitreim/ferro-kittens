@@ -1,6 +1,6 @@
 //! Kernels written against the API we want.
 //!
-//! Four kernels, each with a header stating whether it **runs** or only
+//! Five kernels, each with a header stating whether it **runs** or only
 //! **compiles**. There used to be a third status — *aspirational*, naming API
 //! that did not exist yet — and an example in it was not a placeholder but a
 //! precise statement of a missing surface, in the only terms that matter, which
@@ -10,19 +10,20 @@
 //! | Kernel | Status |
 //! | --- | --- |
 //! | [`gemm`] | runs — checked against a CPU reference by [`gemm::check`] |
+//! | [`gemm_sol`] | runs — all three size-specialized entries checked exactly by [`gemm_sol::check`] |
 //! | [`softmax`] | runs — checked against a CPU reference by [`softmax::check`] |
 //! | [`layernorm`] | runs — checked against a CPU reference by [`layernorm::check`] |
 //! | [`flash_forward`] | compiles — no launcher yet |
 //!
 //! **Every kernel here is in the default build**, and there are no cargo
 //! features left. That is what makes `scripts/modal-run build` — a real
-//! `sm_100a` codegen of this crate — a regression gate on all four: a gated
+//! `sm_100a` codegen of this crate — a regression gate on all five: a gated
 //! kernel is not in the default feature set, so it was never compiled by the
 //! thing that compiles this crate, and the example exercising the most of the
 //! library at once was the one nothing checked.
 //!
 //! **Compiles is not runs**, and the distinction is the point of the column.
-//! Three of these have a launcher and a CPU reference and exit non-zero on a
+//! Four of these have a launcher and a CPU reference and exit non-zero on a
 //! wrong number; one has neither. Giving the last one a launcher is real work
 //! with a real failure mode — see the seed arguments in
 //! [`softmax::permutation`] and [`layernorm::value`], which had to answer
@@ -53,6 +54,7 @@ use std::process::ExitCode;
 pub mod bench;
 pub mod flash_forward;
 pub mod gemm;
+pub mod gemm_sol;
 pub mod layernorm;
 pub mod softmax;
 
@@ -87,6 +89,13 @@ fn examples() -> Vec<Example> {
             // The envelope the shipped epilogue declares: the operand rings and
             // the four per-warp staging tiles on the end of them.
             shared_bytes: gemm::STAGED_SHARED_BYTES,
+            entry: None,
+        },
+        Example {
+            name: "gemm_sol",
+            status: "runs (three cluster-tile entries)",
+            threads: gemm_sol::THREADS,
+            shared_bytes: gemm_sol::LARGE_SHARED_BYTES,
             entry: None,
         },
         Example {
@@ -234,6 +243,10 @@ fn checks(
         (
             "gemm",
             gemm::check(context).map_err(|error| error.to_string()),
+        ),
+        (
+            "gemm_sol",
+            gemm_sol::check(context).map_err(|error| error.to_string()),
         ),
         (
             "softmax",

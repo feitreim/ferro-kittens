@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use cuda_core::CudaContext;
 
-use crate::{gemm, layernorm, softmax};
+use crate::{gemm, gemm_sol, layernorm, softmax};
 
 #[path = "../../examples/src/bench.rs"]
 mod harness;
@@ -164,6 +164,18 @@ pub const CUBLASLT: Option<Baseline> = Some(Baseline {
 #[cfg(not(feature = "cublas"))]
 pub const CUBLASLT: Option<Baseline> = None;
 
+/// Closest live cuBLASLt reference for `gemm_sol`: FP16 inputs, FP32 compute,
+/// FP16 output. The port writes BF16, so the final 16-bit conversion differs
+/// while operand traffic, compute precision, and output width match.
+#[cfg(feature = "cublas")]
+pub const CUBLASLT_F16: Option<Baseline> = Some(Baseline {
+    name: "cuBLASLt FP16",
+    about: crate::cublaslt::about,
+    bench: crate::cublaslt::bench_f16,
+});
+#[cfg(not(feature = "cublas"))]
+pub const CUBLASLT_F16: Option<Baseline> = None;
+
 /// Sizes for `gemm`, picked to cross a regime rather than to be large.
 ///
 /// A cluster owns a `256 x 128` tile of `C`, so the first row is the smallest
@@ -194,6 +206,24 @@ pub const CUBLASLT: Option<Baseline> = None;
 /// `C` is 512 MiB of bf16 since #108, where it was 1 GiB of fp32 — against the
 /// 180 GiB a B200 carries, so the size is bounded by host staging time and not
 /// by the device.
+const GEMM_SOL_SIZES: &[Shape] = &[
+    Shape {
+        m: 4096,
+        n: 4096,
+        k: 4096,
+    },
+    Shape {
+        m: 8192,
+        n: 8192,
+        k: 8192,
+    },
+    Shape {
+        m: 16384,
+        n: 16384,
+        k: 16384,
+    },
+];
+
 const GEMM_SIZES: &[Shape] = &[
     // The smallest shape that is **one cluster running exactly one item**, and
     // therefore §7's "the small-size floor is one item boundary" row. It was
@@ -446,7 +476,8 @@ const LAYERNORM_SIZES: &[Shape] = &[
 ];
 
 fn cases() -> Vec<Case> {
-    vec![
+    #[allow(unused_mut)]
+    let mut cases = vec![
         Case {
             name: "gemm",
             bound: Bound::Compute,
@@ -455,6 +486,15 @@ fn cases() -> Vec<Case> {
             blocks: |shape| gemm::grid(shape.m, shape.n),
             bench: gemm::bench,
             baseline: CUBLASLT,
+        },
+        Case {
+            name: "gemm-sol",
+            bound: Bound::Compute,
+            sizes: GEMM_SOL_SIZES,
+            work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
+            blocks: gemm_sol::grid,
+            bench: gemm_sol::bench,
+            baseline: CUBLASLT_F16,
         },
         Case {
             name: "gemm-footprint",
@@ -508,7 +548,48 @@ fn cases() -> Vec<Case> {
             bench: layernorm::bench,
             baseline: None,
         },
-    ]
+    ];
+
+    // `gemm-sol`'s denominator was cuBLASLt and its *numerator* had no control
+    // arm: a port that reaches 0.795 of the library at 4096³ is either carrying
+    // port overhead or standing where the kernel it ports stands, and no
+    // measurement in this tree could tell those apart. These two cases are that
+    // control arm — upstream's device code unmodified, through this clock,
+    // staged from the same generators and held to the same exact check. See
+    // `gemm_sol_upstream.rs`.
+    //
+    // Two cases and not one because the variant policies differ: upstream takes
+    // M256xN256 up to 8192³ and the port crosses over to M512xN256 there, so
+    // `gemm-sol-upstream` is upstream's own selector and
+    // `gemm-sol-upstream-m512` forces the large entry at every size. The 8192³
+    // rows of the three tables are only comparable through the second.
+    //
+    // Feature-gated with the module, and `Cargo.toml` says why: with upstream's
+    // kernels in the bundle and no `-switch-to-lookup=false`, *nothing* in this
+    // crate loads.
+    #[cfg(feature = "gemm-sol-upstream")]
+    cases.extend([
+        Case {
+            name: "gemm-sol-upstream",
+            bound: Bound::Compute,
+            sizes: GEMM_SOL_SIZES,
+            work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
+            blocks: crate::gemm_sol_upstream::grid,
+            bench: crate::gemm_sol_upstream::bench,
+            baseline: CUBLASLT_F16,
+        },
+        Case {
+            name: "gemm-sol-upstream-m512",
+            bound: Bound::Compute,
+            sizes: GEMM_SOL_SIZES,
+            work: |shape| 2.0 * shape.m as f64 * shape.n as f64 * shape.k as f64,
+            blocks: crate::gemm_sol_upstream::grid,
+            bench: crate::gemm_sol_upstream::bench_m512,
+            baseline: CUBLASLT_F16,
+        },
+    ]);
+
+    cases
 }
 
 /// Examples with no row above, and why. There is no path through this file
@@ -575,7 +656,7 @@ fn compare(case: &Case, baseline: Baseline, rows: &[(Shape, Timings, Timings, St
          stream, not wall clock around the driver call."
     );
     println!(
-        "both sides read byte-identical operands — plain packed bf16 [m, k] and [n, k],\n\
+        "both sides read byte-identical operands — plain packed 16-bit [m, k] and [n, k],\n\
          K contiguous. ours reads them through a TMA tensor map and {0} through its own\n\
          matrix layouts; both descriptors are built once, outside the clock, as is every\n\
          allocation on both sides. no operand is rearranged for either party.",
@@ -587,8 +668,8 @@ fn compare(case: &Case, baseline: Baseline, rows: &[(Shape, Timings, Timings, St
     );
     println!(
         "ours computes only this form: both operands K-major, alpha 1, beta 0, no epilogue,\n\
-         and m % 256 == n % 128 == k % 64 == 0. {0} takes any of that, so a like-for-like\n\
-         rate against a library that is also general reads in our favour.",
+         with dimensions aligned to the compiled tile contract. {0} takes any of that, so a\n\
+         like-for-like rate against a library that is also general reads in our favour.",
         baseline.name
     );
     println!(
@@ -957,8 +1038,16 @@ fn relative_range(over: &[f64]) -> f64 {
     worst / best - 1.0
 }
 
-/// What a `bench <name> [<m> <n> <k>]` argument list selects: one case, and
-/// optionally one size of it instead of that case's whole sweep.
+/// What a `bench <name>[,<name>...] [<m> <n> <k>]` argument list selects: some
+/// of the cases, and optionally one size of them instead of their whole sweep.
+///
+/// **The list is one argument, comma-separated, and that is not cosmetic.**
+/// `modal_app.py::bench` takes a single `--case` and every extra invocation is
+/// another container, another image pull and another harness build for a few
+/// seconds of device time. Three tables that have to be read against each other
+/// — a kernel, the kernel it is a port of, and their shared baseline — are also
+/// three tables that should be taken on one device on one day, and one argument
+/// is what makes that a single run.
 ///
 /// Both narrowings exist for the same reason, which is that the sweep is the
 /// wrong thing to point an instrument at. A profiler serializes and replays
@@ -1133,6 +1222,41 @@ pub fn main() -> ExitCode {
         };
     }
 
+    // `bench sol` is the ninth, and the first of these that is about
+    // `gemm_sol` rather than about `gemm`. It rides this argument for the
+    // reason the eight above do, and it is its own sweep rather than more rows
+    // of the `gemm-sol` case because what it varies is the *plan* — which entry
+    // and which N band — with a wave-quantization prediction printed beside
+    // every row it is a test of.
+    if let Some((name, _)) = &selected
+        && name == "sol"
+    {
+        return match crate::sol::sweep(&context, CUBLASLT_F16) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // `bench sol-small` is the same sweep's sub-4096 ladder, and it is a
+    // separate argument rather than a fifth table because it is the only table
+    // in this file whose rows are short enough that the measurement is the
+    // binding uncertainty. It takes both rungs twice round-robin for that
+    // reason, which is rule 5 at the top of this file applied where it bites.
+    if let Some((name, _)) = &selected
+        && name == "sol-small"
+    {
+        return match crate::sol::sweep_small(&context, CUBLASLT_F16) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // `bench ablation` is the fourth, and the one that decomposes rather than
     // sweeps: the same size sweep `gemm-depth` runs, with one phase of the
     // item removed per rung and everything else held at the shipped kernel's.
@@ -1151,17 +1275,57 @@ pub fn main() -> ExitCode {
         };
     }
 
+    // `bench sol-ablate` is `ablation` asked of the other GEMM: #138's port is
+    // 0.795 of cuBLASLt at 4096³ and the PR names three suspects for it. It
+    // leads with the one that is arithmetic — one cluster per output tile over
+    // 74 resident clusters is a 0.865 ceiling at that shape before any cadence
+    // is measured — and then removes one phase at a time from the kernel's own
+    // device body to price the other three. #144 called this `sol`; `sol` is
+    // #146's plan sweep, so the two tables have two names.
     if let Some((name, _)) = &selected
-        && !cases().iter().any(|case| case.name == name)
+        && name == "sol-ablate"
     {
-        println!("no case named {name}; the sweep runs all of them when given no arguments");
+        return match crate::sol_ablate::decompose(&context) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // `bench sol-k` is the loose end #146 left: one shape it ran did not return.
+    // It is its own case and never part of another table, because a launch that
+    // hangs takes every row after it, which is exactly how it was found.
+    if let Some((name, _)) = &selected
+        && name == "sol-k"
+    {
+        return match crate::sol::sweep_k(&context, CUBLASLT_F16) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // Each name in the list has to name a case. A list where one of three is a
+    // typo would otherwise run two tables and say nothing about the third,
+    // which is the failure mode worth being loud about: the reader gets a
+    // plausible-looking run that is missing the arm they asked for.
+    if let Some((names, _)) = &selected
+        && let Some(unknown) = names
+            .split(',')
+            .find(|name| !cases().iter().any(|case| case.name == *name))
+    {
+        println!("no case named {unknown}; the sweep runs all of them when given no arguments");
         return ExitCode::FAILURE;
     }
 
     let mut failures = 0;
     for case in cases() {
         let sizes = match &selected {
-            Some((name, _)) if name != case.name => continue,
+            Some((names, _)) if !names.split(',').any(|name| name == case.name) => continue,
             Some((_, Some(shape))) => vec![*shape],
             _ => case.sizes.to_vec(),
         };
