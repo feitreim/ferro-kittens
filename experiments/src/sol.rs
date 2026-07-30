@@ -278,7 +278,7 @@ pub fn sweep_small(
 }
 
 /// A `k` ladder walked downward, one row at a time, announced before each launch —
-/// `bench sol-k`.
+/// `bench sol-k`. See #149.
 ///
 /// #146 found `4096x4096x1024` on `[256, 256]` printing nothing for 1200 s until
 /// `scripts/modal-run`'s watchdog stopped the container, while `4096x4096x2048`
@@ -291,6 +291,10 @@ pub fn sweep_small(
 /// printed is then the whole of the answer. Every row is a complete
 /// stage-check-time cycle at the shipped plan, so a row that prints is a row that
 /// computed the right `C`.
+///
+/// Pipe the run through `tee` and read the file as it grows rather than waiting on
+/// the exit status: the announcements are the instrument, and a capture that
+/// buffers them until the process ends throws away the one line that matters.
 pub fn sweep_k(
     context: &Arc<CudaContext>,
     baseline: Option<Baseline>,
