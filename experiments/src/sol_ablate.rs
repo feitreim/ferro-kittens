@@ -153,8 +153,8 @@ use crate::bench::{Shape, Timings, time};
 use crate::gemm_sol::{
     ATile, B_BOX, BLOCK_N, BPanel, DRAIN_NOCVT, DRAIN_PACK16, DRAIN_PAIRED, DRAIN_PER_ISSUE,
     DRAIN_WIDE, FEED_ONLY, HALF_N, ISSUE_ONLY, MMA_ONLY, NO_DRAIN, SHIPPED_DRAIN, SMALL_RINGS_END,
-    THREADS, TWICE_ALL, TWICE_GLOBAL, TWICE_SHARED, Variant, WHOLE, WIDE_B_BOX, WideBPanel,
-    clusters, default_group, large_body, small_body,
+    THREADS, TWICE_ALL, TWICE_GLOBAL, TWICE_SHARED, Variant, WATCH_OFF, WHOLE, WIDE_B_BOX,
+    WideBPanel, clusters, default_group, large_body, small_body,
 };
 
 /// SMs on the B200 this file's arithmetic is for, and CTAs one of them holds at

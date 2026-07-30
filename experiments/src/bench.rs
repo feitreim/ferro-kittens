@@ -1314,15 +1314,26 @@ pub fn main() -> ExitCode {
     // making progress terminates carrying where all six of its warps were
     // instead of riding the watchdog to the end of the container. Both handoff
     // depths, at the shape #149 is about and three below it.
+    // It runs the `sol-k` ladder after itself, in that order and in one
+    // container, because the two halves are one finding: the instrument says
+    // where the launch stopped, and the ladder says the shipped entry now walks
+    // the whole shallow-`k` region it stopped in. The instrument goes first
+    // because it is the half that cannot hang — a ladder that does would take
+    // everything printed after it.
     if let Some((name, _)) = &selected
         && name == "sol-watch"
     {
-        return match crate::sol_watch::sweep(&context) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                println!("FAIL  {error}");
-                ExitCode::FAILURE
-            }
+        let watched = crate::sol_watch::sweep(&context);
+        if let Err(error) = &watched {
+            println!("FAIL  {error}");
+        }
+        let laddered = crate::sol::sweep_k(&context, CUBLASLT_F16);
+        if let Err(error) = &laddered {
+            println!("FAIL  {error}");
+        }
+        return match (watched, laddered) {
+            (Ok(()), Ok(())) => ExitCode::SUCCESS,
+            _ => ExitCode::FAILURE,
         };
     }
 

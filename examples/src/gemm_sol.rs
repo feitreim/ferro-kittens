@@ -673,7 +673,7 @@ impl Common {
     /// At [`items`] of one this is `(ready.sem(0), index & 1)` and cell zero,
     /// which is the spelling the port carried and [`WATCH_ONE_DEEP`] keeps.
     #[inline(always)]
-    fn handoff<const ABLATE: u8>(self, index: u32) -> (Semaphore, u32, SharedCell<TileInfo>) {
+    fn handoff<const WATCH: u8>(self, index: u32) -> (Semaphore, u32, SharedCell<TileInfo>) {
         let depth = items(WATCH);
         (
             self.ready.sem(index % depth),
@@ -683,9 +683,9 @@ impl Common {
     }
 
     #[inline(always)]
-    unsafe fn publish<const ABLATE: u8>(self, index: u32, row: u32, column: u32, has_work: bool) {
+    unsafe fn publish<const WATCH: u8>(self, index: u32, row: u32, column: u32, has_work: bool) {
         unsafe {
-            let (ready, _, info) = self.handoff::<ABLATE>(index);
+            let (ready, _, info) = self.handoff::<WATCH>(index);
             info.write(TileInfo {
                 row,
                 column,
@@ -701,9 +701,9 @@ impl Common {
     /// leaves its loop by the path it already has, having first left the mark
     /// that says the exit was a stall and not a sentinel.
     #[inline(always)]
-    unsafe fn next_info<const ABLATE: u8>(self, sequence: u32) -> TileInfo {
+    unsafe fn next_info<const WATCH: u8>(self, sequence: u32) -> TileInfo {
         unsafe {
-            let (ready, parity, info) = self.handoff::<ABLATE>(sequence);
+            let (ready, parity, info) = self.handoff::<WATCH>(sequence);
             if watches(WATCH) && !ready.wait_before(parity, DEADLINE) {
                 self.stall(SITE_READY, sequence, sequence % items(WATCH), parity);
                 return TileInfo {
@@ -728,7 +728,7 @@ impl Common {
     /// The arm computes a deliberately wrong `C` past that point and is on no
     /// correctness gate.
     #[inline(always)]
-    unsafe fn wait_load<const ABLATE: u8>(self, slot: u32, parity: u32) {
+    unsafe fn wait_load<const WATCH: u8>(self, slot: u32, parity: u32) {
         unsafe {
             if watches(WATCH) {
                 if !self.load.sem(slot).wait_before(parity, DEADLINE) {
@@ -743,7 +743,7 @@ impl Common {
     /// [`Self::wait_load`] addressed by K-block index rather than by stage — the
     /// `global_k` spelling of the same wait.
     #[inline(always)]
-    unsafe fn wait_load_at<const ABLATE: u8>(self, index: u32) {
+    unsafe fn wait_load_at<const WATCH: u8>(self, index: u32) {
         unsafe {
             self.wait_load::<WATCH>(index % STAGES as u32, (index / STAGES as u32) & 1);
         }
@@ -752,7 +752,7 @@ impl Common {
     /// The epilogue's accumulator-full wait, per [`Self::wait_load`]. `false` is
     /// a stall the caller must leave its loop on.
     #[inline(always)]
-    unsafe fn wait_full<const ABLATE: u8>(self, sequence: u32) -> bool {
+    unsafe fn wait_full<const WATCH: u8>(self, sequence: u32) -> bool {
         unsafe {
             if watches(WATCH) {
                 let ok = self.full.wait_before(sequence, DEADLINE);
@@ -775,7 +775,7 @@ impl Common {
     /// Whether some warp of this CTA has given up. Const-false at every shipped
     /// arm, so the poll is not in the shipped kernel at all.
     #[inline(always)]
-    unsafe fn stalled<const ABLATE: u8>(self) -> bool {
+    unsafe fn stalled<const WATCH: u8>(self) -> bool {
         unsafe { watches(WATCH) && self.stop.read() != 0 }
     }
 
@@ -799,7 +799,7 @@ impl Common {
     /// separately. Written at every loop head as well as on every stall, so the
     /// last mark a warp left is where it was even when it never stalled at all.
     #[inline(always)]
-    unsafe fn mark<const ABLATE: u8>(self, site: u32, sequence: u32, index: u32, parity: u32) {
+    unsafe fn mark<const WATCH: u8>(self, site: u32, sequence: u32, index: u32, parity: u32) {
         if watches(WATCH) {
             unsafe { self.write_mark(site, sequence, index, parity) }
         }
