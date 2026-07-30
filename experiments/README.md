@@ -5116,7 +5116,7 @@ macro's business, not the type's. If it does not, the statics have to be declare
 per `#[kernel]` and threaded in, which is the design cost. Either way it is a
 **library-level** change — `src/sync.rs`'s `Semaphore` takes a pointer derived from
 a dynamic base and the `*_offset` consts are that base's layout, which #137 made
-one walk — so it pays every kernel with a pipeline and does not belong in this PR.
+one walk — so it pays every kernel with a pipeline and does not belong in this PR. Filed as **#150**.
 
 One thing the poll body says that is new: **five of its seven or eight
 instructions are not addressing at all** — `selp.b32`, `and.b32`, `setp.ne.b32`,
@@ -5124,7 +5124,9 @@ instructions are not addressing at all** — `selp.b32`, `and.b32`, `setp.ne.b32
 predicate and inverted, because `mbarrier_try_wait_parity` returns a Rust `bool`
 and the loop is `while !…`. A tight spin is `try_wait` then `@!p bra`, which is
 two. Upstream pays the same five, so this does not explain the gap against it — but
-it is five of eight instructions in every mbarrier spin in the repo.
+it is five of eight instructions in every mbarrier spin in the repo. Filed as
+**#151**. Both are PTX counts and `ptxas` may already fold them, so a CPU-only
+`cuobjdump -sass` step should settle both before either is treated as a lever.
 
 **What this does not separate.** Why the feed in situ costs 24.5% at 95.5% duty
 and 0.0% at 55.7% is a duty-cycle argument, not a mechanism: **bank conflicts
