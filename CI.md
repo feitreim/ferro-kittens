@@ -34,8 +34,19 @@ neither, so each gets those two checks for free.
 `#[path]`, so rustfmt visits those files twice. That is idempotent, and it is
 why `scripts/fmt` is a loop over manifests rather than anything cleverer.
 
-The `host`-gated links in `global`'s docs are allowed to dangle here (see the
-`cfg_attr` at the top of `src/lib.rs`); tier 2 is where they must resolve.
+**This tier does not check intra-doc links at all** — not `global`'s, not any.
+The `cfg_attr` at the top of `src/lib.rs` was added so the `host`-gated links
+into `global` could dangle without the feature, but `allow` at crate root
+applies to the whole crate: off `--features host`, *every* broken link in
+`src/` is suppressed. So a green `doc --no-deps` here says nothing about links,
+and tier 2's `cargo doc --features host` is the only gate on them. A bad
+`[crate::sync::depth_needed]` (the item is `sync::handoff::depth_needed`)
+passed a local `RUSTDOCFLAGS=-D warnings` doc run that way, and tier 2 on #164
+is what caught it.
+
+To check links before pushing, comment that `cfg_attr` line out and run
+`cargo doc --no-deps`. Every error naming `GlobalLayout` is a legitimate
+host-gated dangle; anything else is real. Restore the line before committing.
 
 ## Tier 2 — the host feature, device codegen without a device, and the register gate
 

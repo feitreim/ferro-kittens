@@ -27,7 +27,9 @@
 //! Design notes and measurements live in `docs/library/`.
 //!
 // `global`'s types are `feature = "host"`-gated, so the doc links pointing at
-// them from across the crate resolve only in the host build.
+// them from across the crate resolve only in the host build. This suppresses
+// *every* broken link off that feature, not just those — `cargo doc --features
+// host` is the only real gate on them (CI.md, tier 1).
 #![cfg_attr(not(feature = "host"), allow(rustdoc::broken_intra_doc_links))]
 
 pub mod epilogue;
