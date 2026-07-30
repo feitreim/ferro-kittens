@@ -81,6 +81,66 @@
 //! both of the others. An arm whose census does not read that way did not remove
 //! what it names, and its number is void.
 //!
+//! # The epilogue, which is the other half of this file
+//!
+//! Nine more arms decompose the drain rather than the launch: a **doubling
+//! ladder** (`twice global`/`twice shared`/`twice all`), four **drain rungs**
+//! (`per issue`, `paired`, `wide`, and the `nocvt` oracle), the never-launched
+//! `pack16`, and the **warpgroup split** (`two warpgroups` and its own control).
+//!
+//! Each ladder rung repeats one more pass of the drain per band, with the extra
+//! global stores aimed at the cluster's own first output tile so they stay in L2.
+//! An extra pass has nothing left to hide behind, so it is paid **serially by
+//! construction**: `twice all − per issue` is the drain's own occupancy cost `D`,
+//! and `paired − no drain` is what the launch pays. µs per tile per cluster:
+//!
+//! | | 4096³ `[256,256]` | 8192³ `[512,256]` |
+//! | --- | ---: | ---: |
+//! | `ld.shared` + `st.global` | 0.97 (36%) | 3.58 (41%) |
+//! | `stmatrix`, and a doubled one's write-after-write | 1.59 (59%) | 6.01 (69%) |
+//! | **`cvt`, `paired − nocvt`** | **−0.18 (0%)** | **−1.21 (0%)** |
+//! | **LDTM and its wait** | **0.14 (5%)** | **−0.86 (0%)** |
+//! | `D`, the whole chain serially | 2.70 | 8.73 |
+//! | `E`, what the launch pays | **5.35 (198% of `D`)** | **9.45 (108% of `D`)** |
+//!
+//! **`E > D`, so there is no overlap to fail** — the first drain costs the launch
+//! more than a whole extra one does, which is only possible if it slows the phase
+//! beside it. At 4096³, where the accumulator *is* double-buffered across output
+//! tiles, it is nearly twice as bad, so buffering is not sufficient.
+//!
+//! **And four of the five levers inside it measure zero.**
+//!
+//! - *LDTM waits.* Doubling `tcgen05.ld` and its waits costs nothing. #117 took
+//!   eight issues and eight waits a band down to one and one for +23.6/+8.6/+3.6%;
+//!   from there the rest are covered by the other warps. `paired` takes the last
+//!   two to one and is worth +0.7% at 8192³ and nothing at 4096³.
+//! - *The convert.* `nocvt` holds the LDTM count, the wait count, the eight
+//!   `stmatrix` a band and the stores, and takes `cvt` to **zero** — and is 0.0 to
+//!   1.4% *slower*. So the 69% is `stmatrix` and a doubled pass's own
+//!   write-after-write, not the `cvt` beside it. This is also what closes
+//!   `.pack::16b`: it folds the convert into the load (census `cvt` 0) and folding
+//!   the convert away is worth nothing. It faults besides.
+//! - *Store width.* Already maximal — `stmatrix.m8n8.x4` is the widest b16 form
+//!   and `st.global.v4` is 16 bytes.
+//! - *Warps.* The split doubles the epilogue's warps at the same total work, the
+//!   same byte-identical shared plan, and a `no drain` control at its own 320
+//!   threads that matches the 192-thread one to a tenth of a percent — and the
+//!   drain moves **−9% at 4096³ and +3% at 8192³**. See
+//!   [`crate::gemm_sol::TWO_WARPGROUPS`] for why: warps 0 and 4 own the *same* 32
+//!   tensor-memory lanes, so a column split puts two requesters on each of four
+//!   sub-partitions rather than spreading over more of them. The axis that is free
+//!   to split is not the axis the hardware parallelizes.
+//!
+//! So the drain is bound by something shared across warps rather than by
+//! per-warp latency, and it is not bytes: 262 144 B into shared per cluster per
+//! tile in ~6 µs is 3.5 TB/s device-wide against an SM's ~230 GB/s of shared write
+//! bandwidth, under 10% of it. It is not bank conflicts either — `Swizzle128B`
+//! maps one `stmatrix.m8n8` matrix's eight rows onto eight chunks whose banks tile
+//! all 32 exactly once, at every staging pitch here, because every row pitch is a
+//! whole multiple of 128 B and the row term drops out of the bank index. What is
+//! left is the `stmatrix` scatter's **transaction** rate, which nothing in this
+//! file separates from its byte rate.
+//!
 //! # The two levers, one of which pays
 //!
 //! Neither is an ablation: both compute the same `C` as the shipped kernel and
@@ -151,10 +211,11 @@ use kittens::shared::F16;
 
 use crate::bench::{Shape, Timings, time};
 use crate::gemm_sol::{
-    ATile, B_BOX, BLOCK_N, BPanel, DRAIN_NOCVT, DRAIN_PACK16, DRAIN_PAIRED, DRAIN_PER_ISSUE,
-    DRAIN_WIDE, FEED_ONLY, HALF_N, ISSUE_ONLY, MMA_ONLY, NO_DRAIN, SHIPPED_DRAIN, SMALL_RINGS_END,
-    THREADS, TWICE_ALL, TWICE_GLOBAL, TWICE_SHARED, Variant, WATCH_OFF, WHOLE, WIDE_B_BOX,
-    WideBPanel, clusters, default_group, large_body, small_body,
+    ATile, B_BOX, BAND_N, BLOCK_N, BPanel, DRAIN_NOCVT, DRAIN_PACK16, DRAIN_PAIRED,
+    DRAIN_PER_ISSUE, DRAIN_WIDE, FEED_ONLY, HALF_N, ISSUE_ONLY, LARGE_STAGE_N, MMA_ONLY, NO_DRAIN,
+    SHIPPED_DRAIN, SHIPPED_GROUPS, SMALL_RINGS_END, THREADS, TWICE_ALL, TWICE_GLOBAL, TWICE_SHARED,
+    TWO_WARPGROUPS, Variant, WATCH_OFF, WHOLE, WIDE_B_BOX, WideBPanel, clusters, default_group,
+    large_body, small_body, threads,
 };
 
 /// SMs on the B200 this file's arithmetic is for, and CTAs one of them holds at
@@ -213,6 +274,9 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -252,6 +316,9 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -291,6 +358,9 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -331,6 +401,9 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -372,6 +445,9 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -412,6 +488,9 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -453,6 +532,9 @@ pub mod kernels {
                 false,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -493,6 +575,9 @@ pub mod kernels {
                 false,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -522,9 +607,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, NO_DRAIN, true, SHIPPED_DRAIN, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                B_BOX,
+                NO_DRAIN,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -553,9 +646,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, ISSUE_ONLY, true, SHIPPED_DRAIN, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                B_BOX,
+                ISSUE_ONLY,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -584,9 +685,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, FEED_ONLY, true, SHIPPED_DRAIN, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                B_BOX,
+                FEED_ONLY,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -615,9 +724,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, MMA_ONLY, true, SHIPPED_DRAIN, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                B_BOX,
+                MMA_ONLY,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -648,9 +765,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<WIDE_B_BOX, WHOLE, true, SHIPPED_DRAIN, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                WIDE_B_BOX,
+                WHOLE,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -679,9 +804,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<WIDE_B_BOX, FEED_ONLY, true, SHIPPED_DRAIN, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                WIDE_B_BOX,
+                FEED_ONLY,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -711,9 +844,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, WHOLE, false, SHIPPED_DRAIN, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                B_BOX,
+                WHOLE,
+                false,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -742,9 +883,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, MMA_ONLY, false, SHIPPED_DRAIN, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                B_BOX,
+                MMA_ONLY,
+                false,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -784,6 +933,9 @@ pub mod kernels {
                 true,
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -823,6 +975,9 @@ pub mod kernels {
                 true,
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -862,6 +1017,9 @@ pub mod kernels {
                 true,
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -902,6 +1060,9 @@ pub mod kernels {
                 true,
                 DRAIN_PAIRED,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -941,6 +1102,9 @@ pub mod kernels {
                 true,
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -980,6 +1144,9 @@ pub mod kernels {
                 true,
                 DRAIN_WIDE,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -1020,6 +1187,9 @@ pub mod kernels {
                 true,
                 DRAIN_NOCVT,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -1060,6 +1230,9 @@ pub mod kernels {
                 true,
                 DRAIN_PACK16,
                 WATCH_OFF,
+                SHIPPED_GROUPS,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -1090,9 +1263,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, TWICE_GLOBAL, true, DRAIN_PER_ISSUE, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                B_BOX,
+                TWICE_GLOBAL,
+                true,
+                DRAIN_PER_ISSUE,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -1121,9 +1302,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, TWICE_SHARED, true, DRAIN_PER_ISSUE, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                B_BOX,
+                TWICE_SHARED,
+                true,
+                DRAIN_PER_ISSUE,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -1152,9 +1341,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, TWICE_ALL, true, DRAIN_PER_ISSUE, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                B_BOX,
+                TWICE_ALL,
+                true,
+                DRAIN_PER_ISSUE,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -1184,9 +1381,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, WHOLE, true, DRAIN_PAIRED, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                B_BOX,
+                WHOLE,
+                true,
+                DRAIN_PAIRED,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -1215,9 +1420,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, WHOLE, true, DRAIN_PER_ISSUE, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                B_BOX,
+                WHOLE,
+                true,
+                DRAIN_PER_ISSUE,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -1246,9 +1459,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, WHOLE, true, DRAIN_WIDE, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                B_BOX,
+                WHOLE,
+                true,
+                DRAIN_WIDE,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -1278,9 +1499,17 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, WHOLE, true, DRAIN_NOCVT, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                B_BOX,
+                WHOLE,
+                true,
+                DRAIN_NOCVT,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 
@@ -1310,9 +1539,178 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, WHOLE, true, DRAIN_PACK16, WATCH_OFF>(
-                a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
-            )
+            large_body::<
+                B_BOX,
+                WHOLE,
+                true,
+                DRAIN_PACK16,
+                WATCH_OFF,
+                SHIPPED_GROUPS,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
+        }
+    }
+
+    /// Eight epilogue warps splitting the accumulator's **columns** — two
+    /// warpgroups, `EPILOGUE_ROWS` warps each, at a byte-identical shared plan.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m256`], **at 320 threads**.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (320, 1, 1),
+        dynamic_shared = 196_864,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m256_wg2(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            small_body::<
+                BLOCK_N,
+                HALF_N,
+                B_BOX,
+                { BLOCK_N / 2 },
+                SMALL_RINGS_END,
+                WHOLE,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                TWO_WARPGROUPS,
+                BAND_N,
+                2,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
+        }
+    }
+
+    /// [`gemm_sol_m256_wg2`]'s own `no drain` control. It cannot share the
+    /// 192-thread one: the launch geometry differs, so the subtraction would
+    /// otherwise carry two warps of scheduling with it.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m256`], **at 320 threads**.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (320, 1, 1),
+        dynamic_shared = 196_864,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m256_wg2_nodrain(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            small_body::<
+                BLOCK_N,
+                HALF_N,
+                B_BOX,
+                { BLOCK_N / 2 },
+                SMALL_RINGS_END,
+                NO_DRAIN,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                TWO_WARPGROUPS,
+                BAND_N,
+                2,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
+        }
+    }
+
+    /// [`gemm_sol_m256_wg2`] at the `[512, 256]` entry.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m512`], **at 320 threads**.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (320, 1, 1),
+        dynamic_shared = 229_632,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m512_wg2(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            large_body::<
+                B_BOX,
+                WHOLE,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                TWO_WARPGROUPS,
+                { LARGE_STAGE_N / 2 },
+                BAND_N,
+                2,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
+        }
+    }
+
+    /// [`gemm_sol_m256_wg2_nodrain`] at the `[512, 256]` entry.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m512`], **at 320 threads**.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (320, 1, 1),
+        dynamic_shared = 229_632,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m512_wg2_nodrain(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            large_body::<
+                B_BOX,
+                NO_DRAIN,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                TWO_WARPGROUPS,
+                { LARGE_STAGE_N / 2 },
+                BAND_N,
+                2,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
 }
@@ -1338,6 +1736,10 @@ pub enum Arm {
     PerIssue,
     Wide,
     NoCvt,
+    /// Eight epilogue warps splitting the accumulator's columns.
+    Wg2,
+    /// [`Arm::Wg2`]'s own control, at its own thread count.
+    Wg2NoDrain,
     /// **Never launched.** `.pack::16b` faults on the device against an fp32
     /// accumulator — `Xid 13, Out Of Range Address` on every SM — so this arm
     /// exists for its opcode census and has no timed row. See
@@ -1376,7 +1778,11 @@ impl Arm {
     const DRAINS: [Arm; 4] = [Arm::Paired, Arm::PerIssue, Arm::Wide, Arm::NoCvt];
     /// The drain rungs that compute a right `C` and are therefore on [`check`].
     /// `NoCvt` and `Pack16` are not among them and cannot be.
-    const EXACT_DRAINS: [Arm; 3] = [Arm::Paired, Arm::PerIssue, Arm::Wide];
+    const EXACT_DRAINS: [Arm; 4] = [Arm::Paired, Arm::PerIssue, Arm::Wide, Arm::Wg2];
+    /// The warpgroup split and the pair of controls it is read against. Each arm
+    /// subtracts the `no drain` at **its own** thread count, because the split
+    /// changes the launch geometry and a shared control would carry that with it.
+    const WARPGROUPS: [Arm; 4] = [Arm::Paired, Arm::NoDrain, Arm::Wg2, Arm::Wg2NoDrain];
     /// Every arm the depth table turns into a rate. The two levers under test
     /// come last, because they are not phases removed.
     const LADDER: [Arm; 7] = [
@@ -1411,6 +1817,8 @@ impl Arm {
             Arm::PerIssue => "per issue",
             Arm::Wide => "wide",
             Arm::NoCvt => "nocvt",
+            Arm::Wg2 => "two warpgroups",
+            Arm::Wg2NoDrain => "two wg, no drain",
             Arm::Pack16 => "pack16",
         }
     }
@@ -1433,7 +1841,19 @@ impl Arm {
             Arm::PerIssue => "the drain #144 shipped: a wait per LDTM issue",
             Arm::Wide => "128-column bands, 4 LDTM in flight, 1 wait",
             Arm::NoCvt => "the shipped drain minus the cvt; WRONG C",
+            Arm::Wg2 => "8 epilogue warps, columns split, 320 threads",
+            Arm::Wg2NoDrain => "the same launch with the drain removed",
             Arm::Pack16 => ".pack::16b; FAULTS ON THE DEVICE, never launched",
+        }
+    }
+
+    /// Threads this arm's launch takes. The warpgroup-split arms are 320 and
+    /// everything else is 192, and getting this wrong is a launch that either
+    /// deadlocks on an arrival count or leaves warps out of the epilogue.
+    fn threads(self) -> u32 {
+        match self {
+            Arm::Wg2 | Arm::Wg2NoDrain => threads(TWO_WARPGROUPS),
+            _ => THREADS,
         }
     }
 
@@ -1515,7 +1935,7 @@ pub fn measure(
 
     let config = LaunchConfig1D::new(
         RANKS * (m / variant.m_tile() * (n / variant.n_tile())) as u32,
-        THREADS,
+        arm.threads(),
         variant.shared_bytes() as u32,
     );
     let (stream_ref, a_ptr, b_ptr) = (&stream, a_map.as_ptr(), b_map.as_ptr());
@@ -1547,6 +1967,26 @@ pub fn measure(
     }
 
     let launch_once = match (variant, arm) {
+        (Variant::M256xN256, Arm::Wg2) => {
+            launcher!(&ablated, prepare_gemm_sol_m256_wg2, gemm_sol_m256_wg2)
+        }
+        (Variant::M256xN256, Arm::Wg2NoDrain) => {
+            launcher!(
+                &ablated,
+                prepare_gemm_sol_m256_wg2_nodrain,
+                gemm_sol_m256_wg2_nodrain
+            )
+        }
+        (Variant::M512xN256, Arm::Wg2) => {
+            launcher!(&ablated, prepare_gemm_sol_m512_wg2, gemm_sol_m512_wg2)
+        }
+        (Variant::M512xN256, Arm::Wg2NoDrain) => {
+            launcher!(
+                &ablated,
+                prepare_gemm_sol_m512_wg2_nodrain,
+                gemm_sol_m512_wg2_nodrain
+            )
+        }
         (Variant::M256xN256, Arm::TwiceGlobal) => {
             launcher!(
                 &ablated,
@@ -2093,6 +2533,45 @@ fn drain_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The warpgroup split, each arm against the `no drain` at **its own** launch.
+///
+/// Four warps cannot fill the shared-memory pipeline and lane ownership forbids a
+/// fifth *within* a warpgroup — but warp 4 is warpgroup 1's warp 0 and owns the
+/// same rows, so eight warps split the accumulator's **columns**. Two whole passes
+/// each, because the effect being looked for is a few percent and one pass of that
+/// is not a number.
+fn warpgroup_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
+    println!(
+        "\n6. the epilogue's warpgroups — four warps against eight, splitting the\n\
+         accumulator's columns rather than its rows, at a byte-identical shared plan.\n\
+         each arm subtracts the `no drain` at its own thread count, because the split\n\
+         changes the launch geometry. `epilogue` is `whole - no drain` within a thread\n\
+         count, in µs per tile per cluster; `of one wg` above 1.00 is the split ahead."
+    );
+    for (shape, variant) in HEADLINE {
+        let (_, waves, _) = quantization(shape, variant);
+        for pass in 1..=2 {
+            println!("\n  {shape} — {}, pass {pass}", variant.name());
+            let minima = arm_rows(context, shape, variant, &Arm::WARPGROUPS, Arm::Paired)?;
+            println!(
+                "  {:<16}{:>9}{:>11}{:>13}{:>12}",
+                "warpgroups", "threads", "min ms", "epilogue", "of one wg"
+            );
+            for (name, whole, control, count) in [
+                ("one", minima[0], minima[1], THREADS),
+                ("two", minima[2], minima[3], threads(TWO_WARPGROUPS)),
+            ] {
+                println!(
+                    "  {name:<16}{count:>9}{whole:>11.4}{:>10.2} µs{:>12.3}",
+                    1e3 * (whole - control) / waves as f64,
+                    minima[0] / whole,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The drain rungs that compute a right `C`, against the reference
 /// `gemm_sol::check` uses, at the size it uses.
 ///
@@ -2131,13 +2610,13 @@ pub fn check(context: &Arc<CudaContext>) -> Result<String, Box<dyn Error>> {
     let mut notes = Vec::new();
     for variant in [Variant::M256xN256, Variant::M512xN256] {
         let tiles_n = (n / variant.n_tile()) as u32;
-        let config = LaunchConfig1D::new(
-            RANKS * (m / variant.m_tile() * (n / variant.n_tile())) as u32,
-            THREADS,
-            variant.shared_bytes() as u32,
-        );
         let group = default_group(m);
         for arm in Arm::EXACT_DRAINS {
+            let config = LaunchConfig1D::new(
+                RANKS * (m / variant.m_tile() * (n / variant.n_tile())) as u32,
+                arm.threads(),
+                variant.shared_bytes() as u32,
+            );
             let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
             macro_rules! launch {
                 ($prepare:ident, $call:ident) => {{
@@ -2165,6 +2644,9 @@ pub fn check(context: &Arc<CudaContext>) -> Result<String, Box<dyn Error>> {
                 (Variant::M256xN256, Arm::PerIssue) => {
                     launch!(prepare_gemm_sol_m256_per_issue, gemm_sol_m256_per_issue)
                 }
+                (Variant::M256xN256, Arm::Wg2) => {
+                    launch!(prepare_gemm_sol_m256_wg2, gemm_sol_m256_wg2)
+                }
                 (Variant::M256xN256, _) => {
                     launch!(prepare_gemm_sol_m256_wide, gemm_sol_m256_wide)
                 }
@@ -2173,6 +2655,9 @@ pub fn check(context: &Arc<CudaContext>) -> Result<String, Box<dyn Error>> {
                 }
                 (Variant::M512xN256, Arm::PerIssue) => {
                     launch!(prepare_gemm_sol_m512_per_issue, gemm_sol_m512_per_issue)
+                }
+                (Variant::M512xN256, Arm::Wg2) => {
+                    launch!(prepare_gemm_sol_m512_wg2, gemm_sol_m512_wg2)
                 }
                 (Variant::M512xN256, _) => {
                     launch!(prepare_gemm_sol_m512_wide, gemm_sol_m512_wide)
@@ -2364,6 +2849,7 @@ pub fn decompose(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
     fold_table(context)?;
     chain_table(context)?;
     drain_table(context)?;
+    warpgroup_table(context)?;
     depth_table(context)?;
     upstream_depth_table(context)?;
     println!(
