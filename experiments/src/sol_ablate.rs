@@ -530,7 +530,7 @@ pub mod kernels {
                 BLOCK_N,
                 SMALL_RINGS_END,
                 TWICE_GLOBAL,
-                SHIPPED_DRAIN,
+                DRAIN_PER_ISSUE,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -567,7 +567,7 @@ pub mod kernels {
                 BLOCK_N,
                 SMALL_RINGS_END,
                 TWICE_SHARED,
-                SHIPPED_DRAIN,
+                DRAIN_PER_ISSUE,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -597,7 +597,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, TWICE_ALL, SHIPPED_DRAIN>(
+            small_body::<BLOCK_N, HALF_N, B_BOX, BLOCK_N, SMALL_RINGS_END, TWICE_ALL, DRAIN_PER_ISSUE>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -756,7 +756,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, TWICE_GLOBAL, SHIPPED_DRAIN>(
+            large_body::<B_BOX, TWICE_GLOBAL, DRAIN_PER_ISSUE>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -787,7 +787,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, TWICE_SHARED, SHIPPED_DRAIN>(
+            large_body::<B_BOX, TWICE_SHARED, DRAIN_PER_ISSUE>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -818,7 +818,7 @@ pub mod kernels {
         mut c: DisjointSlice<u16>,
     ) {
         unsafe {
-            large_body::<B_BOX, TWICE_ALL, SHIPPED_DRAIN>(
+            large_body::<B_BOX, TWICE_ALL, DRAIN_PER_ISSUE>(
                 a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c,
             )
         }
@@ -989,7 +989,7 @@ impl Arm {
     /// rung against `paired` prices a whole extra drain, serially, by
     /// construction.
     const LADDER: [Arm; 4] = [
-        Arm::Paired,
+        Arm::PerIssue,
         Arm::TwiceGlobal,
         Arm::TwiceShared,
         Arm::TwiceAll,
@@ -1556,12 +1556,13 @@ fn chain_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
         let (_, waves, _) = quantization(shape, variant);
         let per_tile = |milliseconds: f64| 1e3 * milliseconds / waves as f64;
         println!("\n  {shape} — {}", variant.name());
-        let minima = arm_rows(context, shape, variant, &Arm::LADDER, Arm::Paired)?;
+        let minima = arm_rows(context, shape, variant, &Arm::LADDER, Arm::PerIssue)?;
         let no_drain = measure(context, shape, variant, Arm::NoDrain)?.min();
         let pack16 = measure(context, shape, variant, Arm::Pack16)?.min();
+        let paired = measure(context, shape, variant, Arm::Paired)?.min();
 
         let (base, twice_all) = (minima[0], minima[3]);
-        let exposed = per_tile(base - no_drain);
+        let exposed = per_tile(paired - no_drain);
         let serial = per_tile(twice_all - base);
         println!(
             "\n  the drain at {shape}, µs per tile per cluster ({:.0} B of `C`):",
@@ -1578,14 +1579,24 @@ fn chain_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
             );
         }
         println!(
-            "  {:<26}{serial:>8.2}           serial, `twice all - paired`",
+            "  {:<26}{serial:>8.2}           serial, `twice all - per issue`",
             "the whole chain"
         );
         println!(
-            "  {:<26}{:>8.2}{:>9.0}%  of the serial drain, and the cvt with no WAW on itself",
-            "cvt alone, `- pack16`",
-            per_tile(base - pack16),
-            100.0 * per_tile(base - pack16) / serial
+            "  {:<26}{:>8.2}{:>9.0}%  of the serial drain, and with no write-after-write on\n\
+             {:>36}its own staging tile, which the rung above pays",
+            "cvt alone, `paired - pack16`",
+            per_tile(paired - pack16),
+            100.0 * per_tile(paired - pack16) / serial,
+            "",
+        );
+        println!(
+            "  {:<26}{:>8.2}           `per issue - no drain`: the drain #144 shipped, so the\n\
+             {:>36}wait this file removed is worth {:.2} in situ",
+            "what it paid before",
+            per_tile(base - no_drain),
+            "",
+            per_tile(base - paired),
         );
         println!(
             "  {:<26}{exposed:>8.2}{:>9.0}%  of the serial drain — `paired - no drain`",
