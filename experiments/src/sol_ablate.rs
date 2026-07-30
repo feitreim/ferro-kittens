@@ -1316,7 +1316,11 @@ impl Arm {
     /// below, so the differences price the chain a third at a time — and the top
     /// rung against `per issue` prices a whole extra drain, serially, by
     /// construction.
-    const LADDER: [Arm; 4] = [
+    ///
+    /// Not to be confused with [`Arm::LADDER`], which is the depth table's arm
+    /// set: that one sweeps `K` with the kernel held, this one holds the shape and
+    /// repeats a phase.
+    const DOUBLING: [Arm; 4] = [
         Arm::PerIssue,
         Arm::TwiceGlobal,
         Arm::TwiceShared,
@@ -1378,6 +1382,14 @@ impl Arm {
             Arm::WideFeed => "feed only, B in one TMA not two",
             Arm::RuntimeWhole => "the shipped kernel, ring index off global_k",
             Arm::RuntimeMma => "mma only, ring index off global_k",
+            Arm::TwiceGlobal => "+ a second ld.shared + st.global pass a band",
+            Arm::TwiceShared => "+ a second cvt + stmatrix pass as well",
+            Arm::TwiceAll => "+ a second LDTM: the whole drain twice",
+            Arm::Paired => "the shipped drain, this crate: 2 LDTM, 1 wait",
+            Arm::PerIssue => "the drain #144 shipped: a wait per LDTM issue",
+            Arm::Wide => "128-column bands, 4 LDTM in flight, 1 wait",
+            Arm::NoCvt => "the shipped drain minus the cvt; WRONG C",
+            Arm::Pack16 => ".pack::16b; FAULTS ON THE DEVICE, never launched",
         }
     }
 
@@ -1931,7 +1943,7 @@ fn chain_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
         let (_, waves, _) = quantization(shape, variant);
         let per_tile = |milliseconds: f64| 1e3 * milliseconds / waves as f64;
         println!("\n  {shape} — {}", variant.name());
-        let minima = arm_rows(context, shape, variant, &Arm::LADDER, Arm::PerIssue)?;
+        let minima = arm_rows(context, shape, variant, &Arm::DOUBLING, Arm::PerIssue)?;
         let no_drain = measure(context, shape, variant, Arm::NoDrain)?.min();
         let nocvt = measure(context, shape, variant, Arm::NoCvt)?.min();
         let paired = measure(context, shape, variant, Arm::Paired)?.min();
