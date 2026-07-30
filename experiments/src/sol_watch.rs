@@ -23,14 +23,47 @@
 //! `C` to compare against. That is what makes the pair a test of the depth rather
 //! than a story about it.
 //!
-//! # What a healthy row looks like
+//! # What it found
 //!
-//! Every warp's last mark is `exited`, the report has no `STALL` in it, and `C` is
-//! exact. A row that stalls prints the marks instead, and the sites are the whole
-//! diagnosis: `STALL ready` is the item handoff, `STALL free` and `STALL load` the
-//! operand ring, `STALL clc` the hardware's work queue, `STALL full` and
-//! `STALL empty` the accumulator handshake — one site per candidate in #149's
-//! list.
+//! One container, four `k` rungs, both depths, every row's `C` compared against
+//! the fp32 reference over all 16 777 216 outputs:
+//!
+//! | shape | one deep | four deep |
+//! | --- | --- | --- |
+//! | 4096x4096x1280 | exact | exact |
+//! | 4096x4096x1024 | exact | exact |
+//! | **4096x4096x512** | **11 885 748 of 16 777 216 outputs wrong** | exact |
+//! | **4096x4096x256** | **11 896 908 of 16 777 216 outputs wrong** | exact |
+//!
+//! **The wrong outputs are zeros** — `C[0, 1536] = 0, want -1042` — so they are
+//! not miscomputed, they are **never written**. Whole output tiles are missing,
+//! which is the overwrite branch of the defect seen directly: the producer
+//! republished into the one `info` cell before the epilogue read it, the epilogue
+//! read a later item's coordinates, and the item it skipped was left at the
+//! buffer's zeros. 71% of `C` is a large number for that because a cluster runs
+//! three or four items and losing one loses a quarter of its work.
+//!
+//! **No CTA stalled at any rung**, which is the honest caveat: the instrument
+//! perturbs the race it measures. The marks are stores, they cost the roles a
+//! little, and under them the one-deep arm takes the *overwrite* branch where the
+//! shipped kernel took the *never-flips-again* branch two rungs higher. The two
+//! are one defect — [`kittens::sync::handoff::depth_needed`] enumerates both from
+//! the same state space — but this arm did not reproduce the hang itself, and
+//! nothing here says which branch `4096x4096x1024` took before the fix.
+//!
+//! The report also says what a launch's warp population actually is, which is
+//! worth knowing: at 4096² only **888** of the 3072 warps the grid asks for ever
+//! wrote a mark, and 888 is 148 CTAs × 6 warps. CLC cancelled the other 364
+//! clusters before they launched, so a "512-cluster launch" is 74 clusters running
+//! three or four items each.
+//!
+//! # Reading a row
+//!
+//! Every warp's last mark is `exited` in a healthy row. A row that stalls prints
+//! the marks instead, and the sites are the whole diagnosis: `STALL ready` is the
+//! item handoff, `STALL free` and `STALL load` the operand ring, `STALL clc` the
+//! hardware's work queue, `STALL full` and `STALL empty` the accumulator
+//! handshake — one site per candidate in #149's list.
 
 use std::error::Error;
 use std::sync::Arc;

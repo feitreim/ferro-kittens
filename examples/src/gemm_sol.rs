@@ -31,6 +31,18 @@
 //! FP16 B `[N, K]` (therefore `A·Bᵀ`), and packed row-major BF16 C `[M, N]`.
 //! `n` is a multiple of 256 for the two 256-wide entries and of 128 for
 //! `[256, 128]`, which is the one place the shape contract widens.
+//!
+//! **The item handoff is [`ITEMS`] deep and the depth is derived, not chosen.** A
+//! cluster's producer publishes a work item's coordinates through a mailbox behind
+//! a phase-parity wait, and such a mailbox is sound only while the producer leads
+//! its slowest consumer by less than the ring's depth. This was **one** barrier and
+//! **one** cell through #148 — upstream spells it that way too — while the chain of
+//! back-pressure between the producer, the MMA warp and the epilogue lets **four**
+//! publications be outstanding. #149 is what that cost: `4096x4096x1024` did not
+//! return, inside its own shape contract. The derivation is on [`ITEMS`], the
+//! exhaustive search that checks it is
+//! [`kittens::sync::handoff::depth_needed`], and the depth costs no shared memory
+//! — it fits in the padding the staging buffer already left.
 
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::cluster;

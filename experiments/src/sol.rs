@@ -49,7 +49,10 @@
 //! 4. **a shape whose `k` is not its `m`** — one row, last, because the tables
 //!    above are worth more than it is and a launch that does not return takes
 //!    everything after it with it. `4096x4096x1024` wedged a container in the
-//!    first run of this sweep and is not in it; `4096x4096x2048` is.
+//!    first run of this sweep and is not in it; `4096x4096x2048` is. That shape is
+//!    fixed as of #149 — the item handoff was one cell deep and the chain of
+//!    back-pressure needs four — and [`sweep_k`] is where the whole region below
+//!    `k = 2048` is now walked, on all three entries, down to `k = 256`.
 //!
 //! # What is deliberately not here
 //!
@@ -295,6 +298,37 @@ pub fn sweep_small(
 /// Pipe the run through `tee` and read the file as it grows rather than waiting on
 /// the exit status: the announcements are the instrument, and a capture that
 /// buffers them until the process ends throws away the one line that matters.
+///
+/// # Since #149 every rung returns
+///
+/// The mechanism was the item handoff's depth — one `ready` barrier and one `info`
+/// cell against a chain of back-pressure that lets four publications be
+/// outstanding — so the ladder was widened rather than left at the boundary it
+/// found. All 22 rows below are exact and timed, in one container:
+///
+/// | shape | `[256, 256]` | `[256, 128]` | `[512, 256]` |
+/// | --- | ---: | ---: | ---: |
+/// | 4096x4096x2048 | 0.772 | 0.662 | 0.686 |
+/// | 4096x4096x1280 | 0.728 | 0.661 | 0.608 |
+/// | **4096x4096x1024** | **0.688** | 0.642 | 0.570 |
+/// | 4096x4096x768 | 0.651 | 0.593 | 0.510 |
+/// | 4096x4096x512 | 0.578 | 0.547 | 0.459 |
+/// | 4096x4096x256 | 0.539 | 0.524 | 0.452 |
+///
+/// as a fraction of cuBLASLt FP16 at the same shape. `4096x4096x1024` is the row
+/// that did not return; it is 0.0394 ms and 871.5 TFLOP/s.
+///
+/// **Shallow `k` is a real slope and not a cliff**, which is what makes the fixed
+/// ladder worth keeping: the ratio falls monotonically from 0.772 to 0.539 as `k`
+/// drops from 2048 to 256, because the per-tile constant #148 priced at 3.4 µs is
+/// amortized over four K blocks instead of thirty-two. That is the entry's shape,
+/// not a defect, and the entry ordering does not change across it — `[256, 256]`
+/// leads at every rung.
+///
+/// The `m` sweep after it is the control the issue asked for: at 4096² the grid is
+/// 256 tiles over 256 clusters at *every* `k`, so the ladder cannot separate the
+/// trip count from tiles-per-cluster. Sweeping `m` at `k = 1024` moves the grid
+/// from 64 clusters to 512 at one trip count, and all four rows are exact.
 pub fn sweep_k(
     context: &Arc<CudaContext>,
     baseline: Option<Baseline>,
