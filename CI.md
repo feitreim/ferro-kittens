@@ -67,8 +67,17 @@ see it; only an actual device build can. This is the highest value-per-minute
 job here, and it needs no GPU.
 
 A second job runs `scripts/modal-run regcount`: the `ptxas -v` table, the
-shape ladder, #63's timed twins, and #95's **occupancy-step gate**, which fails
-when a named kernel's register count would cost it a CTA per SM. That entry
+shape ladder, #63's timed twins, #95's **occupancy-step gate**, which fails
+when a named kernel's register count would cost it a CTA per SM, and the
+**local-memory depot census** — `.local` in the PTX text, which is upstream of
+ptxas and disjoint from the spill columns (a ptxas spill happens after PTX and
+never appears in it). The census was built as a gate against the depot a
+value-select among per-stage shared symbols lowers to (710 vs 857 TFLOP/s on
+otherwise-identical kernels, cuda-learning `kernels/barrier_bench`), and its
+first run is why it reports instead: every shipped kernel already carries a
+frame nobody had attributed, sitting in the stack column no audit was reading.
+It arms into a gate when the shipped set reads zero — the section comment in
+`modal_app.py` carries the day-one census and the argument. That entry
 point predates this job by a long way and until #95 ran in no workflow at all,
 so a kernel could cross the step on any PR and nothing would say so. It is a
 separate job because it goes red for a different reason than `build` does — a

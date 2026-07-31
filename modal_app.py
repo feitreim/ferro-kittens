@@ -1848,6 +1848,103 @@ def _check_occupancy_step(measured: dict[tuple[str, str], dict[str, int]]) -> No
     print("\n  every gated kernel is inside its step.")
 
 
+# --- the local-memory depot --------------------------------------------------
+#
+# A stage selection that makes LLVM *choose a value* among distinct shared
+# symbols — a `match` yielding pointers or barrier references, one static per
+# stage — lowers through a local-memory depot: the candidates are stored to
+# `.local` and the winner reloaded, in the hot loop, every iteration. Measured
+# on the real work-stealing gemm at 8192³ in cuda-learning's `barrier_bench`,
+# three otherwise-identical kernels: the depot spelling reads 710 TFLOP/s
+# against 857 for the same pipeline with stage selection as `base.add(i)`.
+#
+# This library's ring types (`SemaphoreRing`, `SharedTileRing`, `StoreRing`)
+# and the single-symbol `SharedPlan` exist so that selection *is* `base.add(i)`
+# and that class cannot arise. But `.local` has more than one way in, and the
+# depot is LLVM's, so it is in the PTX **text** — a `.local .align` frame
+# declaration and the `st.local`/`ld.local` that traffic it. That makes this
+# census exactly disjoint from the spill columns above: a ptxas spill happens
+# *after* PTX and never appears in it. Nothing in the tree emits `.local` by
+# hand — no `ptx_asm!` block contains it — so any occurrence is the compiler's.
+#
+# **This began life as a gate and its first run is why it is a report.** On the
+# tree at #165 every kernel either crate ships carries a frame: 256 B with
+# 64 st.local / 16 ld.local for the whole staged-x8x4 family — the examples
+# copy, the experiments copy, and every `gemm_sol_*` / `gemm_ws_*` rung beside
+# them — 528 B on `gemm_cg2`, 1824 B on `flash_forward`, ~1540 B on
+# `groupnorm_tile`. All of it was in ptxas' stack column all along, watched by
+# nobody, because every audit (#152 most recently) read the *spill* columns,
+# which are ptxas' own decisions and stayed zero. The 64-store/16-load shape —
+# scalar stores, a quarter as many loads, so plausibly `.v4` reads of an array
+# built element-wise — points at a dynamically-indexed fragment array rather
+# than at stage selection, and it recurs across kernels that share `reg.rs`
+# types. That is a guess: what these frames are, and whether any of their
+# traffic sits in a hot loop (`_print_sass_loops` can say), is unestablished.
+# Until it is, failing on them would gate on a number nobody understands. The
+# arming condition is a shipped set that reads zero here; flip the report back
+# to a raise when it does.
+#
+# Substrings of the PTX text, counted per entry function the way the census
+# counts opcodes. The frame declaration is one column and its traffic is two
+# more, so a row says not just that a frame exists but whether anything still
+# reads it.
+DEPOT_PATTERNS = (
+    (".local decl", ".local .align"),
+    ("st.local", "st.local"),
+    ("ld.local", "ld.local"),
+)
+
+
+def _local_census() -> dict[tuple[str, str], dict[str, int]]:
+    """`.local` declarations and traffic per entry function, over every
+    crate's PTX, keyed by `(crate, kernel)` like the occupancy gate."""
+    counted: dict[tuple[str, str], dict[str, int]] = {}
+    for _, directory in PTX_CRATES:
+        for ptx in sorted(Path(directory).rglob("*.ptx")):
+            crate = str(ptx.relative_to(PROJECT_DIR)).split("/", 1)[0]
+            for chunk in ptx.read_text().split(".visible .entry ")[1:]:
+                name = chunk.split("(", 1)[0].strip()
+                counted[(crate, name)] = {
+                    column: chunk.count(pattern) for column, pattern in DEPOT_PATTERNS
+                }
+    return counted
+
+
+def _print_local_depot() -> None:
+    """`.local` in the PTX text, per entry function — a report today, a gate
+    when the shipped set reads zero (see the section comment for why not yet).
+
+    The `shipped` column marks every kernel `examples/` emits plus the
+    `GATED_KERNELS` rows: the kernels a launch gets by default, and the ones
+    whose residency is already an argument. Those are the rows the armed gate
+    will fail on. Probes will stay report-only either way — the ladder's
+    `all_in_place` spelling streams its band through local memory on purpose,
+    and #94's history says a kernel can pay a frame and win."""
+    counted = _local_census()
+    trafficked = {key: counts for key, counts in counted.items() if any(counts.values())}
+    shipped = {key for key in counted if key[0] == "examples"}
+    shipped |= {(package, kernel) for kernel, package, _ in GATED_KERNELS}
+
+    print("\n  the local-memory depot — `.local` in the PTX text, per entry function.")
+    print("  A ptxas spill never appears in PTX, so this is LLVM's local memory and")
+    print("  nothing else; the stack column above is where it has been hiding. Diff")
+    print("  this table across a change the way the register table is diffed:")
+    if not trafficked:
+        print(f"    zero everywhere: none of the {len(counted)} entry functions declare")
+        print("    or touch `.local`. The section comment says this is the arming")
+        print("    condition — flip this report back to a gate.")
+        return
+
+    columns = [column for column, _ in DEPOT_PATTERNS]
+    print(f"    {'kernel':<46}" + "".join(f"{column:>13}" for column in columns) + f"{'':>9}")
+    for (crate, name), counts in sorted(trafficked.items()):
+        row = "".join(f"{counts[column]:>13}" for column in columns)
+        print(f"    {crate + '/' + name:<46}{row}{'shipped' if (crate, name) in shipped else '':>9}")
+    carrying = sum(1 for key in trafficked if key in shipped)
+    print(f"    ({len(counted) - len(trafficked)} further entry functions carry none.)")
+    print(f"\n  {carrying} of {len(shipped)} shipped kernels carry local memory.")
+
+
 @app.function(cpu=8, timeout=CHECKING)
 @completes
 def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) -> None:
@@ -1888,6 +1985,12 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     one is about *occupancy*, which is the one consequence of the count that
     does not depend on a theory of what the registers are for.
 
+    The fifth reads a different substrate: the PTX *text*, where LLVM's
+    local-memory depot lives and a ptxas spill does not. It is a report rather
+    than a gate, because its first run found every shipped kernel carrying one
+    — see `_print_local_depot`'s section comment for the day-one census, the
+    idiom the check was built against, and the condition under which it arms.
+
     `--determinism` measures the same tree twice, with both crates' artifacts
     thrown away in between, and asserts the two tables are identical. It is not
     ceremony: a diff of this table is only evidence if the table is a function
@@ -1904,6 +2007,7 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     _print_ladder(measured)
     _print_timed_twins(measured)
     _check_occupancy_step(measured)
+    _print_local_depot()
 
     if not determinism:
         return
