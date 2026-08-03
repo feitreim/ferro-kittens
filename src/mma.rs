@@ -172,6 +172,20 @@ pub unsafe fn mma_abt<
 /// One 64-wide output band per `B` subtile, accumulated into
 /// `tmem + subtile * 64`; `accumulate` false starts every band fresh.
 ///
+/// **`shape`'s `N` is the band's width and not the tile's** — 64 under a
+/// 128-byte swizzle atom and a 2-byte element, for every `B` this walk accepts.
+/// The `[M, N]` the operands describe is the *whole* accumulation, which this
+/// walk reaches in `B::SUBTILES` instructions rather than one; passing it here
+/// makes every band overlap the next by half and the last run `N / 2` columns
+/// past the accumulator. That is a wrong `D` and not a fault, since the columns
+/// are usually still inside the allocation ([#175]).
+///
+/// It is the one place in this module where the shape is not the operands'
+/// logical product, and the reason it is an argument at all is [#128].
+///
+/// [#175]: https://github.com/feitreim/ferro-kittens/issues/175
+/// [#128]: https://github.com/feitreim/ferro-kittens/issues/128
+///
 /// ```no_run
 /// # use kittens::mma::{MmaShape, mma_ab};
 /// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
@@ -180,13 +194,15 @@ pub unsafe fn mma_abt<
 /// #     p: SharedTile<Bf16, 128, 64, Swizzle128B>,
 /// #     v: SharedTile<Bf16, 64, 128, Swizzle128B>,
 /// # ) { unsafe {
-/// mma_ab(tmem, p, v, MmaShape::M128_N128, true);
+/// // `[128, 128]` of accumulator, in two `M128_N64` bands.
+/// mma_ab(tmem, p, v, MmaShape::M128_N64, true);
 /// # } }
 /// ```
 ///
 /// # Safety
 ///
 /// - As [`mma_abt`].
+/// - `shape`'s `N` is `B::SUBTILE_COLS`, per the paragraph above.
 /// - `tmem` owns `64 * B::SUBTILES` fp32 columns.
 #[inline(always)]
 pub unsafe fn mma_ab<E: MmaElement, const AR: usize, const K: usize, const N: usize, S: Swizzle>(
@@ -394,11 +410,13 @@ pub unsafe fn mm_abt<
     unsafe { mma_abt(tmem, a, b, shape, false) }
 }
 
-/// `D = A·B` — [`mma_ab`] starting every output band fresh. See [`mm_abt`].
+/// `D = A·B` — [`mma_ab`] starting every output band fresh. See [`mm_abt`],
+/// and [`mma_ab`] for why `shape`'s `N` is the band's width rather than the
+/// tile's.
 ///
 /// # Safety
 ///
-/// As [`mma_ab`].
+/// As [`mma_ab`], including the band-width clause on `shape`.
 #[inline(always)]
 pub unsafe fn mm_ab<E: MmaElement, const AR: usize, const K: usize, const N: usize, S: Swizzle>(
     tmem: u32,
