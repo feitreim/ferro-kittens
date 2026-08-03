@@ -250,9 +250,16 @@ pub mod kernels {
 
             let out_acc = out_acc.div_row(running_sum);
 
+            // The output is packed [heads, queries, HEAD] — the panel axis of
+            // the three input maps, spelled on the output's row axis. The head
+            // term of this sum was missing until the first checked run: the
+            // TMA maps take the head as a plane coordinate and could not get
+            // it wrong, but this cursor takes the address it is handed, and
+            // every head wrote query block x's rows of the same panel.
+            let out_base = QUERIES as u32 * thread::gridDim_x() * thread::blockIdx_y() + query_base;
             store_rows(
                 GlobalRows::<F32>::from_slice(&mut out, HEAD),
-                query_base + 32 * warp_id,
+                out_base + 32 * warp_id,
                 0,
                 lane,
                 out_acc,
@@ -425,9 +432,10 @@ fn run<T>(
     use cuda_core::{DeviceBuffer, LaunchConfig};
     use kittens::global::encode_bf16_panels;
 
-    /// One doubling above the measured worst relative error of the correct
-    /// kernel; the argument is in `docs/kernels/flash_forward.md`.
-    const TOLERANCE: f32 = 1.0 / 128.0;
+    /// One doubling above the 1.66e-3 a correct kernel measures, which is
+    /// `P`'s trip to bf16 on its way to being the second MMA's `A` operand;
+    /// the argument is in `docs/kernels/flash_forward.md`.
+    const TOLERANCE: f32 = 1.0 / 256.0;
 
     if !sequence.is_multiple_of(QUERIES) || heads == 0 {
         return Err(format!(
@@ -511,7 +519,7 @@ fn run<T>(
         }
     }
     if wrong > 0 {
-        return Err(format!("{wrong} outputs outside 2^-7: {}", sample.join("; ")).into());
+        return Err(format!("{wrong} outputs outside 2^-8: {}", sample.join("; ")).into());
     }
 
     let mut launch_once = || launch(&mut out);
