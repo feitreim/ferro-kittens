@@ -184,6 +184,28 @@ fn a_staged_drain_is_two_calls<E: Element<Unpacked = [f32; 2]>, const M: usize, 
     }
 }
 
+/// §2.6 — a staged tile can be folded into memory as well as written over it
+/// (#169), and the fold is the element's arithmetic.
+///
+/// Named separately from `a_staged_drain_is_two_calls` because the two halves
+/// can rot apart: `accumulate_shared_rows` could survive a rename of
+/// `Element::add_packed` only by growing a hand-written add, which is the exact
+/// thing the trait method exists to prevent. `E` is unbounded here where the
+/// staged drain bounds `Unpacked = [f32; 2]`, which is the claim that the fold
+/// is *not* an `stmatrix` path and takes an fp32 destination too.
+fn a_staged_tile_can_be_folded_into_memory<E: Element, const M: usize, const N: usize>(
+    tile: kittens::SharedTile<E, M, N, kittens::Swizzle128B>,
+    rows: kittens::global::GlobalRows<E>,
+    thread: u32,
+) {
+    let _: u32 = E::add_packed(0, 0);
+    unsafe {
+        kittens::global::accumulate_shared_rows::<E, M, N, kittens::Swizzle128B, 32>(
+            rows, 0, 0, thread, tile,
+        );
+    }
+}
+
 /// §2.1 — the `.x8` drain (#117), beside the `.x1` one it is eight times fewer
 /// issues than.
 fn the_tmem_drain_has_both_widths<const M: usize, const N: usize>(

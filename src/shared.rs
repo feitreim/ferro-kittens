@@ -119,6 +119,20 @@ pub trait Element {
     unsafe fn read_pair(at: *const u8) -> (f32, f32) {
         unsafe { (Self::read(at), Self::read(at.add(Self::BYTES))) }
     }
+
+    /// Fold two packed words lane-wise: widen both, add in fp32, round the sum
+    /// back to `Self` **once**.
+    ///
+    /// What an accumulating epilogue owes, and the reason it belongs here
+    /// rather than at a call site. `C += x` at a narrow element is not
+    /// `pack(unpack(c)) + pack(unpack(x))` — the addend has already been
+    /// rounded on its way in, and rounding the sum again after that is a second
+    /// error the accumulator did not have to carry.
+    /// [`crate::global::accumulate_shared_rows`] is the only caller, and every
+    /// implementation here is `unpack`, `+`, `pack` with nothing between.
+    ///
+    /// Pure arithmetic on two words: no addresses, so nothing to make unsafe.
+    fn add_packed(current: u32, update: u32) -> u32;
 }
 
 /// `collector::a::discard` — tcgen05's own default, and what every walk here
@@ -206,6 +220,12 @@ impl Element for F16 {
     unsafe fn read_pair(at: *const u8) -> (f32, f32) {
         let [first, second] = Self::unpack(unsafe { *(at as *const u32) });
         (first, second)
+    }
+
+    #[inline(always)]
+    fn add_packed(current: u32, update: u32) -> u32 {
+        let ([a, b], [c, d]) = (Self::unpack(current), Self::unpack(update));
+        Self::pack([a + c, b + d])
     }
 }
 
@@ -295,6 +315,12 @@ impl Element for Bf16 {
     unsafe fn read_pair(at: *const u8) -> (f32, f32) {
         let [first, second] = Self::unpack(unsafe { *(at as *const u32) });
         (first, second)
+    }
+
+    #[inline(always)]
+    fn add_packed(current: u32, update: u32) -> u32 {
+        let ([a, b], [c, d]) = (Self::unpack(current), Self::unpack(update));
+        Self::pack([a + c, b + d])
     }
 }
 
@@ -410,6 +436,15 @@ impl Element for F32 {
             );
             (first, second)
         }
+    }
+
+    /// One value a word, and fp32 rounds nothing on the way back — so this is
+    /// the fp32 addition itself, and the "round once" the trait's contract talks
+    /// about is vacuous here.
+    #[inline(always)]
+    fn add_packed(current: u32, update: u32) -> u32 {
+        let ([a], [b]) = (Self::unpack(current), Self::unpack(update));
+        Self::pack([a + b])
     }
 }
 
@@ -1602,6 +1637,39 @@ mod tests {
         // Neighbours untouched: four elements, four distinct words.
         assert_eq!(storage[0], 1.0f32.to_bits());
         assert_eq!(storage[3], 0.1f32.to_bits());
+    }
+
+    /// `F32::add_packed` is the whole fold at fp32, and it is ordinary bit math
+    /// — so unlike `Bf16::add_packed` (whose `pack` is a device intrinsic) it is
+    /// checkable here.
+    #[test]
+    fn f32_add_packed_is_the_fp32_addition_itself() {
+        for (a, b) in [(1.0f32, 2.0f32), (-0.5, 0.5), (1e30, 1e30), (0.1, 0.2)] {
+            let sum = F32::add_packed(F32::pack([a]), F32::pack([b]));
+            assert_eq!(F32::unpack(sum), [a + b]);
+        }
+        // Adding nothing is the identity on the bits, which is what makes an
+        // accumulate over a zeroed `C` the same answer as a store.
+        for bits in [0u32, 0x3f80_0000, 0xc180_0000, 0x7f7f_ffff] {
+            assert_eq!(F32::add_packed(bits, 0), bits);
+        }
+    }
+
+    /// The bf16 fold, as far as the host can see it: `pack` is
+    /// `cvt.rn.bf16x2.f32` and has no host body, so what is checkable is that
+    /// `add_packed` widens *both* halves of *both* words and pairs them off
+    /// lane-wise. The rounding it applies afterwards is the device's, and the
+    /// `shared accumulate` device cases are what hold it.
+    #[test]
+    fn bf16_add_packed_pairs_the_halves_lane_wise() {
+        // 0x4000 is 2.0 and 0x3f80 is 1.0 as bf16; low half first.
+        let (current, update) = (0x4000_3f80u32, 0x3f80_4000u32);
+        let ([a, b], [c, d]) = (Bf16::unpack(current), Bf16::unpack(update));
+        assert_eq!([a, b], [1.0, 2.0]);
+        assert_eq!([c, d], [2.0, 1.0]);
+        // Both lanes sum to 3.0, which is exact in bf16 — so a device run of
+        // `add_packed` on these two words owes 0x4040_4040 and nothing else.
+        assert_eq!([a + c, b + d], [3.0, 3.0]);
     }
 
     #[test]

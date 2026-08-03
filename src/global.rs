@@ -467,6 +467,79 @@ pub unsafe fn store_shared_rows<
     }
 }
 
+/// Fold a whole `[R, C]` shared tile **into** the `(row, column)` rectangle of a
+/// row-major global buffer: `C += tile`, at [`store_shared_rows`]' access widths.
+///
+/// The `+=` twin of [`store_shared_rows`], and the same function with the copy
+/// replaced by a load of both sides, an [`Element::add_packed`] and a store. Same
+/// signature, same chunk split, same [`access_width`] ladder, so an accumulating
+/// epilogue costs the read and nothing else — where a hand-rolled
+/// read-modify-write drops to 4-byte accesses and costs more than the rest of the
+/// kernel (#169 measured 1113 → 536 TFLOP/s for exactly that).
+///
+/// The addition is the *element's*: a narrow `E` widens both sides, adds in fp32
+/// and rounds the sum once. Nothing rounds twice, and no partial sum is held at
+/// `E`.
+///
+/// ```no_run
+/// use kittens::global::{GlobalRows, accumulate_shared_rows};
+/// use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+///
+/// # unsafe fn drain(staged: *mut u8, c: *mut u8, ldc: usize, thread: u32) {
+/// let tile = unsafe { SharedTile::<Bf16, 64, 128, Swizzle128B>::from_raw(staged) };
+/// let dest = unsafe { GlobalRows::<Bf16>::from_raw(c, ldc) };
+/// unsafe { accumulate_shared_rows::<_, 64, 128, _, 128>(dest, 0, 0, thread, tile) };
+/// # }
+/// ```
+///
+/// # Safety
+///
+/// - As [`store_shared_rows`], and the rectangle must additionally be *readable*:
+///   this reads `C` before it writes it.
+/// - No other thread is writing that rectangle. The read and the write are two
+///   instructions and not an atomic, so two accumulators over one destination
+///   lose each other's contribution rather than serializing.
+#[inline(always)]
+pub unsafe fn accumulate_shared_rows<
+    E: Element,
+    const R: usize,
+    const C: usize,
+    S: Swizzle,
+    const THREADS: u32,
+>(
+    dest: GlobalRows<E>,
+    row: u32,
+    column: u32,
+    thread: u32,
+    tile: SharedTile<E, R, C, S>,
+) {
+    const {
+        assert!(
+            E::BYTES == 2 || E::BYTES == 4,
+            "the access ladder's narrowest rung is two bytes, so a narrower element has none"
+        )
+    };
+    const { assert!(THREADS > 0, "a drain needs at least one thread") };
+    const {
+        assert!(
+            (R * C * E::BYTES / CHUNK_BYTES).is_multiple_of(THREADS as usize),
+            "the drain's threads must divide the tile's 16-byte chunks between them exactly"
+        )
+    };
+    unsafe {
+        match access_width(dest, column) {
+            CHUNK_BYTES => fold_in_accesses::<CHUNK_BYTES, E, R, C, S, THREADS>(
+                dest, row, column, thread, tile,
+            ),
+            8 => fold_in_accesses::<8, E, R, C, S, THREADS>(dest, row, column, thread, tile),
+            2 if E::BYTES == 2 => {
+                fold_in_accesses::<2, E, R, C, S, THREADS>(dest, row, column, thread, tile)
+            }
+            _ => fold_in_accesses::<4, E, R, C, S, THREADS>(dest, row, column, thread, tile),
+        }
+    }
+}
+
 /// Bytes per access the ladder settles on for this cursor and column origin —
 /// the whole of [`store_shared_rows`]' width decision, as a pure function.
 ///
@@ -552,6 +625,102 @@ unsafe fn drain_in_accesses<
                 byte += WIDTH;
             }
             item += THREADS as usize;
+        }
+    }
+}
+
+/// [`accumulate_shared_rows`] at one access width — [`drain_in_accesses`] with
+/// [`add_bytes`] in place of [`copy_bytes`], and the same chunk split, so the two
+/// drains cover a tile identically.
+///
+/// # Safety
+///
+/// As [`accumulate_shared_rows`], and `WIDTH` must be what [`access_width`]
+/// returned for this cursor and column.
+#[inline(always)]
+unsafe fn fold_in_accesses<
+    const WIDTH: usize,
+    E: Element,
+    const R: usize,
+    const C: usize,
+    S: Swizzle,
+    const THREADS: u32,
+>(
+    dest: GlobalRows<E>,
+    row: u32,
+    column: u32,
+    thread: u32,
+    tile: SharedTile<E, R, C, S>,
+) {
+    unsafe {
+        let chunks = tile.chunk_writer();
+        let per_row = C * E::BYTES / CHUNK_BYTES;
+        let chunk_columns = CHUNK_BYTES / E::BYTES;
+        let mut item = thread as usize;
+        while item < R * per_row {
+            let (tile_row, chunk) = drain_item(item, per_row);
+            let from = chunks.at(tile_row, chunk);
+            let to = dest.at(
+                row + tile_row as u32,
+                column + (chunk * chunk_columns) as u32,
+            );
+            let mut byte = 0usize;
+            while byte < CHUNK_BYTES {
+                add_bytes::<WIDTH, E>(from.add(byte), to.add(byte));
+                byte += WIDTH;
+            }
+            item += THREADS as usize;
+        }
+    }
+}
+
+/// Add `WIDTH` bytes of shared memory into the same width of global memory, in
+/// `E`'s arithmetic.
+///
+/// One load from each side, [`Element::add_packed`] per 32-bit word, one store —
+/// at the same widths [`copy_bytes`] moves, so the fold keeps the store shape the
+/// staged epilogue exists for. The 2-byte rung carries half a word and
+/// [`Element::add_packed`] folds its unused half against zero, which packs back
+/// to a value this store then drops.
+///
+/// # Safety
+///
+/// - As [`copy_bytes`], and `to` must additionally name `WIDTH` *readable* bytes.
+#[inline(always)]
+unsafe fn add_bytes<const WIDTH: usize, E: Element>(from: *const u8, to: *mut u8) {
+    const {
+        assert!(
+            WIDTH == 16 || WIDTH == 8 || WIDTH == 4 || WIDTH == 2,
+            "a shared-to-global access is 2, 4, 8 or 16 bytes wide"
+        )
+    };
+    unsafe {
+        match WIDTH {
+            16 => {
+                let (staged, current) = (read_shared_v4(from), read_global_v4(to));
+                let mut sum = [0u32; 4];
+                let mut word = 0usize;
+                while word < 4 {
+                    sum[word] = E::add_packed(current[word], staged[word]);
+                    word += 1;
+                }
+                write_v4(to, sum)
+            }
+            8 => {
+                let (staged, current) = (read_shared_v2(from), read_global_v2(to));
+                write_v2(
+                    to,
+                    [
+                        E::add_packed(current[0], staged[0]),
+                        E::add_packed(current[1], staged[1]),
+                    ],
+                )
+            }
+            4 => *(to as *mut u32) = E::add_packed(*(to as *const u32), *(from as *const u32)),
+            _ => {
+                *(to as *mut u16) =
+                    E::add_packed(*(to as *const u16) as u32, *(from as *const u16) as u32) as u16
+            }
         }
     }
 }
@@ -654,6 +823,52 @@ unsafe fn write_v4(to: *mut u8, words: [u32; 4]) {
             in("r") words[3],
             clobber("memory"),
         );
+    }
+}
+
+/// 16 bytes of global memory in one access: `ld.global.v4.b32`.
+///
+/// The read half of an accumulating drain, at [`write_v4`]'s width so the fold
+/// keeps the store's shape: a warp of 32 lanes reads the same 512 contiguous
+/// bytes it is about to write.
+///
+/// # Safety
+///
+/// - `from` is a 16-byte-aligned global address with 16 readable bytes.
+#[inline(always)]
+unsafe fn read_global_v4(from: *const u8) -> [u32; 4] {
+    unsafe {
+        let (a, b, c, d): (u32, u32, u32, u32);
+        ptx_asm!(
+            "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];",
+            out("=r") a,
+            out("=r") b,
+            out("=r") c,
+            out("=r") d,
+            in("l") from as u64,
+            clobber("memory"),
+        );
+        [a, b, c, d]
+    }
+}
+
+/// `ld.global.v2.b32` — the rung below [`read_global_v4`].
+///
+/// # Safety
+///
+/// - As [`read_global_v4`], 8-byte aligned with 8 readable bytes.
+#[inline(always)]
+unsafe fn read_global_v2(from: *const u8) -> [u32; 2] {
+    unsafe {
+        let (a, b): (u32, u32);
+        ptx_asm!(
+            "ld.global.v2.b32 {%0, %1}, [%2];",
+            out("=r") a,
+            out("=r") b,
+            in("l") from as u64,
+            clobber("memory"),
+        );
+        [a, b]
     }
 }
 

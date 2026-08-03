@@ -110,14 +110,26 @@ express the other's. Everything else is still baked into its index math:
 
 | | TK | ferro-kittens |
 | --- | --- | --- |
-| Operands | bf16, half, fp8 (e4m3/e5m2/e8m0), fp4 (e2m1), int8, tf32, fp32 | bf16 only |
+| Operands | bf16, half, fp8 (e4m3/e5m2/e8m0), fp4 (e2m1), int8, tf32, fp32 | bf16, fp16 |
 | Accumulate | fp32, fp16, int32 | fp32 only |
 | Complex | `crt`/`crv`/`cst`/`csv` throughout | — **[SCOPE]** |
 
 `Element` now carries the byte width, the fp32 → element pack, and (via
 `MmaElement`) the tcgen05 operand kind, so shape math, `ldst`'s pack, and
-`mma`'s bounds are all generic — but `Bf16` is still the only *operand* impl
-(issue #2 did the trait work; #16 adds fp8). `F32` is the second `Element`
+`mma`'s bounds are all generic (issue #2 did the trait work; #16 adds fp8).
+
+**This entry read "`Bf16` is still the only *operand* impl" until #169, and it
+had not been true since `F16` landed** — `impl MmaElement for F16` sits eight
+lines above `impl MmaElement for Bf16` in the same file, `MMA_KIND = 0` with
+`Tcgen05ElementType::F16` telling the two apart, and `experiments`' `gemm_sol`
+rung is benchmarked against a cuBLASLt FP16 baseline *because* the port's
+operands are fp16. The failure is this file's usual one and not a slow rot: the
+line was written when it was true and nothing re-read it. Two operand impls are
+also what makes the sentence worth checking — one impl is a sentence about a
+type, two is a claim about a trait. tf32 (`KIND = 1`) and fp8 are the genuinely
+absent ones, and tf32 is the one downstream keeps asking for: `oxide-train` #67
+was filed believing its fp32 GEMM needed it, when that kernel's operands are
+bf16 and only its `C` is fp32 (see 2.6). `F32` is the third `Element`
 since #3, and deliberately not an `MmaElement`: it exists so a statistic can be
 staged in shared memory without rounding, which is a storage question and not
 an operand one. One bf16 fact remains hardcoded behind an assert rather than
@@ -359,7 +371,7 @@ TK has cluster-scope shared→shared copies. Still absent: #50 brought in the
 *addressing* half, since `Semaphore::at_rank` names a peer's shared offset, but
 nothing here moves data between two CTAs' shared memory.
 
-### 2.6 Shared → global without an engine — done (#113), and the inverse absent
+### 2.6 Shared → global without an engine — done (#113), folding too (#169), the inverse absent
 
 Not a TK entry, which is why it had none here: TK's shared→global path is the
 TMA and nothing else. `global::store_shared_rows` is the other one — a whole
@@ -374,10 +386,40 @@ down to the element and takes the first the cursor admits, so an odd `ldc` gets
 narrower stores rather than a fault.
 
 It is the shipped GEMM epilogue's second half, and #123 measured it **beating**
-the TMA route on that kernel. Absent: the load direction. Nothing reads a global
-rectangle into a shared tile without a descriptor, which is what an irregular
-operand not worth a host-built map would want — the mirror of the argument 2.2
-makes for `load_rows`.
+the TMA route on that kernel.
+
+`global::accumulate_shared_rows` (#169) is the same function folding instead of
+overwriting: same signature, same chunk split, same ladder, with the copy
+replaced by a load of both sides, an `Element::add_packed` and a store. It
+exists because `C += A·Bᵀ` — every backward pass — had no library route at all,
+and a hand-rolled read-modify-write drops off the ladder to 4-byte accesses:
+`oxide-train`'s tcgen05 GEMM measured **1113.8 TFLOP/s storing and 536.2
+accumulating** at 4096³ on one compute pipeline, so the fold cost more than the
+whole rest of the kernel. Not bandwidth — re-reading a 4096² bf16 `C` is 33.5 MB
+against a 133 µs difference — the *shape*, which is #116's finding again one
+level up. The rounding is the element's and not the caller's:
+`Element::add_packed` widens both sides, adds in fp32 and rounds the sum **once**,
+which is why it is a trait method rather than a snippet at each epilogue. Named
+in `tests/gaps.rs` as `a_staged_tile_can_be_folded_into_memory`; held on a B200
+by `device-tests`' `shared accumulate` and `shared accumulate wide`.
+
+Absent: the load direction. Nothing reads a global rectangle into a shared tile
+without a descriptor, which is what an irregular operand not worth a host-built
+map would want — the mirror of the argument 2.2 makes for `load_rows`.
+
+Absent, and the reason an **fp32** epilogue is still on the register route:
+nothing can *fill* an `SharedTile<F32, …>`. `store_shared_rows` and
+`accumulate_shared_rows` are generic over `E` and would take one, but
+`ldst::store_tile`/`store_tile_x4` bound `E: Element<Unpacked = [f32; 2]>`
+because they are `stmatrix`, which moves b16 matrices and nothing else. So an
+fp32 accumulator band reaches memory only through `store_rows`' scattered
+per-value stores — the shape #116 measured at **20.43 µs/tile** against the
+staged route's 6.68 — and every kernel with an fp32 `C` pays that. What it wants
+is a plain (non-`stmatrix`) `store_tile` over `SwizzledChunks`, generic in `E`.
+Filed as **#174**, with `oxide-train`'s two entry points as the measurement: the
+same compute pipeline reaches **0.783 / 0.914 / 0.910** of cuBLASLt at
+4096³ / 8192³ / 16384³ with a bf16 `C` and **0.636 / 0.710 / 0.836** with an
+fp32 one.
 
 ---
 
