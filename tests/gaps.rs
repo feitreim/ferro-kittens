@@ -159,6 +159,25 @@ fn global_movers_carry_an_element<E: Element, const M: usize, const N: usize, L>
     }
 }
 
+/// §2.2/§1.4 — the `RegVec` bridge to global memory (#130's first half).
+///
+/// A per-row statistic is what every attention and normalization kernel
+/// computes and what §2.2 said for a long time could not leave the warp except
+/// folded to a scalar. `RowLayout::owns_row` is named beside the movers because
+/// it is the claim the store spends: `row_of` is not injective across a warp, so
+/// without an owner the store is four threads writing one address.
+fn a_row_statistic_reaches_global_memory<E: Element, const M: usize, L: RowLayout<M>>(
+    rows: kittens::global::GlobalRows<E>,
+    lane: u32,
+    statistic: RegVec<M, L>,
+) {
+    unsafe {
+        kittens::global::store_row_vec(rows, 0, 0, lane, statistic);
+        let _: RegVec<M, L> = kittens::global::load_row_vec(rows, 0, 0, lane);
+        let _: bool = L::owns_row(lane);
+    }
+}
+
 /// §2.6 — shared → global with no engine between them (#113), and the wide
 /// register→shared store the epilogue in front of it uses (#116).
 ///
