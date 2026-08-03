@@ -416,7 +416,10 @@ fp32 accumulator band reaches memory only through `store_rows`' scattered
 per-value stores — the shape #116 measured at **20.43 µs/tile** against the
 staged route's 6.68 — and every kernel with an fp32 `C` pays that. What it wants
 is a plain (non-`stmatrix`) `store_tile` over `SwizzledChunks`, generic in `E`.
-Filed nowhere.
+Filed as **#174**, with `oxide-train`'s two entry points as the measurement: the
+same compute pipeline reaches **0.783 / 0.914 / 0.910** of cuBLASLt at
+4096³ / 8192³ / 16384³ with a bf16 `C` and **0.636 / 0.710 / 0.836** with an
+fp32 one.
 
 ---
 
