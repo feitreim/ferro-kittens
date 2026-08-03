@@ -5,7 +5,7 @@
 //! | [`gemm`] | runs — checked against a CPU reference by [`gemm::check`] |
 //! | [`gemm_sol`] | runs — all three size-specialized entries checked exactly by [`gemm_sol::check`] |
 //! | [`softmax`] | runs — checked against a CPU reference by [`softmax::check`] |
-//! | [`layernorm`] | runs — checked against a CPU reference by [`layernorm::check`] |
+//! | [`layernorm`] | runs — both kernels checked against CPU references by [`layernorm::check`] and [`layernorm::check_group`] |
 //! | [`flash_forward`] | compiles — no launcher yet |
 //!
 //! **Runs** means the kernel has a launcher and a CPU reference and exits
@@ -76,10 +76,17 @@ fn examples() -> Vec<Example> {
             name: "layernorm",
             // A status longer than the table's 38-column field silently pushes
             // the shared-memory column out of the table.
-            status: "runs (groupnorm_tile compiles)",
+            status: "runs",
             threads: layernorm::THREADS,
             shared_bytes: layernorm::SHARED_BYTES,
             entry: Some("layernorm_rows"),
+        },
+        Example {
+            name: "groupnorm",
+            status: "runs",
+            threads: layernorm::THREADS,
+            shared_bytes: layernorm::SHARED_BYTES,
+            entry: Some("groupnorm_tile"),
         },
         Example {
             name: "flash_forward",
@@ -192,6 +199,10 @@ fn checks(
         (
             "layernorm",
             layernorm::check(context).map_err(|error| error.to_string()),
+        ),
+        (
+            "groupnorm",
+            layernorm::check_group(context).map_err(|error| error.to_string()),
         ),
     ]
 }

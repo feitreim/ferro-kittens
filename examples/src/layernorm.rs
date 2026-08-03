@@ -472,3 +472,130 @@ pub fn bench(
 ) -> Result<Timings, Box<dyn Error>> {
     run(context, shape.m, time).map(|(_, timings)| timings)
 }
+
+/// The mean and `1/√(variance + ε)` of any tile whose first row is of boost
+/// class `class`. Three cover every grid: a row holds each ladder entry
+/// exactly once, so a tile's multiset depends only on where its 128 rows land
+/// in the boost cycle, and [`ROWS`] is not a multiple of [`BOOSTS`], which is
+/// what makes consecutive tiles differ.
+fn tile_statistics(class: usize) -> (f64, f64) {
+    let values: Vec<f64> = (0..ROWS)
+        .flat_map(|row| (0..COLUMNS).map(move |p| value(p, class + row) as f64))
+        .collect();
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance =
+        values.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / values.len() as f64;
+    (mean, 1.0 / (variance + EPSILON as f64).sqrt())
+}
+
+/// Launch `groupnorm_tile` over `rows`, compare every output against a CPU
+/// reference, and only then hand the launch to `then`.
+fn run_group<T>(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    rows: usize,
+    then: impl FnOnce(
+        &cuda_core::CudaStream,
+        &mut dyn FnMut() -> Result<(), Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<(String, T), Box<dyn Error>> {
+    use cuda_core::{DeviceBuffer, LaunchConfig};
+    use kittens::global::encode_bf16_panels;
+    use kittens::shared::Element;
+
+    /// Absolute where [`run`]'s is relative: this kernel's outputs are
+    /// zero-mean and unit-variance by construction, so there is no `beta`
+    /// holding a denominator away from zero, and an absolute error *is* the
+    /// error relative to the tile's own scale.
+    const TOLERANCE: f32 = 1.0 / 128.0;
+
+    if !rows.is_multiple_of(ROWS) {
+        return Err(format!("{rows} rows does not divide the {ROWS} a CTA owns").into());
+    }
+
+    let stream = context.default_stream();
+    let module = kernels::load(context)?;
+
+    let staged = packed(rows * COLUMNS, |flat| input(flat / COLUMNS, flat % COLUMNS));
+    let source = DeviceBuffer::from_host(&stream, &staged)?;
+    let destination = DeviceBuffer::<u32>::zeroed(&stream, staged.len())?;
+    // SAFETY: both buffers outlive every launch consuming their maps below.
+    let (source_map, destination_map) = unsafe {
+        (
+            encode_bf16_panels::<ROWS, COLUMNS>(&stream, source.cu_deviceptr(), rows, 1)?,
+            encode_bf16_panels::<ROWS, COLUMNS>(&stream, destination.cu_deviceptr(), rows, 1)?,
+        )
+    };
+
+    let config = LaunchConfig {
+        grid_dim: (grid(rows), 1, 1),
+        block_dim: (THREADS, 1, 1),
+        shared_mem_bytes: SHARED_BYTES as u32,
+    };
+    let mut launch_once = || -> Result<(), Box<dyn Error>> {
+        // SAFETY: the grid covers exactly the rows the tile maps describe, and
+        // the block and shared plan are the kernel's own.
+        unsafe {
+            module.groupnorm_tile(
+                &stream,
+                config,
+                source_map.as_ptr(),
+                destination_map.as_ptr(),
+                EPSILON,
+            )?
+        };
+        Ok(())
+    };
+    launch_once()?;
+
+    let classes: Vec<(f64, f64)> = (0..BOOSTS).map(tile_statistics).collect();
+    let observed = destination.to_host_vec(&stream)?;
+    let (mut wrong, mut sample, mut worst) = (0usize, Vec::new(), 0.0f32);
+    for row in 0..rows {
+        let tile_first_row = row / ROWS * ROWS;
+        let (mean, deviation) = classes[tile_first_row % BOOSTS];
+        for column in 0..COLUMNS {
+            let index = (row * COLUMNS + column) / 2;
+            let word = Bf16::unpack(observed[index]);
+            let value = word[column % 2];
+            let expected = ((input(row, column) as f64 - mean) * deviation) as f32;
+            let error = (value - expected).abs();
+            worst = worst.max(error);
+            // Negated rather than `error > TOLERANCE`: a NaN compares false
+            // either way, so only this spelling counts one as wrong.
+            #[allow(clippy::neg_cmp_op_on_partial_ord)]
+            if !(error <= TOLERANCE) {
+                wrong += 1;
+                if sample.len() < 8 {
+                    sample.push(format!(
+                        "[{row}, {column}] = {value}, want {expected} ({error:.2e})"
+                    ));
+                }
+            }
+        }
+    }
+    if wrong > 0 {
+        return Err(format!("{wrong} outputs outside 2^-7: {}", sample.join("; ")).into());
+    }
+
+    let after = then(&stream, &mut launch_once)?;
+    Ok((
+        format!("{rows}x{COLUMNS} rows group-normalized, worst absolute error {worst:.2e}"),
+        after,
+    ))
+}
+
+/// As [`check`], for the whole-tile statistic.
+pub fn check_group(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+) -> Result<String, Box<dyn Error>> {
+    run_group(context, CHECK_ROWS, nothing_after).map(|(note, ())| note)
+}
+
+/// The benchmark's entry point for `groupnorm_tile`. Same [`Shape`] as
+/// [`bench`], which is what makes the two sweeps' rows comparable numbers.
+pub fn bench_group(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    shape: Shape,
+) -> Result<Timings, Box<dyn Error>> {
+    run_group(context, shape.m, time).map(|(_, timings)| timings)
+}
