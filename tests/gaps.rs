@@ -145,11 +145,11 @@ fn shared_vectors_move_and_are_read<E: Element, const N: usize, L: ColLayout<N>>
 /// claim the *layout* makes and the movers spend; a layout that dropped it
 /// would leave both of them silently scalar.
 ///
-/// `load_cols` (#172) is the vector shape of the same path and the global half
-/// of §1.4's "`RegVec` has no bridge to memory at all" — the per-column operand
-/// §3.1 wants, read off one row instead of broadcast through a tile. It is
-/// named here rather than beside `ldst::load_vec` because what it is generic
-/// over is the *cursor*, not the element.
+/// `load_cols` (#172) is the vector shape of the same path and the `ColVec`
+/// half of §1.4's vector-bridge hole — the per-column operand §3.1 wants, read
+/// off one row instead of broadcast through a tile. It is named here rather
+/// than beside `ldst::load_vec` because what it is generic over is the
+/// *cursor*, not the element.
 fn global_movers_carry_an_element<E: Element, const M: usize, const N: usize, L>(
     rows: kittens::global::GlobalRows<E>,
     lane: u32,
