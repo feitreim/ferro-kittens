@@ -2039,6 +2039,62 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     print(f"identical: {len(measured)} kernels, every counter, across two builds.")
 
 
+@app.function(cpu=8, timeout=CHECKING)
+@completes
+def ptxdump(kernels: str = "fragment_map_32x128", context: int = 6, unroll: int = 0) -> None:
+    """Attribution probe for #166, temporary: print the PTX around every
+    `.local` occurrence of the named kernels, plus the loop labels between the
+    first and last occurrence, so the depot can be read rather than counted.
+
+    `--unroll N` rebuilds with `opt` wrapped to pass `-unroll-threshold=N`,
+    the experiment that says whether the depot is the unroll budget: if the
+    frames vanish at a raised threshold, the dynamic indices SROA chokes on
+    are loop counters that stopped unrolling, not anything structural."""
+    wanted = {k.strip() for k in kernels.split(",") if k.strip()}
+    environment = [*STUB_ENV]
+    if unroll:
+        wrapper = "/tmp/opt-unroll-threshold"
+        _run(["sh", "-c",
+              f"printf '#!/bin/sh\\nexec %s -unroll-threshold={unroll} \"$@\"\\n'"
+              f" \"$(which opt)\" > {wrapper}; chmod +x {wrapper}"], cwd="/")
+        environment = [*STUB_ENV, f"CUDA_OXIDE_OPT={wrapper}"]
+    for package, directory in PTX_CRATES:
+        _run(["cargo", "clean", "-p", package], cwd=directory)
+        _run([*environment, "cargo", "oxide", "build", package, "--arch", "sm_100a"],
+             cwd=directory)
+        for ptx in sorted(Path(directory).rglob("*.ptx")):
+            for chunk in ptx.read_text().split(".visible .entry ")[1:]:
+                name = chunk.split("(", 1)[0].strip()
+                if name not in wanted:
+                    continue
+                lines = chunk.splitlines()
+                hits = [i for i, line in enumerate(lines) if ".local" in line]
+                print(f"\n=== {name} ({ptx.name}): {len(lines)} lines, "
+                      f"{len(hits)} .local lines ===")
+                shown: set[int] = set()
+                for hit in hits:
+                    for i in range(max(0, hit - context), min(len(lines), hit + context + 1)):
+                        shown.add(i)
+                previous = -2
+                for i in sorted(shown):
+                    if i != previous + 1:
+                        print("    ...")
+                    print(f"    {i:>6}  {lines[i]}")
+                    previous = i
+                if hits:
+                    first, last = hits[0], hits[-1]
+                    labels = [
+                        f"    {i:>6}  {lines[i].strip()}"
+                        for i in range(first, last + 1)
+                        if lines[i].strip().startswith("$L__") or "bra" in lines[i]
+                    ]
+                    print(f"  labels and branches between lines {first} and {last}:")
+                    print("\n".join(labels) if labels else "    (straight-line code)")
+    # The whole census under this build's flags, so an `--unroll` run reports
+    # every kernel and not only the ones dumped.
+    _print_local_depot()
+
+
 @app.local_entrypoint()
 def main() -> None:
     device_tests.remote()

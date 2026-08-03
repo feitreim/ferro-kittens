@@ -26,6 +26,7 @@
 //! # }
 //! ```
 
+use cuda_device::thread::__unroll_config;
 use cuda_device::warp;
 
 /// NaN-free float max, as a comparison-select rather than a libdevice call.
@@ -759,7 +760,8 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     pub fn any_exceeds(self, reference: Self, slack: f32) -> bool {
         let mut exceed = false;
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             exceed = exceed || self.get(slot) > reference.get(slot) + slack;
             slot += 1;
         }
@@ -774,7 +776,8 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     pub fn quad_reduce<Op: ReduceOp>(self) -> Self {
         let mut out = self;
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             out.set(slot, quad_reduce::<Op>(self.get(slot)));
             slot += 1;
         }
@@ -806,7 +809,8 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     pub fn reduce<Op: ReduceOp>(self) -> f32 {
         let mut folded = Op::IDENTITY;
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             folded = Op::apply(folded, self.get(slot));
             slot += 1;
         }
@@ -817,7 +821,8 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     #[inline(always)]
     pub fn unary_map_assign<Op: UnaryOp>(&mut self) {
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             self.set(slot, Op::apply(self.get(slot)));
             slot += 1;
         }
@@ -828,7 +833,8 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     pub fn unary_map<Op: UnaryOp>(self) -> Self {
         let mut out = self;
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             out.set(slot, Op::apply(self.get(slot)));
             slot += 1;
         }
@@ -839,7 +845,8 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     #[inline(always)]
     pub fn bin_map_assign<Op: BinaryOp>(&mut self, other: Self) {
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             self.set(slot, Op::apply(self.get(slot), other.get(slot)));
             slot += 1;
         }
@@ -850,7 +857,8 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     pub fn bin_map<Op: BinaryOp>(self, other: Self) -> Self {
         let mut out = self;
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             out.set(slot, Op::apply(self.get(slot), other.get(slot)));
             slot += 1;
         }
@@ -861,7 +869,8 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     #[inline(always)]
     pub fn scalar_map_assign<Op: BinaryOp>(&mut self, k: f32) {
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             self.set(slot, Op::apply(self.get(slot), k));
             slot += 1;
         }
@@ -873,7 +882,8 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     pub fn scalar_map<Op: BinaryOp>(self, k: f32) -> Self {
         let mut out = self;
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             out.set(slot, Op::apply(self.get(slot), k));
             slot += 1;
         }
@@ -884,7 +894,8 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     #[inline(always)]
     pub fn ternary_map_assign<Op: TernaryOp>(&mut self, b: Self, c: Self) {
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             self.set(slot, Op::apply(self.get(slot), b.get(slot), c.get(slot)));
             slot += 1;
         }
@@ -895,7 +906,8 @@ impl<const M: usize, L: RowLayout<M>> RegVec<M, L> {
     pub fn ternary_map<Op: TernaryOp>(self, b: Self, c: Self) -> Self {
         let mut out = self;
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             out.set(slot, Op::apply(self.get(slot), b.get(slot), c.get(slot)));
             slot += 1;
         }
@@ -1009,7 +1021,8 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
     pub fn reduce<Op: ReduceOp>(self) -> f32 {
         let mut folded = Op::IDENTITY;
         let mut value = 0;
-        while value < L::VALUES {
+        while value < const { L::VALUES } {
+            __unroll_config::<0>();
             folded = Op::apply(folded, self.get(value));
             value += 1;
         }
@@ -1023,7 +1036,8 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
     pub fn column_group_reduce<Op: ReduceOp>(self) -> Self {
         let mut out = self;
         let mut value = 0;
-        while value < L::VALUES {
+        while value < const { L::VALUES } {
+            __unroll_config::<0>();
             out.set(value, column_group_reduce::<Op>(self.get(value)));
             value += 1;
         }
@@ -1034,7 +1048,8 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
     #[inline(always)]
     pub fn unary_map_assign<Op: UnaryOp>(&mut self) {
         let mut value = 0;
-        while value < L::VALUES {
+        while value < const { L::VALUES } {
+            __unroll_config::<0>();
             self.set(value, Op::apply(self.get(value)));
             value += 1;
         }
@@ -1045,7 +1060,8 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
     pub fn unary_map<Op: UnaryOp>(self) -> Self {
         let mut out = self;
         let mut value = 0;
-        while value < L::VALUES {
+        while value < const { L::VALUES } {
+            __unroll_config::<0>();
             out.set(value, Op::apply(self.get(value)));
             value += 1;
         }
@@ -1056,7 +1072,8 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
     #[inline(always)]
     pub fn bin_map_assign<Op: BinaryOp>(&mut self, other: Self) {
         let mut value = 0;
-        while value < L::VALUES {
+        while value < const { L::VALUES } {
+            __unroll_config::<0>();
             self.set(value, Op::apply(self.get(value), other.get(value)));
             value += 1;
         }
@@ -1067,7 +1084,8 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
     pub fn bin_map<Op: BinaryOp>(self, other: Self) -> Self {
         let mut out = self;
         let mut value = 0;
-        while value < L::VALUES {
+        while value < const { L::VALUES } {
+            __unroll_config::<0>();
             out.set(value, Op::apply(self.get(value), other.get(value)));
             value += 1;
         }
@@ -1078,7 +1096,8 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
     #[inline(always)]
     pub fn scalar_map_assign<Op: BinaryOp>(&mut self, k: f32) {
         let mut value = 0;
-        while value < L::VALUES {
+        while value < const { L::VALUES } {
+            __unroll_config::<0>();
             self.set(value, Op::apply(self.get(value), k));
             value += 1;
         }
@@ -1089,7 +1108,8 @@ impl<const N: usize, L: ColLayout<N>> ColVec<N, L> {
     pub fn scalar_map<Op: BinaryOp>(self, k: f32) -> Self {
         let mut out = self;
         let mut value = 0;
-        while value < L::VALUES {
+        while value < const { L::VALUES } {
+            __unroll_config::<0>();
             out.set(value, Op::apply(self.get(value), k));
             value += 1;
         }
@@ -1181,10 +1201,12 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     pub fn broadcast_row(rows: RegVec<M, L>) -> Self {
         let mut out = Self::zero();
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let row = rows.get(slot);
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 out.set(slot, value, row);
                 value += 1;
             }
@@ -1198,9 +1220,11 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     pub fn broadcast_col(cols: ColVec<N, L>) -> Self {
         let mut out = Self::zero();
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 out.set(slot, value, cols.get(value));
                 value += 1;
             }
@@ -1254,10 +1278,12 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     #[inline(always)]
     pub fn mask(&mut self, lane: u32, fill: f32, keep: impl Fn(i32, i32) -> bool) {
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let row = L::row_of(lane, slot) as i32;
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 let column = L::col_of(lane, value) as i32;
                 if !keep(row, column) {
                     self.set(slot, value, fill);
@@ -1399,9 +1425,11 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     #[inline(always)]
     pub fn unary_map_assign<Op: UnaryOp>(&mut self) {
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 self.set(slot, value, Op::apply(self.get(slot, value)));
                 value += 1;
             }
@@ -1427,9 +1455,11 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     pub fn unary_map<Op: UnaryOp>(self) -> Self {
         let mut out = self;
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 out.set(slot, value, Op::apply(self.get(slot, value)));
                 value += 1;
             }
@@ -1460,9 +1490,11 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     #[inline(always)]
     pub fn bin_map_assign<Op: BinaryOp>(&mut self, other: Self) {
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 self.set(
                     slot,
                     value,
@@ -1480,9 +1512,11 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     pub fn bin_map<Op: BinaryOp>(self, other: Self) -> Self {
         let mut out = self;
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 out.set(
                     slot,
                     value,
@@ -1513,9 +1547,11 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     pub fn scalar_map<Op: BinaryOp>(self, k: f32) -> Self {
         let mut out = self;
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 out.set(slot, value, Op::apply(self.get(slot, value), k));
                 value += 1;
             }
@@ -1530,9 +1566,11 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     #[inline(always)]
     pub fn scalar_map_assign<Op: BinaryOp>(&mut self, k: f32) {
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 self.set(slot, value, Op::apply(self.get(slot, value), k));
                 value += 1;
             }
@@ -1545,9 +1583,11 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     #[inline(always)]
     pub fn ternary_map_assign<Op: TernaryOp>(&mut self, b: Self, c: Self) {
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 self.set(
                     slot,
                     value,
@@ -1568,9 +1608,11 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     pub fn ternary_map<Op: TernaryOp>(self, b: Self, c: Self) -> Self {
         let mut out = self;
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 out.set(
                     slot,
                     value,
@@ -1607,10 +1649,12 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     #[inline(always)]
     pub fn row_map_assign<Op: BinaryOp>(&mut self, rows: RegVec<M, L>) {
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let row = rows.get(slot);
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 self.set(slot, value, Op::apply(self.get(slot, value), row));
                 value += 1;
             }
@@ -1632,10 +1676,12 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     pub fn row_map<Op: BinaryOp>(self, rows: RegVec<M, L>) -> Self {
         let mut out = self;
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let row = rows.get(slot);
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 out.set(slot, value, Op::apply(self.get(slot, value), row));
                 value += 1;
             }
@@ -1652,9 +1698,11 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     pub fn col_map<Op: BinaryOp>(self, cols: ColVec<N, L>) -> Self {
         let mut out = self;
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 out.set(
                     slot,
                     value,
@@ -1672,9 +1720,11 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     #[inline(always)]
     pub fn col_map_assign<Op: BinaryOp>(&mut self, cols: ColVec<N, L>) {
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 self.set(
                     slot,
                     value,
@@ -1712,10 +1762,12 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     pub fn row_reduce<Op: ReduceOp>(self) -> RegVec<M, L> {
         let mut partials = RegVec::<M, L>::splat(Op::IDENTITY);
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let mut folded = Op::IDENTITY;
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 folded = Op::apply(folded, self.get(slot, value));
                 value += 1;
             }
@@ -1735,10 +1787,12 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     pub fn col_reduce<Op: ReduceOp>(self) -> ColVec<N, L> {
         let mut partials = ColVec::<N, L>::splat(Op::IDENTITY);
         let mut value = 0;
-        while value < L::VALUES {
+        while value < const { L::VALUES } {
+            __unroll_config::<0>();
             let mut folded = Op::IDENTITY;
             let mut slot = 0;
-            while slot < L::SLOTS {
+            while slot < const { L::SLOTS } {
+                __unroll_config::<0>();
                 folded = Op::apply(folded, self.get(slot, value));
                 slot += 1;
             }
@@ -1760,9 +1814,11 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     pub fn tile_reduce<Op: ReduceOp>(self) -> f32 {
         let mut folded = Op::IDENTITY;
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 folded = Op::apply(folded, self.get(slot, value));
                 value += 1;
             }
@@ -1882,13 +1938,15 @@ pub fn online_rescale<const M: usize, const N: usize, L: FragmentLayout<M, N>>(
     out_acc: &mut RegTile<M, N, L>,
 ) {
     let mut slot = 0;
-    while slot < L::SLOTS {
+    while slot < const { L::SLOTS } {
+        __unroll_config::<0>();
         let next = fmax(m_ref.get(slot), row_max.get(slot));
         let factor = exp2_approx(m_ref.get(slot) - next);
         m_ref.set(slot, next);
         running_sum.set(slot, running_sum.get(slot) * factor);
         let mut value = 0;
-        while value < L::VALUES {
+        while value < const { L::VALUES } {
+            __unroll_config::<0>();
             out_acc.set(slot, value, out_acc.get(slot, value) * factor);
             value += 1;
         }
