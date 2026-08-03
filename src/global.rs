@@ -5,18 +5,18 @@
 //! encodes one for a given [`crate::shared::SharedTile`], so the descriptor and
 //! the tile it feeds agree by construction. Host-only (`feature = "host"`).
 //!
-//! [`GlobalRows`], [`load_rows`], [`store_rows`], [`load_row_vec`],
-//! [`store_row_vec`] and [`store_shared_rows`] are the direct path: ordinary
-//! loads and stores against a row-major window at a runtime leading dimension,
-//! no engine and nothing asynchronous. It is what an fp32 epilogue, a row
-//! statistic, a small irregular operand, or a band staged through shared memory
-//! takes to reach global memory.
+//! [`GlobalRows`], [`load_rows`], [`store_rows`], [`load_cols`],
+//! [`load_row_vec`], [`store_row_vec`] and [`store_shared_rows`] are the direct
+//! path: ordinary loads and stores against a row-major window at a runtime
+//! leading dimension, no engine and nothing asynchronous. It is what an fp32
+//! epilogue, a row statistic, a small irregular operand, or a band staged
+//! through shared memory takes to reach global memory.
 //!
 //! Design notes and measurements: `docs/library/global.md`.
 
 use core::marker::PhantomData;
 
-use crate::reg::{FragmentLayout, RegTile, RegVec, RowLayout};
+use crate::reg::{ColLayout, ColVec, FragmentLayout, RegTile, RegVec, RowLayout};
 use crate::shared::{Element, SharedTile, Swizzle};
 use cuda_device::DisjointSlice;
 use cuda_device::ptx_asm;
@@ -225,7 +225,7 @@ pub unsafe fn store_rows<E: Element, const M: usize, const N: usize, L: Fragment
     tile: RegTile<M, N, L>,
 ) {
     unsafe {
-        if pairs_are_one_access::<E, M, N, L>(dest, column) {
+        if pairs_are_one_access::<E, N, L>(dest, column) {
             store_rows_in_runs::<2, E, M, N, L>(dest, row, column, lane, tile)
         } else {
             store_rows_in_runs::<1, E, M, N, L>(dest, row, column, lane, tile)
@@ -234,10 +234,13 @@ pub unsafe fn store_rows<E: Element, const M: usize, const N: usize, L: Fragment
 }
 
 /// Whether this cursor and this layout together make two consecutive values
-/// one memory access — the whole of the decision [`store_rows`] and
-/// [`load_rows`] take, so they take it the same way.
+/// one memory access — the whole of the decision [`store_rows`], [`load_rows`]
+/// and [`load_cols`] take, so they take it the same way.
+///
+/// Bounded on [`ColLayout`] and not [`FragmentLayout`] because the pairing is
+/// a claim about columns alone; that is what lets the vector mover share it.
 #[inline(always)]
-fn pairs_are_one_access<E: Element, const M: usize, const N: usize, L: FragmentLayout<M, N>>(
+fn pairs_are_one_access<E: Element, const N: usize, L: ColLayout<N>>(
     rows: GlobalRows<E>,
     column: u32,
 ) -> bool {
@@ -326,7 +329,7 @@ pub unsafe fn load_rows<E: Element, const M: usize, const N: usize, L: FragmentL
     lane: u32,
 ) -> RegTile<M, N, L> {
     unsafe {
-        if pairs_are_one_access::<E, M, N, L>(src, column) {
+        if pairs_are_one_access::<E, N, L>(src, column) {
             load_rows_in_runs::<2, E, M, N, L>(src, row, column, lane)
         } else {
             load_rows_in_runs::<1, E, M, N, L>(src, row, column, lane)
@@ -374,6 +377,91 @@ unsafe fn load_rows_in_runs<
             slot += 1;
         }
         tile
+    }
+}
+
+/// Read `N` consecutive elements of one global row as the per-column operand a
+/// `col_map` takes.
+///
+/// The global twin of [`crate::ldst::load_vec`], which reads the same
+/// [`ColVec`] out of a [`crate::shared::SharedVec`]. A parameter vector — a
+/// norm's weight, a bias — is one row of memory and `N` values that every row
+/// of the tile it multiplies shares, so this is what it takes to reach the
+/// registers that multiply by it when its length is a runtime number and a
+/// `SharedVec<E, N>` is therefore not available to stage it in.
+///
+/// `L::VALUES` registers, where reading the same vector through [`load_rows`]
+/// against a stride-zero cursor costs `L::SLOTS * L::VALUES` and holds every
+/// value once per row the thread owns. Addresses, and the
+/// [`crate::reg::ColLayout::CONTIGUOUS_VALUES`] pairing spent on them, are
+/// [`load_rows`]' own for the single row `row`.
+///
+/// Not warp-collective: 32 threads each read the columns their layout gives
+/// them, and a lane that does not call it leaves its own values unset.
+///
+/// ```no_run
+/// use kittens::global::{GlobalRows, load_cols};
+/// use kittens::reg::{BaseLdtm, ColVec};
+/// use kittens::shared::F32;
+///
+/// # unsafe fn weights(gamma: *mut u8, column: u32, lane: u32) -> ColVec<64, BaseLdtm> {
+/// // A `[dim]` parameter vector: one row, and no stride to speak of.
+/// let src = unsafe { GlobalRows::<F32>::from_raw(gamma, 0) };
+/// unsafe { load_cols(src, 0, column, lane) }
+/// # }
+/// ```
+///
+/// # Safety
+///
+/// - `column..column + N` of row `row` lies inside the buffer `src` names.
+/// - No other thread is writing those elements.
+#[inline(always)]
+pub unsafe fn load_cols<E: Element, const N: usize, L: ColLayout<N>>(
+    src: GlobalRows<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+) -> ColVec<N, L> {
+    unsafe {
+        if pairs_are_one_access::<E, N, L>(src, column) {
+            load_cols_in_runs::<2, E, N, L>(src, row, column, lane)
+        } else {
+            load_cols_in_runs::<1, E, N, L>(src, row, column, lane)
+        }
+    }
+}
+
+/// [`load_cols`] at one access width; the single-row form of
+/// [`load_rows_in_runs`].
+///
+/// # Safety
+///
+/// As [`load_cols`], and `RUN > 1` additionally requires
+/// [`pairs_are_one_access`].
+#[inline(always)]
+unsafe fn load_cols_in_runs<const RUN: usize, E: Element, const N: usize, L: ColLayout<N>>(
+    src: GlobalRows<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+) -> ColVec<N, L> {
+    unsafe {
+        let mut cols = ColVec::<N, L>::splat(0.0);
+        let start = src.at(row, column);
+        let mut value = 0usize;
+        while value < L::VALUES {
+            let at = start.add(E::BYTES * L::col_of(lane, value) as usize);
+            match RUN {
+                2 => {
+                    let (first, second) = E::read_pair(at);
+                    cols.set(value, first);
+                    cols.set(value + 1, second);
+                }
+                _ => cols.set(value, E::read(at)),
+            }
+            value += RUN;
+        }
+        cols
     }
 }
 

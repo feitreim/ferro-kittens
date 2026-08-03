@@ -207,9 +207,10 @@ type. **#130** now carries the vector half — with two smaller holes beside it
 that the audit found in the same corner: a `SharedVec` cannot be sliced, so
 `layernorm` reaches a chunk of its parameter vector by laundering `at()` through
 `from_raw`, and `RegVec` had no bridge to memory at all. The **global** half of
-that last one landed (2.2, `global::load_row_vec`/`store_row_vec`); the shared
-half and the slice have not. The shared-*tile* half is still tracked nowhere
-(3.1).
+that last one landed (2.2, `global::load_row_vec`/`store_row_vec`), and the
+`ColVec` side of the same corner closed its global half with #172's
+`global::load_cols` (2.2); the shared halves and the slice have not. The
+shared-*tile* half is still tracked nowhere (3.1).
 
 ### 1.5 Global layout — a type since #8, and still bf16-only
 
@@ -303,6 +304,18 @@ contract an odd leading dimension would break. Named in `tests/gaps.rs` as
 `global_movers_carry_an_element`, which is what stops it going back to fp32 in
 prose.
 
+`load_cols` (#172) is the vector shape of the same walk on this cursor: `N`
+consecutive elements of **one** row, read into the `ColVec` a `col_map` takes,
+at `L::VALUES` registers where broadcasting the same vector through a
+stride-zero `load_rows` costs `L::SLOTS * L::VALUES` and holds every value once
+per row the thread owns. Its consumer is oxide-train's RMSNorm port, whose
+`[dim]` weight is a runtime length and so cannot be a `SharedVec<E, N>` for
+`ldst::load_vec` to read; the redundant-tile spelling it replaces put that
+kernel on a spill cliff past a 32-column chunk. The pairing test is shared with
+the tile movers rather than restated, which is why `pairs_are_one_access` is
+bounded on `ColLayout` and not `FragmentLayout`. Device case
+`global column map`.
+
 `RegVec` reaches global memory too, since #130's first half:
 `global::load_row_vec`/`store_row_vec` write one element per row of a band into
 a single column of a row-major buffer — attention's log-sum-exp in the head's
@@ -320,10 +333,14 @@ What is genuinely left. It **bounds-checks nothing**: the extents a TMA
 descriptor carries are absent rather than forgotten, since predicating every
 value would be paid by the epilogues that do divide. TK's ragged-tail loads want
 them back. Then `RegVec`'s *shared*-memory bridge, which is still absent where
-`ColVec` has had `ldst::load_vec`/`store_vec` since #13 — the remainder of
-**#130**, and the reason the two vectors need different code: a `ColVec`'s
-entries depend only on `lane % 4` and shared memory broadcasts them, where a
-`RegVec`'s slots are spread across `lane / 4`. Group scope is 1.1.
+`ColVec` now has both of its (`ldst::load_vec`/`store_vec` to shared,
+`load_cols` to global) — the remainder of **#130**, and the reason the two
+vectors need different code: a `ColVec`'s entries depend only on `lane % 4` and
+one contiguous run of memory holds them, where a `RegVec`'s slots are spread
+across `lane / 4` and moving one is a scatter. There is no `store_cols`,
+deliberately: a kernel that *produces* a per-column result produces it from
+`col_reduce` across a grid and wants an atomic, not a plain store. Group scope
+is 1.1.
 
 ### 2.3 TMA store side — plain stores landed (#9), reductions absent
 
@@ -458,8 +475,9 @@ data comes back to registers before anything is done to it. #13 asked for these
 beside the `SharedVec` type and closed on the type alone (1.4). **#130 carries
 the vector half; the tile half is still filed nowhere.** The per-column operand
 of `col_map` is no longer the hole
-this entry described: `col_reduce` produces one (3.2), and `ldst::load_vec`
-reads one out of shared memory.
+this entry described: `col_reduce` produces one (3.2), `ldst::load_vec` reads
+one out of shared memory, and `global::load_cols` reads one out of global memory
+without staging it first (#172, 2.2).
 
 ### 3.2 Reductions — the register side is done (#6), the shared side is not
 
