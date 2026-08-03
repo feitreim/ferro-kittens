@@ -215,9 +215,21 @@ Two instruction widths on top of that, and both are about the *wait*:
   count at identical addresses.
 
 Together those are **+23.1% / +8.8% / +5.1% at 4096³ / 8192³ / 16384³** over the
-staged drain without them, which is **1645.0 and 1754.6 TFLOP/s** and **0.939
-and 0.958 of cuBLASLt** at 8192³ and 16384³. `ptxas` reads **80 registers and no
-spill**.
+staged drain without them, which was **1645.0 and 1754.6 TFLOP/s** and **0.939
+and 0.958 of cuBLASLt** at 8192³ and 16384³.
+
+That drain then turned out to be paying a third chain nobody had priced: the
+composed `RegTile` between the `tcgen05.ld` and the `stmatrix` was homed to a
+256 B `.local` frame, because `store_tile_x4`'s block walk stopped unrolling
+past ~32 fp32 columns and SROA cannot split an aggregate behind a dynamic
+index (#166 — the census that found it, the attribution, and why the spill
+columns never showed it). With the walk pinned unrolled
+(`__unroll_config::<0>()` on an inline-`const` bound), the depot is gone from
+the PTX and the same bench reads **1772.9 TFLOP/s and 0.978 of cuBLASLt at
+8192³** — the drain was the gap (#144), and the depot was a third of the
+drain. `ptxas` now reads **80 registers with 12/16 spill st/ld and an 8 B
+stack**: what remains of the round-trip at the launch's register budget, 64
+scalar `st.local` fewer than the frame it replaces.
 
 ### The staging tile is per warp, and there is no proxy fence
 

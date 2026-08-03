@@ -21,6 +21,7 @@ use crate::reg::{ColLayout, ColVec, FragmentLayout, RegTile, RegVec, RowLayout};
 use crate::shared::{Element, SharedTile, Swizzle};
 use cuda_device::DisjointSlice;
 use cuda_device::ptx_asm;
+use cuda_device::thread::__unroll_config;
 
 /// A row-major window of global memory: a base address, the elements per row
 /// that separate one row from the next, and the element those are.
@@ -278,10 +279,12 @@ unsafe fn store_rows_in_runs<
 ) {
     unsafe {
         let mut slot = 0usize;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let start = dest.at(row + L::row_of(lane, slot), column);
             let mut value = 0usize;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 let at = start.add(E::BYTES * L::col_of(lane, value) as usize);
                 match RUN {
                     2 => E::write_pair(at, tile.get(slot, value), tile.get(slot, value + 1)),
@@ -360,10 +363,12 @@ unsafe fn load_rows_in_runs<
     unsafe {
         let mut tile = RegTile::<M, N, L>::zero();
         let mut slot = 0usize;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let start = src.at(row + L::row_of(lane, slot), column);
             let mut value = 0usize;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 let at = start.add(E::BYTES * L::col_of(lane, value) as usize);
                 match RUN {
                     2 => {
@@ -450,7 +455,8 @@ unsafe fn load_cols_in_runs<const RUN: usize, E: Element, const N: usize, L: Col
         let mut cols = ColVec::<N, L>::splat(0.0);
         let start = src.at(row, column);
         let mut value = 0usize;
-        while value < L::VALUES {
+        while value < const { L::VALUES } {
+            __unroll_config::<0>();
             let at = start.add(E::BYTES * L::col_of(lane, value) as usize);
             match RUN {
                 2 => {
@@ -516,7 +522,8 @@ pub unsafe fn store_row_vec<E: Element, const M: usize, L: RowLayout<M>>(
             return;
         }
         let mut slot = 0usize;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             E::write(dest.at(row + L::row_of(lane, slot), column), rows.get(slot));
             slot += 1;
         }
@@ -556,7 +563,8 @@ pub unsafe fn load_row_vec<E: Element, const M: usize, L: RowLayout<M>>(
     unsafe {
         let mut rows = RegVec::<M, L>::splat(0.0);
         let mut slot = 0usize;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             rows.set(slot, E::read(src.at(row + L::row_of(lane, slot), column)));
             slot += 1;
         }
@@ -620,7 +628,8 @@ pub unsafe fn load_col_vec<E: Element, const N: usize, L: ColLayout<N>>(
     unsafe {
         let mut cols = ColVec::<N, L>::splat(0.0);
         let mut value = 0usize;
-        while value < L::VALUES {
+        while value < const { L::VALUES } {
+            __unroll_config::<0>();
             cols.set(value, E::read(src.at(row + L::col_of(lane, value), column)));
             value += 1;
         }

@@ -1878,11 +1878,26 @@ def _check_occupancy_step(measured: dict[tuple[str, str], dict[str, int]]) -> No
 # scalar stores, a quarter as many loads, so plausibly `.v4` reads of an array
 # built element-wise — points at a dynamically-indexed fragment array rather
 # than at stage selection, and it recurs across kernels that share `reg.rs`
-# types. That is a guess: what these frames are, and whether any of their
-# traffic sits in a hot loop (`_print_sass_loops` can say), is unestablished.
-# Until it is, failing on them would gate on a number nobody understands. The
-# arming condition is a shipped set that reads zero here; flip the report back
-# to a raise when it does.
+# types. That guess attributed cleanly (#166): the frames were the register
+# tiles themselves, memory-homed because a storage-walking loop past ~32 fp32
+# columns stops unrolling, its indices stay runtime values, and SROA cannot
+# split an aggregate behind a dynamic GEP. One rolled *reader* was enough to
+# home a tile whose builder was fully unrolled — the staged family's 256 B
+# frame was built scalar by the drain and re-read by the rolled `stmatrix`
+# pack loop, inside the per-tile epilogue.
+#
+# The *mover* walks (`ldst`, `tmem`, `global`) now carry
+# `__unroll_config::<0>()` and an inline-`const` bound — the backend's
+# trip-count analysis sees `M / 16` as a runtime division otherwise, warns,
+# and leaves the loop rolled — and every GEMM in both crates reads zero here.
+# The `reg.rs` map/reduce walks deliberately do **not**: unrolling them
+# blanket was measured (2026-08-03) at 255 registers and 208/208 ptxas
+# spill st/ld on `flash_forward` against the 1058-store depot it replaced,
+# which is #94's lesson again — a kernel can pay a frame and win. What
+# remains on this table is exactly those kernels' map walks, and the arming
+# condition is unchanged: flip the report to a raise when the shipped set
+# reads zero, which now waits on a per-kernel answer for the maps rather
+# than on attribution.
 #
 # Substrings of the PTX text, counted per entry function the way the census
 # counts opcodes. The frame declaration is one column and its traffic is two
@@ -1911,15 +1926,17 @@ def _local_census() -> dict[tuple[str, str], dict[str, int]]:
 
 
 def _print_local_depot() -> None:
-    """`.local` in the PTX text, per entry function — a report today, a gate
-    when the shipped set reads zero (see the section comment for why not yet).
+    """`.local` in the PTX text, per entry function — attributed (#166, the
+    section comment) and still a report: the mover walks are fixed and the
+    remainder is the map walks, whose blanket fix measured worse than the
+    depot on `flash_forward`.
 
     The `shipped` column marks every kernel `examples/` emits plus the
     `GATED_KERNELS` rows: the kernels a launch gets by default, and the ones
     whose residency is already an argument. Those are the rows the armed gate
-    will fail on. Probes will stay report-only either way — the ladder's
-    `all_in_place` spelling streams its band through local memory on purpose,
-    and #94's history says a kernel can pay a frame and win."""
+    will fail on. Probes will stay report-only either way — a probe exists to
+    measure a spelling, and #94's history says a kernel can pay a frame and
+    win."""
     counted = _local_census()
     trafficked = {key: counts for key, counts in counted.items() if any(counts.values())}
     shipped = {key for key in counted if key[0] == "examples"}
@@ -1931,8 +1948,7 @@ def _print_local_depot() -> None:
     print("  this table across a change the way the register table is diffed:")
     if not trafficked:
         print(f"    zero everywhere: none of the {len(counted)} entry functions declare")
-        print("    or touch `.local`. The section comment says this is the arming")
-        print("    condition — flip this report back to a gate.")
+        print("    or touch `.local`.")
         return
 
     columns = [column for column, _ in DEPOT_PATTERNS]

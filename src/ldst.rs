@@ -17,6 +17,7 @@
 //! Design notes and measurements: `docs/library/ldst.md`.
 
 use cuda_device::ptx_asm;
+use cuda_device::thread::__unroll_config;
 use cuda_device::wmma::ldmatrix_x2;
 
 use crate::reg::{BaseLdtm, ColLayout, ColVec, Fragment, FragmentLayout, RegTile};
@@ -176,10 +177,16 @@ pub unsafe fn store_tile_x4<E: Element<Unpacked = [f32; 2]>, const M: usize, con
     BaseLdtm: FragmentLayout<M, N>,
 {
     unsafe {
+        // Both walks fully unrolled, or the counters stay runtime values, the
+        // reads of `tile` stay dynamic GEPs SROA cannot split, and the whole
+        // aggregate is homed to a `.local` depot (#166). LLVM stops unrolling
+        // on its own near 32 fp32 columns.
         let mut row_block = 0usize;
-        while row_block < M / 16 {
+        while row_block < const { M / 16 } {
+            __unroll_config::<0>();
             let mut column_block = 0usize;
-            while column_block < N / 16 {
+            while column_block < const { N / 16 } {
+                __unroll_config::<0>();
                 store_fragment_x4(
                     chunks,
                     row + 16 * row_block as u32,
@@ -286,10 +293,13 @@ where
 {
     unsafe {
         let mut tile = RegTile::<M, N, BaseLdtm>::zero();
+        // Fully unrolled for `tile`'s sake — see `store_tile_x4` (#166).
         let mut row_block = 0usize;
-        while row_block < M / 16 {
+        while row_block < const { M / 16 } {
+            __unroll_config::<0>();
             let mut column_block = 0usize;
-            while column_block < N / 16 {
+            while column_block < const { N / 16 } {
+                __unroll_config::<0>();
                 place_block(
                     &mut tile,
                     row_block,
@@ -338,10 +348,13 @@ pub unsafe fn store_tile<E: Element<Unpacked = [f32; 2]>, const M: usize, const 
     BaseLdtm: FragmentLayout<M, N>,
 {
     unsafe {
+        // Fully unrolled for `tile`'s sake — see `store_tile_x4` (#166).
         let mut row_block = 0usize;
-        while row_block < M / 16 {
+        while row_block < const { M / 16 } {
+            __unroll_config::<0>();
             let mut column_block = 0usize;
-            while column_block < N / 16 {
+            while column_block < const { N / 16 } {
+                __unroll_config::<0>();
                 store_fragment(
                     chunks,
                     row + 16 * row_block as u32,
@@ -388,7 +401,8 @@ pub unsafe fn load_vec<E: Element, const N: usize, L: ColLayout<N>>(
     unsafe {
         let mut cols = ColVec::<N, L>::splat(0.0);
         let mut value = 0usize;
-        while value < L::VALUES {
+        while value < const { L::VALUES } {
+            __unroll_config::<0>();
             cols.set(value, vec.get(L::col_of(lane, value) as usize));
             value += 1;
         }
@@ -415,7 +429,8 @@ pub unsafe fn store_vec<E: Element, const N: usize, L: ColLayout<N>>(
 ) {
     unsafe {
         let mut value = 0usize;
-        while value < L::VALUES {
+        while value < const { L::VALUES } {
+            __unroll_config::<0>();
             vec.set(L::col_of(lane, value) as usize, cols.get(value));
             value += 1;
         }

@@ -58,6 +58,7 @@ use cuda_device::tcgen05::{
     tcgen05_load_wait, tcgen05_relinquish_alloc_permit, tcgen05_relinquish_alloc_permit_cg2,
     tcgen05_st_16x256b_x1_raw, tcgen05_store_wait,
 };
+use cuda_device::thread::__unroll_config;
 use cuda_device::{cluster, thread};
 
 use crate::reg::{BaseLdtm, Fragment, FragmentLayout, RegTile};
@@ -571,10 +572,16 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     {
         unsafe {
             let mut tile = RegTile::<M, N, BaseLdtm>::zero();
+            // Both walks fully unrolled, or `tile`'s indices stay dynamic,
+            // SROA cannot split it, and the aggregate is homed to a `.local`
+            // depot (#166). LLVM stops unrolling on its own near 32 fp32
+            // columns.
             let mut row_block = 0usize;
-            while row_block < M / 16 {
+            while row_block < const { M / 16 } {
+                __unroll_config::<0>();
                 let mut column_block = 0usize;
-                while column_block < N / 16 {
+                while column_block < const { N / 16 } {
+                    __unroll_config::<0>();
                     place_block(
                         &mut tile,
                         row_block,
@@ -674,14 +681,18 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
         };
         unsafe {
             let mut tile = RegTile::<M, N, BaseLdtm>::zero();
+            // Fully unrolled for `tile` and `blocks`' sake — see `tile` (#166).
             let mut row_block = 0usize;
-            while row_block < M / 16 {
+            while row_block < const { M / 16 } {
+                __unroll_config::<0>();
                 let mut group = 0usize;
-                while group < N / 64 {
+                while group < const { N / 64 } {
+                    __unroll_config::<0>();
                     let blocks =
                         self.fragments_x8(row + 16 * row_block as u32, column + 64 * group as u32);
                     let mut block = 0usize;
                     while block < 4 {
+                        __unroll_config::<0>();
                         place_block(&mut tile, row_block, 4 * group + block, blocks[block]);
                         block += 1;
                     }
@@ -804,10 +815,13 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
         BaseLdtm: FragmentLayout<M, N>,
     {
         unsafe {
+            // Fully unrolled for `tile`'s sake — see `Self::tile` (#166).
             let mut row_block = 0usize;
-            while row_block < M / 16 {
+            while row_block < const { M / 16 } {
+                __unroll_config::<0>();
                 let mut column_block = 0usize;
-                while column_block < N / 16 {
+                while column_block < const { N / 16 } {
+                    __unroll_config::<0>();
                     self.store_fragment_tile(
                         row + 16 * row_block as u32,
                         column + 16 * column_block as u32,
