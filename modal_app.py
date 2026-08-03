@@ -1893,11 +1893,14 @@ def _check_occupancy_step(measured: dict[tuple[str, str], dict[str, int]]) -> No
 # The `reg.rs` map/reduce walks deliberately do **not**: unrolling them
 # blanket was measured (2026-08-03) at 255 registers and 208/208 ptxas
 # spill st/ld on `flash_forward` against the 1058-store depot it replaced,
-# which is #94's lesson again — a kernel can pay a frame and win. What
-# remains on this table is exactly those kernels' map walks, and the arming
-# condition is unchanged: flip the report to a raise when the shipped set
-# reads zero, which now waits on a per-kernel answer for the maps rather
-# than on attribution.
+# which is #94's lesson again — a kernel can pay a frame and win. A map
+# walk's frame is a tile that does not *fit*, and the fix there is not
+# unrolling but streaming: `groupnorm_tile` held its whole [32, 128] band
+# and its frame left when the band did (168 regs / 1536 B / 594 GB/s to
+# 48 / 0 / 5996 — `docs/kernels/layernorm.md`). What remains on this table
+# is `flash_forward`, whose accumulator band is the algorithm's own live
+# state, and the arming condition is unchanged: flip the report to a raise
+# when the shipped set reads zero, which now waits on that one kernel.
 #
 # Substrings of the PTX text, counted per entry function the way the census
 # counts opcodes. The frame declaration is one column and its traffic is two
