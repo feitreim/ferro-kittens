@@ -171,7 +171,12 @@ pub mod kernels {
             }
 
             let score_shape = MmaShape::M128_N64;
-            let output_shape = MmaShape::M128_N128;
+            // The output is `[QUERIES, HEAD]`, but `mm_ab` reaches it in one
+            // 64-wide band per `V` subtile, so the shape is the *band's* and
+            // `M128_N128` here would have band 1 overwrite half of band 0
+            // (kittens #175). This kernel had it wrong from the day it was
+            // written, and having no reference `O` is why (#85).
+            let output_shape = MmaShape::M128_N64;
 
             let mut running_max = Rows::splat(f32::NEG_INFINITY);
             let mut running_sum = Rows::splat(0.0);

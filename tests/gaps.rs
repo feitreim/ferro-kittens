@@ -166,6 +166,25 @@ fn global_movers_carry_an_element<E: Element, const M: usize, const N: usize, L>
     }
 }
 
+/// §2.2/§1.4 — the `RegVec` bridge to global memory (#130's first half).
+///
+/// A per-row statistic is what every attention and normalization kernel
+/// computes and what §2.2 said for a long time could not leave the warp except
+/// folded to a scalar. `RowLayout::owns_row` is named beside the movers because
+/// it is the claim the store spends: `row_of` is not injective across a warp, so
+/// without an owner the store is four threads writing one address.
+fn a_row_statistic_reaches_global_memory<E: Element, const M: usize, L: RowLayout<M>>(
+    rows: kittens::global::GlobalRows<E>,
+    lane: u32,
+    statistic: RegVec<M, L>,
+) {
+    unsafe {
+        kittens::global::store_row_vec(rows, 0, 0, lane, statistic);
+        let _: RegVec<M, L> = kittens::global::load_row_vec(rows, 0, 0, lane);
+        let _: bool = L::owns_row(lane);
+    }
+}
+
 /// §2.6 — shared → global with no engine between them (#113), and the wide
 /// register→shared store the epilogue in front of it uses (#116).
 ///
@@ -187,6 +206,28 @@ fn a_staged_drain_is_two_calls<E: Element<Unpacked = [f32; 2]>, const M: usize, 
         kittens::ldst::store_fragment_x4(chunks, 0, 0, lane, kittens::Fragment::zero());
         kittens::global::store_shared_rows::<E, M, N, kittens::Swizzle128B, 32>(
             rows, 0, 0, lane, tile,
+        );
+    }
+}
+
+/// §2.6 — a staged tile can be folded into memory as well as written over it
+/// (#169), and the fold is the element's arithmetic.
+///
+/// Named separately from `a_staged_drain_is_two_calls` because the two halves
+/// can rot apart: `accumulate_shared_rows` could survive a rename of
+/// `Element::add_packed` only by growing a hand-written add, which is the exact
+/// thing the trait method exists to prevent. `E` is unbounded here where the
+/// staged drain bounds `Unpacked = [f32; 2]`, which is the claim that the fold
+/// is *not* an `stmatrix` path and takes an fp32 destination too.
+fn a_staged_tile_can_be_folded_into_memory<E: Element, const M: usize, const N: usize>(
+    tile: kittens::SharedTile<E, M, N, kittens::Swizzle128B>,
+    rows: kittens::global::GlobalRows<E>,
+    thread: u32,
+) {
+    let _: u32 = E::add_packed(0, 0);
+    unsafe {
+        kittens::global::accumulate_shared_rows::<E, M, N, kittens::Swizzle128B, 32>(
+            rows, 0, 0, thread, tile,
         );
     }
 }

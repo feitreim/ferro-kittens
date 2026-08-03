@@ -5,17 +5,18 @@
 //! encodes one for a given [`crate::shared::SharedTile`], so the descriptor and
 //! the tile it feeds agree by construction. Host-only (`feature = "host"`).
 //!
-//! [`GlobalRows`], [`load_rows`], [`store_rows`] and [`store_shared_rows`] are
-//! the direct path: ordinary loads and stores against a row-major window at a
-//! runtime leading dimension, no engine and nothing asynchronous. It is what an
-//! fp32 epilogue, a small irregular operand, or a band staged through shared
-//! memory takes to reach global memory.
+//! [`GlobalRows`], [`load_rows`], [`store_rows`], [`load_cols`],
+//! [`load_row_vec`], [`store_row_vec`] and [`store_shared_rows`] are the direct
+//! path: ordinary loads and stores against a row-major window at a runtime
+//! leading dimension, no engine and nothing asynchronous. It is what an fp32
+//! epilogue, a row statistic, a small irregular operand, or a band staged
+//! through shared memory takes to reach global memory.
 //!
 //! Design notes and measurements: `docs/library/global.md`.
 
 use core::marker::PhantomData;
 
-use crate::reg::{ColLayout, ColVec, FragmentLayout, RegTile};
+use crate::reg::{ColLayout, ColVec, FragmentLayout, RegTile, RegVec, RowLayout};
 use crate::shared::{Element, SharedTile, Swizzle};
 use cuda_device::DisjointSlice;
 use cuda_device::ptx_asm;
@@ -464,6 +465,104 @@ unsafe fn load_cols_in_runs<const RUN: usize, E: Element, const N: usize, L: Col
     }
 }
 
+/// Write a row statistic out: one element per row of `row..row + M`, all in
+/// global column `column`.
+///
+/// The [`RegVec`] half of [`store_rows`], and what an attention epilogue's
+/// log-sum-exp, a normalization's per-row mean or its inverse standard deviation
+/// takes to leave the warp. `column` is a column and not a second buffer,
+/// because a per-row statistic of a `[rows, heads]` output is one column of it —
+/// a cursor at stride `heads` and `column = head` writes the head's, which is
+/// the shape that made the store a scatter rather than a run in the first place.
+///
+/// **The addresses are a scatter**: consecutive slots are 8 rows apart, so this
+/// is one store per owned row and there is no run to widen. Only the lanes
+/// [`RowLayout::owns_row`] names store — under [`crate::reg::BaseLdtm`] one lane
+/// of each quad, since the other three hold the same value.
+///
+/// Not warp-collective, for [`store_rows`]' reason: a lane that does not call it
+/// leaves its own rows unwritten.
+///
+/// ```no_run
+/// use kittens::global::{GlobalRows, store_row_vec};
+/// use kittens::reg::{BaseLdtm, RegVec};
+/// use kittens::shared::F32;
+///
+/// # unsafe fn epilogue(lse: *mut u8, heads: usize, head: u32, row: u32, lane: u32) {
+/// let running_sum = RegVec::<32, BaseLdtm>::splat(1.0);
+/// // One f32 per query row, in the head's own column of a `[rows, heads]` buffer.
+/// let dest = unsafe { GlobalRows::<F32>::from_raw(lse, heads) };
+/// unsafe { store_row_vec(dest, row, head, lane, running_sum.log2()) };
+/// # }
+/// ```
+///
+/// # Safety
+///
+/// - The column segment `row..row + M` at `column` lies inside the buffer `dest`
+///   names, at `dest.stride()` elements per row.
+/// - Every lane passing the layout's [`RowLayout::owns_row`] test calls it, or
+///   the rows only that lane writes stay unwritten.
+#[inline(always)]
+pub unsafe fn store_row_vec<E: Element, const M: usize, L: RowLayout<M>>(
+    dest: GlobalRows<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+    rows: RegVec<M, L>,
+) {
+    unsafe {
+        if !L::owns_row(lane) {
+            return;
+        }
+        let mut slot = 0usize;
+        while slot < L::SLOTS {
+            E::write(dest.at(row + L::row_of(lane, slot), column), rows.get(slot));
+            slot += 1;
+        }
+    }
+}
+
+/// Read a row statistic in — a per-row bias, a saved log-sum-exp a backward pass
+/// recomputes probabilities against — over [`store_row_vec`]' addresses.
+///
+/// Every lane loads, including the replicas [`RowLayout::owns_row`] rejects for
+/// the store: a [`RegVec`] is *defined* as one copy per lane holding the row, so
+/// the reads that look redundant are what makes the vector well-formed. They are
+/// the same address across a quad and coalesce into one transaction.
+///
+/// ```no_run
+/// use kittens::global::{GlobalRows, load_row_vec};
+/// use kittens::reg::{BaseLdtm, RegVec};
+/// use kittens::shared::F32;
+///
+/// # unsafe fn recompute(lse: *mut u8, heads: usize, head: u32, row: u32, lane: u32) {
+/// let src = unsafe { GlobalRows::<F32>::from_raw(lse, heads) };
+/// let _: RegVec<32, BaseLdtm> = unsafe { load_row_vec(src, row, head, lane) };
+/// # }
+/// ```
+///
+/// # Safety
+///
+/// - As [`store_row_vec`], reading instead of writing.
+/// - No other thread is writing that column segment.
+#[inline(always)]
+pub unsafe fn load_row_vec<E: Element, const M: usize, L: RowLayout<M>>(
+    src: GlobalRows<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+) -> RegVec<M, L> {
+    unsafe {
+        let mut rows = RegVec::<M, L>::splat(0.0);
+        let mut slot = 0usize;
+        while slot < L::SLOTS {
+            rows.set(slot, E::read(src.at(row + L::row_of(lane, slot), column)));
+            slot += 1;
+        }
+        rows
+    }
+}
+
 /// The unit both ends of a staged drain agree on: the largest run contiguous in
 /// shared *and* in global memory, and the widest access PTX has
 /// (`st.global.v4.b32`).
@@ -555,6 +654,79 @@ pub unsafe fn store_shared_rows<
     }
 }
 
+/// Fold a whole `[R, C]` shared tile **into** the `(row, column)` rectangle of a
+/// row-major global buffer: `C += tile`, at [`store_shared_rows`]' access widths.
+///
+/// The `+=` twin of [`store_shared_rows`], and the same function with the copy
+/// replaced by a load of both sides, an [`Element::add_packed`] and a store. Same
+/// signature, same chunk split, same [`access_width`] ladder, so an accumulating
+/// epilogue costs the read and nothing else — where a hand-rolled
+/// read-modify-write drops to 4-byte accesses and costs more than the rest of the
+/// kernel (#169 measured 1113 → 536 TFLOP/s for exactly that).
+///
+/// The addition is the *element's*: a narrow `E` widens both sides, adds in fp32
+/// and rounds the sum once. Nothing rounds twice, and no partial sum is held at
+/// `E`.
+///
+/// ```no_run
+/// use kittens::global::{GlobalRows, accumulate_shared_rows};
+/// use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+///
+/// # unsafe fn drain(staged: *mut u8, c: *mut u8, ldc: usize, thread: u32) {
+/// let tile = unsafe { SharedTile::<Bf16, 64, 128, Swizzle128B>::from_raw(staged) };
+/// let dest = unsafe { GlobalRows::<Bf16>::from_raw(c, ldc) };
+/// unsafe { accumulate_shared_rows::<_, 64, 128, _, 128>(dest, 0, 0, thread, tile) };
+/// # }
+/// ```
+///
+/// # Safety
+///
+/// - As [`store_shared_rows`], and the rectangle must additionally be *readable*:
+///   this reads `C` before it writes it.
+/// - No other thread is writing that rectangle. The read and the write are two
+///   instructions and not an atomic, so two accumulators over one destination
+///   lose each other's contribution rather than serializing.
+#[inline(always)]
+pub unsafe fn accumulate_shared_rows<
+    E: Element,
+    const R: usize,
+    const C: usize,
+    S: Swizzle,
+    const THREADS: u32,
+>(
+    dest: GlobalRows<E>,
+    row: u32,
+    column: u32,
+    thread: u32,
+    tile: SharedTile<E, R, C, S>,
+) {
+    const {
+        assert!(
+            E::BYTES == 2 || E::BYTES == 4,
+            "the access ladder's narrowest rung is two bytes, so a narrower element has none"
+        )
+    };
+    const { assert!(THREADS > 0, "a drain needs at least one thread") };
+    const {
+        assert!(
+            (R * C * E::BYTES / CHUNK_BYTES).is_multiple_of(THREADS as usize),
+            "the drain's threads must divide the tile's 16-byte chunks between them exactly"
+        )
+    };
+    unsafe {
+        match access_width(dest, column) {
+            CHUNK_BYTES => fold_in_accesses::<CHUNK_BYTES, E, R, C, S, THREADS>(
+                dest, row, column, thread, tile,
+            ),
+            8 => fold_in_accesses::<8, E, R, C, S, THREADS>(dest, row, column, thread, tile),
+            2 if E::BYTES == 2 => {
+                fold_in_accesses::<2, E, R, C, S, THREADS>(dest, row, column, thread, tile)
+            }
+            _ => fold_in_accesses::<4, E, R, C, S, THREADS>(dest, row, column, thread, tile),
+        }
+    }
+}
+
 /// Bytes per access the ladder settles on for this cursor and column origin —
 /// the whole of [`store_shared_rows`]' width decision, as a pure function.
 ///
@@ -640,6 +812,102 @@ unsafe fn drain_in_accesses<
                 byte += WIDTH;
             }
             item += THREADS as usize;
+        }
+    }
+}
+
+/// [`accumulate_shared_rows`] at one access width — [`drain_in_accesses`] with
+/// [`add_bytes`] in place of [`copy_bytes`], and the same chunk split, so the two
+/// drains cover a tile identically.
+///
+/// # Safety
+///
+/// As [`accumulate_shared_rows`], and `WIDTH` must be what [`access_width`]
+/// returned for this cursor and column.
+#[inline(always)]
+unsafe fn fold_in_accesses<
+    const WIDTH: usize,
+    E: Element,
+    const R: usize,
+    const C: usize,
+    S: Swizzle,
+    const THREADS: u32,
+>(
+    dest: GlobalRows<E>,
+    row: u32,
+    column: u32,
+    thread: u32,
+    tile: SharedTile<E, R, C, S>,
+) {
+    unsafe {
+        let chunks = tile.chunk_writer();
+        let per_row = C * E::BYTES / CHUNK_BYTES;
+        let chunk_columns = CHUNK_BYTES / E::BYTES;
+        let mut item = thread as usize;
+        while item < R * per_row {
+            let (tile_row, chunk) = drain_item(item, per_row);
+            let from = chunks.at(tile_row, chunk);
+            let to = dest.at(
+                row + tile_row as u32,
+                column + (chunk * chunk_columns) as u32,
+            );
+            let mut byte = 0usize;
+            while byte < CHUNK_BYTES {
+                add_bytes::<WIDTH, E>(from.add(byte), to.add(byte));
+                byte += WIDTH;
+            }
+            item += THREADS as usize;
+        }
+    }
+}
+
+/// Add `WIDTH` bytes of shared memory into the same width of global memory, in
+/// `E`'s arithmetic.
+///
+/// One load from each side, [`Element::add_packed`] per 32-bit word, one store —
+/// at the same widths [`copy_bytes`] moves, so the fold keeps the store shape the
+/// staged epilogue exists for. The 2-byte rung carries half a word and
+/// [`Element::add_packed`] folds its unused half against zero, which packs back
+/// to a value this store then drops.
+///
+/// # Safety
+///
+/// - As [`copy_bytes`], and `to` must additionally name `WIDTH` *readable* bytes.
+#[inline(always)]
+unsafe fn add_bytes<const WIDTH: usize, E: Element>(from: *const u8, to: *mut u8) {
+    const {
+        assert!(
+            WIDTH == 16 || WIDTH == 8 || WIDTH == 4 || WIDTH == 2,
+            "a shared-to-global access is 2, 4, 8 or 16 bytes wide"
+        )
+    };
+    unsafe {
+        match WIDTH {
+            16 => {
+                let (staged, current) = (read_shared_v4(from), read_global_v4(to));
+                let mut sum = [0u32; 4];
+                let mut word = 0usize;
+                while word < 4 {
+                    sum[word] = E::add_packed(current[word], staged[word]);
+                    word += 1;
+                }
+                write_v4(to, sum)
+            }
+            8 => {
+                let (staged, current) = (read_shared_v2(from), read_global_v2(to));
+                write_v2(
+                    to,
+                    [
+                        E::add_packed(current[0], staged[0]),
+                        E::add_packed(current[1], staged[1]),
+                    ],
+                )
+            }
+            4 => *(to as *mut u32) = E::add_packed(*(to as *const u32), *(from as *const u32)),
+            _ => {
+                *(to as *mut u16) =
+                    E::add_packed(*(to as *const u16) as u32, *(from as *const u16) as u32) as u16
+            }
         }
     }
 }
@@ -742,6 +1010,52 @@ unsafe fn write_v4(to: *mut u8, words: [u32; 4]) {
             in("r") words[3],
             clobber("memory"),
         );
+    }
+}
+
+/// 16 bytes of global memory in one access: `ld.global.v4.b32`.
+///
+/// The read half of an accumulating drain, at [`write_v4`]'s width so the fold
+/// keeps the store's shape: a warp of 32 lanes reads the same 512 contiguous
+/// bytes it is about to write.
+///
+/// # Safety
+///
+/// - `from` is a 16-byte-aligned global address with 16 readable bytes.
+#[inline(always)]
+unsafe fn read_global_v4(from: *const u8) -> [u32; 4] {
+    unsafe {
+        let (a, b, c, d): (u32, u32, u32, u32);
+        ptx_asm!(
+            "ld.global.v4.b32 {%0, %1, %2, %3}, [%4];",
+            out("=r") a,
+            out("=r") b,
+            out("=r") c,
+            out("=r") d,
+            in("l") from as u64,
+            clobber("memory"),
+        );
+        [a, b, c, d]
+    }
+}
+
+/// `ld.global.v2.b32` — the rung below [`read_global_v4`].
+///
+/// # Safety
+///
+/// - As [`read_global_v4`], 8-byte aligned with 8 readable bytes.
+#[inline(always)]
+unsafe fn read_global_v2(from: *const u8) -> [u32; 2] {
+    unsafe {
+        let (a, b): (u32, u32);
+        ptx_asm!(
+            "ld.global.v2.b32 {%0, %1}, [%2];",
+            out("=r") a,
+            out("=r") b,
+            in("l") from as u64,
+            clobber("memory"),
+        );
+        [a, b]
     }
 }
 
@@ -909,6 +1223,71 @@ mod rows_tests {
                     let (r, c) = RegTile::<32, 64, BaseLdtm>::coordinate(lane, slot, value);
                     assert_eq!(rows.index(7 + r, 64 + c), start + c as usize);
                 }
+            }
+        }
+    }
+
+    /// The row axis' version of `a_bands_threads_cover_its_rectangle_exactly
+    /// _once`, and the whole of what [`RowLayout::owns_row`] is for: the owning
+    /// lanes between them name each of the band's `M` rows exactly once. Without
+    /// the predicate every row would be named four times.
+    #[test]
+    fn the_owning_lanes_cover_a_bands_rows_exactly_once() {
+        fn one_writer_per_row<const M: usize>()
+        where
+            BaseLdtm: RowLayout<M>,
+        {
+            let mut written = vec![0usize; M];
+            for lane in 0..32u32 {
+                if !<BaseLdtm as RowLayout<M>>::owns_row(lane) {
+                    continue;
+                }
+                for slot in 0..<BaseLdtm as RowLayout<M>>::SLOTS {
+                    written[<BaseLdtm as RowLayout<M>>::row_of(lane, slot) as usize] += 1;
+                }
+            }
+            assert!(written.iter().all(|&n| n == 1), "M = {M}: {written:?}");
+        }
+        one_writer_per_row::<16>();
+        one_writer_per_row::<32>();
+        one_writer_per_row::<128>();
+    }
+
+    /// `F32`'s reads and writes are plain pointer accesses, so the mover itself
+    /// runs on the host: a statistic stored into one column of a `[rows, heads]`
+    /// buffer lands at that column of each of its rows, touches nothing else,
+    /// and reads back into every replica.
+    #[test]
+    fn a_row_statistic_round_trips_through_one_column() {
+        const HEADS: usize = 3;
+        const HEAD: u32 = 1;
+        const ROW: u32 = 32;
+        let mut buffer = vec![0.0f32; (ROW as usize + 32) * HEADS];
+        let dest = unsafe { GlobalRows::<F32>::from_raw(buffer.as_mut_ptr().cast(), HEADS) };
+
+        for lane in 0..32u32 {
+            let mut statistic = RegVec::<32, BaseLdtm>::splat(0.0);
+            for slot in 0..<BaseLdtm as RowLayout<32>>::SLOTS {
+                statistic.set(slot, BaseLdtm::row(lane, slot) as f32 + 0.5);
+            }
+            unsafe { store_row_vec(dest, ROW, HEAD, lane, statistic) };
+        }
+
+        for (index, &value) in buffer.iter().enumerate() {
+            let (row, head) = (index / HEADS, index % HEADS);
+            let expected = if row >= ROW as usize && head == HEAD as usize {
+                row as f32 - ROW as f32 + 0.5
+            } else {
+                0.0
+            };
+            assert_eq!(value, expected, "row {row} head {head}");
+        }
+
+        // Every lane reads, replicas included — four copies of each row's value.
+        for lane in 0..32u32 {
+            let read: RegVec<32, BaseLdtm> = unsafe { load_row_vec(dest, ROW, HEAD, lane) };
+            for slot in 0..<BaseLdtm as RowLayout<32>>::SLOTS {
+                assert_eq!(read.get(slot), BaseLdtm::row(lane, slot) as f32 + 0.5);
             }
         }
     }

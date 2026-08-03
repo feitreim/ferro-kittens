@@ -74,8 +74,8 @@ use cuda_device::{cluster, cluster_launch, cuda_module, debug, kernel, thread, w
 
 use kittens::epilogue::{StoreRing, Warp};
 use kittens::global::{
-    GlobalLayout, GlobalRows, encode_bf16_panels, load_cols, load_rows, store_rows,
-    store_shared_rows,
+    GlobalLayout, GlobalRows, accumulate_shared_rows, encode_bf16_panels, load_cols, load_rows,
+    store_rows, store_shared_rows,
 };
 use kittens::ldst::{load_fragment, load_tile, load_vec, store_fragment, store_tile};
 use kittens::mma::{self, MmaShape, mm_ab, mm_abt, mm_atb, mm_atbt, mma_abt};
@@ -1087,8 +1087,18 @@ pub mod kernels {
     /// this case unchanged; only `access_width`'s host tests say which rung a
     /// cursor gets. Launch with [`DRAIN_THREADS`].
     #[inline(always)]
-    unsafe fn shared_drain_probe<const C: usize>(column: u32, out: &mut DisjointSlice<u16>)
-    where
+    ///
+    /// `ACCUMULATE` swaps the drain for
+    /// [`kittens::global::accumulate_shared_rows`], which is the same rectangle
+    /// by the same addresses at the same widths, folded in rather than
+    /// overwritten. Everything the store case proves about the geometry the
+    /// accumulate case proves again, and it additionally reads `C`: a fold that
+    /// dropped the read leaves the destination's seed nowhere in the answer.
+    #[inline(always)]
+    unsafe fn shared_drain_probe<const C: usize, const ACCUMULATE: bool>(
+        column: u32,
+        out: &mut DisjointSlice<u16>,
+    ) where
         BaseLdtm: FragmentLayout<DRAIN_WARP_ROWS, C>,
     {
         unsafe {
@@ -1116,20 +1126,31 @@ pub mod kernels {
             thread::sync_threads();
 
             let destination = GlobalRows::<Bf16>::from_slice(out, DRAIN_PITCH);
-            store_shared_rows::<Bf16, DRAIN_ROWS, C, Swizzle128B, DRAIN_THREADS>(
-                destination,
-                DRAIN_ROW,
-                column,
-                thread::threadIdx_x(),
-                tile,
-            );
+            let thread = thread::threadIdx_x();
+            if ACCUMULATE {
+                accumulate_shared_rows::<Bf16, DRAIN_ROWS, C, Swizzle128B, DRAIN_THREADS>(
+                    destination,
+                    DRAIN_ROW,
+                    column,
+                    thread,
+                    tile,
+                );
+            } else {
+                store_shared_rows::<Bf16, DRAIN_ROWS, C, Swizzle128B, DRAIN_THREADS>(
+                    destination,
+                    DRAIN_ROW,
+                    column,
+                    thread,
+                    tile,
+                );
+            }
         }
     }
 
     /// [`shared_drain_probe`] over one subtile.
     #[kernel]
     pub unsafe fn shared_drain(column: u32, mut out: DisjointSlice<u16>) {
-        unsafe { shared_drain_probe::<TILE>(column, &mut out) }
+        unsafe { shared_drain_probe::<TILE, false>(column, &mut out) }
     }
 
     /// [`shared_drain_probe`] over two stacked subtiles: chunks 8.. of every
@@ -1138,7 +1159,21 @@ pub mod kernels {
     /// sides' notions of "next" disagree.
     #[kernel]
     pub unsafe fn shared_drain_wide(column: u32, mut out: DisjointSlice<u16>) {
-        unsafe { shared_drain_probe::<WIDE>(column, &mut out) }
+        unsafe { shared_drain_probe::<WIDE, false>(column, &mut out) }
+    }
+
+    /// [`shared_drain`]'s rectangle folded into its destination instead of
+    /// overwriting it.
+    #[kernel]
+    pub unsafe fn shared_accumulate(column: u32, mut out: DisjointSlice<u16>) {
+        unsafe { shared_drain_probe::<TILE, true>(column, &mut out) }
+    }
+
+    /// [`shared_drain_wide`]'s rectangle folded in — the stacked-subtile stride
+    /// on the accumulating path.
+    #[kernel]
+    pub unsafe fn shared_accumulate_wide(column: u32, mut out: DisjointSlice<u16>) {
+        unsafe { shared_drain_probe::<WIDE, true>(column, &mut out) }
     }
 
     /// TMA the same tile [`swizzle_probe`] stages, then read every `[16, 16]`
@@ -4373,6 +4408,51 @@ fn check_shared_drain<const C: usize>(
     ))
 }
 
+/// Does the same rectangle *fold into* its destination, reading `C` and
+/// rounding the sum once?
+///
+/// [`check_shared_drain`] with the seed inside the rectangle changed from
+/// poison to the identities themselves, so the answer is every identity
+/// doubled. Doubling a bf16 moves the exponent and leaves the mantissa alone,
+/// which is why the comparison can stay on bit patterns with no tolerance
+/// anywhere: a fold that rounded twice, accumulated at bf16, or added the wrong
+/// neighbour lands on a different pattern, not a nearby one.
+///
+/// Every geometry failure [`check_shared_drain`] names is named here too — the
+/// margins are still poison and still checked. The one failure only this case
+/// can see is a fold that **dropped the read**: that writes the identities
+/// undoubled, which is exactly what the store case expects and this one does
+/// not.
+fn check_shared_accumulate<const C: usize>(
+    stream: &CudaStream,
+    launch: impl Fn(LaunchConfig, u32, &mut DeviceBuffer<u16>) -> Result<(), cuda_core::DriverError>,
+) -> Result<String, Box<dyn Error>> {
+    let poison = vec![POISON_HALF; DRAIN_MATRIX_ROWS * DRAIN_PITCH];
+    for column in DRAIN_COLUMNS {
+        let (mut seed, mut expected) = (poison.clone(), poison.clone());
+        for row in 0..DRAIN_ROWS {
+            for tile_column in 0..C {
+                let at = (DRAIN_ROW as usize + row) * DRAIN_PITCH + column as usize + tile_column;
+                seed[at] = cell_bits(row, tile_column);
+                expected[at] = to_bf16(2.0 * cell(row, tile_column));
+            }
+        }
+        let mut destination = DeviceBuffer::from_host(stream, &seed)?;
+        launch(
+            launch_config(DRAIN_THREADS, Tile::<DRAIN_ROWS, C>::BYTES as u32),
+            column,
+            &mut destination,
+        )?;
+        compare_matrix(&destination.to_host_vec(stream)?, &expected, column)?;
+    }
+    let columns = C;
+    Ok(format!(
+        "[{DRAIN_ROWS}, {columns}] folded into its own identities at row \
+         {DRAIN_ROW} of a {DRAIN_MATRIX_ROWS}x{DRAIN_PITCH} matrix, at columns \
+         {DRAIN_COLUMNS:?}"
+    ))
+}
+
 /// Compare a whole pitched bf16 matrix against what the drain owed it —
 /// identities inside the rectangle, poison everywhere else — reporting the
 /// first few wrong elements by position, and each one as the position its value
@@ -4394,7 +4474,11 @@ fn compare_matrix(observed: &[u16], expected: &[u16], column: u32) -> Result<(),
             };
             let wanted = match decode_cell(f32::from_bits((want as u32) << 16)) {
                 Some((r, c)) => format!("tile ({r}, {c})"),
-                None => "poison".to_string(),
+                None if want == POISON_HALF => "poison".to_string(),
+                // An accumulating drain's expectation is a doubled identity,
+                // which names no position — so say the bits rather than call
+                // every one of them poison.
+                None => format!("{want:#06x}"),
             };
             let _ = write!(
                 report,
@@ -6095,6 +6179,26 @@ fn run() -> Result<usize, Box<dyn Error>> {
         Box::new(|| {
             check_shared_drain::<WIDE>(stream, |config, column, out| unsafe {
                 module.shared_drain_wide(stream, config, column, out)
+            })
+        }),
+    ));
+    // The same two rectangles folded in rather than overwritten (#169). Same
+    // addresses, same widths, one extra load — so what these two add over the
+    // pair above is the read and the single rounding, and nothing about the
+    // geometry.
+    cases.push((
+        "shared accumulate",
+        Box::new(|| {
+            check_shared_accumulate::<TILE>(stream, |config, column, out| unsafe {
+                module.shared_accumulate(stream, config, column, out)
+            })
+        }),
+    ));
+    cases.push((
+        "shared accumulate wide",
+        Box::new(|| {
+            check_shared_accumulate::<WIDE>(stream, |config, column, out| unsafe {
+                module.shared_accumulate_wide(stream, config, column, out)
             })
         }),
     ));
