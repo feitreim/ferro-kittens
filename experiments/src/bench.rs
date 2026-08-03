@@ -548,6 +548,19 @@ fn cases() -> Vec<Case> {
             bench: layernorm::bench,
             baseline: None,
         },
+        Case {
+            name: "groupnorm",
+            bound: Bound::Memory,
+            // The same traffic as `layernorm` minus the parameter vectors it
+            // never reads, over the same sizes: a row of this table and the
+            // `layernorm` row above it differ only in the statistic's axis and
+            // in where the band lives.
+            work: |shape| 2.0 * 2.0 * (shape.m * shape.n) as f64,
+            sizes: LAYERNORM_SIZES,
+            blocks: |shape| layernorm::grid(shape.m),
+            bench: layernorm::bench_group,
+            baseline: None,
+        },
     ];
 
     // `gemm-sol`'s denominator was cuBLASLt and its *numerator* had no control

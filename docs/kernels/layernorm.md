@@ -142,12 +142,30 @@ local-memory traffic itself: a streamed band is cheap when the registers it
 frees buy resident warps, and this kernel is past the point where they buy
 anything.
 
-`groupnorm_tile` is deliberately left holding the whole band, at 236 registers
-on a 1536-byte frame. It has no launcher and no reference, and a rewrite
-nothing can check is not an improvement — but it shares the file, the shared
-vector staging and the `[32, 128]` band, so its counters *not* moving while
-`layernorm_rows`' do is the control that says the change is the band walk and
-not something the module did.
+`groupnorm_tile` was deliberately left holding the whole band while it had no
+launcher and no reference — a rewrite nothing can check is not an improvement —
+and its counters *not* moving while `layernorm_rows`' did was the control that
+said the change was the band walk and not something the module did. Once it
+got its own check (below), the same streaming was applied and the same thing
+happened, one column over:
+
+| `groupnorm_tile` | regs | frame | blocks/SM | GB/s at 8192 blocks |
+| --- | --- | --- | --- | --- |
+| whole band, as filed | 168 | 1536 B | 3 | 594 |
+| streamed at [`CHUNK`] | **48** | **0** | 6 | **5996** |
+
+594 → 5996 GB/s, a factor of **10.1**, at a bit-identical worst error
+(7.76e-3 both ways — the arithmetic is the same centred form, only where the
+band lives changed). The 168 was `#[launch_bounds(128, 3)]` forcing `ptxas`
+under a cap; the whole band never fit, and the difference between this
+kernel's 594 and `layernorm_rows`' pre-fix 317 is that the cap bought a third
+resident CTA to hide some of the local-memory latency behind. The streamed
+form runs 8% *above* `layernorm_rows`' 5539 — the same traffic minus two
+parameter vectors. The carry across chunks here is one scalar per statistic
+rather than a `Rows`: a chunk's `tile_sum` is already a number the warp agrees
+on. The rung is inherited from the column sweep above rather than re-swept —
+the two kernels differ only in the statistic's axis — and the shipped rung is
+measured.
 
 ### Why the variance pass centres first
 
@@ -168,18 +186,19 @@ the live set across two full passes.
 
 ### `groupnorm_tile` declares its residency
 
-`#[launch_bounds(128, 3)]` is `__launch_bounds__`: it puts `.maxntid 128, 1, 1`
-and `.minnctapersm 3` on the entry, so `ptxas` is told the residency the kernel
-is written for and caps registers to reach it. Three CTAs an SM at 128 threads
-is 168 registers a thread, which is exactly the step —
-`_register_ceiling(3, 128)` in `modal_app.py` derives the same 168 — and shared
-memory permits six at the declared plan, so **registers are this kernel's
-binding term** and nothing else was going to hold the line.
+`#[launch_bounds(128, 6)]` is `__launch_bounds__`: it puts `.maxntid 128, 1, 1`
+and `.minnctapersm 6` on the entry, so `ptxas` is told the residency the kernel
+is written for. Six is what shared memory admits at the declared plan, which is
+the same binding term `layernorm_rows` has — the kernel streams its band now,
+and at 48 registers nothing register-side is close to the line.
 
-It sat on 168 without saying so until the file was compiled into a smaller
-crate, at which point the same source came out at 236 and the step was crossed
-with nothing in the tree to notice. A count that lands on its ceiling by luck is
-not a residency, and the occupancy gate can only watch a kernel that states
+The attribute said 3 while the kernel held its whole band: three CTAs an SM at
+128 threads is 168 registers a thread — `_register_ceiling(3, 128)` in
+`modal_app.py` derives the same 168 — and that was a cap `ptxas` had to be
+*forced* under, because it had sat on 168 by luck until the file was compiled
+into a smaller crate and the same source came out at 236, crossing the step
+with nothing in the tree to notice. A count that lands on its ceiling by luck
+is not a residency, and the occupancy gate can only watch a kernel that states
 one. The attribute takes a literal thread count and the occupancy gate reads it
 back out of the source with a digit regex, while `THREADS` derives from `ROWS` —
 a tile that changed shape would move one and leave the other, so the file
@@ -267,6 +286,29 @@ than an SFU approximation. What is left over is the order the shuffle butterfly
 sums a row in, and the seed keeps every value at least 0.22 away from its row's
 mean, so no output is built out of a cancellation the host reference does not
 also perform.
+
+### `groupnorm_tile`'s check, and why its error is absolute
+
+The same seed feeds `check_group` — the whole point of its non-identical row
+multisets is that the tile statistic and the row statistic differ, so a kernel
+that reduced over the wrong axis fails here. The reference needs three tile
+statistics the way the row check needs three class statistics: a row's multiset
+depends only on its boost class, so a tile's depends only on where its 128 rows
+land in the 3-class cycle, and 128 not dividing by 3 is what makes consecutive
+tiles differ.
+
+The error is absolute where the row check's is relative, because there is no
+`beta`. `groupnorm_tile` has no parameters, its outputs are zero-mean and
+unit-variance by construction, and nothing holds one away from zero — a
+relative error against a near-zero expected value measures nothing but the
+denominator. Against outputs whose scale *is* 1, an absolute error is the
+relative error to the tile's scale, said without the division.
+
+The floor is the same rounding argument one octave up: this seed's largest
+normalized outputs sit in `[2, 4)`, where a bf16 ulp is 2⁻⁶, and the
+correctness run measures a worst absolute error of **7.76e-3 = 0.99 × 2⁻⁷** —
+half an ulp at that magnitude, exactly as the row check's 3.87e-3 is half an
+ulp at `[1, 2)`. The tolerance is 2⁻⁶, one doubling above.
 
 ### The errors it is against
 
