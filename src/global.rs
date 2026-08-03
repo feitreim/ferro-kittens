@@ -6,7 +6,8 @@
 //! the tile it feeds agree by construction. Host-only (`feature = "host"`).
 //!
 //! [`GlobalRows`], [`load_rows`], [`store_rows`], [`load_cols`],
-//! [`load_row_vec`], [`store_row_vec`] and [`store_shared_rows`] are the direct
+//! [`load_row_vec`], [`load_col_vec`], [`store_row_vec`] and
+//! [`store_shared_rows`] are the direct
 //! path: ordinary loads and stores against a row-major window at a runtime
 //! leading dimension, no engine and nothing asynchronous. It is what an fp32
 //! epilogue, a row statistic, a small irregular operand, or a band staged
@@ -560,6 +561,70 @@ pub unsafe fn load_row_vec<E: Element, const M: usize, L: RowLayout<M>>(
             slot += 1;
         }
         rows
+    }
+}
+
+/// Read the same statistic [`load_row_vec`] reads, onto the other axis: one
+/// element per *column* of a band, taken from the column segment
+/// `row..row + N` of global column `column`.
+///
+/// The addresses are [`load_row_vec`]'s exactly — a stride apart, down one
+/// column of a `[rows, heads]`-shaped buffer. What differs is which axis of the
+/// tile they land on, and that is a property of the *band*, not of the
+/// statistic. An attention backward pass is where the two meet: its
+/// query-parallel kernel scores `Q·Kᵀ`, whose rows are queries, and reads the
+/// saved log-sum-exp with [`load_row_vec`]; its key-parallel kernel scores
+/// `K·Qᵀ`, whose rows are keys and whose *columns* are the same queries, and
+/// needs the same numbers as the [`ColVec`] a
+/// [`crate::reg::RegTile::sub_col_assign`] takes.
+///
+/// **Not [`load_cols`], which also returns a [`ColVec`].** The two differ in
+/// the memory they read, and the difference is the whole point of having both:
+/// `load_cols` reads `N` *consecutive* elements of one row — a parameter
+/// vector laid out along the axis it multiplies, where consecutive values pair
+/// into one access — while this walks `N` rows of one column, a stride apart,
+/// with no run to widen and no
+/// [`crate::reg::ColLayout::CONTIGUOUS_VALUES`] pairing to spend. Choose by
+/// where the numbers are, not by the type they arrive in.
+///
+/// Every lane loads, for [`load_row_vec`]'s reason: under
+/// [`crate::reg::BaseLdtm`] the eight lanes of a column group hold the same
+/// columns, and it is the replicated copies that make the vector well-formed.
+/// Shared addresses across the group coalesce.
+///
+/// ```no_run
+/// use kittens::global::{GlobalRows, load_col_vec};
+/// use kittens::reg::{BaseLdtm, ColVec};
+/// use kittens::shared::F32;
+///
+/// # unsafe fn recompute(lse: *mut u8, heads: usize, head: u32, query: u32, lane: u32) {
+/// // The transposed band's columns are query rows, so the head's own column
+/// // of `[rows, heads]` arrives as a per-column operand.
+/// let src = unsafe { GlobalRows::<F32>::from_raw(lse, heads) };
+/// let _: ColVec<16, BaseLdtm> = unsafe { load_col_vec(src, query, head, lane) };
+/// # }
+/// ```
+///
+/// # Safety
+///
+/// - The column segment `row..row + N` at `column` lies inside the buffer
+///   `src` names, at `src.stride()` elements per row.
+/// - No other thread is writing that column segment.
+#[inline(always)]
+pub unsafe fn load_col_vec<E: Element, const N: usize, L: ColLayout<N>>(
+    src: GlobalRows<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+) -> ColVec<N, L> {
+    unsafe {
+        let mut cols = ColVec::<N, L>::splat(0.0);
+        let mut value = 0usize;
+        while value < L::VALUES {
+            cols.set(value, E::read(src.at(row + L::col_of(lane, value), column)));
+            value += 1;
+        }
+        cols
     }
 }
 
@@ -1288,6 +1353,36 @@ mod rows_tests {
             let read: RegVec<32, BaseLdtm> = unsafe { load_row_vec(dest, ROW, HEAD, lane) };
             for slot in 0..<BaseLdtm as RowLayout<32>>::SLOTS {
                 assert_eq!(read.get(slot), BaseLdtm::row(lane, slot) as f32 + 0.5);
+            }
+        }
+    }
+
+    /// The same statistic, the same addresses, the other axis: what
+    /// [`load_col_vec`] delivers at value `v` is what [`load_row_vec`] delivers
+    /// at the slot naming the same element of the band. Written as an
+    /// assertion between the two movers rather than against a literal, because
+    /// the claim is exactly that they read one column and disagree only about
+    /// which axis of a tile it broadcasts along.
+    #[test]
+    fn a_row_statistic_reaches_the_column_axis_over_the_same_addresses() {
+        const HEADS: usize = 3;
+        const HEAD: u32 = 1;
+        const ROW: u32 = 32;
+        let buffer: Vec<f32> = (0..(ROW as usize + 64) * HEADS)
+            .map(|index| index as f32)
+            .collect();
+        let src = unsafe { GlobalRows::<F32>::from_raw(buffer.as_ptr().cast_mut().cast(), HEADS) };
+
+        for lane in 0..32u32 {
+            let cols: ColVec<64, BaseLdtm> = unsafe { load_col_vec(src, ROW, HEAD, lane) };
+            for value in 0..<BaseLdtm as ColLayout<64>>::VALUES {
+                let column = <BaseLdtm as ColLayout<64>>::col_of(lane, value);
+                let element = (ROW + column) as usize * HEADS + HEAD as usize;
+                assert_eq!(
+                    cols.get(value),
+                    element as f32,
+                    "lane {lane} value {value} names band column {column}"
+                );
             }
         }
     }

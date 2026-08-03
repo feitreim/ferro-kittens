@@ -329,6 +329,22 @@ same address. The load has no such rule and every replica issues, which is what
 makes the vector well-formed on the way in. Named in `tests/gaps.rs` as
 `a_row_statistic_reaches_global_memory`.
 
+**The same statistic reaches the column axis too**, since the flash backward
+became the first kernel to want it: `global::load_col_vec` walks `load_row_vec`'s
+addresses — one element per band position, down a single global column — and
+delivers a `ColVec` instead of a `RegVec`. Which axis a statistic broadcasts
+along is a property of the *band*, not of the statistic: a query-parallel
+backward scores `Q·Kᵀ` and reads the saved log-sum-exp per row, while the
+key-parallel one scores `K·Qᵀ`, whose rows are keys and whose columns are those
+same queries. **It is not `load_cols`, and the two returning one type is the
+hazard here**: `load_cols` reads a run *along* one row and pairs consecutive
+values into one access; this walks rows a stride apart and has no run to widen.
+Device case `global column statistic`, kept separate from `global column map`
+for exactly that reason — the two share an argument list, and a mover that took
+the wrong walk passes the other case. Named in `tests/gaps.rs` beside
+`load_row_vec`, grouped by the memory the two share rather than by the type
+`load_cols` shares with it.
+
 What is genuinely left. It **bounds-checks nothing**: the extents a TMA
 descriptor carries are absent rather than forgotten, since predicating every
 value would be paid by the epilogues that do divide. TK's ragged-tail loads want
@@ -586,6 +602,15 @@ origin** TK's signatures do not have — a `diagonal`, or a signed fill index �
 because the tile is a sub-block of a larger matrix whose diagonal sits at
 `query_base - key_base`; TK's origin-free form is right only for the diagonal
 block. `broadcast_row`/`broadcast_col` landed with 3.1.
+
+Both diagonals now carry the *block-origin* form as well, not just the signed
+`diagonal`: `make_causal_at` since #7 and `make_causal_t_at` since the flash
+backward asked for it. The transposed band is where the argument for the `_at`
+form is strongest, and it was the half that did not have one — a CTA owning a
+block of keys streams the queries at and after them, so `key_base -
+query_base` is negative on every visit but the first, and the `u32` subtraction
+a call site would otherwise write wraps and masks nothing. Named in
+`tests/gaps.rs` as `every_diagonal_mask_has_a_coordinate_origin`.
 
 Absent: `transpose`, `swap_layout`, `copy` between layouts — all three need a
 second `FragmentLayout`, which the crate does not have and no issue asks for
