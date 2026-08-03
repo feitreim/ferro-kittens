@@ -74,8 +74,8 @@ use cuda_device::{cluster, cluster_launch, cuda_module, debug, kernel, thread, w
 
 use kittens::epilogue::{StoreRing, Warp};
 use kittens::global::{
-    GlobalLayout, GlobalRows, accumulate_shared_rows, encode_bf16_panels, load_cols, load_rows,
-    store_rows, store_shared_rows,
+    GlobalLayout, GlobalRows, accumulate_shared_rows, encode_bf16_panels, load_col_vec, load_cols,
+    load_rows, store_rows, store_shared_rows,
 };
 use kittens::ldst::{load_fragment, load_tile, load_vec, store_fragment, store_tile};
 use kittens::mma::{self, MmaShape, mm_ab, mm_abt, mm_atb, mm_atbt, mma_abt};
@@ -547,6 +547,10 @@ const GLOBAL_PITCH: usize = 192;
 /// 16-column blocks should make the origin prefer a block boundary.
 const GLOBAL_ROW: u32 = 16;
 const GLOBAL_COLUMN: u32 = 40;
+/// Columns of the band [`kernels::global_col_vec_map`]'s statistic covers.
+/// Thirty-two and not `WIDE`: the band runs down the matrix's rows from
+/// `GLOBAL_ROW`, and there are only `GLOBAL_ROWS - GLOBAL_ROW` of them left.
+const COLUMN_BAND: usize = 32;
 
 /// The matrix's value at `(row, column)` — its own flat index, unique over the
 /// buffer and an exact fp32 integer well under 2^24, so a value that reaches
@@ -1397,6 +1401,37 @@ pub mod kernels {
             let mut value = 0usize;
             while value < values {
                 *out.get_unchecked_mut(lane as usize * values + value) = cols.get(value);
+                value += 1;
+            }
+        }
+    }
+
+    /// Read a `[COLUMN_BAND]` statistic *down* one column of the same pitched
+    /// matrix with [`load_col_vec`] and dump it by thread coordinate.
+    ///
+    /// **What this proves, that the case above cannot.** `load_rows` walks a
+    /// rectangle: consecutive values of a thread are consecutive elements, and
+    /// a mover that confused the two axes would still deliver something. This
+    /// walks one column, so consecutive values are a *pitch* apart and land on
+    /// the tile's column axis — the shape an attention backward pass needs
+    /// when its score band is `K·Qᵀ` and the saved per-query statistic is
+    /// therefore per-column. A mover that read along the row instead would
+    /// deliver `GLOBAL_COLUMN + value`'s elements and every one of them names
+    /// itself, so the failure reports which walk actually ran.
+    ///
+    /// One warp, for [`kernels::global_rows_map`]'s reason.
+    #[kernel]
+    pub unsafe fn global_col_vec_map(source: &[f32], mut out: DisjointSlice<f32>) {
+        unsafe {
+            let lane = warp::lane_id();
+            // SAFETY: read-only, as in `global_rows_map`.
+            let rows = GlobalRows::<F32>::from_raw(source.as_ptr().cast_mut().cast(), GLOBAL_PITCH);
+            let stat: ColVec<COLUMN_BAND, BaseLdtm> =
+                load_col_vec(rows, GLOBAL_ROW, GLOBAL_COLUMN, lane);
+            let values = <BaseLdtm as ColLayout<COLUMN_BAND>>::VALUES;
+            let mut value = 0usize;
+            while value < values {
+                *out.get_unchecked_mut(lane as usize * values + value) = stat.get(value);
                 value += 1;
             }
         }
@@ -4696,6 +4731,70 @@ fn check_global_cols(
     .into())
 }
 
+/// Does [`load_col_vec`] read *down* the column the caller named, onto the
+/// axis a `col_map` broadcasts along?
+///
+/// The same matrix and origin as the two cases above, because that is what
+/// makes all three separable: every element carries its own flat index, so a
+/// mover that walked the row — which is exactly what [`load_cols`] beside it
+/// does, over the same argument list — delivers
+/// `GLOBAL_ROW * GLOBAL_PITCH + GLOBAL_COLUMN + value` where this expects
+/// `(GLOBAL_ROW + value) * GLOBAL_PITCH + GLOBAL_COLUMN`, and the failure
+/// names the element it actually read. Two movers returning one type is the
+/// hazard this case exists to pin.
+fn check_global_col_vec(
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<String, Box<dyn Error>> {
+    let staged: Vec<f32> = (0..GLOBAL_ROWS)
+        .flat_map(|row| (0..GLOBAL_PITCH).map(move |column| global_cell(row, column)))
+        .collect();
+    let source = DeviceBuffer::from_host(stream, &staged)?;
+
+    let values = <BaseLdtm as ColLayout<COLUMN_BAND>>::VALUES;
+    let mut out = DeviceBuffer::<f32>::zeroed(stream, 32 * values)?;
+    unsafe { module.global_col_vec_map(stream, launch_config(32, 0), &source, &mut out)? };
+    let observed = out.to_host_vec(stream)?;
+
+    let mut report = String::new();
+    let mut mismatches = 0usize;
+    for lane in 0..32u32 {
+        for value in 0..values {
+            let column = <BaseLdtm as ColLayout<COLUMN_BAND>>::col_of(lane, value) as usize;
+            let row = GLOBAL_ROW as usize + column;
+            let got = observed[lane as usize * values + value];
+            if got == global_cell(row, GLOBAL_COLUMN as usize) {
+                continue;
+            }
+            mismatches += 1;
+            if mismatches <= 8 {
+                let named = if got >= 0.0 && got.fract() == 0.0 && got < staged.len() as f32 {
+                    let index = got as usize;
+                    format!("({}, {})", index / GLOBAL_PITCH, index % GLOBAL_PITCH)
+                } else {
+                    format!("{got}, which names no element")
+                };
+                let _ = write!(
+                    report,
+                    "\n    lane {lane} value {value}: band column {column} is \
+                     ({row}, {GLOBAL_COLUMN}), memory delivered {named}"
+                );
+            }
+        }
+    }
+    if mismatches == 0 {
+        return Ok(format!(
+            "[{COLUMN_BAND}] columns down ({GLOBAL_ROW}.., {GLOBAL_COLUMN}) of a \
+             {GLOBAL_ROWS}x{GLOBAL_PITCH} matrix, all at BaseLdtm's columns"
+        ));
+    }
+    Err(format!(
+        "{mismatches} of {} values misplaced{report}",
+        observed.len()
+    )
+    .into())
+}
+
 /// Does a [`SharedVec`] survive the whole loop — global, shared, registers,
 /// shared, global — with every element where the library says it is?
 ///
@@ -6068,6 +6167,13 @@ fn run() -> Result<usize, Box<dyn Error>> {
     cases.push((
         "global column map",
         Box::new(|| check_global_cols(stream, module)),
+    ));
+    // The other vector twin: the same `ColVec`, read *down* a column instead
+    // of along a row. Separate from the case above because the two share a
+    // type and an argument list and differ only in the walk.
+    cases.push((
+        "global column statistic",
+        Box::new(|| check_global_col_vec(stream, module)),
     ));
     // The vector shape (#13): an unswizzled box, at rank 1 and rank 2.
     cases.push((

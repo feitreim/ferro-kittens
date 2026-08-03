@@ -103,6 +103,29 @@ fn maps_reach_every_register_family<const M: usize, const N: usize, L>(
     let _ = RegTile::<M, N, L>::broadcast_col(cols);
 }
 
+/// §3.4 — the mask set, and that each half of it has a coordinate-origin form.
+///
+/// §3.4's claim is not that the masks exist but that every one of them "takes
+/// a **coordinate origin** TK's signatures do not have", because a tile is a
+/// sub-block of a larger matrix. That claim is only true while *both*
+/// diagonals have an `_at`: a kernel whose score band is `K·Qᵀ` has the same
+/// need and had only the origin-free `make_causal_t` to meet it, which is the
+/// asymmetry `make_causal_t_at` closes. Named here so the pairing cannot be
+/// dropped on one side and left claimed on the other.
+fn every_diagonal_mask_has_a_coordinate_origin<const M: usize, const N: usize, L>(
+    tile: &mut RegTile<M, N, L>,
+    lane: u32,
+) where
+    L: RowLayout<M> + ColLayout<N>,
+{
+    tile.tril(lane, 0, 0.0);
+    tile.triu(lane, 0, 0.0);
+    tile.make_causal(lane, 0, 0.0);
+    tile.make_causal_t(lane, 0, 0.0);
+    tile.make_causal_at(lane, 0, 0, 0.0);
+    tile.make_causal_t_at(lane, 0, 0, 0.0);
+}
+
 /// §1.4 — `SharedVec` as a first-class type: scalar access, both TMA
 /// directions at both ranks, and the `ColVec` bridge in `ldst`.
 ///
@@ -173,7 +196,19 @@ fn global_movers_carry_an_element<E: Element, const M: usize, const N: usize, L>
 /// folded to a scalar. `RowLayout::owns_row` is named beside the movers because
 /// it is the claim the store spends: `row_of` is not injective across a warp, so
 /// without an owner the store is four threads writing one address.
-fn a_row_statistic_reaches_global_memory<E: Element, const M: usize, L: RowLayout<M>>(
+///
+/// `load_col_vec` is named in the same claim and not beside `load_cols`,
+/// because the thing it shares with `load_row_vec` is the *memory* — one
+/// column of a `[rows, heads]` buffer, walked a stride at a time — and the
+/// thing it shares with `load_cols` is only the return type. A file that
+/// grouped it by type would be recording the wrong invariant: the two `ColVec`
+/// movers must stay distinguishable, and this is where that is said.
+fn a_row_statistic_reaches_global_memory<
+    E: Element,
+    const M: usize,
+    const N: usize,
+    L: RowLayout<M> + ColLayout<N>,
+>(
     rows: kittens::global::GlobalRows<E>,
     lane: u32,
     statistic: RegVec<M, L>,
@@ -181,6 +216,7 @@ fn a_row_statistic_reaches_global_memory<E: Element, const M: usize, L: RowLayou
     unsafe {
         kittens::global::store_row_vec(rows, 0, 0, lane, statistic);
         let _: RegVec<M, L> = kittens::global::load_row_vec(rows, 0, 0, lane);
+        let _: ColVec<N, L> = kittens::global::load_col_vec(rows, 0, 0, lane);
         let _: bool = L::owns_row(lane);
     }
 }

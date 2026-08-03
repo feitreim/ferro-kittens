@@ -1327,6 +1327,31 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
         self.make_causal(lane, query_base as i32 - key_base as i32, fill);
     }
 
+    /// [`Self::make_causal_at`] for a transposed score band: the band covers
+    /// keys `key_base..key_base + M` against queries `query_base..query_base +
+    /// N`, so its rows are the keys and its diagonal sits at
+    /// `key_base - query_base`.
+    ///
+    /// Row origin first, as in [`Self::make_causal_at`] — the two differ in
+    /// which axis is which, not in the order they are named. The reason to
+    /// prefer it over [`Self::make_causal_t`] is the same and is if anything
+    /// stronger here: an attention backward pass that owns a block of *keys*
+    /// streams the queries at and after them, so `key_base - query_base` is
+    /// negative for every band but the first one it visits, and a `u32`
+    /// subtraction there masks nothing.
+    ///
+    /// ```no_run
+    /// # use kittens::lane;
+    /// # use kittens::reg::{BaseLdtm, RegTile};
+    /// # unsafe fn demo(scores: &mut RegTile<32, 64, BaseLdtm>, query_block: u32) {
+    /// scores.make_causal_t_at(lane(), 32 * kittens::warp_id(), 64 * query_block, -1.0e30);
+    /// # }
+    /// ```
+    #[inline(always)]
+    pub fn make_causal_t_at(&mut self, lane: u32, key_base: u32, query_base: u32, fill: f32) {
+        self.make_causal_t(lane, key_base as i32 - query_base as i32, fill);
+    }
+
     /// Fill the columns at and right of `column`, keeping the rest — the
     /// ragged-tail mask, with `column` the number of real keys left at this
     /// band's origin (`keys - key_base`, which may be negative or past `N`).
@@ -2774,6 +2799,38 @@ mod tests {
                                 MASKED
                             },
                             "({query_base}, {key_base}) lane {lane} at ({row}, {column})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_transposed_band_masks_about_the_same_diagonal() {
+        // The key-parallel half of an attention backward: rows are keys and
+        // columns are queries, so the surviving elements are the transpose of
+        // the ones `make_causal_at` keeps for the same block pair. A CTA
+        // owning keys streams the queries at and after them, so every base
+        // pair here but the first has `key_base > query_base` — the sign an
+        // origin-free `u32` difference cannot carry.
+        for (key_base, query_base) in [(0u32, 0u32), (64, 0), (0, 64), (128, 128), (256, 64)] {
+            for lane in 0..32 {
+                let unmasked: Band = indexed(lane);
+                let mut band = unmasked;
+                band.make_causal_t_at(lane, key_base, query_base, MASKED);
+                for slot in 0..Band::SLOTS {
+                    for value in 0..Band::VALUES {
+                        let (row, column) = Band::coordinate(lane, slot, value);
+                        let attends = key_base + row <= query_base + column;
+                        assert_eq!(
+                            band.get(slot, value),
+                            if attends {
+                                unmasked.get(slot, value)
+                            } else {
+                                MASKED
+                            },
+                            "({key_base}, {query_base}) lane {lane} at ({row}, {column})"
                         );
                     }
                 }
