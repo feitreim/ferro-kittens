@@ -194,8 +194,9 @@ instantiations, on shared vectors **and** shared tiles. The issue closed on the
 type. **#130** now carries the vector half — with two smaller holes beside it
 that the audit found in the same corner: a `SharedVec` cannot be sliced, so
 `layernorm` reaches a chunk of its parameter vector by laundering `at()` through
-`from_raw`, and `RegVec` has no bridge to memory at all. The shared-*tile* half
-is still tracked nowhere (3.1).
+`from_raw`, and `RegVec` has no bridge to memory at all. The `ColVec` half of
+that last hole closed with #172's `global::load_cols` (2.2); `RegVec`'s did not.
+The shared-*tile* half is still tracked nowhere (3.1).
 
 ### 1.5 Global layout — a type since #8, and still bf16-only
 
@@ -289,18 +290,32 @@ contract an odd leading dimension would break. Named in `tests/gaps.rs` as
 `global_movers_carry_an_element`, which is what stops it going back to fp32 in
 prose.
 
+`load_cols` (#172) is the third mover on this cursor and the vector shape of
+the same walk: `N` consecutive elements of **one** row, read into the `ColVec` a
+`col_map` takes, at `L::VALUES` registers where broadcasting the same vector
+through a stride-zero `load_rows` costs `L::SLOTS * L::VALUES` and holds every
+value once per row the thread owns. Its consumer is oxide-train's RMSNorm port,
+whose `[dim]` weight is a runtime length and so cannot be a `SharedVec<E, N>`
+for `ldst::load_vec` to read; the redundant-tile spelling it replaces put that
+kernel on a spill cliff past a 32-column chunk. The pairing test is shared with
+the tile movers rather than restated, which is why `pairs_are_one_access` is
+bounded on `ColLayout` and not `FragmentLayout`. Device case
+`global column map`.
+
 What is genuinely left. It **bounds-checks nothing**: the extents a TMA
 descriptor carries are absent rather than forgotten, since predicating every
 value would be paid by the epilogues that do divide. TK's ragged-tail loads want
-them back. Then the vector shapes, and they are less symmetric than this entry
-used to imply: `ColVec` has a shared-memory bridge (`ldst::load_vec`/`store_vec`)
-and no global one, and **`RegVec` has neither** — a per-row statistic, which is
-what every attention and normalization kernel actually computes, cannot leave
-the warp except by being folded to a scalar through `sync::block_reduce`. That
-is **#130**, with the reason the two vectors need different code: a `ColVec`'s
-entries depend only on `lane % 4` and shared memory broadcasts them, where a
-`RegVec`'s slots are spread across `lane / 4` and staging one is a scatter.
-Group scope is 1.1.
+them back. Then the remaining vector shape: with `load_cols` in, `ColVec` has
+both bridges (`ldst::load_vec`/`store_vec` to shared, `load_cols` to global) and
+**`RegVec` has neither** — a per-row statistic, which is what every attention
+and normalization kernel actually computes, cannot leave the warp except by
+being folded to a scalar through `sync::block_reduce`. That is **#130**, and the
+reason it is the harder half is the reason `load_cols` was the easy one: a
+`ColVec`'s entries depend only on `lane % 4` and one contiguous run of memory
+holds them, where a `RegVec`'s slots are spread across `lane / 4` and moving one
+is a scatter. There is no `store_cols`, deliberately: a kernel that *produces* a
+per-column result produces it from `col_reduce` across a grid and wants an
+atomic, not a plain store. Group scope is 1.1.
 
 ### 2.3 TMA store side — plain stores landed (#9), reductions absent
 
@@ -405,8 +420,9 @@ data comes back to registers before anything is done to it. #13 asked for these
 beside the `SharedVec` type and closed on the type alone (1.4). **#130 carries
 the vector half; the tile half is still filed nowhere.** The per-column operand
 of `col_map` is no longer the hole
-this entry described: `col_reduce` produces one (3.2), and `ldst::load_vec`
-reads one out of shared memory.
+this entry described: `col_reduce` produces one (3.2), `ldst::load_vec` reads
+one out of shared memory, and `global::load_cols` reads one out of global memory
+without staging it first (#172, 2.2).
 
 ### 3.2 Reductions — the register side is done (#6), the shared side is not
 

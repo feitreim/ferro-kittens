@@ -74,7 +74,8 @@ use cuda_device::{cluster, cluster_launch, cuda_module, debug, kernel, thread, w
 
 use kittens::epilogue::{StoreRing, Warp};
 use kittens::global::{
-    GlobalLayout, GlobalRows, encode_bf16_panels, load_rows, store_rows, store_shared_rows,
+    GlobalLayout, GlobalRows, encode_bf16_panels, load_cols, load_rows, store_rows,
+    store_shared_rows,
 };
 use kittens::ldst::{load_fragment, load_tile, load_vec, store_fragment, store_tile};
 use kittens::mma::{self, MmaShape, mm_ab, mm_abt, mm_atb, mm_atbt, mma_abt};
@@ -1334,6 +1335,35 @@ pub mod kernels {
             let band: RegTile<32, WIDE, BaseLdtm> =
                 load_rows(rows, GLOBAL_ROW, GLOBAL_COLUMN, lane);
             dump_band(band, 0, lane, &mut out);
+        }
+    }
+
+    /// Read one row of the same matrix as a [`ColVec`] with [`load_cols`] and
+    /// dump it by lane and value.
+    ///
+    /// **What this proves.** A per-column operand reaches registers from global
+    /// memory at exactly the columns `BaseLdtm::column` names — off a row that
+    /// is not the buffer's first and a column origin that is neither a
+    /// 16-column block boundary nor the row's start, so a value arriving where
+    /// the host expects means `load_cols` walked the row origin and the column
+    /// map independently. `GLOBAL_COLUMN` is even and the pitch is too, so this
+    /// takes the paired `ld.global.v2` arm; the scalar arm is
+    /// [`load_rows`]' own and covered by `global rows map`.
+    ///
+    /// Launch with one warp, for [`global_rows_map`]'s reason.
+    #[kernel]
+    pub unsafe fn global_cols_map(source: &[f32], mut out: DisjointSlice<f32>) {
+        unsafe {
+            let lane = warp::lane_id();
+            // SAFETY: read-only, as `global_rows_map`.
+            let rows = GlobalRows::<F32>::from_raw(source.as_ptr().cast_mut().cast(), GLOBAL_PITCH);
+            let cols: ColVec<WIDE, BaseLdtm> = load_cols(rows, GLOBAL_ROW, GLOBAL_COLUMN, lane);
+            let values = ColVec::<WIDE, BaseLdtm>::VALUES;
+            let mut value = 0usize;
+            while value < values {
+                *out.get_unchecked_mut(lane as usize * values + value) = cols.get(value);
+                value += 1;
+            }
         }
     }
 
@@ -4528,6 +4558,60 @@ fn check_global_rows(
     .into())
 }
 
+/// Does [`load_cols`] deliver the columns `BaseLdtm::column` names, off one
+/// row of the same pitched matrix `check_global_rows` reads a band out of?
+///
+/// The vector twin of that case, and the reason it is a separate one: a
+/// `ColVec` is `VALUES` registers and not `SLOTS * VALUES`, so a mover that
+/// silently read the tile's rows would still pass there and could not pass
+/// here.
+fn check_global_cols(
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<String, Box<dyn Error>> {
+    let staged: Vec<f32> = (0..GLOBAL_ROWS)
+        .flat_map(|row| (0..GLOBAL_PITCH).map(move |column| global_cell(row, column)))
+        .collect();
+    let source = DeviceBuffer::from_host(stream, &staged)?;
+
+    type Columns = ColVec<WIDE, BaseLdtm>;
+    let values = Columns::VALUES;
+    let mut out = DeviceBuffer::<f32>::zeroed(stream, 32 * values)?;
+    unsafe { module.global_cols_map(stream, launch_config(32, 0), &source, &mut out)? };
+    let observed = out.to_host_vec(stream)?;
+
+    let mut report = String::new();
+    let mut mismatches = 0usize;
+    for lane in 0..32u32 {
+        for value in 0..values {
+            let column = GLOBAL_COLUMN as usize + Columns::column(lane, value) as usize;
+            let got = observed[lane as usize * values + value];
+            if got == global_cell(GLOBAL_ROW as usize, column) {
+                continue;
+            }
+            mismatches += 1;
+            if mismatches <= 8 {
+                let _ = write!(
+                    report,
+                    "\n    lane {lane} value {value}: map says ({GLOBAL_ROW}, {column}), \
+                     memory delivered {got}"
+                );
+            }
+        }
+    }
+    if mismatches == 0 {
+        return Ok(format!(
+            "[{WIDE}] columns at ({GLOBAL_ROW}, {GLOBAL_COLUMN}) of a \
+             {GLOBAL_ROWS}x{GLOBAL_PITCH} matrix, all at BaseLdtm's columns"
+        ));
+    }
+    Err(format!(
+        "{mismatches} of {} values misplaced{report}",
+        observed.len()
+    )
+    .into())
+}
+
 /// Does a [`SharedVec`] survive the whole loop — global, shared, registers,
 /// shared, global — with every element where the library says it is?
 ///
@@ -5895,6 +5979,11 @@ fn run() -> Result<usize, Box<dyn Error>> {
     cases.push((
         "global rows map",
         Box::new(|| check_global_rows(stream, module)),
+    ));
+    // Its vector twin (#172): the per-column operand, off the same matrix.
+    cases.push((
+        "global column map",
+        Box::new(|| check_global_cols(stream, module)),
     ));
     // The vector shape (#13): an unswizzled box, at rank 1 and rank 2.
     cases.push((
