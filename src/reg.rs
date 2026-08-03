@@ -281,6 +281,22 @@ pub trait RowLayout<const M: usize> {
     /// The logical row in `0..M` that `lane` holds in `slot`.
     fn row_of(lane: u32, slot: usize) -> u32;
 
+    /// Whether `lane` is the single writer of the rows it holds.
+    ///
+    /// A row statistic is *replicated*: [`Self::row_of`] is not injective across
+    /// the warp, because a row's `f32` lives in every lane that holds any of
+    /// that row's columns. Reading one back is a broadcast and needs no owner,
+    /// but writing one out does — every replica storing would be the same value
+    /// to the same address from several threads, which is idempotent and still
+    /// not a single writer.
+    ///
+    /// This is the row axis' answer to what
+    /// [`ColLayout::CONTIGUOUS_VALUES`] is on the column axis: a claim about the
+    /// map that only the map can make. [`crate::global::store_row_vec`] acts on
+    /// it, and an impl that returned `true` everywhere would turn one store into
+    /// `M`-many.
+    fn owns_row(lane: u32) -> bool;
+
     /// Every slot set to `value`.
     fn splat_slots<T: Copy>(value: T) -> Self::Slots<T>;
 
@@ -445,6 +461,13 @@ macro_rules! base_ldtm_rows {
             #[inline(always)]
             fn row_of(lane: u32, slot: usize) -> u32 {
                 Self::row(lane, slot)
+            }
+
+            // A row depends on `lane / 4`, so the four lanes of a quad share
+            // it and the first of them writes for all four.
+            #[inline(always)]
+            fn owns_row(lane: u32) -> bool {
+                lane % 4 == 0
             }
 
             #[inline(always)]

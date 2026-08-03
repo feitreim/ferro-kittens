@@ -206,8 +206,10 @@ instantiations, on shared vectors **and** shared tiles. The issue closed on the
 type. **#130** now carries the vector half — with two smaller holes beside it
 that the audit found in the same corner: a `SharedVec` cannot be sliced, so
 `layernorm` reaches a chunk of its parameter vector by laundering `at()` through
-`from_raw`, and `RegVec` has no bridge to memory at all. The shared-*tile* half
-is still tracked nowhere (3.1).
+`from_raw`, and `RegVec` had no bridge to memory at all. The **global** half of
+that last one landed (2.2, `global::load_row_vec`/`store_row_vec`); the shared
+half and the slice have not. The shared-*tile* half is still tracked nowhere
+(3.1).
 
 ### 1.5 Global layout — a type since #8, and still bf16-only
 
@@ -301,18 +303,27 @@ contract an odd leading dimension would break. Named in `tests/gaps.rs` as
 `global_movers_carry_an_element`, which is what stops it going back to fp32 in
 prose.
 
+`RegVec` reaches global memory too, since #130's first half:
+`global::load_row_vec`/`store_row_vec` write one element per row of a band into
+a single column of a row-major buffer — attention's log-sum-exp in the head's
+own column of `[rows, heads]`, and the saved statistic a backward pass reads
+back. It is a scatter and not a run (consecutive slots are 8 rows apart), so
+there is no `CONTIGUOUS_VALUES` analogue to widen it; what the row axis needs
+instead is **`RowLayout::owns_row`**, since `row_of` is not injective across a
+warp — a row's `f32` lives in every lane holding any of that row's columns, and
+a store without an owner would be four threads writing the same value to the
+same address. The load has no such rule and every replica issues, which is what
+makes the vector well-formed on the way in. Named in `tests/gaps.rs` as
+`a_row_statistic_reaches_global_memory`.
+
 What is genuinely left. It **bounds-checks nothing**: the extents a TMA
 descriptor carries are absent rather than forgotten, since predicating every
 value would be paid by the epilogues that do divide. TK's ragged-tail loads want
-them back. Then the vector shapes, and they are less symmetric than this entry
-used to imply: `ColVec` has a shared-memory bridge (`ldst::load_vec`/`store_vec`)
-and no global one, and **`RegVec` has neither** — a per-row statistic, which is
-what every attention and normalization kernel actually computes, cannot leave
-the warp except by being folded to a scalar through `sync::block_reduce`. That
-is **#130**, with the reason the two vectors need different code: a `ColVec`'s
+them back. Then `RegVec`'s *shared*-memory bridge, which is still absent where
+`ColVec` has had `ldst::load_vec`/`store_vec` since #13 — the remainder of
+**#130**, and the reason the two vectors need different code: a `ColVec`'s
 entries depend only on `lane % 4` and shared memory broadcasts them, where a
-`RegVec`'s slots are spread across `lane / 4` and staging one is a scatter.
-Group scope is 1.1.
+`RegVec`'s slots are spread across `lane / 4`. Group scope is 1.1.
 
 ### 2.3 TMA store side — plain stores landed (#9), reductions absent
 

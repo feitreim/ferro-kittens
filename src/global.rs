@@ -5,17 +5,18 @@
 //! encodes one for a given [`crate::shared::SharedTile`], so the descriptor and
 //! the tile it feeds agree by construction. Host-only (`feature = "host"`).
 //!
-//! [`GlobalRows`], [`load_rows`], [`store_rows`] and [`store_shared_rows`] are
-//! the direct path: ordinary loads and stores against a row-major window at a
-//! runtime leading dimension, no engine and nothing asynchronous. It is what an
-//! fp32 epilogue, a small irregular operand, or a band staged through shared
-//! memory takes to reach global memory.
+//! [`GlobalRows`], [`load_rows`], [`store_rows`], [`load_row_vec`],
+//! [`store_row_vec`] and [`store_shared_rows`] are the direct path: ordinary
+//! loads and stores against a row-major window at a runtime leading dimension,
+//! no engine and nothing asynchronous. It is what an fp32 epilogue, a row
+//! statistic, a small irregular operand, or a band staged through shared memory
+//! takes to reach global memory.
 //!
 //! Design notes and measurements: `docs/library/global.md`.
 
 use core::marker::PhantomData;
 
-use crate::reg::{FragmentLayout, RegTile};
+use crate::reg::{FragmentLayout, RegTile, RegVec, RowLayout};
 use crate::shared::{Element, SharedTile, Swizzle};
 use cuda_device::DisjointSlice;
 use cuda_device::ptx_asm;
@@ -373,6 +374,104 @@ unsafe fn load_rows_in_runs<
             slot += 1;
         }
         tile
+    }
+}
+
+/// Write a row statistic out: one element per row of `row..row + M`, all in
+/// global column `column`.
+///
+/// The [`RegVec`] half of [`store_rows`], and what an attention epilogue's
+/// log-sum-exp, a normalization's per-row mean or its inverse standard deviation
+/// takes to leave the warp. `column` is a column and not a second buffer,
+/// because a per-row statistic of a `[rows, heads]` output is one column of it —
+/// a cursor at stride `heads` and `column = head` writes the head's, which is
+/// the shape that made the store a scatter rather than a run in the first place.
+///
+/// **The addresses are a scatter**: consecutive slots are 8 rows apart, so this
+/// is one store per owned row and there is no run to widen. Only the lanes
+/// [`RowLayout::owns_row`] names store — under [`crate::reg::BaseLdtm`] one lane
+/// of each quad, since the other three hold the same value.
+///
+/// Not warp-collective, for [`store_rows`]' reason: a lane that does not call it
+/// leaves its own rows unwritten.
+///
+/// ```no_run
+/// use kittens::global::{GlobalRows, store_row_vec};
+/// use kittens::reg::{BaseLdtm, RegVec};
+/// use kittens::shared::F32;
+///
+/// # unsafe fn epilogue(lse: *mut u8, heads: usize, head: u32, row: u32, lane: u32) {
+/// let running_sum = RegVec::<32, BaseLdtm>::splat(1.0);
+/// // One f32 per query row, in the head's own column of a `[rows, heads]` buffer.
+/// let dest = unsafe { GlobalRows::<F32>::from_raw(lse, heads) };
+/// unsafe { store_row_vec(dest, row, head, lane, running_sum.log2()) };
+/// # }
+/// ```
+///
+/// # Safety
+///
+/// - The column segment `row..row + M` at `column` lies inside the buffer `dest`
+///   names, at `dest.stride()` elements per row.
+/// - Every lane passing the layout's [`RowLayout::owns_row`] test calls it, or
+///   the rows only that lane writes stay unwritten.
+#[inline(always)]
+pub unsafe fn store_row_vec<E: Element, const M: usize, L: RowLayout<M>>(
+    dest: GlobalRows<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+    rows: RegVec<M, L>,
+) {
+    unsafe {
+        if !L::owns_row(lane) {
+            return;
+        }
+        let mut slot = 0usize;
+        while slot < L::SLOTS {
+            E::write(dest.at(row + L::row_of(lane, slot), column), rows.get(slot));
+            slot += 1;
+        }
+    }
+}
+
+/// Read a row statistic in — a per-row bias, a saved log-sum-exp a backward pass
+/// recomputes probabilities against — over [`store_row_vec`]' addresses.
+///
+/// Every lane loads, including the replicas [`RowLayout::owns_row`] rejects for
+/// the store: a [`RegVec`] is *defined* as one copy per lane holding the row, so
+/// the reads that look redundant are what makes the vector well-formed. They are
+/// the same address across a quad and coalesce into one transaction.
+///
+/// ```no_run
+/// use kittens::global::{GlobalRows, load_row_vec};
+/// use kittens::reg::{BaseLdtm, RegVec};
+/// use kittens::shared::F32;
+///
+/// # unsafe fn recompute(lse: *mut u8, heads: usize, head: u32, row: u32, lane: u32) {
+/// let src = unsafe { GlobalRows::<F32>::from_raw(lse, heads) };
+/// let _: RegVec<32, BaseLdtm> = unsafe { load_row_vec(src, row, head, lane) };
+/// # }
+/// ```
+///
+/// # Safety
+///
+/// - As [`store_row_vec`], reading instead of writing.
+/// - No other thread is writing that column segment.
+#[inline(always)]
+pub unsafe fn load_row_vec<E: Element, const M: usize, L: RowLayout<M>>(
+    src: GlobalRows<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+) -> RegVec<M, L> {
+    unsafe {
+        let mut rows = RegVec::<M, L>::splat(0.0);
+        let mut slot = 0usize;
+        while slot < L::SLOTS {
+            rows.set(slot, E::read(src.at(row + L::row_of(lane, slot), column)));
+            slot += 1;
+        }
+        rows
     }
 }
 
@@ -1036,6 +1135,71 @@ mod rows_tests {
                     let (r, c) = RegTile::<32, 64, BaseLdtm>::coordinate(lane, slot, value);
                     assert_eq!(rows.index(7 + r, 64 + c), start + c as usize);
                 }
+            }
+        }
+    }
+
+    /// The row axis' version of `a_bands_threads_cover_its_rectangle_exactly
+    /// _once`, and the whole of what [`RowLayout::owns_row`] is for: the owning
+    /// lanes between them name each of the band's `M` rows exactly once. Without
+    /// the predicate every row would be named four times.
+    #[test]
+    fn the_owning_lanes_cover_a_bands_rows_exactly_once() {
+        fn one_writer_per_row<const M: usize>()
+        where
+            BaseLdtm: RowLayout<M>,
+        {
+            let mut written = vec![0usize; M];
+            for lane in 0..32u32 {
+                if !<BaseLdtm as RowLayout<M>>::owns_row(lane) {
+                    continue;
+                }
+                for slot in 0..<BaseLdtm as RowLayout<M>>::SLOTS {
+                    written[<BaseLdtm as RowLayout<M>>::row_of(lane, slot) as usize] += 1;
+                }
+            }
+            assert!(written.iter().all(|&n| n == 1), "M = {M}: {written:?}");
+        }
+        one_writer_per_row::<16>();
+        one_writer_per_row::<32>();
+        one_writer_per_row::<128>();
+    }
+
+    /// `F32`'s reads and writes are plain pointer accesses, so the mover itself
+    /// runs on the host: a statistic stored into one column of a `[rows, heads]`
+    /// buffer lands at that column of each of its rows, touches nothing else,
+    /// and reads back into every replica.
+    #[test]
+    fn a_row_statistic_round_trips_through_one_column() {
+        const HEADS: usize = 3;
+        const HEAD: u32 = 1;
+        const ROW: u32 = 32;
+        let mut buffer = vec![0.0f32; (ROW as usize + 32) * HEADS];
+        let dest = unsafe { GlobalRows::<F32>::from_raw(buffer.as_mut_ptr().cast(), HEADS) };
+
+        for lane in 0..32u32 {
+            let mut statistic = RegVec::<32, BaseLdtm>::splat(0.0);
+            for slot in 0..<BaseLdtm as RowLayout<32>>::SLOTS {
+                statistic.set(slot, BaseLdtm::row(lane, slot) as f32 + 0.5);
+            }
+            unsafe { store_row_vec(dest, ROW, HEAD, lane, statistic) };
+        }
+
+        for (index, &value) in buffer.iter().enumerate() {
+            let (row, head) = (index / HEADS, index % HEADS);
+            let expected = if row >= ROW as usize && head == HEAD as usize {
+                row as f32 - ROW as f32 + 0.5
+            } else {
+                0.0
+            };
+            assert_eq!(value, expected, "row {row} head {head}");
+        }
+
+        // Every lane reads, replicas included — four copies of each row's value.
+        for lane in 0..32u32 {
+            let read: RegVec<32, BaseLdtm> = unsafe { load_row_vec(dest, ROW, HEAD, lane) };
+            for slot in 0..<BaseLdtm as RowLayout<32>>::SLOTS {
+                assert_eq!(read.get(slot), BaseLdtm::row(lane, slot) as f32 + 0.5);
             }
         }
     }
