@@ -207,6 +207,14 @@ const DEPTH: usize = 64;
 /// types. The shape-generic alias is what lets one probe body serve the narrow
 /// and wide cases, so a case cannot drift between widths.
 type Tile<const R: usize, const C: usize> = SharedTile<Bf16, R, C, Swizzle128B>;
+
+/// The reduction-store case's tile (#42): fp32, two stacked 32-column
+/// subtiles, at the `[16, 64]` shape whose 4096 bytes are exactly one bf16
+/// `[32, 64]` staging buffer — the reinterpretation an accumulating fp32
+/// epilogue leans on.
+type AddTile = SharedTile<F32, ADD_ROWS, ADD_COLS, Swizzle128B>;
+const ADD_ROWS: usize = 16;
+const ADD_COLS: usize = 64;
 /// The staging tile at fp32 — the one `stmatrix` cannot fill, and the whole
 /// subject of the scatter cases.
 type F32Tile<const R: usize, const C: usize> = SharedTile<F32, R, C, Swizzle128B>;
@@ -826,6 +834,48 @@ pub mod kernels {
         pitched: *const TmaDescriptor,
     ) {
         unsafe { tma_store_probe::<TILE, TILE, true>(source, packed, pitched) }
+    }
+
+    /// TMA an fp32 tile in and *reduce-store* it out **twice**
+    /// ([`SharedTile::tma_store_add_2d`], #42), onto a destination the host
+    /// seeded nonzero.
+    ///
+    /// The double issue is the whole assertion: the expected answer is
+    /// `seed + 2 · tile`, which a plain store (`tile`), a single add
+    /// (`seed + tile`) and a store that lost the seed (`2 · tile`) all miss —
+    /// so the op is pinned as an *add at the destination* rather than any
+    /// overwrite that happens to land in the right place. Both reductions ride
+    /// one committed group; element-wise fp32 addition is commutative here
+    /// because every operand is an exact small integer.
+    #[kernel]
+    pub unsafe fn tma_store_add_twice(source: *const TmaDescriptor, dest: *const TmaDescriptor) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tile = AddTile::from_raw(smem);
+            let tma = Semaphore::attach(smem.add(AddTile::BYTES) as *mut Barrier);
+            let tid = thread::threadIdx_x();
+
+            if tid == 0 {
+                tma.init(1);
+                fence_proxy_async_shared_cta();
+            }
+            thread::sync_threads();
+            if tid == 0 {
+                tma.expect_tx(tile.tma_load_2d(source, 0, 0, tma));
+            }
+            tma.wait(0);
+            thread::sync_threads();
+
+            // Async proxy on both sides, so the load's barrier is the whole
+            // ordering — `tma_store_probe`'s argument, unchanged by the add.
+            if tid == 0 {
+                tile.tma_store_add_2d(dest, 0, 0);
+                tile.tma_store_add_2d(dest, 0, 0);
+                tma_store_commit();
+                tma_store_wait::<0>();
+                tma.inval();
+            }
+        }
     }
 
     /// Fill an `[R, C]` shared tile from registers through [`store_fragment`],
@@ -4444,6 +4494,82 @@ fn check_tma_store<const R: usize, const C: usize>(
         .map_err(|error| format!("pitched destination: {error}").into())
 }
 
+/// Does the reduction store **add**, in fp32, exactly where its map says?
+///
+/// The destination is pitched with poison margins like [`check_tma_store`]'s,
+/// but seeded with a large constant inside the rectangle — the two-pass answer
+/// `seed + 2 · value` is then computed on the host and expected bit-exactly,
+/// every term an integer far below 2^24. A plain store, a single add, an add
+/// that dropped the seed, or an add at a neighbouring coordinate each produce
+/// a distinct wrong value, and a reduction that strayed into the margins
+/// touches poison no seeded element holds.
+fn check_tma_store_add(
+    stream: &CudaStream,
+    launch: impl Fn(
+        LaunchConfig,
+        *const TmaDescriptor,
+        *const TmaDescriptor,
+    ) -> Result<(), cuda_core::DriverError>,
+) -> Result<String, Box<dyn Error>> {
+    const PITCH: usize = 2 * ADD_COLS;
+    const SEED: f32 = 1_048_576.0;
+    const POISON_F32: f32 = -7.0;
+
+    let tile: Vec<f32> = (0..ADD_ROWS * ADD_COLS).map(|i| (i + 1) as f32).collect();
+    let source = DeviceBuffer::from_host(stream, &tile)?;
+    let source_map = unsafe {
+        GlobalLayout::<F32, 2>::packed(source.cu_deviceptr(), [ADD_COLS, ADD_ROWS])
+            .tensor_map::<AddTile>(stream)?
+    };
+
+    let mut seeded = vec![POISON_F32; ADD_ROWS * PITCH];
+    for row in 0..ADD_ROWS {
+        seeded[row * PITCH..row * PITCH + ADD_COLS].fill(SEED);
+    }
+    let dest = DeviceBuffer::from_host(stream, &seeded)?;
+    let dest_map = unsafe {
+        GlobalLayout::<F32, 2>::strided(dest.cu_deviceptr(), [ADD_COLS, ADD_ROWS], [1, PITCH])
+            .tensor_map::<AddTile>(stream)?
+    };
+
+    launch(
+        launch_config(32, (AddTile::BYTES + 32) as u32),
+        source_map.as_ptr(),
+        dest_map.as_ptr(),
+    )?;
+
+    let mut expected = seeded;
+    for row in 0..ADD_ROWS {
+        for column in 0..ADD_COLS {
+            expected[row * PITCH + column] = SEED + 2.0 * tile[row * ADD_COLS + column];
+        }
+    }
+    let observed = dest.to_host_vec(stream)?;
+    let mut report = String::new();
+    let mut mismatches = 0usize;
+    for (index, (&got, &want)) in observed.iter().zip(&expected).enumerate() {
+        if got.to_bits() == want.to_bits() {
+            continue;
+        }
+        mismatches += 1;
+        if mismatches <= 8 {
+            let _ = write!(
+                report,
+                "\n    (row {}, column {}): expected {want}, read back {got}",
+                index / PITCH,
+                index % PITCH
+            );
+        }
+    }
+    if mismatches != 0 {
+        return Err(format!("{mismatches} of {} elements wrong{report}", expected.len()).into());
+    }
+    Ok(format!(
+        "{} elements at seed + 2·value exactly, margins intact",
+        ADD_ROWS * ADD_COLS
+    ))
+}
+
 /// Does a band written into a [`StoreRing`] reach the global rows it was
 /// committed for, at every depth — including after the ring has wrapped?
 ///
@@ -6398,6 +6524,16 @@ fn run() -> Result<usize, Box<dyn Error>> {
         Box::new(|| {
             check_tma_store::<TILE, TILE>(stream, |config, source, packed, pitched| unsafe {
                 module.tma_store_recycle(stream, config, source, packed, pitched)
+            })
+        }),
+    ));
+    // The reduction store (#42): the same engine path with an add at the
+    // destination, seeded nonzero so nothing that overwrites can pass.
+    cases.push((
+        "tma reduce-add store",
+        Box::new(|| {
+            check_tma_store_add(stream, |config, source, dest| unsafe {
+                module.tma_store_add_twice(stream, config, source, dest)
             })
         }),
     ));

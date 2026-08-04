@@ -1555,7 +1555,7 @@ mod host {
     use cuda_core::{CudaStream, DeviceBuffer};
     use cuda_device::tma::TmaDescriptor;
 
-    use crate::shared::{Bf16, Element, F16, SharedTile, SharedVec, Swizzle, Swizzle128B};
+    use crate::shared::{Bf16, Element, F16, F32, SharedTile, SharedVec, Swizzle, Swizzle128B};
 
     /// An [`Element`] the TMA engine can name in a tensor map.
     ///
@@ -1576,6 +1576,14 @@ mod host {
     impl TensorMapElement for F16 {
         const DATA_TYPE: CUtensorMapDataType =
             cuda_core::sys::CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+    }
+
+    /// What an fp32 `C` needs to leave through the engine at all — and what a
+    /// reduction store ([`SharedTile::tma_store_add_2d`]) sums in, so an
+    /// accumulating fp32 epilogue keeps the accumulator's own precision.
+    impl TensorMapElement for F32 {
+        const DATA_TYPE: CUtensorMapDataType =
+            cuda_core::sys::CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
     }
 
     /// The box a shared destination wants delivered, as the map has to state
