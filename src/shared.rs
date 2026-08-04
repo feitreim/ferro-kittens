@@ -1187,6 +1187,26 @@ impl<E: Element> SwizzledChunks<E> {
                 .add(row * 128 + (chunk ^ ((row + self.phase) & 7)) * 16)
         }
     }
+
+    /// Address of element `column` of row `row` — [`Self::at`] in the tile's
+    /// own element coordinates, which is what a per-value scatter addresses
+    /// with.
+    ///
+    /// A chunk is 16 contiguous bytes, so a column splits into the chunk that
+    /// holds it and the byte offset inside that chunk; the swizzle is entirely
+    /// [`Self::at`]'s and nothing here repeats it. This is the shared-side
+    /// counterpart of [`crate::global::GlobalRows::at`], and having both is
+    /// what lets [`crate::ldst::scatter_tile`] be
+    /// [`crate::global::store_rows`]' loop with the destination swapped.
+    ///
+    /// # Safety
+    ///
+    /// - `row` is inside the tile and `column * E::BYTES < 16 * self.chunks()`.
+    #[inline(always)]
+    pub unsafe fn element(self, row: usize, column: usize) -> *mut u8 {
+        let byte = column * E::BYTES;
+        unsafe { self.at(row, byte / 16).add(byte % 16) }
+    }
 }
 
 /// `N` elements of `E` in shared memory, contiguous and **unswizzled** — the
@@ -1851,6 +1871,42 @@ mod tests {
             injective::<128, 128>(0x10000 + phase * 128);
             injective::<64, 256>(0x10000 + phase * 128);
             injective::<4, 128>(0x10000 + phase * 128);
+        }
+    }
+
+    #[test]
+    fn every_column_owns_its_own_bytes_of_the_chunk_holding_it() {
+        // The element cursor is the chunk cursor plus an offset inside the
+        // chunk, and the two claims that makes are that the offset is the
+        // column's position in its chunk and that the tile's columns partition
+        // its bytes — at fp32, where four columns share a chunk, and at bf16,
+        // where eight do.
+        fn columns_partition_the_tile<E: Element, const R: usize, const C: usize>(base: usize) {
+            let tile = unsafe { SharedTile::<E, R, C, Swizzle128B>::from_raw(base as *mut u8) };
+            let chunks = tile.chunk_writer();
+            let mut seen = vec![false; SharedTile::<E, R, C, Swizzle128B>::BYTES];
+            for row in 0..R {
+                for column in 0..C {
+                    let offset = unsafe { chunks.element(row, column) } as usize - base;
+                    let chunk = unsafe { chunks.at(row, column * E::BYTES / 16) } as usize - base;
+                    assert_eq!(offset - chunk, column * E::BYTES % 16);
+                    for byte in 0..E::BYTES {
+                        assert!(offset + byte < seen.len(), "({row}, {column}) escaped");
+                        assert!(!seen[offset + byte], "({row}, {column}) collided");
+                        seen[offset + byte] = true;
+                    }
+                }
+            }
+            assert!(seen.iter().all(|&byte| byte));
+        }
+        // A single subtile at each element and stacked subtiles at each: the
+        // element split is the same arithmetic either side of a subtile edge.
+        for phase in 0..8usize {
+            let base = 0x10000 + phase * 128;
+            columns_partition_the_tile::<F32, 16, 32>(base);
+            columns_partition_the_tile::<F32, 16, 128>(base);
+            columns_partition_the_tile::<Bf16, 16, 64>(base);
+            columns_partition_the_tile::<Bf16, 16, 128>(base);
         }
     }
 

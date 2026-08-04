@@ -10,6 +10,11 @@
 //! compose those blocks into an `[M, N]` band — the same composition
 //! [`crate::tmem::TmemTile::tile`] does over the drain.
 //!
+//! [`scatter_tile`] is the store direction for the elements `stmatrix` cannot
+//! move: one `st.shared` per owned value instead of one instruction per block,
+//! generic in the element and the layout. An fp32 band reaches a staging tile
+//! that way and no other.
+//!
 //! [`load_vec`] and [`store_vec`] are the vector pair, and are plain scalar
 //! accesses rather than a matrix instruction: a [`ColVec`]'s values are one
 //! element each at columns no `ldmatrix` shape describes.
@@ -369,6 +374,90 @@ pub unsafe fn store_tile<E: Element<Unpacked = [f32; 2]>, const M: usize, const 
     }
 }
 
+/// [`store_tile`] for an element `stmatrix` cannot move: each lane writes its
+/// own values one at a time, at the coordinates its layout gives it.
+///
+/// This is [`crate::global::store_rows`]' loop with a
+/// [`SwizzledChunks::element`] where the [`crate::global::GlobalRows::at`] was,
+/// and it needs no new instruction — a store into shared memory at any element
+/// is an ordinary `st.shared`. What it buys is the *route*: an fp32 band could
+/// not reach a staging tile at all, because `stmatrix` moves b16 matrices and
+/// [`store_tile`] therefore bounds `Element<Unpacked = [f32; 2]>`. So an fp32
+/// epilogue was stuck on the per-value **global** stores #116 measured at
+/// 20.43 µs a tile against the staged route's 6.68, and this is what lets it
+/// be the same two calls a bf16 one is: `scatter_tile` here, then
+/// [`crate::global::store_shared_rows`] or
+/// [`crate::global::accumulate_shared_rows`] out.
+///
+/// Generic in the layout as well as the element, for
+/// [`crate::global::store_rows`]' reason rather than [`store_tile`]'s: nothing
+/// here is an `ldmatrix` shape, so nothing here is [`BaseLdtm`]'s.
+///
+/// **Not warp-collective**, and that is the second difference from
+/// [`store_tile`]: 32 threads each write their own values, so a lane that skips
+/// it leaves its own values unwritten rather than making an instruction
+/// ill-formed. The barrier the tile's *reader* needs is still the caller's.
+///
+/// Under [`BaseLdtm`] the values a lane owns are scattered across the row in
+/// pairs, so a warp's writes hit each bank twice — half the conflict-free rate,
+/// against a global store that would have touched eight discontiguous runs.
+/// Measurements: `docs/library/ldst.md`.
+///
+/// ```no_run
+/// use kittens::global::{GlobalRows, store_shared_rows};
+/// use kittens::ldst::scatter_tile;
+/// use kittens::shared::{F32, SharedTile, Swizzle128B};
+/// use kittens::{BaseLdtm, RegTile, lane, warp_id};
+/// use cuda_device::thread;
+///
+/// # unsafe fn drain(stage: SharedTile<F32, 64, 128, Swizzle128B>, c: *mut u8, ldc: usize) {
+/// let band = RegTile::<16, 128, BaseLdtm>::zero();
+/// unsafe { scatter_tile(stage.chunk_writer(), 16 * warp_id(), 0, lane(), band) };
+/// // Generic proxy on both sides, so a plain block barrier publishes it.
+/// thread::sync_threads();
+/// let dest = unsafe { GlobalRows::<F32>::from_raw(c, ldc) };
+/// unsafe { store_shared_rows::<_, 64, 128, _, 128>(dest, 0, 0, thread::threadIdx_x(), stage) };
+/// # }
+/// ```
+///
+/// # Safety
+///
+/// - `chunks` must belong to a tile at least `row + M` rows tall into which
+///   `column + N` fits.
+/// - `L`'s map is injective across the warp, or two lanes write the same
+///   element — [`crate::global::store_rows`]' contract, for the same reason.
+/// - The caller owes the reader a barrier: a `bar.sync` for another warp's
+///   [`crate::global::store_shared_rows`], and a
+///   [`crate::shared::publish_to_async_proxy`] before any MMA or TMA reads the
+///   tile.
+#[inline(always)]
+pub unsafe fn scatter_tile<E: Element, const M: usize, const N: usize, L: FragmentLayout<M, N>>(
+    chunks: SwizzledChunks<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+    tile: RegTile<M, N, L>,
+) {
+    unsafe {
+        // Fully unrolled for `tile`'s sake — see `store_tile_x4` (#166).
+        let mut slot = 0usize;
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
+            let tile_row = (row + L::row_of(lane, slot)) as usize;
+            let mut value = 0usize;
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
+                E::write(
+                    chunks.element(tile_row, (column + L::col_of(lane, value)) as usize),
+                    tile.get(slot, value),
+                );
+                value += 1;
+            }
+            slot += 1;
+        }
+    }
+}
+
 /// Broadcast a [`SharedVec`] into the [`ColVec`] a per-column op consumes:
 /// each lane reads the `L::VALUES` columns [`ColLayout::col_of`] says it holds.
 ///
@@ -488,7 +577,56 @@ pub unsafe fn stmatrix_m8n8_x4(smem_ptr: *mut u8, r0: u32, r1: u32, r2: u32, r3:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reg::BaseLdtm;
+    use crate::reg::{BaseLdtm, ColLayout, RowLayout};
+    use crate::shared::{Bf16, F32, SharedTile, Swizzle128B};
+
+    /// The addresses a warp's [`scatter_tile`] forms are exactly the tile's
+    /// `[M, N]` band, each element written once — which is the whole of its
+    /// contract, and the reason an fp32 tile filled this way comes back as
+    /// itself.
+    ///
+    /// Pure address arithmetic, so it holds here rather than only on a GPU:
+    /// the values ride the same [`crate::shared::Element::write`] a
+    /// [`crate::shared::SharedVec`] uses.
+    #[test]
+    fn a_warps_scatter_covers_the_band_exactly_once() {
+        fn covers<E: Element, const R: usize, const C: usize>(base: usize, row: u32, column: u32)
+        where
+            BaseLdtm: RowLayout<16> + ColLayout<64>,
+        {
+            let tile = unsafe { SharedTile::<E, R, C, Swizzle128B>::from_raw(base as *mut u8) };
+            let chunks = tile.chunk_writer();
+            let mut seen = vec![false; SharedTile::<E, R, C, Swizzle128B>::BYTES];
+            for lane in 0..32u32 {
+                for slot in 0..<BaseLdtm as RowLayout<16>>::SLOTS {
+                    for value in 0..<BaseLdtm as ColLayout<64>>::VALUES {
+                        let at = unsafe {
+                            chunks.element(
+                                (row + <BaseLdtm as RowLayout<16>>::row_of(lane, slot)) as usize,
+                                (column + <BaseLdtm as ColLayout<64>>::col_of(lane, value))
+                                    as usize,
+                            )
+                        } as usize
+                            - base;
+                        for byte in 0..E::BYTES {
+                            assert!(!seen[at + byte], "lane {lane} wrote a byte twice");
+                            seen[at + byte] = true;
+                        }
+                    }
+                }
+            }
+            // 16 rows x 64 columns of the tile, and nothing outside them.
+            assert_eq!(
+                seen.iter().filter(|&&byte| byte).count(),
+                16 * 64 * E::BYTES
+            );
+        }
+        // At the origin, and at a band origin inside a taller, wider tile —
+        // the placement an epilogue warp uses.
+        covers::<F32, 16, 64>(0x10000, 0, 0);
+        covers::<F32, 64, 128>(0x10080, 32, 64);
+        covers::<Bf16, 64, 128>(0x10080, 32, 64);
+    }
 
     /// The 16 addressing lanes of one slot name the slot's 8 rows in each of
     /// the two 8-column halves — the `.x2`'s two matrices — and nothing else.

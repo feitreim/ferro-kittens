@@ -56,6 +56,45 @@ bound rather than an assertion: a 4-per-word element does not typecheck against
 these functions, and so gets the instruction shape it actually needs instead of
 quietly moving half the bytes.
 
+## `scatter_tile` is the route for the elements that bound excludes
+
+The bound above is a fact about `stmatrix`, but for a long time it read as a
+fact about the *library*: an fp32 band had no way into a shared tile at all, so
+an fp32 epilogue stayed on `store_rows`' per-value **global** stores — eight
+discontiguous 8-byte runs a warp, where the staged route writes four contiguous
+128-byte ones. #116 measured that difference at 20.43 µs/tile against 6.68 for
+bf16, and the whole of what was missing was a filling instruction, not a design.
+
+`scatter_tile` is that instruction, and it is deliberately not a new one: a
+store into shared memory at any element is an ordinary `st.shared`, so the
+function is `global::store_rows`' loop with `SwizzledChunks::element` where the
+`GlobalRows::at` was. The two claims it rests on are addressing claims, and both
+are host tests — `element` splits a column into the chunk holding it and the
+offset inside it (`every_column_owns_its_own_bytes_of_the_chunk_holding_it`),
+and a warp's scatter covers its band exactly once
+(`a_warps_scatter_covers_the_band_exactly_once`).
+
+It is generic in the layout as well as the element, where `store_tile` is
+`BaseLdtm`-only. That asymmetry is the point rather than an oversight:
+`store_tile`'s addressing *is* an `ldmatrix` shape and cannot be anything else,
+while a scatter only ever asks the layout which `(row, column)` a value is.
+
+**What it costs, per band, against the `stmatrix` route it parallels.** A
+`[16, 64]` fp32 band is 64 values a thread and therefore 64 `st.shared.b32`,
+where the same band at bf16 is 8 `stmatrix.m8n8.x4`. Under `BaseLdtm` the values
+a lane owns come in adjacent pairs sharing a 16-byte chunk, so the 32 lanes of a
+warp land on 16 of the 32 banks twice over — a 2-way conflict, not a broadcast
+and not a clean sweep. The trade is that against, and the global half it buys is
+`store_shared_rows`' unchanged 16-byte contiguous stores.
+
+**What it does not do is reduce the band.** A scatter holds exactly what
+`store_rows` held; the register pressure an fp32 drain has comes from the band's
+width, and it falls when the *epilogue* narrows its pass to the staging tile's
+width — which is what having a staging tile makes possible, and not what this
+function does by itself. `device-tests`' `scatter drain` / `register drain` pair
+is the same rectangle by the two routes at 32 and at 128 columns, so the
+`regcount` table reads the difference directly.
+
 ## `store_packed_x4` computes nothing correct in tree
 
 Nothing in tree computes a right answer with `store_packed_x4`, and that is not
