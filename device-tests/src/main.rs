@@ -69,6 +69,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 use cuda_device::DisjointSlice;
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
+use cuda_device::thread::__unroll_config;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cluster, cluster_launch, cuda_module, debug, kernel, thread, warp};
 
@@ -1114,6 +1115,13 @@ pub mod kernels {
     ///
     /// Shared by the bf16 and fp32 probes so the two fill a band from the same
     /// [`RegTile::coordinate`] and a disagreement between them is the drain's.
+    ///
+    /// Both walks are fully unrolled for the reason every mover in the library
+    /// is (ferro #166): a rolled walk over a `RegTile` keeps its indices
+    /// dynamic, SROA cannot split the aggregate, and the whole band is homed to
+    /// a `.local` depot. That depot is the *fill's* and would sit in every one
+    /// of these probes' `regcount` rows, which is exactly what stops the drains
+    /// below being comparable to each other.
     #[inline(always)]
     fn drain_identities<const C: usize>(row_base: u32, lane: u32) -> DrainBand<C>
     where
@@ -1121,9 +1129,11 @@ pub mod kernels {
     {
         let mut values = DrainBand::<C>::zero();
         let mut slot = 0usize;
-        while slot < DrainBand::<C>::SLOTS {
+        while slot < const { DrainBand::<C>::SLOTS } {
+            __unroll_config::<0>();
             let mut value = 0usize;
-            while value < DrainBand::<C>::VALUES {
+            while value < const { DrainBand::<C>::VALUES } {
+                __unroll_config::<0>();
                 let (row, tile_column) = DrainBand::<C>::coordinate(lane, slot, value);
                 values.set(
                     slot,
