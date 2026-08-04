@@ -458,14 +458,37 @@ through `store_rows`' scattered per-value stores, the shape #116 measured at
 `C` paid it.
 
 `scatter_tile` is `store_rows`' own loop with a `SwizzledChunks::element` where
-the `GlobalRows::at` was: one `st.shared` per owned value, generic in the
-element *and* in the layout, since nothing about it is an `ldmatrix` shape. An
-fp32 epilogue is now the two calls a bf16 one is. Named in `tests/gaps.rs` as
-`an_fp32_band_reaches_a_staging_tile`, whose unbounded `E` and free `L` are the
-claim; held on a B200 by `device-tests`' `scatter drain` and `scatter drain
-wide`, against `register drain`/`register drain wide` — the same rectangle
-written the old way, which is the control for the register counts as well as for
-the bytes.
+the `GlobalRows::at` was: one shared access per owned *pair*
+(`Element::write_pair_shared`, `st.shared.v2.f32` at fp32 and a packed
+`st.shared.b32` at bf16), generic in the element *and* in the layout, since
+nothing about it is an `ldmatrix` shape. An fp32 epilogue is now the two calls a
+bf16 one is. Named in `tests/gaps.rs` as `an_fp32_band_reaches_a_staging_tile`,
+whose unbounded `E` and free `L` are the claim; held on a B200 by
+`device-tests`' `scatter drain` and `scatter drain wide`, against `register
+drain`/`register drain wide` — the same rectangle written the old way, which is
+the control for the register counts as well as for the bytes.
+
+**What it bought downstream, and what it did not.** `oxide-train`'s
+`gemm_tcgen05_f32_optimized` converted to the staged drain goes from **120
+registers and a 512 B `.local` frame to 96 and none**: the frame was a band that
+did not fit — `store_rows` held a whole `[32, 64]` fp32 band, and the
+accumulating mode held `C`'s band beside it — and staging removes both, since
+the fold becomes `accumulate_shared_rows`', which holds no band at all. The
+milliseconds did **not** follow. Against three baseline runs on a B200, the
+store arm is ~5% faster at 4096³ and a wash at 8192³ and 16384³, and the
+accumulate arm is **15% slower** at 4096³ and 8192³ — reproducibly, at the shape
+where the harness' variance is smallest.
+
+The reason is the tile, not the route. At four bytes an element the same 4096 B
+a warp is `[16, 64]` where bf16 gets `[32, 64]`, so an fp32 band is eight passes
+where the bf16 one is four, and each pass is a serial
+scatter → `ld.shared` → global → `bar.warp.sync` chain. Twice the passes is
+twice that exposed latency, and at the accumulating variant the `ld.global` sits
+on it too. So the staged drain wins when the staging tile is wide enough to
+amortize a pass, and that kernel's shared budget — 98 392 B of operand rings
+against a 116 736 B ceiling — does not leave enough for one. The conversion was
+therefore **not shipped**; the route is here for the epilogue that can afford
+the tile.
 
 Absent: the load direction. Nothing reads a global rectangle into a shared tile
 without a descriptor, which is what an irregular operand not worth a host-built

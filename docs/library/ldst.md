@@ -107,6 +107,29 @@ function does by itself. `device-tests`' `scatter drain` / `register drain` pair
 is the same rectangle by the two routes at 32 and at 128 columns, so the
 `regcount` table reads the difference directly.
 
+## The measured downstream answer, which is not the one the gap predicted
+
+`oxide-train`'s `gemm_tcgen05_f32_optimized` was converted to this route and
+measured on a B200. The register story landed: **120 registers and a 512 B
+`.local` frame → 96 and none**, the frame being a band that did not fit, which
+staging removes twice over — a pass narrows from `[32, 64]` to `[16, 64]`, and
+the accumulating mode stops holding `C`'s band because `accumulate_shared_rows`
+does the fold in memory. The milliseconds did not: against three baseline runs
+the store arm is ~5% faster at 4096³ and a wash above it, and the accumulate arm
+is 15% slower at 4096³ and 8192³.
+
+The cause is the tile's *height*, and it is worth stating because it bounds when
+this route is the right one. Four bytes an element buys half the rows in the
+same shared bytes, so an fp32 band takes eight passes where the bf16 band takes
+four, and a pass is a serial
+scatter → `ld.shared` → global → `bar.warp.sync` chain. Twice the passes is
+twice that exposed latency, and the accumulating variant puts an `ld.global` on
+it as well. #116's −19% for bf16 was measured with a tile wide enough to
+amortize the pass; that kernel's operand rings leave 18 344 B for four warps,
+which at fp32 is not. **The staged drain is a trade against pass count, not
+against element width** — an epilogue that can spend `[32, 64]` fp32 of shared
+memory is the one to re-measure this on.
+
 ## `store_packed_x4` computes nothing correct in tree
 
 Nothing in tree computes a right answer with `store_packed_x4`, and that is not
