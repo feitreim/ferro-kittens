@@ -398,10 +398,19 @@ pub unsafe fn store_tile<E: Element<Unpacked = [f32; 2]>, const M: usize, const 
 /// it leaves its own values unwritten rather than making an instruction
 /// ill-formed. The barrier the tile's *reader* needs is still the caller's.
 ///
+/// Two values a layout declares adjacent
+/// ([`crate::reg::ColLayout::CONTIGUOUS_VALUES`]) become **one**
+/// [`Element::write_pair_shared`], halving the store count. Where
+/// [`crate::global::store_rows`] has to test a runtime leading dimension for
+/// that, this knows it at compile time: a chunk is 16-byte aligned, a pair
+/// starts at a column the layout's own contract makes a multiple of
+/// `CONTIGUOUS_VALUES`, and both element widths keep a pair inside one chunk.
+/// So the decision is a `const` and neither path carries a branch.
+///
 /// Under [`BaseLdtm`] the values a lane owns are scattered across the row in
-/// pairs, so a warp's writes hit each bank twice — half the conflict-free rate,
-/// against a global store that would have touched eight discontiguous runs.
-/// Measurements: `docs/library/ldst.md`.
+/// those pairs, so a warp's writes hit each bank twice — half the
+/// conflict-free rate, against a global store that would have touched eight
+/// discontiguous runs. Measurements: `docs/library/ldst.md`.
 ///
 /// ```no_run
 /// use kittens::global::{GlobalRows, store_shared_rows};
@@ -430,6 +439,9 @@ pub unsafe fn store_tile<E: Element<Unpacked = [f32; 2]>, const M: usize, const 
 ///   [`crate::global::store_shared_rows`], and a
 ///   [`crate::shared::publish_to_async_proxy`] before any MMA or TMA reads the
 ///   tile.
+/// - `column` must be a multiple of `L::CONTIGUOUS_VALUES`, so that the pairs
+///   the layout promises start where the tile's chunks admit them. Every band
+///   origin an epilogue uses is a multiple of 16 and satisfies it.
 #[inline(always)]
 pub unsafe fn scatter_tile<E: Element, const M: usize, const N: usize, L: FragmentLayout<M, N>>(
     chunks: SwizzledChunks<E>,
@@ -438,8 +450,15 @@ pub unsafe fn scatter_tile<E: Element, const M: usize, const N: usize, L: Fragme
     lane: u32,
     tile: RegTile<M, N, L>,
 ) {
+    const {
+        assert!(
+            E::BYTES == 2 || E::BYTES == 4,
+            "a pair of elements has to fit a 16-byte chunk at a pair-aligned column"
+        )
+    };
     unsafe {
         // Fully unrolled for `tile`'s sake — see `store_tile_x4` (#166).
+        let paired = const { L::CONTIGUOUS_VALUES % 2 == 0 };
         let mut slot = 0usize;
         while slot < const { L::SLOTS } {
             __unroll_config::<0>();
@@ -447,11 +466,13 @@ pub unsafe fn scatter_tile<E: Element, const M: usize, const N: usize, L: Fragme
             let mut value = 0usize;
             while value < const { L::VALUES } {
                 __unroll_config::<0>();
-                E::write(
-                    chunks.element(tile_row, (column + L::col_of(lane, value)) as usize),
-                    tile.get(slot, value),
-                );
-                value += 1;
+                let at = chunks.element(tile_row, (column + L::col_of(lane, value)) as usize);
+                if paired {
+                    E::write_pair_shared(at, tile.get(slot, value), tile.get(slot, value + 1));
+                } else {
+                    E::write(at, tile.get(slot, value));
+                }
+                value += const { 1 + (L::CONTIGUOUS_VALUES % 2 == 0) as usize };
             }
             slot += 1;
         }
@@ -580,14 +601,15 @@ mod tests {
     use crate::reg::{BaseLdtm, ColLayout, RowLayout};
     use crate::shared::{Bf16, F32, SharedTile, Swizzle128B};
 
-    /// The addresses a warp's [`scatter_tile`] forms are exactly the tile's
-    /// `[M, N]` band, each element written once — which is the whole of its
+    /// The accesses a warp's [`scatter_tile`] forms are exactly the tile's
+    /// `[M, N]` band, each byte written once — which is the whole of its
     /// contract, and the reason an fp32 tile filled this way comes back as
     /// itself.
     ///
-    /// Pure address arithmetic, so it holds here rather than only on a GPU:
-    /// the values ride the same [`crate::shared::Element::write`] a
-    /// [`crate::shared::SharedVec`] uses.
+    /// Walked at the *pair* stride the function uses, so it holds the pair
+    /// rung's two claims as well: a pair is one aligned access inside one
+    /// 16-byte chunk, and the pairs still tile the band. Pure address
+    /// arithmetic, so it holds here rather than only on a GPU.
     #[test]
     fn a_warps_scatter_covers_the_band_exactly_once() {
         fn covers<E: Element, const R: usize, const C: usize>(base: usize, row: u32, column: u32)
@@ -596,10 +618,12 @@ mod tests {
         {
             let tile = unsafe { SharedTile::<E, R, C, Swizzle128B>::from_raw(base as *mut u8) };
             let chunks = tile.chunk_writer();
+            let run = <BaseLdtm as ColLayout<64>>::CONTIGUOUS_VALUES;
+            assert_eq!(run % 2, 0, "the pair rung is what this walks");
             let mut seen = vec![false; SharedTile::<E, R, C, Swizzle128B>::BYTES];
             for lane in 0..32u32 {
                 for slot in 0..<BaseLdtm as RowLayout<16>>::SLOTS {
-                    for value in 0..<BaseLdtm as ColLayout<64>>::VALUES {
+                    for value in (0..<BaseLdtm as ColLayout<64>>::VALUES).step_by(2) {
                         let at = unsafe {
                             chunks.element(
                                 (row + <BaseLdtm as RowLayout<16>>::row_of(lane, slot)) as usize,
@@ -608,7 +632,12 @@ mod tests {
                             )
                         } as usize
                             - base;
-                        for byte in 0..E::BYTES {
+                        // One access of two elements: aligned to its own width
+                        // and inside a single chunk, which is what makes it
+                        // legal to issue as one instruction.
+                        assert_eq!(at % (2 * E::BYTES), 0, "lane {lane} pair misaligned");
+                        assert_eq!(at / 16, (at + 2 * E::BYTES - 1) / 16, "pair split a chunk");
+                        for byte in 0..2 * E::BYTES {
                             assert!(!seen[at + byte], "lane {lane} wrote a byte twice");
                             seen[at + byte] = true;
                         }

@@ -120,6 +120,22 @@ pub trait Element {
         unsafe { (Self::read(at), Self::read(at.add(Self::BYTES))) }
     }
 
+    /// [`Self::write_pair`] into **shared** memory — a different address space,
+    /// so a different instruction, and there is no default because the two
+    /// element widths reach it by different routes: a 2-byte element's adjacent
+    /// pair *is* one packed word, where a 4-byte element's is a vector store.
+    ///
+    /// [`crate::ldst::scatter_tile`] is the only caller, and halving its store
+    /// count is the whole of why this exists — a per-value scatter is the one
+    /// place in the crate where the shared-memory instruction count is the
+    /// cost.
+    ///
+    /// # Safety
+    ///
+    /// - `at` is aligned to `2 * BYTES` and does not straddle a 16-byte chunk.
+    /// - `at` names two writable elements of a **shared** tile.
+    unsafe fn write_pair_shared(at: *mut u8, first: f32, second: f32);
+
     /// Fold two packed words lane-wise: widen both, add in fp32, round the sum
     /// back to `Self` **once**.
     ///
@@ -222,6 +238,14 @@ impl Element for F16 {
         (first, second)
     }
 
+    /// The pair is one 32-bit word at two bytes an element, so the shared store
+    /// is [`Self::write_pair`]'s own body — one `st.shared.b32`, and one
+    /// `cvt` for both values rather than one each.
+    #[inline(always)]
+    unsafe fn write_pair_shared(at: *mut u8, first: f32, second: f32) {
+        unsafe { *(at as *mut u32) = Self::pack([first, second]) }
+    }
+
     #[inline(always)]
     fn add_packed(current: u32, update: u32) -> u32 {
         let ([a, b], [c, d]) = (Self::unpack(current), Self::unpack(update));
@@ -315,6 +339,13 @@ impl Element for Bf16 {
     unsafe fn read_pair(at: *const u8) -> (f32, f32) {
         let [first, second] = Self::unpack(unsafe { *(at as *const u32) });
         (first, second)
+    }
+
+    /// As [`F16::write_pair_shared`]: two bytes an element makes the pair one
+    /// word, so nothing here is a vector instruction.
+    #[inline(always)]
+    unsafe fn write_pair_shared(at: *mut u8, first: f32, second: f32) {
+        unsafe { *(at as *mut u32) = Self::pack([first, second]) }
     }
 
     #[inline(always)]
@@ -435,6 +466,30 @@ impl Element for F32 {
                 clobber("memory"),
             );
             (first, second)
+        }
+    }
+
+    /// `st.shared.v2.f32` — the two fp32 at `at` and `at + 4` in one
+    /// instruction, and the reason [`crate::ldst::scatter_tile`] costs a band
+    /// half the shared stores it would otherwise.
+    ///
+    /// Inline PTX for [`Self::write_pair`]'s reason, one address space along:
+    /// widening two adjacent stores is a transformation ptxas may only make
+    /// when the address is provably aligned, and an address built from a lane
+    /// id through a swizzle never is. The caller that knows it is aligned — a
+    /// pair starts at a multiple of
+    /// [`crate::reg::ColLayout::CONTIGUOUS_VALUES`] inside a 16-byte chunk — is
+    /// the only one in a position to spell it.
+    #[inline(always)]
+    unsafe fn write_pair_shared(at: *mut u8, first: f32, second: f32) {
+        unsafe {
+            ptx_asm!(
+                "{ .reg .u64 smem; cvta.to.shared.u64 smem, %0; st.shared.v2.f32 [smem], {%1, %2}; }",
+                in("l") at as u64,
+                in("f") first,
+                in("f") second,
+                clobber("memory"),
+            );
         }
     }
 

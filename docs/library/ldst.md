@@ -80,11 +80,23 @@ It is generic in the layout as well as the element, where `store_tile` is
 while a scatter only ever asks the layout which `(row, column)` a value is.
 
 **What it costs, per band, against the `stmatrix` route it parallels.** A
-`[16, 64]` fp32 band is 64 values a thread and therefore 64 `st.shared.b32`,
-where the same band at bf16 is 8 `stmatrix.m8n8.x4`. Under `BaseLdtm` the values
-a lane owns come in adjacent pairs sharing a 16-byte chunk, so the 32 lanes of a
-warp land on 16 of the 32 banks twice over — a 2-way conflict, not a broadcast
-and not a clean sweep. The trade is that against, and the global half it buys is
+`[16, 64]` fp32 band is 64 values a thread; at one store each that is 64
+`st.shared.b32`, where the same band at bf16 is 8 `stmatrix.m8n8.x4`. The gap is
+the whole risk in this route, and the pair rung halves it: `BaseLdtm`'s
+`CONTIGUOUS_VALUES` is 2, so two values are one `st.shared.v2.f32` and the band
+costs 32. At bf16 the same rung is not a vector instruction at all — two
+adjacent bf16 *are* one 32-bit word — so it is a plain `st.shared.b32` of one
+`pack`, which halves the `cvt` count too.
+
+Where `global::store_rows` has to test its cursor at run time to earn the same
+pairing, this knows the answer statically: a chunk is 16-byte aligned, a pair
+starts at a multiple of `CONTIGUOUS_VALUES` by that constant's own contract, and
+`2 * E::BYTES` divides 16 at both element widths. So the decision is a `const`
+and neither path carries a branch.
+
+Under `BaseLdtm` a lane's pairs are scattered across the row, so the 32 lanes of
+a warp land on half the banks twice over — a 2-way conflict, not a broadcast and
+not a clean sweep. The trade is that against, and the global half it buys is
 `store_shared_rows`' unchanged 16-byte contiguous stores.
 
 **What it does not do is reduce the band.** A scatter holds exactly what
