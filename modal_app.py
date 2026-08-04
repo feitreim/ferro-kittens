@@ -539,8 +539,16 @@ def clc_bench() -> None:
 
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
 @completes
-def ws_bench() -> None:
+def ws_bench(case: str = "") -> None:
     """The warp-specialized GEMM against the one it is a variant of.
+
+    `--case shallow` runs #188's arm instead: the same A/B at the K = 3072
+    geometries oxide-train#80 counts in (gate_up fwd, qkv fwd, o_proj fwd, and
+    8192^3 as the deep-K control), five arms in one container -- `gemm
+    staged84`, `ws staged8`, `ws s6`, the `ws no drain` floor, and cuBLASLt.
+    Every prior gemm_ws table is at K = M = N, where the overlap the design
+    buys is worth the least; the floor is the kill criterion, since a floor
+    already losing to `gemm staged84` closes the design point cheaply.
 
     `experiments/src/gemm.rs` gets its overlap across CTAs -- two per SM, so one
     CTA's epilogue runs against another's MMA. `experiments/src/gemm_ws.rs` gets it
@@ -574,7 +582,7 @@ def ws_bench() -> None:
           "--format=csv"], cwd="/")
     _run(
         ["cargo", "oxide", "run", "kittens-experiments", "--features", "cublas",
-         "--", "ws"],
+         "--", "ws"] + ([case] if case else []),
         cwd=EXPERIMENTS_DIR,
     )
 
