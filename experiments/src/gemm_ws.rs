@@ -2388,3 +2388,111 @@ pub fn compare(
     }
     Ok(())
 }
+
+/// The K = 3072 geometries oxide-train#80's model_shapes rows put this design
+/// point's question at, and no smaller a question — `scripts/modal-run
+/// ws_bench --case shallow` (#188).
+///
+/// Every number this file held before it was at K = M = N, which is the regime
+/// where the overlap warp specialization buys is worth the least: #114's cube
+/// put the shipped kernel's epilogue at ~20 µs a tile *fixed*, so its share of
+/// an item falls as K grows, and −7.3% at 16384³ (#112) priced the solo MMA
+/// chain and said nothing about the drain. At K = 3072 the exposed drain is
+/// 15–25% of an item downstream and the shipped design decays to 0.75–0.85 of
+/// cuBLASLt; this is the first table where both facts are in frame at once.
+///
+/// Five arms, each the smallest set that can settle the question:
+/// `gemm staged84` is the shipped 2-CTA design at its best rung, `ws staged8`
+/// this kernel at its own, `ws s6` the depth the freed shared memory affords,
+/// `ws no drain` the floor — **not a GEMM**, and the kill criterion: a floor
+/// already losing to `gemm staged84` means no epilogue placement can save the
+/// design point — and cuBLASLt the denominator, all in one container.
+pub fn shallow(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    baseline: Option<Baseline>,
+) -> Result<(), Box<dyn Error>> {
+    const SHALLOW: [Shape; 4] = [
+        // oxide-train's gate_up fwd, qkv fwd and o_proj fwd geometries, then
+        // 8192³ — the deep-K control every prior gemm_ws table is quotable at.
+        Shape {
+            m: 6144,
+            n: 8192,
+            k: 3072,
+        },
+        Shape {
+            m: 24576,
+            n: 9216,
+            k: 3072,
+        },
+        Shape {
+            m: 24576,
+            n: 3072,
+            k: 3072,
+        },
+        Shape {
+            m: 8192,
+            n: 8192,
+            k: 8192,
+        },
+    ];
+    println!(
+        "gemm_ws at shallow K (#188) — min ms over 30 timed launches, every arm but the\n\
+         floor checked element-by-element against the CPU reference before it was timed.\n\
+         `gemm 84` is experiments/src/gemm.rs on staged84: 2 CTAs an SM, 256 accumulator\n\
+         columns, the epilogue exposed (#114: 1.01x). `ws` rungs are this file: 1 CTA an\n\
+         SM, 512 columns in two ping-ponged stages, the epilogue deferred one item on\n\
+         warps of its own. `ws floor` computes no C and is the most this design could\n\
+         reach with a free epilogue."
+    );
+    println!(
+        "{:<18}{:>8}{:>12}{:>12}{:>12}{:>12}{:>13}",
+        "shape", "tiles", "gemm 84 ms", "ws 8 ms", "ws s6 ms", "ws floor", "ws 8 vs 84"
+    );
+    let mut rows = Vec::new();
+    for shape in SHALLOW {
+        eprintln!("{shape} on gemm staged84 (the control): staging and checking");
+        let control =
+            crate::gemm::bench_with(context, shape, crate::gemm::Epilogue::StagedWideX4)?.min();
+        let ours = rung(context, shape, SHIPPED_ENTRY)?;
+        let deep = rung(context, shape, Entry::S6)?;
+        let floor = rung(context, shape, Entry::NoDrain)?;
+        println!(
+            "{:<18}{:>8}{:>12.4}{:>12.4}{:>12.4}{:>12.4}{:>13}",
+            shape,
+            tiles(shape.m, shape.n),
+            control,
+            ours,
+            deep,
+            floor,
+            format!("{:+.1}%", 100.0 * (control / ours - 1.0))
+        );
+        rows.push((shape, control, ours, deep, floor));
+    }
+    println!("\nagainst cuBLASLt in the same container — the ratio oxide-train#80 counts in");
+    println!(
+        "{:<18}{:>13}{:>13}{:>9}{:>9}{:>9}{:>10}",
+        "shape", "cuBLASLt ms", "theirs TF/s", "gemm 84", "ws 8", "ws s6", "ws floor"
+    );
+    for &(shape, control, ours, deep, floor) in &rows {
+        let Some(baseline) = baseline else {
+            println!(
+                "no cuBLASLt column: built without --features cublas, and a ratio is the\n\
+                 point of this table."
+            );
+            break;
+        };
+        eprintln!("{shape}: staging and checking {}", baseline.name);
+        let theirs = (baseline.bench)(context, shape)?.0.min();
+        println!(
+            "{:<18}{:>13.4}{:>13.1}{:>9.3}{:>9.3}{:>9.3}{:>10.3}",
+            shape,
+            theirs,
+            tflops(shape, theirs),
+            theirs / control,
+            theirs / ours,
+            theirs / deep,
+            theirs / floor
+        );
+    }
+    Ok(())
+}

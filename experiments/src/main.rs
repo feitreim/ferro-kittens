@@ -91,8 +91,8 @@ const COMMANDS: [(&str, &str); 4] = [
         "the GEMM's three item sources on one clock (#88) — `clc_bench`",
     ),
     (
-        "ws",
-        "the warp-specialized GEMM against the one it is a variant of — `ws_bench`",
+        "ws [shallow]",
+        "the warp-specialized GEMM against the one it is a variant of — `ws_bench`; `shallow` is #188's K = 3072 arm",
     ),
 ];
 
@@ -195,7 +195,16 @@ fn main() -> ExitCode {
             println!("ws needs a CUDA device");
             return ExitCode::FAILURE;
         };
-        return match gemm_ws::compare(&context, bench::CUBLASLT) {
+        // `ws shallow` is #188: the same A/B at the K = 3072 geometries
+        // oxide-train#80 counts in, where the overlap the design buys is worth
+        // the most — every table `compare` prints is at K = M = N, which is
+        // where it is worth the least.
+        let run = if std::env::args().nth(2).as_deref() == Some("shallow") {
+            gemm_ws::shallow(&context, bench::CUBLASLT)
+        } else {
+            gemm_ws::compare(&context, bench::CUBLASLT)
+        };
+        return match run {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 println!("FAIL  {error}");
