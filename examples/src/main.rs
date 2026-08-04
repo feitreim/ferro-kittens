@@ -6,7 +6,7 @@
 //! | [`gemm_sol`] | runs — all three size-specialized entries checked exactly by [`gemm_sol::check`] |
 //! | [`softmax`] | runs — checked against a CPU reference by [`softmax::check`] |
 //! | [`layernorm`] | runs — both kernels checked against CPU references by [`layernorm::check`] and [`layernorm::check_group`] |
-//! | [`flash_forward`] | compiles — no launcher yet |
+//! | [`flash_forward`] | runs — checked against a CPU reference by [`flash_forward::check`] |
 //!
 //! **Runs** means the kernel has a launcher and a CPU reference and exits
 //! non-zero on a wrong number; **compiles** means it does not. Every kernel is
@@ -90,7 +90,7 @@ fn examples() -> Vec<Example> {
         },
         Example {
             name: "flash_forward",
-            status: "compiles (no launcher yet)",
+            status: "runs",
             threads: flash_forward::THREADS,
             shared_bytes: flash_forward::SHARED_BYTES,
             entry: Some("flash_forward"),
@@ -203,6 +203,10 @@ fn checks(
         (
             "groupnorm",
             layernorm::check_group(context).map_err(|error| error.to_string()),
+        ),
+        (
+            "flash_forward",
+            flash_forward::check(context).map_err(|error| error.to_string()),
         ),
     ]
 }

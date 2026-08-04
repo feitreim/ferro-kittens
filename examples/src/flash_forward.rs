@@ -16,15 +16,24 @@
 //! to shared through `stmatrix` to be the `A` operand of the second MMA, and
 //! the epilogue stores fp32 straight out of registers.
 //!
-//! **Status: compiles**, and is in the default build. There is no launcher and
-//! no CPU reference, so nothing here is measured against a known-good `O`.
+//! [`check`] launches it against a CPU reference and [`bench`] times the same
+//! launch afterwards, in that order: a number only ever comes out of a checked
+//! run. The seed puts a score ramp on the key axis, so the running max moves
+//! at nearly every key block and the keys above the diagonal are the
+//! best-scored ones a broken mask could admit; the check runs four key blocks,
+//! one past [`STAGES`], so the ring wraps.
+//!
+//!     modal run modal_app.py::examples
 //!
 //! The shared plan by component, the 1 block/SM ceiling and why it is tcgen05
-//! rather than this plan, and the register-side measurements:
-//! `docs/kernels/flash_forward.md`.
+//! rather than this plan, the register-side measurements, the seed argument
+//! and the tolerance: `docs/kernels/flash_forward.md`.
 
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
+
+use crate::bench::{Shape, Timings, time};
+use std::error::Error;
 
 use kittens::global::{GlobalRows, store_rows};
 use kittens::ldst::store_tile;
@@ -241,9 +250,16 @@ pub mod kernels {
 
             let out_acc = out_acc.div_row(running_sum);
 
+            // The output is packed [heads, queries, HEAD] — the panel axis of
+            // the three input maps, spelled on the output's row axis. The head
+            // term of this sum was missing until the first checked run: the
+            // TMA maps take the head as a plane coordinate and could not get
+            // it wrong, but this cursor takes the address it is handed, and
+            // every head wrote query block x's rows of the same panel.
+            let out_base = QUERIES as u32 * thread::gridDim_x() * thread::blockIdx_y() + query_base;
             store_rows(
                 GlobalRows::<F32>::from_slice(&mut out, HEAD),
-                query_base + 32 * warp_id,
+                out_base + 32 * warp_id,
                 0,
                 lane,
                 out_acc,
@@ -264,4 +280,265 @@ pub mod kernels {
             }
         }
     }
+}
+
+/// One key block past [`STAGES`], so the ring wraps and `free`'s recycled
+/// phase is waited on for real.
+pub const CHECK_SEQUENCE: usize = 4 * KEYS;
+/// Two, so a head plane read or written in the wrong place is a wrong number
+/// rather than a coincidence.
+pub const CHECK_HEADS: usize = 2;
+/// A power of two, so folding [`LOG2E`] into it is the only rounding the
+/// score scale carries.
+pub const SCALE: f32 = 0.125;
+
+/// Column strides the row axis cycles through. Odd, and per row rather than
+/// per band: two rows of one warp band must not share a stride, or their
+/// scores against a common key correlate.
+const STRIDES: usize = 63;
+
+/// The seed's one ladder: 128 lattice points, permuted per (tensor, head,
+/// row). `tensor` shifts both the stride cycle and the offset so Q, K and V
+/// draw different permutations of the same lattice.
+fn permutation(tensor: usize, head: usize, row: usize, column: usize) -> usize {
+    let stride = 11 + 2 * ((row + 17 * tensor) % STRIDES);
+    (53 * head + 37 * row + stride * column + 71 * tensor) % 128
+}
+
+/// Dimension 0 of `Q` and `K` is a carrier pair: `2 · row/8` puts a ramp on
+/// the key axis, so later key blocks score higher and the running max moves —
+/// which is the online rescale actually being exercised, not merely compiled.
+/// The other 127 dimensions are zero-centred lattice noise, which is what
+/// spreads each row's weights over many keys. Every value is bf16-exact.
+fn q_value(head: usize, row: usize, dim: usize) -> f32 {
+    if dim == 0 {
+        2.0
+    } else {
+        (permutation(0, head, row, dim) as f32 - 64.0) / 64.0
+    }
+}
+
+fn k_value(head: usize, row: usize, dim: usize) -> f32 {
+    if dim == 0 {
+        row as f32 / 8.0
+    } else {
+        (permutation(1, head, row, dim) as f32 - 64.0) / 64.0
+    }
+}
+
+/// `V` in `[1, 3)`: the output is a convex combination of these, so every
+/// output sits in `[1, 3)` too and a relative error is never against a
+/// cancellation the reference does not also perform.
+fn v_value(head: usize, row: usize, dim: usize) -> f32 {
+    1.0 + permutation(2, head, row, dim) as f32 / 64.0
+}
+
+fn to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    (bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+}
+
+fn from_bf16(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+/// The value the device actually sees: the seed is bf16-exact by
+/// construction, but the reference states its inputs as "bf16-rounded" rather
+/// than trusting that.
+fn rounded(value: f32) -> f64 {
+    from_bf16(to_bf16(value)) as f64
+}
+
+/// `[heads, sequence, HEAD]` bf16 staging words for one input tensor — the
+/// panel layout all three maps describe, head-major.
+fn staged(sequence: usize, heads: usize, at: impl Fn(usize, usize, usize) -> f32) -> Vec<u32> {
+    let mut staged = Vec::with_capacity(heads * sequence * HEAD / 2);
+    for head in 0..heads {
+        for row in 0..sequence {
+            for pair in 0..HEAD / 2 {
+                let (low, high) = (at(head, row, 2 * pair), at(head, row, 2 * pair + 1));
+                staged.push(to_bf16(low) as u32 | ((to_bf16(high) as u32) << 16));
+            }
+        }
+    }
+    staged
+}
+
+/// One head's inputs in f64 over the bf16-rounded seed, flat `[sequence, HEAD]`.
+struct Panels {
+    q: Vec<f64>,
+    k: Vec<f64>,
+    v: Vec<f64>,
+}
+
+fn panels(head: usize, sequence: usize) -> Panels {
+    let tensor = |at: &dyn Fn(usize, usize, usize) -> f32| -> Vec<f64> {
+        (0..sequence * HEAD)
+            .map(|flat| rounded(at(head, flat / HEAD, flat % HEAD)))
+            .collect()
+    };
+    Panels {
+        q: tensor(&q_value),
+        k: tensor(&k_value),
+        v: tensor(&v_value),
+    }
+}
+
+/// The straightforward stable causal softmax times `V` for one query row, in
+/// f64: scores against keys `0..=row`, subtract the row max, exponentiate,
+/// weight `V`, divide by the sum. The kernel's `exp2`/[`LOG2E`] folding and
+/// its online rescale are ways of computing exactly this.
+fn reference_row(panels: &Panels, row: usize) -> Vec<f64> {
+    let q = &panels.q[row * HEAD..(row + 1) * HEAD];
+    let scores: Vec<f64> = (0..=row)
+        .map(|key| {
+            let k = &panels.k[key * HEAD..(key + 1) * HEAD];
+            SCALE as f64 * q.iter().zip(k).map(|(a, b)| a * b).sum::<f64>()
+        })
+        .collect();
+    let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+    let total: f64 = weights.iter().sum();
+    (0..HEAD)
+        .map(|dim| {
+            weights
+                .iter()
+                .enumerate()
+                .map(|(key, w)| w * panels.v[key * HEAD + dim])
+                .sum::<f64>()
+                / total
+        })
+        .collect()
+}
+
+fn nothing_after(
+    _: &cuda_core::CudaStream,
+    _: &mut dyn FnMut() -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+/// Launch over `sequence` queries and keys by `heads` heads, compare every
+/// output against the CPU reference, and only then hand the launch to `then`.
+fn run<T>(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    sequence: usize,
+    heads: usize,
+    then: impl FnOnce(
+        &cuda_core::CudaStream,
+        &mut dyn FnMut() -> Result<(), Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<(String, T), Box<dyn Error>> {
+    use cuda_core::{DeviceBuffer, LaunchConfig};
+    use kittens::global::encode_bf16_panels;
+
+    /// One doubling above the 1.66e-3 a correct kernel measures, which is
+    /// `P`'s trip to bf16 on its way to being the second MMA's `A` operand;
+    /// the argument is in `docs/kernels/flash_forward.md`.
+    const TOLERANCE: f32 = 1.0 / 256.0;
+
+    if !sequence.is_multiple_of(QUERIES) || heads == 0 {
+        return Err(format!(
+            "{sequence} queries x {heads} heads does not divide the {QUERIES} queries a CTA owns"
+        )
+        .into());
+    }
+    let key_blocks = (sequence / KEYS) as u32;
+
+    let stream = context.default_stream();
+    let module = kernels::load(context)?;
+    // 144 KiB of dynamic shared memory: past 48 KiB the function must be
+    // opted in or the launch is inadmissible, not slow.
+    let function = module.as_cuda_module().load_function("flash_forward")?;
+    kittens::launch::admit_shared_plan(&function, SHARED_BYTES as u32)?;
+
+    let q = DeviceBuffer::from_host(&stream, &staged(sequence, heads, q_value))?;
+    let k = DeviceBuffer::from_host(&stream, &staged(sequence, heads, k_value))?;
+    let v = DeviceBuffer::from_host(&stream, &staged(sequence, heads, v_value))?;
+    let mut out = DeviceBuffer::<f32>::zeroed(&stream, heads * sequence * HEAD)?;
+    // SAFETY: all three buffers outlive every launch consuming their maps
+    // below.
+    let (q_map, k_map, v_map) = unsafe {
+        (
+            encode_bf16_panels::<QUERIES, HEAD>(&stream, q.cu_deviceptr(), sequence, heads)?,
+            encode_bf16_panels::<KEYS, HEAD>(&stream, k.cu_deviceptr(), sequence, heads)?,
+            encode_bf16_panels::<KEYS, HEAD>(&stream, v.cu_deviceptr(), sequence, heads)?,
+        )
+    };
+
+    let config = LaunchConfig {
+        grid_dim: ((sequence / QUERIES) as u32, heads as u32, 1),
+        block_dim: (THREADS, 1, 1),
+        shared_mem_bytes: SHARED_BYTES as u32,
+    };
+    // Takes the output buffer as an argument rather than capturing it: the
+    // check below reads `out` between the verifying launch and the timed
+    // ones, so the closure must not hold the mutable borrow across it.
+    let launch = |out: &mut DeviceBuffer<f32>| -> Result<(), Box<dyn Error>> {
+        // SAFETY: the grid covers exactly the query blocks and heads the
+        // three maps describe, `out` holds a `[sequence, HEAD]` fp32 panel
+        // per head, and the block and shared plan are the kernel's own.
+        unsafe {
+            module.flash_forward(
+                &stream,
+                config,
+                q_map.as_ptr(),
+                k_map.as_ptr(),
+                v_map.as_ptr(),
+                key_blocks,
+                SCALE,
+                out,
+            )?
+        };
+        Ok(())
+    };
+    launch(&mut out)?;
+
+    let observed = out.to_host_vec(&stream)?;
+    let (mut wrong, mut sample, mut worst) = (0usize, Vec::new(), 0.0f32);
+    for head in 0..heads {
+        let panels = panels(head, sequence);
+        for row in 0..sequence {
+            let expected = reference_row(&panels, row);
+            for (column, expected) in expected.iter().enumerate() {
+                let value = observed[(head * sequence + row) * HEAD + column];
+                let error = ((value as f64 - expected) / expected).abs() as f32;
+                worst = worst.max(error);
+                // Negated rather than `error > TOLERANCE`: a NaN compares
+                // false either way, so only this spelling counts one as wrong.
+                #[allow(clippy::neg_cmp_op_on_partial_ord)]
+                if !(error <= TOLERANCE) {
+                    wrong += 1;
+                    if sample.len() < 8 {
+                        sample.push(format!(
+                            "[{head}, {row}, {column}] = {value}, want {expected} ({error:.2e})"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if wrong > 0 {
+        return Err(format!("{wrong} outputs outside 2^-8: {}", sample.join("; ")).into());
+    }
+
+    let mut launch_once = || launch(&mut out);
+    let after = then(&stream, &mut launch_once)?;
+    Ok((
+        format!("{heads}x{sequence}x{HEAD} rows attended, worst relative error {worst:.2e}"),
+        after,
+    ))
+}
+
+pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String, Box<dyn Error>> {
+    run(context, CHECK_SEQUENCE, CHECK_HEADS, nothing_after).map(|(note, ())| note)
+}
+
+/// The benchmark's entry point. A flash-forward [`Shape`] is `sequence x HEAD
+/// x heads`.
+pub fn bench(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    shape: Shape,
+) -> Result<Timings, Box<dyn Error>> {
+    run(context, shape.m, shape.k, time).map(|(_, timings)| timings)
 }

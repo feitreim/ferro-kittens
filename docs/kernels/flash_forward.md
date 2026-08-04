@@ -8,10 +8,13 @@ three panel maps.
 
 ## Status
 
-**Compiles**, and is in the default build. It has no launcher and no CPU
-reference, which is the only thing between it and *runs* — "runs against an
-exact reference" is a claim that has to be earned, and for the two kernels that
-make it, earning it was its own piece of work.
+**Runs**, checked against an f64 causal reference by `flash_forward::check` —
+worst relative error **1.66e-3** over two heads and four key blocks. Earning
+that word cost this kernel its second real bug: the epilogue's output cursor
+dropped the head term, so every head wrote query block *x*'s rows of the same
+panel, and the first checked run failed 50,885 of 65,536 outputs (see below).
+The first bug was #175's band overwrite, found by inspection; both lived here
+exactly as long as nothing compared `O` to a known-good answer.
 
 It is in the default build deliberately. A kernel behind a cargo feature is
 absent from what `modal run modal_app.py::build` compiles, so the one example
@@ -171,9 +174,18 @@ shared tile in the way. The round trip it used to owe — pack to bf16,
 `stmatrix`, TMA out — was a precision loss it never asked for, and the
 allocation was one this kernel's shared plan could not spare either.
 
-The output is packed `[_, HEAD]`, so the cursor's stride is the band's own width
-and its column base is zero: the degenerate case of the stride the GEMM's
-epilogue needs, spelled the same way.
+The output is packed `[heads, _, HEAD]` — the panel axis of the three input
+maps, spelled on the output's row axis — so the cursor's stride is the band's
+own width and its column base is zero: the degenerate case of the stride the
+GEMM's epilogue needs, spelled the same way.
+
+The head term of the cursor's row was **missing until the first checked run**.
+The TMA maps take the head as a plane coordinate and cannot get it wrong; this
+cursor takes the address it is handed, and every head wrote query block *x*'s
+rows of panel zero — head 1's panel stayed zeroed and head 0's held whichever
+CTA wrote last. The failure was 50,885 of 65,536 outputs at two heads, and it
+is why [the check](#the-check) runs two: at one head the collision has nobody
+to collide with and the kernel scores a pass it has not earned.
 
 ### Causal masking
 
@@ -181,3 +193,46 @@ epilogue needs, spelled the same way.
 their difference. The difference is negative for every band above the diagonal,
 which is most of them, and computing `query_base - key_base` in `u32` at that
 call site would wrap and mask nothing.
+
+## The check
+
+The reference is the straightforward stable softmax in f64 over bf16-rounded
+inputs — scores against keys `0..=row`, subtract the row max, exponentiate,
+weight `V`, divide by the sum. The kernel's `exp2`/`LOG2E` folding and its
+online rescale are ways of computing exactly this, and the reference deliberately
+is neither.
+
+### The seed
+
+Dimension 0 of `Q` and `K` is a carrier pair — `Q` holds `2`, `K` holds
+`row / 8` — that puts a **ramp on the key axis**, so later key blocks score
+higher and the running max moves at nearly every block. That is the online
+rescale being *exercised* rather than merely compiled: against a flat seed, a
+kernel that never rescaled its accumulator would be wrong by a factor the
+tolerance could miss. The ramp also makes the keys above the diagonal the
+best-scored ones a broken mask could admit, so masking failures are large, not
+subtle. The other 127 dimensions are zero-centred lattice noise permuted per
+`(tensor, head, row)`, which spreads each row's weights over many keys, and
+every value is bf16-exact by construction.
+
+`V` sits in `[1, 3)`: the output is a convex combination of its values, so
+every output sits in `[1, 3)` too and a relative error is never taken against
+a cancellation the reference does not also perform.
+
+The check runs **four key blocks** — one past `STAGES`, so the ring wraps and
+`free`'s recycled phase is waited on for real — and **two heads**, which is
+what makes a head plane read or written in the wrong place a wrong number
+rather than a coincidence. The epilogue bug above is the check-of-the-check:
+run at one head, it would have passed.
+
+### The tolerance
+
+2⁻⁸ relative. The floor is `P`'s trip to bf16: the probabilities cross to
+shared as the `stmatrix`-staged `A` operand of `O = P·V`, and rounding the
+weights of a convex combination moves the result by about a weight ulp —
+scale-free in the sequence, since the weights sum to one. The measured worst
+over both heads is **1.66e-3 = 0.85 × 2⁻⁹**, under half a bf16 ulp at the
+outputs' `[2, 4)` end and the same neighbourhood `softmax`'s floor lives in
+(its `ex2` polynomial is in play here too, folded into the same number). 2⁻⁸
+is one doubling above the floor, the repository's usual headroom, arrived at
+from this kernel's own measurement.

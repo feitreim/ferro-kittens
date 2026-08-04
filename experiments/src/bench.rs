@@ -608,7 +608,10 @@ fn cases() -> Vec<Case> {
 /// Examples with no row above, and why. There is no path through this file
 /// that times a launch it did not first check — so a missing reference is what
 /// keeps one out, not its speed.
-const SKIPPED: &[(&str, &str)] = &[("flash_forward", "no launcher yet — would report TFLOP/s")];
+const SKIPPED: &[(&str, &str)] = &[(
+    "flash_forward",
+    "checked in `examples` but not included in this crate; a timed case owes a causal-FLOP denominator first",
+)];
 
 /// The ratio table, and the caveats that make it readable.
 ///
