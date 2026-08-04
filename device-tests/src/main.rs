@@ -69,6 +69,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 use cuda_device::DisjointSlice;
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
+use cuda_device::thread::__unroll_config;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cluster, cluster_launch, cuda_module, debug, kernel, thread, warp};
 
@@ -77,7 +78,7 @@ use kittens::global::{
     GlobalLayout, GlobalRows, accumulate_shared_rows, encode_bf16_panels, load_col_vec, load_cols,
     load_rows, store_rows, store_shared_rows,
 };
-use kittens::ldst::{load_fragment, load_tile, load_vec, store_fragment, store_tile};
+use kittens::ldst::{load_fragment, load_tile, load_vec, scatter_tile, store_fragment, store_tile};
 use kittens::mma::{self, MmaShape, mm_ab, mm_abt, mm_atb, mm_atbt, mma_abt};
 use kittens::reg::{
     BaseLdtm, ColLayout, ColVec, Fragment, FragmentLayout, Max, Mul, RegTile, RegVec,
@@ -182,6 +183,14 @@ const DRAIN_COLUMNS: [u32; 4] = [64, 68, 66, 65];
 /// and a value [`cell_bits`] can never take.
 const POISON_HALF: u16 = 0xffff;
 
+/// Columns of the narrow fp32 staging tile: 32 fp32 is one 128-byte swizzle
+/// atom, so it is [`TILE`]'s single-subtile role at four bytes an element.
+const F32_TILE: usize = 32;
+/// Columns of the wide one — four stacked subtiles rather than [`WIDE`]'s two,
+/// which is the same 128 logical columns costing three subtile crossings a row
+/// instead of one.
+const F32_WIDE: usize = 128;
+
 /// One warp's band of the drain probe, at the staging tile's full width.
 type DrainBand<const C: usize> = RegTile<DRAIN_WARP_ROWS, C, BaseLdtm>;
 
@@ -198,6 +207,9 @@ const DEPTH: usize = 64;
 /// types. The shape-generic alias is what lets one probe body serve the narrow
 /// and wide cases, so a case cannot drift between widths.
 type Tile<const R: usize, const C: usize> = SharedTile<Bf16, R, C, Swizzle128B>;
+/// The staging tile at fp32 — the one `stmatrix` cannot fill, and the whole
+/// subject of the scatter cases.
+type F32Tile<const R: usize, const C: usize> = SharedTile<F32, R, C, Swizzle128B>;
 type AOperand = Tile<ROWS, DEPTH>;
 type BOperand = Tile<TILE, DEPTH>;
 type Accumulator = TmemTile<ROWS, COLUMNS>;
@@ -1098,6 +1110,43 @@ pub mod kernels {
     /// overwritten. Everything the store case proves about the geometry the
     /// accumulate case proves again, and it additionally reads `C`: a fold that
     /// dropped the read leaves the destination's seed nowhere in the answer.
+    /// One warp's band of the drain probes, every register holding the
+    /// identity of the tile position it owns.
+    ///
+    /// Shared by the bf16 and fp32 probes so the two fill a band from the same
+    /// [`RegTile::coordinate`] and a disagreement between them is the drain's.
+    ///
+    /// Both walks are fully unrolled for the reason every mover in the library
+    /// is (ferro #166): a rolled walk over a `RegTile` keeps its indices
+    /// dynamic, SROA cannot split the aggregate, and the whole band is homed to
+    /// a `.local` depot. That depot is the *fill's* and would sit in every one
+    /// of these probes' `regcount` rows, which is exactly what stops the drains
+    /// below being comparable to each other.
+    #[inline(always)]
+    fn drain_identities<const C: usize>(row_base: u32, lane: u32) -> DrainBand<C>
+    where
+        BaseLdtm: FragmentLayout<DRAIN_WARP_ROWS, C>,
+    {
+        let mut values = DrainBand::<C>::zero();
+        let mut slot = 0usize;
+        while slot < const { DrainBand::<C>::SLOTS } {
+            __unroll_config::<0>();
+            let mut value = 0usize;
+            while value < const { DrainBand::<C>::VALUES } {
+                __unroll_config::<0>();
+                let (row, tile_column) = DrainBand::<C>::coordinate(lane, slot, value);
+                values.set(
+                    slot,
+                    value,
+                    cell((row_base + row) as usize, tile_column as usize),
+                );
+                value += 1;
+            }
+            slot += 1;
+        }
+        values
+    }
+
     #[inline(always)]
     unsafe fn shared_drain_probe<const C: usize, const ACCUMULATE: bool>(
         column: u32,
@@ -1111,21 +1160,7 @@ pub mod kernels {
             let lane = warp::lane_id();
             let row_base = DRAIN_WARP_ROWS as u32 * warp::warp_id();
 
-            let mut values = DrainBand::<C>::zero();
-            let mut slot = 0usize;
-            while slot < DrainBand::<C>::SLOTS {
-                let mut value = 0usize;
-                while value < DrainBand::<C>::VALUES {
-                    let (row, tile_column) = DrainBand::<C>::coordinate(lane, slot, value);
-                    values.set(
-                        slot,
-                        value,
-                        cell((row_base + row) as usize, tile_column as usize),
-                    );
-                    value += 1;
-                }
-                slot += 1;
-            }
+            let values = drain_identities::<C>(row_base, lane);
             store_tile(tile.chunk_writer(), row_base, 0, lane, values);
             thread::sync_threads();
 
@@ -1178,6 +1213,87 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn shared_accumulate_wide(column: u32, mut out: DisjointSlice<u16>) {
         unsafe { shared_drain_probe::<WIDE, true>(column, &mut out) }
+    }
+
+    /// [`shared_drain_probe`] at **fp32**, where `stmatrix` cannot go: the band
+    /// reaches the staging tile through
+    /// [`kittens::ldst::scatter_tile`] and leaves it through the same
+    /// [`kittens::global::store_shared_rows`] (#174).
+    ///
+    /// `STAGED` is the whole comparison. False is the route an fp32 epilogue
+    /// had before this — [`kittens::global::store_rows`] straight out of the
+    /// registers, no shared hop and no barrier — and it writes the same
+    /// rectangle by the same arithmetic, so one host check holds both and a
+    /// difference between them is the staging tile's alone. The two are also
+    /// the register-pressure A/B the `regcount` table reads: same band, same
+    /// destination, one pass through shared memory.
+    ///
+    /// The identities are [`cell`]s, whose low 16 bits are zero, so they are
+    /// exact at fp32 as they are at bf16 and the comparison is still on bit
+    /// patterns with no tolerance in it.
+    ///
+    /// Nothing here needs a proxy fence, for [`shared_drain_probe`]'s reason
+    /// twice over: `scatter_tile` is an ordinary `st.shared` and
+    /// `store_shared_rows` an ordinary `ld.shared`, both generic-proxy, so the
+    /// `sync_threads` between them is the whole of what the four warps owe each
+    /// other. Launch with [`DRAIN_THREADS`].
+    #[inline(always)]
+    unsafe fn scatter_drain_probe<const C: usize, const STAGED: bool>(
+        column: u32,
+        out: &mut DisjointSlice<f32>,
+    ) where
+        BaseLdtm: FragmentLayout<DRAIN_WARP_ROWS, C>,
+    {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tile = F32Tile::<DRAIN_ROWS, C>::from_raw(smem);
+            let lane = warp::lane_id();
+            let row_base = DRAIN_WARP_ROWS as u32 * warp::warp_id();
+
+            let values = drain_identities::<C>(row_base, lane);
+            let destination = GlobalRows::<F32>::from_slice(out, DRAIN_PITCH);
+            if STAGED {
+                scatter_tile(tile.chunk_writer(), row_base, 0, lane, values);
+                thread::sync_threads();
+                store_shared_rows::<F32, DRAIN_ROWS, C, Swizzle128B, DRAIN_THREADS>(
+                    destination,
+                    DRAIN_ROW,
+                    column,
+                    thread::threadIdx_x(),
+                    tile,
+                );
+            } else {
+                store_rows(destination, DRAIN_ROW + row_base, column, lane, values);
+            }
+        }
+    }
+
+    /// [`scatter_drain_probe`] over one subtile — 32 fp32 columns is exactly
+    /// one 128-byte swizzle atom, so the cursor never leaves it.
+    #[kernel]
+    pub unsafe fn scatter_drain(column: u32, mut out: DisjointSlice<f32>) {
+        unsafe { scatter_drain_probe::<F32_TILE, true>(column, &mut out) }
+    }
+
+    /// [`scatter_drain_probe`] over four stacked subtiles: at four bytes an
+    /// element a 128-column row crosses a [`SharedTile::SUBTILE_BYTES`] stride
+    /// three times, where the bf16 tile of the same width crosses it once.
+    #[kernel]
+    pub unsafe fn scatter_drain_wide(column: u32, mut out: DisjointSlice<f32>) {
+        unsafe { scatter_drain_probe::<F32_WIDE, true>(column, &mut out) }
+    }
+
+    /// [`scatter_drain`]'s rectangle by the register route — the control, and
+    /// what an fp32 epilogue had to use before #174.
+    #[kernel]
+    pub unsafe fn register_drain(column: u32, mut out: DisjointSlice<f32>) {
+        unsafe { scatter_drain_probe::<F32_TILE, false>(column, &mut out) }
+    }
+
+    /// [`scatter_drain_wide`]'s rectangle by the register route.
+    #[kernel]
+    pub unsafe fn register_drain_wide(column: u32, mut out: DisjointSlice<f32>) {
+        unsafe { scatter_drain_probe::<F32_WIDE, false>(column, &mut out) }
     }
 
     /// TMA the same tile [`swizzle_probe`] stages, then read every `[16, 16]`
@@ -4488,6 +4604,93 @@ fn check_shared_accumulate<const C: usize>(
     ))
 }
 
+/// Does an **fp32** band reach the same rectangle, through a staging tile
+/// `stmatrix` cannot fill?
+///
+/// [`check_shared_drain`] at four bytes an element (#174), and it names every
+/// failure that one does — the rectangle is the same one, inset from a pitch it
+/// does not divide, so a wrong row stride, a dropped origin, a confused swizzle
+/// and a short drain each land somewhere the identities cannot.
+///
+/// What is new here is the *element*: at fp32 a 128-column row is four stacked
+/// subtiles rather than two, and a column's four bytes sit inside a 16-byte
+/// chunk rather than filling a quarter of one — so the byte offset
+/// `SwizzledChunks::element` adds is exercised at both widths and both ends of
+/// a chunk.
+///
+/// The same launcher runs the register route (`register_drain`), which writes
+/// this rectangle with no shared tile in the way. Passing it says the two
+/// routes agree element for element, which is what makes the register counts
+/// the `regcount` table reports for them a comparison of one thing.
+fn check_scatter_drain<const C: usize>(
+    stream: &CudaStream,
+    launch: impl Fn(LaunchConfig, u32, &mut DeviceBuffer<f32>) -> Result<(), cuda_core::DriverError>,
+) -> Result<String, Box<dyn Error>> {
+    let seed = vec![f32::from_bits(POISON); DRAIN_MATRIX_ROWS * DRAIN_PITCH];
+    for column in DRAIN_COLUMNS {
+        let mut destination = DeviceBuffer::from_host(stream, &seed)?;
+        launch(
+            launch_config(DRAIN_THREADS, F32Tile::<DRAIN_ROWS, C>::BYTES as u32),
+            column,
+            &mut destination,
+        )?;
+
+        let mut expected = seed.clone();
+        for row in 0..DRAIN_ROWS {
+            for tile_column in 0..C {
+                let at = (DRAIN_ROW as usize + row) * DRAIN_PITCH + column as usize + tile_column;
+                expected[at] = cell(row, tile_column);
+            }
+        }
+        let observed = destination.to_host_vec(stream)?;
+        compare_f32_matrix(&observed, &expected, column)?;
+    }
+    let columns = C;
+    Ok(format!(
+        "[{DRAIN_ROWS}, {columns}] fp32 at row {DRAIN_ROW} of a \
+         {DRAIN_MATRIX_ROWS}x{DRAIN_PITCH} matrix, at columns {DRAIN_COLUMNS:?}"
+    ))
+}
+
+/// [`compare_matrix`] at fp32 — bit patterns, since the identities are exact
+/// at this element and poison is a pattern no identity can take.
+fn compare_f32_matrix(
+    observed: &[f32],
+    expected: &[f32],
+    column: u32,
+) -> Result<(), Box<dyn Error>> {
+    let mut report = String::new();
+    let mut mismatches = 0usize;
+    for (index, (&got, &want)) in observed.iter().zip(expected).enumerate() {
+        if got.to_bits() == want.to_bits() {
+            continue;
+        }
+        mismatches += 1;
+        if mismatches <= 8 {
+            let (row, at) = (index / DRAIN_PITCH, index % DRAIN_PITCH);
+            let name = |value: f32| match decode_cell(value) {
+                Some((r, c)) => format!("the identity of tile ({r}, {c})"),
+                None if value.to_bits() == POISON => "poison".to_string(),
+                None => format!("{:#010x}, which names no element", value.to_bits()),
+            };
+            let _ = write!(
+                report,
+                "\n    ({row}, {at}): wanted {}, found {}",
+                name(want),
+                name(got)
+            );
+        }
+    }
+    if mismatches == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "at column {column}: {mismatches} of {} elements wrong{report}",
+        expected.len()
+    )
+    .into())
+}
+
 /// Compare a whole pitched bf16 matrix against what the drain owed it —
 /// identities inside the rectangle, poison everywhere else — reporting the
 /// first few wrong elements by position, and each one as the position its value
@@ -6305,6 +6508,44 @@ fn run() -> Result<usize, Box<dyn Error>> {
         Box::new(|| {
             check_shared_accumulate::<WIDE>(stream, |config, column, out| unsafe {
                 module.shared_accumulate_wide(stream, config, column, out)
+            })
+        }),
+    ));
+    // The same rectangle at fp32, which had no staged route at all until #174:
+    // `stmatrix` moves b16 matrices, so an fp32 band reaches its staging tile
+    // one value at a time through `scatter_tile`. The two `register drain`
+    // cases are the route it replaces, writing the same rectangle from the same
+    // band with no shared hop — so they are the control for correctness here
+    // and for register pressure in the `regcount` table.
+    cases.push((
+        "scatter drain",
+        Box::new(|| {
+            check_scatter_drain::<F32_TILE>(stream, |config, column, out| unsafe {
+                module.scatter_drain(stream, config, column, out)
+            })
+        }),
+    ));
+    cases.push((
+        "scatter drain wide",
+        Box::new(|| {
+            check_scatter_drain::<F32_WIDE>(stream, |config, column, out| unsafe {
+                module.scatter_drain_wide(stream, config, column, out)
+            })
+        }),
+    ));
+    cases.push((
+        "register drain",
+        Box::new(|| {
+            check_scatter_drain::<F32_TILE>(stream, |config, column, out| unsafe {
+                module.register_drain(stream, config, column, out)
+            })
+        }),
+    ));
+    cases.push((
+        "register drain wide",
+        Box::new(|| {
+            check_scatter_drain::<F32_WIDE>(stream, |config, column, out| unsafe {
+                module.register_drain_wide(stream, config, column, out)
             })
         }),
     ));

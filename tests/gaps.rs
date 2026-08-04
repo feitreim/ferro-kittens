@@ -268,6 +268,35 @@ fn a_staged_tile_can_be_folded_into_memory<E: Element, const M: usize, const N: 
     }
 }
 
+/// §2.6 — an **fp32** band reaches a staging tile (#174), so the staged drain
+/// is two calls at every element and not only at the ones `stmatrix` moves.
+///
+/// The bounds are the claim. `E` is unbounded and `L` is any fragment layout,
+/// where `a_staged_drain_is_two_calls` needs `Unpacked = [f32; 2]` and
+/// `BaseLdtm` — so this signature narrowing to either of those is the gap
+/// reopening, and it fails here rather than in whatever kernel next wanted an
+/// fp32 `C`.
+fn an_fp32_band_reaches_a_staging_tile<
+    E: Element,
+    const M: usize,
+    const N: usize,
+    L: RowLayout<M> + ColLayout<N>,
+>(
+    chunks: kittens::shared::SwizzledChunks<E>,
+    tile: kittens::SharedTile<E, M, N, kittens::Swizzle128B>,
+    rows: kittens::global::GlobalRows<E>,
+    lane: u32,
+    band: RegTile<M, N, L>,
+) {
+    unsafe {
+        let _: *mut u8 = chunks.element(0, 0);
+        kittens::ldst::scatter_tile(chunks, 0, 0, lane, band);
+        kittens::global::store_shared_rows::<E, M, N, kittens::Swizzle128B, 32>(
+            rows, 0, 0, lane, tile,
+        );
+    }
+}
+
 /// §2.1 — the `.x8` drain (#117), beside the `.x1` one it is eight times fewer
 /// issues than.
 fn the_tmem_drain_has_both_widths<const M: usize, const N: usize>(

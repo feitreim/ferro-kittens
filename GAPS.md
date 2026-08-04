@@ -130,9 +130,9 @@ type, two is a claim about a trait. tf32 (`KIND = 1`) and fp8 are the genuinely
 absent ones, and tf32 is the one downstream keeps asking for: `oxide-train` #67
 was filed believing its fp32 GEMM needed it, when that kernel's operands are
 bf16 and only its `C` is fp32 (see 2.6). `F32` is the third `Element`
-since #3, and deliberately not an `MmaElement`: it exists so a statistic can be
-staged in shared memory without rounding, which is a storage question and not
-an operand one. One bf16 fact remains hardcoded behind an assert rather than
+since #3, and deliberately not an `MmaElement`: it exists so a statistic — or,
+since #174, a whole epilogue band — can be staged in shared memory without
+rounding, which is a storage question and not an operand one. One bf16 fact remains hardcoded behind an assert rather than
 guessed at: `mma`'s K=16 chunk geometry assumes 32 bytes per chunk. The
 *instruction* left that list with #12 — the walks issue through
 `MmaElement::mma`, which routes tcgen05's `KIND` off the element. FP8 is the
@@ -415,7 +415,7 @@ TK has cluster-scope shared→shared copies. Still absent: #50 brought in the
 *addressing* half, since `Semaphore::at_rank` names a peer's shared offset, but
 nothing here moves data between two CTAs' shared memory.
 
-### 2.6 Shared → global without an engine — done (#113), folding too (#169), the inverse absent
+### 2.6 Shared → global without an engine — done (#113), folding too (#169), fp32 in (#174), the load inverse absent
 
 Not a TK entry, which is why it had none here: TK's shared→global path is the
 TMA and nothing else. `global::store_shared_rows` is the other one — a whole
@@ -447,23 +447,52 @@ which is why it is a trait method rather than a snippet at each epilogue. Named
 in `tests/gaps.rs` as `a_staged_tile_can_be_folded_into_memory`; held on a B200
 by `device-tests`' `shared accumulate` and `shared accumulate wide`.
 
+`ldst::scatter_tile` (#174) is what fills a tile of an element `stmatrix`
+cannot move. `store_shared_rows` and `accumulate_shared_rows` were already
+generic over `E` and would take a `SharedTile<F32, …>`; nothing could put
+anything *in* one, because `ldst::store_tile`/`store_tile_x4` bound
+`E: Element<Unpacked = [f32; 2]>` — they are `stmatrix`, which moves b16
+matrices and nothing else. So an fp32 accumulator band reached memory only
+through `store_rows`' scattered per-value stores, the shape #116 measured at
+**20.43 µs/tile** against the staged route's 6.68, and every kernel with an fp32
+`C` paid it.
+
+`scatter_tile` is `store_rows`' own loop with a `SwizzledChunks::element` where
+the `GlobalRows::at` was: one shared access per owned *pair*
+(`Element::write_pair_shared`, `st.shared.v2.f32` at fp32 and a packed
+`st.shared.b32` at bf16), generic in the element *and* in the layout, since
+nothing about it is an `ldmatrix` shape. An fp32 epilogue is now the two calls a
+bf16 one is. Named in `tests/gaps.rs` as `an_fp32_band_reaches_a_staging_tile`,
+whose unbounded `E` and free `L` are the claim; held on a B200 by
+`device-tests`' `scatter drain` and `scatter drain wide`, against `register
+drain`/`register drain wide` — the same rectangle written the old way, which is
+the control for the register counts as well as for the bytes.
+
+**What it bought downstream, and what it did not.** `oxide-train`'s
+`gemm_tcgen05_f32_optimized` converted to the staged drain goes from **120
+registers and a 512 B `.local` frame to 96 and none**: the frame was a band that
+did not fit — `store_rows` held a whole `[32, 64]` fp32 band, and the
+accumulating mode held `C`'s band beside it — and staging removes both, since
+the fold becomes `accumulate_shared_rows`', which holds no band at all. The
+milliseconds did **not** follow. Against three baseline runs on a B200, the
+store arm is ~5% faster at 4096³ and a wash at 8192³ and 16384³, and the
+accumulate arm is **15% slower** at 4096³ and 8192³ — reproducibly, at the shape
+where the harness' variance is smallest.
+
+The reason is the tile, not the route. At four bytes an element the same 4096 B
+a warp is `[16, 64]` where bf16 gets `[32, 64]`, so an fp32 band is eight passes
+where the bf16 one is four, and each pass is a serial
+scatter → `ld.shared` → global → `bar.warp.sync` chain. Twice the passes is
+twice that exposed latency, and at the accumulating variant the `ld.global` sits
+on it too. So the staged drain wins when the staging tile is wide enough to
+amortize a pass, and that kernel's shared budget — 98 392 B of operand rings
+against a 116 736 B ceiling — does not leave enough for one. The conversion was
+therefore **not shipped**; the route is here for the epilogue that can afford
+the tile.
+
 Absent: the load direction. Nothing reads a global rectangle into a shared tile
 without a descriptor, which is what an irregular operand not worth a host-built
 map would want — the mirror of the argument 2.2 makes for `load_rows`.
-
-Absent, and the reason an **fp32** epilogue is still on the register route:
-nothing can *fill* an `SharedTile<F32, …>`. `store_shared_rows` and
-`accumulate_shared_rows` are generic over `E` and would take one, but
-`ldst::store_tile`/`store_tile_x4` bound `E: Element<Unpacked = [f32; 2]>`
-because they are `stmatrix`, which moves b16 matrices and nothing else. So an
-fp32 accumulator band reaches memory only through `store_rows`' scattered
-per-value stores — the shape #116 measured at **20.43 µs/tile** against the
-staged route's 6.68 — and every kernel with an fp32 `C` pays that. What it wants
-is a plain (non-`stmatrix`) `store_tile` over `SwizzledChunks`, generic in `E`.
-Filed as **#174**, with `oxide-train`'s two entry points as the measurement: the
-same compute pipeline reaches **0.783 / 0.914 / 0.910** of cuBLASLt at
-4096³ / 8192³ / 16384³ with a bf16 `C` and **0.636 / 0.710 / 0.836** with an
-fp32 one.
 
 ---
 

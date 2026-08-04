@@ -120,6 +120,22 @@ pub trait Element {
         unsafe { (Self::read(at), Self::read(at.add(Self::BYTES))) }
     }
 
+    /// [`Self::write_pair`] into **shared** memory — a different address space,
+    /// so a different instruction, and there is no default because the two
+    /// element widths reach it by different routes: a 2-byte element's adjacent
+    /// pair *is* one packed word, where a 4-byte element's is a vector store.
+    ///
+    /// [`crate::ldst::scatter_tile`] is the only caller, and halving its store
+    /// count is the whole of why this exists — a per-value scatter is the one
+    /// place in the crate where the shared-memory instruction count is the
+    /// cost.
+    ///
+    /// # Safety
+    ///
+    /// - `at` is aligned to `2 * BYTES` and does not straddle a 16-byte chunk.
+    /// - `at` names two writable elements of a **shared** tile.
+    unsafe fn write_pair_shared(at: *mut u8, first: f32, second: f32);
+
     /// Fold two packed words lane-wise: widen both, add in fp32, round the sum
     /// back to `Self` **once**.
     ///
@@ -222,6 +238,14 @@ impl Element for F16 {
         (first, second)
     }
 
+    /// The pair is one 32-bit word at two bytes an element, so the shared store
+    /// is [`Self::write_pair`]'s own body — one `st.shared.b32`, and one
+    /// `cvt` for both values rather than one each.
+    #[inline(always)]
+    unsafe fn write_pair_shared(at: *mut u8, first: f32, second: f32) {
+        unsafe { *(at as *mut u32) = Self::pack([first, second]) }
+    }
+
     #[inline(always)]
     fn add_packed(current: u32, update: u32) -> u32 {
         let ([a, b], [c, d]) = (Self::unpack(current), Self::unpack(update));
@@ -315,6 +339,13 @@ impl Element for Bf16 {
     unsafe fn read_pair(at: *const u8) -> (f32, f32) {
         let [first, second] = Self::unpack(unsafe { *(at as *const u32) });
         (first, second)
+    }
+
+    /// As [`F16::write_pair_shared`]: two bytes an element makes the pair one
+    /// word, so nothing here is a vector instruction.
+    #[inline(always)]
+    unsafe fn write_pair_shared(at: *mut u8, first: f32, second: f32) {
+        unsafe { *(at as *mut u32) = Self::pack([first, second]) }
     }
 
     #[inline(always)]
@@ -435,6 +466,30 @@ impl Element for F32 {
                 clobber("memory"),
             );
             (first, second)
+        }
+    }
+
+    /// `st.shared.v2.f32` — the two fp32 at `at` and `at + 4` in one
+    /// instruction, and the reason [`crate::ldst::scatter_tile`] costs a band
+    /// half the shared stores it would otherwise.
+    ///
+    /// Inline PTX for [`Self::write_pair`]'s reason, one address space along:
+    /// widening two adjacent stores is a transformation ptxas may only make
+    /// when the address is provably aligned, and an address built from a lane
+    /// id through a swizzle never is. The caller that knows it is aligned — a
+    /// pair starts at a multiple of
+    /// [`crate::reg::ColLayout::CONTIGUOUS_VALUES`] inside a 16-byte chunk — is
+    /// the only one in a position to spell it.
+    #[inline(always)]
+    unsafe fn write_pair_shared(at: *mut u8, first: f32, second: f32) {
+        unsafe {
+            ptx_asm!(
+                "{ .reg .u64 smem; cvta.to.shared.u64 smem, %0; st.shared.v2.f32 [smem], {%1, %2}; }",
+                in("l") at as u64,
+                in("f") first,
+                in("f") second,
+                clobber("memory"),
+            );
         }
     }
 
@@ -1187,6 +1242,26 @@ impl<E: Element> SwizzledChunks<E> {
                 .add(row * 128 + (chunk ^ ((row + self.phase) & 7)) * 16)
         }
     }
+
+    /// Address of element `column` of row `row` — [`Self::at`] in the tile's
+    /// own element coordinates, which is what a per-value scatter addresses
+    /// with.
+    ///
+    /// A chunk is 16 contiguous bytes, so a column splits into the chunk that
+    /// holds it and the byte offset inside that chunk; the swizzle is entirely
+    /// [`Self::at`]'s and nothing here repeats it. This is the shared-side
+    /// counterpart of [`crate::global::GlobalRows::at`], and having both is
+    /// what lets [`crate::ldst::scatter_tile`] be
+    /// [`crate::global::store_rows`]' loop with the destination swapped.
+    ///
+    /// # Safety
+    ///
+    /// - `row` is inside the tile and `column * E::BYTES < 16 * self.chunks()`.
+    #[inline(always)]
+    pub unsafe fn element(self, row: usize, column: usize) -> *mut u8 {
+        let byte = column * E::BYTES;
+        unsafe { self.at(row, byte / 16).add(byte % 16) }
+    }
 }
 
 /// `N` elements of `E` in shared memory, contiguous and **unswizzled** — the
@@ -1851,6 +1926,42 @@ mod tests {
             injective::<128, 128>(0x10000 + phase * 128);
             injective::<64, 256>(0x10000 + phase * 128);
             injective::<4, 128>(0x10000 + phase * 128);
+        }
+    }
+
+    #[test]
+    fn every_column_owns_its_own_bytes_of_the_chunk_holding_it() {
+        // The element cursor is the chunk cursor plus an offset inside the
+        // chunk, and the two claims that makes are that the offset is the
+        // column's position in its chunk and that the tile's columns partition
+        // its bytes — at fp32, where four columns share a chunk, and at bf16,
+        // where eight do.
+        fn columns_partition_the_tile<E: Element, const R: usize, const C: usize>(base: usize) {
+            let tile = unsafe { SharedTile::<E, R, C, Swizzle128B>::from_raw(base as *mut u8) };
+            let chunks = tile.chunk_writer();
+            let mut seen = vec![false; SharedTile::<E, R, C, Swizzle128B>::BYTES];
+            for row in 0..R {
+                for column in 0..C {
+                    let offset = unsafe { chunks.element(row, column) } as usize - base;
+                    let chunk = unsafe { chunks.at(row, column * E::BYTES / 16) } as usize - base;
+                    assert_eq!(offset - chunk, column * E::BYTES % 16);
+                    for byte in 0..E::BYTES {
+                        assert!(offset + byte < seen.len(), "({row}, {column}) escaped");
+                        assert!(!seen[offset + byte], "({row}, {column}) collided");
+                        seen[offset + byte] = true;
+                    }
+                }
+            }
+            assert!(seen.iter().all(|&byte| byte));
+        }
+        // A single subtile at each element and stacked subtiles at each: the
+        // element split is the same arithmetic either side of a subtile edge.
+        for phase in 0..8usize {
+            let base = 0x10000 + phase * 128;
+            columns_partition_the_tile::<F32, 16, 32>(base);
+            columns_partition_the_tile::<F32, 16, 128>(base);
+            columns_partition_the_tile::<Bf16, 16, 64>(base);
+            columns_partition_the_tile::<Bf16, 16, 128>(base);
         }
     }
 
