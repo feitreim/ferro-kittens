@@ -105,7 +105,17 @@ width, and it falls when the *epilogue* narrows its pass to the staging tile's
 width — which is what having a staging tile makes possible, and not what this
 function does by itself. `device-tests`' `scatter drain` / `register drain` pair
 is the same rectangle by the two routes at 32 and at 128 columns, so the
-`regcount` table reads the difference directly.
+`regcount` table reads the difference directly: **122 registers against 56** at
+128 fp32 columns, and 44 against 40 at 32. The gap widens with the band because
+the band is what the register route has to hold, and that is the same mechanism
+that takes the downstream kernel's 512 B frame to zero.
+
+Read those rows only with the probes' identity fill unrolled (#166). Before
+`fa70e35` every one of them — including the bf16 `shared_drain_wide`, which has
+nothing to do with this — carried the same 272 B frame, because a rolled walk
+over a `RegTile` homes the band to a depot and the *fill's* depot swamped every
+drain's cost. A probe that means to price one thing has to unroll everything
+else, and this pair is the case that made that concrete.
 
 ## The measured downstream answer, which is not the one the gap predicted
 
