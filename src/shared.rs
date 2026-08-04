@@ -949,6 +949,43 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
         }
     }
 
+    /// [`Self::tma_store_2d`] that **adds** each element into its destination
+    /// instead of overwriting it (`cp.reduce.async.bulk.tensor.2d ... .add`) —
+    /// what lets an accumulating epilogue emit its tile without ever reading
+    /// `C`, and what makes a split-K or multi-CTA reduction cheap.
+    ///
+    /// The add happens at the destination in the element's own type — the
+    /// tensor map's data type, exactly as for a plain store — so an fp32 tile
+    /// is summed in fp32 with round-to-nearest, by the copy engine rather than
+    /// by a thread. One call adds each element exactly once; a caller that
+    /// wants element-wise determinism gets it by owning its output rectangle,
+    /// the same discipline a plain store already needs to avoid a torn tile.
+    ///
+    /// Completion is [`Self::tma_store_2d`]'s: the same bulk-group mechanism,
+    /// so [`tma_store_commit`] and the two waits govern reduction and plain
+    /// stores alike, in one group if issued together.
+    ///
+    /// # Safety
+    ///
+    /// - As [`Self::tma_store_2d`], every clause.
+    /// - The destination elements must hold values, not garbage: this reads
+    ///   what a plain store would ignore.
+    #[inline(always)]
+    pub unsafe fn tma_store_add_2d(self, map: *const TmaDescriptor, leading: i32, minor: i32) {
+        unsafe {
+            let mut i = 0usize;
+            while i < Self::SUBTILES {
+                cp_reduce_async_bulk_tensor_2d_s2g_add(
+                    self.subtile(i),
+                    map,
+                    leading + (i * Self::SUBTILE_COLS) as i32,
+                    minor,
+                );
+                i += 1;
+            }
+        }
+    }
+
     /// The tile base's absolute position in the 8-row swizzle period — what a
     /// tile not 1024-byte aligned starts mid-period at, and what every manual
     /// swizzled store folds in. [`Self::chunk_writer`] captures it for you.
@@ -1141,6 +1178,50 @@ pub fn tma_store_wait<const N: u32>() {
 #[inline(always)]
 pub fn tma_store_wait_read<const N: u32>() {
     cp_async_bulk_wait_group_read(N);
+}
+
+/// One box of `cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.tile.
+/// bulk_group`: [`cp_async_bulk_tensor_2d_s2g`] with the destination element
+/// **added to** rather than overwritten, in the tensor map's data type.
+///
+/// Inline PTX rather than a cuda-oxide intrinsic, and deliberately scoped to
+/// the one op and rank a kernel has asked for (#42): the pinned revision
+/// carries all 64 `int_nvvm_cp_async_bulk_tensor_reduce_*` records in
+/// `intrinsics/imported.json` but admits none of them to the generated
+/// `cuda-device` crate, so the family is a generation-list change upstream —
+/// the preferred end state — and this function is the bridge until it lands,
+/// not the start of a hand-written copy of the cross-product.
+///
+/// Completion is the plain store's bulk-group mechanism:
+/// [`tma_store_commit`] and the two waits cover it exactly as they cover
+/// [`cp_async_bulk_tensor_2d_s2g`].
+///
+/// # Safety
+///
+/// - As [`cp_async_bulk_tensor_2d_s2g`]: `src` a live shared-memory box the
+///   map's shape reads, `tensor_map` a live descriptor, the coordinates
+///   inside the tensor.
+/// - The destination elements are read: they must hold values of the map's
+///   data type, not uninitialized bytes.
+#[inline(always)]
+pub unsafe fn cp_reduce_async_bulk_tensor_2d_s2g_add(
+    src: *const u8,
+    tensor_map: *const TmaDescriptor,
+    coord0: i32,
+    coord1: i32,
+) {
+    unsafe {
+        ptx_asm!(
+            "{ .reg .u64 smem; cvta.to.shared.u64 smem, %0; \
+             cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.tile.bulk_group \
+             [%1, {%2, %3}], [smem]; }",
+            in("l") src as u64,
+            in("l") tensor_map as u64,
+            in("r") coord0 as u32,
+            in("r") coord1 as u32,
+            clobber("memory"),
+        );
+    }
 }
 
 #[inline(always)]

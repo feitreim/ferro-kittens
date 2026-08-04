@@ -365,7 +365,7 @@ is 1.1.
 | `load_async` | `tma_load`, `tma_load_at`, `tma_load_2d`, `tma_load_2d_multicast_cg2`, `tma_load_2d_arriving_at` ✅ |
 | `store_async` | `tma_store`, `tma_store_2d` ✅ |
 | `store_async_wait`, `store_commit_group`, `store_async_read_wait` | `tma_store_wait::<N>`, `tma_store_commit`, `tma_store_wait_read::<N>` ✅ |
-| `store_add_async`, `store_min_async`, `store_max_async` | — |
+| `store_add_async`, `store_min_async`, `store_max_async` | `tma_store_add_2d` (`add`, rank 2 only — the scoped #42 fallback) |
 | `prefetch` | — |
 | im2col descriptors | — **[SCOPE]** (conv-only) |
 
@@ -386,6 +386,14 @@ generation-list change upstream or a local `ptx_asm!` intrinsic (`ldst.rs` sets
 the precedent). `store_add_async` is what makes split-K and multi-CTA reduction
 epilogues cheap; the upstream route is filed as **#42**, and it is a smaller ask
 than this file claimed.
+
+The moment a kernel asked for it (the tcgen05 GEMM's accumulate epilogue,
+oxide-train#80), #42's sanctioned fallback landed as
+`shared::cp_reduce_async_bulk_tensor_2d_s2g_add` behind
+`SharedTile::tma_store_add_2d` and `StoreRing::commit_add_2d` — `add`, rank 2,
+tile mode, nothing else, gated by `device-tests`' `tma reduce-add store`. The
+other seven ops, the other four ranks and im2col stay upstream work; when the
+generation list admits the family, the `ptx_asm!` body shrinks to a call.
 
 **Prefetch is not absent for the same reason, and this file said it was.**
 `int_nvvm_cp_async_bulk_prefetch_L2` and the tensor prefetch forms *are* in

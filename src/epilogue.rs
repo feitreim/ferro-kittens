@@ -333,6 +333,31 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle, const IN_FLIGHT: u3
         self.advance();
     }
 
+    /// [`Self::commit_2d`] through [`SharedTile::tma_store_add_2d`]: the
+    /// buffer's elements are **added into** the destination rather than
+    /// overwriting it, which is how an accumulating epilogue emits its tile
+    /// without ever reading `C` (#42).
+    ///
+    /// The ring's discipline is unchanged — the reduction is a bulk store to
+    /// the group mechanism, so the same fence, commit and waits govern it.
+    ///
+    /// # Safety
+    ///
+    /// - As [`Self::commit_2d`].
+    /// - The destination rectangle holds values of the map's data type: a
+    ///   reduction reads what a plain store would ignore.
+    #[inline(always)]
+    pub unsafe fn commit_add_2d(&mut self, map: *const TmaDescriptor, leading: i32, minor: i32) {
+        unsafe {
+            let staging = self.publish();
+            if SC::issuing() {
+                staging.tma_store_add_2d(map, leading, minor);
+                tma_store_commit();
+            }
+        }
+        self.advance();
+    }
+
     /// Wait until every committed store's bytes are in global memory.
     ///
     /// The last thing a kernel that wrote its result owes, and the one wait
