@@ -1953,9 +1953,9 @@ def _local_census() -> dict[tuple[str, str], dict[str, int]]:
 
 def _print_local_depot() -> None:
     """`.local` in the PTX text, per entry function — attributed (#166, the
-    section comment) and still a report: the mover walks are fixed and the
-    remainder is the map walks, whose blanket fix measured worse than the
-    depot on `flash_forward`.
+    section comment) and still a report: the mover walks are fixed, the
+    masking walk with them (#184), and the remainder is the map walks, whose
+    blanket fix measured worse than the depot on `flash_forward`.
 
     The `shipped` column marks every kernel `examples/` emits plus the
     `GATED_KERNELS` rows: the kernels a launch gets by default, and the ones
