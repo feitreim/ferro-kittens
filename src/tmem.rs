@@ -20,14 +20,19 @@
 //! *drained* shape: `R`/`C` describe what the kernel reads back, not what the
 //! instruction touches.
 //!
+//! **A warp reaches 32 of the 128 lanes**, the quadrant [`warp_lanes`] names,
+//! and every drain and store here is that warp's alone. Which quadrant is
+//! `warp_id() % 4`, so *two* warpgroups share one accumulator lane for lane —
+//! measured, and the whole of what [`warp_lanes`] documents.
+//!
 //! Allocate, multiply, drain, release:
 //!
 //! ```no_run
 //! # use cuda_device::thread;
 //! # use kittens::mma::{MmaShape, commit, mm_abt};
 //! # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
-//! # use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
-//! # use kittens::{BaseLdtm, RegTile, Semaphore, warp_id};
+//! # use kittens::tmem::{TmemTile, alloc_block, dealloc_block, warp_lanes};
+//! # use kittens::{BaseLdtm, RegTile, Semaphore};
 //! # unsafe fn demo(
 //! #     slot: *mut u32,
 //! #     a: SharedTile<Bf16, 128, 64, Swizzle128B>,
@@ -41,7 +46,7 @@
 //!     commit(done);
 //! }
 //! done.wait(0);
-//! let band: RegTile<32, 128, BaseLdtm> = accumulator.tile(32 * warp_id(), 0);
+//! let band: RegTile<32, 128, BaseLdtm> = accumulator.tile(warp_lanes(), 0);
 //! thread::sync_threads();
 //! dealloc_block(accumulator.raw(), COLUMNS);
 //! # let _ = band;
@@ -204,10 +209,10 @@ pub unsafe fn dealloc_cluster(address: u32, columns: u32) {
 /// instead of once per fragment.
 ///
 /// ```no_run
-/// # use kittens::tmem::{TmemTile, store_wait};
-/// # use kittens::{BaseLdtm, RegTile, warp_id};
+/// # use kittens::tmem::{TmemTile, store_wait, warp_lanes};
+/// # use kittens::{BaseLdtm, RegTile};
 /// # unsafe fn demo(accumulator: TmemTile<128, 128>, band: RegTile<32, 128, BaseLdtm>) { unsafe {
-/// accumulator.store_tile(32 * warp_id(), 0, band);
+/// accumulator.store_tile(warp_lanes(), 0, band);
 /// store_wait();
 /// # } }
 /// ```
@@ -216,10 +221,54 @@ pub unsafe fn dealloc_cluster(address: u32, columns: u32) {
 ///
 /// - All 32 lanes of the warp call this together.
 /// - It retires only *that* warp's stores; another warp reading the same TMEM
-///   needs its own ordering.
+///   needs its own ordering, and a block barrier is all of it — see
+///   [`TmemTile::store_fragment`].
 #[inline(always)]
 pub unsafe fn store_wait() {
     tcgen05_store_wait()
+}
+
+/// Warps whose TMEM lane maps differ — a warpgroup's four, and the modulus a
+/// warp's own quadrant is taken over.
+pub const LANE_QUADRANTS: u32 = 4;
+
+/// The first of the 32 TMEM lanes this warp addresses: the `row` every drain
+/// and store on [`TmemTile`] takes.
+///
+/// A warp reaches one quadrant of the 128 lanes and only that one, and *which*
+/// quadrant is `warp_id() % 4` — **not** `warp_id()`. Inside one warpgroup
+/// those are the same number, which is why every kernel written against this
+/// library spells it `32 * warp_id()` and why nothing has ever needed the
+/// distinction. Across two warpgroups they differ, and it is `% 4` that the
+/// hardware uses: warp 4 addresses warp 0's lanes, warp 5 warp 1's, and a
+/// second warpgroup can therefore read and write the same accumulator its
+/// opposite numbers do.
+///
+/// ```no_run
+/// # use kittens::tmem::{TmemTile, warp_lanes};
+/// # use kittens::{BaseLdtm, RegTile};
+/// # unsafe fn demo(accumulator: TmemTile<128, 128>) { unsafe {
+/// // Correct from either warpgroup. `32 * warp_id()` is correct only from the
+/// // first: from the second it names a lane past the 128 there are.
+/// let band: RegTile<32, 128, BaseLdtm> = accumulator.tile(warp_lanes(), 0);
+/// # let _ = band;
+/// # } }
+/// ```
+///
+/// **Measured**, on a B200 (`device-tests`' `tmem across warpgroups`, and see
+/// `docs/library/tmem.md` for the table): a second warpgroup's read of these
+/// lanes is exact at every shape the kernels use, alone and concurrently with
+/// the first warpgroup reading the same lanes, over an accumulator written by
+/// `tcgen05.st` and over one written by an MMA, and its stores land where they
+/// are addressed and nowhere else. No `tcgen05.fence::before_thread_sync` /
+/// `::after_thread_sync` is required beyond the publication a *same*-warpgroup
+/// hand-off already needs.
+///
+/// What is not established: the same question under `cta_group::2`, where the
+/// accumulator spans a CTA pair, and any of it on silicon other than a B200.
+#[inline(always)]
+pub fn warp_lanes() -> u32 {
+    32 * (crate::warp_id() % LANE_QUADRANTS)
 }
 
 /// Resolve a `16x256b` pair's eight registers into a fragment's
@@ -463,8 +512,8 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     ///
     /// # Safety
     ///
-    /// - All 32 lanes of the warp owning TMEM rows `row..row + 16` call this
-    ///   together.
+    /// - All 32 lanes of one warp call this together, and `row..row + 16` lies
+    ///   inside that warp's own [`warp_lanes`] quadrant.
     /// - The MMA writing those rows has committed.
     #[inline(always)]
     pub unsafe fn fragment(self, row: u32, column: u32) -> (TmemRegs4, TmemRegs4) {
@@ -503,18 +552,26 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     ///
     /// # Safety
     ///
-    /// - All 32 lanes of the warp owning TMEM rows `row..row + 16` call this
-    ///   together.
+    /// - All 32 lanes of one warp call this together, and `row..row + 16` lies
+    ///   inside that warp's own [`warp_lanes`] quadrant.
     /// - Ordering the write against whatever reads it — an MMA taking the
     ///   segment as accumulator, a later [`Self::fragment`], or
     ///   [`dealloc_block`] — is the caller's. [`store_wait`] retires it in the
     ///   issuing warp; a consumer in another warp needs whatever sync any
     ///   warp-private write would need besides.
     ///
-    /// Whether a `tcgen05_fence_before_thread_sync` /
-    /// `tcgen05_fence_after_thread_sync` pair is additionally required around
-    /// such a hand-off is **open**. This crate uses neither on any path, and
-    /// that is not a guarantee that they are unnecessary.
+    /// A `tcgen05_fence_before_thread_sync` / `tcgen05_fence_after_thread_sync`
+    /// pair around such a hand-off is **not** additionally required — measured
+    /// on a B200, each layer removed on its own and both together, with the
+    /// consumer in the *other warpgroup* so that the hand-off crosses every
+    /// boundary there is (`device-tests`' `tmem across warpgroups`). This crate
+    /// used neither on any path before that was known; now it is known.
+    ///
+    /// [`store_wait`] is a different matter and stays required. The row that
+    /// dropped it read every cell correctly too, but what that row tested is a
+    /// race whose two sides happened to arrive in order, and a race that
+    /// resolved is not an ordering. It is reported by the case and gates
+    /// nothing.
     #[inline(always)]
     pub unsafe fn store_fragment(self, row: u32, column: u32, low: TmemRegs4, high: TmemRegs4) {
         unsafe {
@@ -548,18 +605,19 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     /// set is the one [`BaseLdtm`] implements [`FragmentLayout`] for.
     ///
     /// ```no_run
-    /// # use kittens::tmem::TmemTile;
-    /// # use kittens::{BaseLdtm, RegTile, warp_id};
+    /// # use kittens::tmem::{TmemTile, warp_lanes};
+    /// # use kittens::{BaseLdtm, RegTile};
     /// # unsafe fn demo(accumulator: TmemTile<128, 128>) { unsafe {
-    /// let band: RegTile<32, 128, BaseLdtm> = accumulator.tile(32 * warp_id(), 0);
+    /// let band: RegTile<32, 128, BaseLdtm> = accumulator.tile(warp_lanes(), 0);
     /// # let _ = band;
     /// # } }
     /// ```
     ///
     /// # Safety
     ///
-    /// - All 32 lanes of the warp owning TMEM rows `row..row + M` call this
-    ///   together, after the MMA writing them has committed.
+    /// - All 32 lanes of one warp call this together, after the MMA writing them
+    ///   has committed, and `row..row + M` lies inside that warp's own
+    ///   [`warp_lanes`] quadrant — so `M` is at most 32.
     /// - `column + N` fits the allocation.
     #[inline(always)]
     pub unsafe fn tile<const M: usize, const N: usize>(
@@ -570,6 +628,12 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     where
         BaseLdtm: FragmentLayout<M, N>,
     {
+        const {
+            assert!(
+                M <= 32,
+                "a warp addresses the 32 TMEM lanes at `tmem::warp_lanes()` and no others; a taller band reads its own quadrant twice"
+            )
+        };
         unsafe {
             let mut tile = RegTile::<M, N, BaseLdtm>::zero();
             // Both walks fully unrolled, or `tile`'s indices stay dynamic,
@@ -610,8 +674,9 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     ///
     /// # Safety
     ///
-    /// - All 32 lanes of the warp owning TMEM rows `row..row + 16` call this
-    ///   together, after the MMA writing them has committed.
+    /// - All 32 lanes of one warp call this together, after the MMA writing them
+    ///   has committed, and `row..row + 16` lies inside that warp's own
+    ///   [`warp_lanes`] quadrant.
     /// - `column + 64` fits the allocation.
     #[inline(always)]
     pub unsafe fn fragments_x8(self, row: u32, column: u32) -> [Fragment; 4] {
@@ -653,10 +718,10 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     /// is that assertion.
     ///
     /// ```no_run
-    /// # use kittens::tmem::TmemTile;
-    /// # use kittens::{BaseLdtm, RegTile, warp_id};
+    /// # use kittens::tmem::{TmemTile, warp_lanes};
+    /// # use kittens::{BaseLdtm, RegTile};
     /// # unsafe fn demo(accumulator: TmemTile<128, 128>) { unsafe {
-    /// let band: RegTile<32, 128, BaseLdtm> = accumulator.tile_x8(32 * warp_id(), 0);
+    /// let band: RegTile<32, 128, BaseLdtm> = accumulator.tile_x8(warp_lanes(), 0);
     /// # let _ = band;
     /// # } }
     /// ```
@@ -675,9 +740,13 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     {
         const {
             assert!(
+                M <= 32,
+                "a warp addresses the 32 TMEM lanes at `tmem::warp_lanes()` and no others; a taller band reads its own quadrant twice"
+            );
+            assert!(
                 N.is_multiple_of(64),
                 "tcgen05.ld.16x256b.x8 covers 64 columns; a band it drains has to be a multiple of that"
-            )
+            );
         };
         unsafe {
             let mut tile = RegTile::<M, N, BaseLdtm>::zero();
@@ -718,21 +787,22 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     /// spelled out rather than looped over.
     ///
     /// ```no_run
-    /// # use kittens::tmem::TmemTile;
-    /// # use kittens::{BaseLdtm, RegTile, warp_id};
+    /// # use kittens::tmem::{TmemTile, warp_lanes};
+    /// # use kittens::{BaseLdtm, RegTile};
     /// # unsafe fn demo(accumulator: TmemTile<128, 128>) { unsafe {
     /// // [32, 128] is 2 row blocks x 2 column groups = 4 issues.
     /// let band: RegTile<32, 128, BaseLdtm> =
-    ///     accumulator.tile_x8_batched::<32, 128, 4>(32 * warp_id(), 0);
+    ///     accumulator.tile_x8_batched::<32, 128, 4>(warp_lanes(), 0);
     /// # let _ = band;
     /// # } }
     /// ```
     ///
     /// # Safety
     ///
-    /// As [`Self::tile_x8`]: all 32 lanes of the warp owning TMEM rows
-    /// `row..row + M` call this together after the MMA writing them has
-    /// committed, and `column + N` fits the allocation.
+    /// As [`Self::tile_x8`]: all 32 lanes of one warp call this together after
+    /// the MMA writing them has committed, `row..row + M` lies inside that
+    /// warp's own [`warp_lanes`] quadrant, and `column + N` fits the
+    /// allocation.
     #[inline(always)]
     pub unsafe fn tile_x8_batched<const M: usize, const N: usize, const ISSUES: usize>(
         self,
@@ -743,6 +813,10 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
         BaseLdtm: FragmentLayout<M, N>,
     {
         const {
+            assert!(
+                M <= 32,
+                "a warp addresses the 32 TMEM lanes at `tmem::warp_lanes()` and no others; a taller band reads its own quadrant twice"
+            );
             assert!(
                 N.is_multiple_of(64),
                 "tcgen05.ld.16x256b.x8 covers 64 columns; a band it drains has to be a multiple of that"
@@ -814,6 +888,12 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     ) where
         BaseLdtm: FragmentLayout<M, N>,
     {
+        const {
+            assert!(
+                M <= 32,
+                "a warp addresses the 32 TMEM lanes at `tmem::warp_lanes()` and no others; a taller band reads its own quadrant twice"
+            )
+        };
         unsafe {
             // Fully unrolled for `tile`'s sake — see `Self::tile` (#166).
             let mut row_block = 0usize;

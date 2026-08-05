@@ -253,6 +253,22 @@ Both sides are `16x256b` at `[16, 16]` granularity, with `TmemTile::tile` and
 store leaves its wait to the caller, since a store's registers are consumed at
 issue.
 
+**Both directions are a warp's, and which lanes are that warp's is measured**
+(#193, for oxide-train#94). The safety clauses said "the warp *owning* TMEM rows
+`row..row + M`" and never said which rows a warp owns; every caller spelled it
+`32 * warp_id()` and every launch had one warpgroup, so the two readings could
+not be told apart. They can now: the lane map is `warp_id() % 4`, exported as
+`tmem::warp_lanes()`, and a **second warpgroup addresses the same lanes as its
+opposite numbers** — reading alone, reading concurrently with the first, over an
+MMA-written accumulator as well as a stored one, and storing back. Neither
+`tcgen05.fence::before_thread_sync` nor `::after_thread_sync` is required around
+that hand-off, which closes the question `store_fragment` carried as open and
+closes it against the hardest case rather than the easiest. The bound is real in
+the other direction too: a warp cannot reach a quadrant that is not its own, so
+`M > 32` was never sound and the clauses now say 32. `device-tests`' `tmem across
+warpgroups` is the standing gate; `docs/library/tmem.md` has the table and what
+is still unestablished (`cta_group::2`, and silicon that is not a B200).
+
 ### 2.1a Shared ↔ register — done (#21)
 
 TK's `shared_to_register.cuh`. `ldst::store_fragment` (`stmatrix`) and
