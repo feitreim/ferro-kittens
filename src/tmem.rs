@@ -510,6 +510,13 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     /// carries the `{0, 1}` offsets of both rows, the high simd the `{8, 9}`.
     /// [`Self::fragment_tile`] resolves that into `(slot, value)` coordinates.
     ///
+    /// **Both accesses are issued before either is waited on.** `tcgen05.wait::ld`
+    /// retires *every* load the warp has outstanding, so one after each is one
+    /// exposed latency too many — the same batching [`Self::tile_x8_batched`]
+    /// does across `.x8` issues, at the two the `.x1` pair already is. Two
+    /// arrivals is eight fp32 of liveness, which is what the caller was going to
+    /// hold anyway.
+    ///
     /// # Safety
     ///
     /// - All 32 lanes of one warp call this together, and `row..row + 16` lies
@@ -519,7 +526,6 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     pub unsafe fn fragment(self, row: u32, column: u32) -> (TmemRegs4, TmemRegs4) {
         unsafe {
             let low = tcgen05_ld_16x256b_pure(self.at(row, column));
-            tcgen05_load_wait();
             let high = tcgen05_ld_16x256b_pure(self.at(row, column + 8));
             tcgen05_load_wait();
             (low, high)

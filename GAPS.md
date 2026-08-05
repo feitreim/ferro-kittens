@@ -629,10 +629,13 @@ cases prove their transpose bits and not merely that some walk multiplies.
 Total: **70 lines of walks, ~420 of harness.**
 
 Two things that fell out of building it. The MN-major operand has *two*
-descriptor spellings in this crate and both are right: `mma_ab` bands 64 wide
-with a 16-byte leading offset, and the new walks cover a 128-wide MN in one
-instruction with the leading offset set to `SUBTILE_BYTES` — the second
-subtile is reached through the descriptor, never by a step along the row. And
+descriptor spellings in this crate and both are right: banding 64 wide with a
+16-byte leading offset, and covering a 128-wide MN in one instruction with the
+leading offset set to `SUBTILE_BYTES` — the second subtile reached through the
+descriptor, never by a step along the row. `mma_ab` was the last caller of the
+first spelling and moved to the second (#175 closed, oxide-train#94), which is
+both one shape rule fewer and 1.50x the tensor-core rate on that product; the
+banding spelling now survives only in the K-major `k_major_offset` walk. And
 `tcgen05_mma_f16` and `tcgen05_mma_shared::<0, 1, 0>` do **not** lower to the
 same PTX at the pinned revision, though they are semantically the same
 instruction: the f16 wrapper emits the `.disable_output_lane` form with an
