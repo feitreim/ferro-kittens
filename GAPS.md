@@ -254,7 +254,7 @@ store leaves its wait to the caller, since a store's registers are consumed at
 issue.
 
 **Both directions are a warp's, and which lanes are that warp's is measured**
-(#192, for oxide-train#94). The safety clauses said "the warp *owning* TMEM rows
+(#193, for oxide-train#94). The safety clauses said "the warp *owning* TMEM rows
 `row..row + M`" and never said which rows a warp owns; every caller spelled it
 `32 * warp_id()` and every launch had one warpgroup, so the two readings could
 not be told apart. They can now: the lane map is `warp_id() % 4`, exported as

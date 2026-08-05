@@ -231,7 +231,7 @@ on no correctness gate because it cannot be.
 
 ## A warp's lanes are its quadrant, and two warpgroups share them
 
-Every drain and store here is a warp's own, and until #192 "a warp's own" was
+Every drain and store here is a warp's own, and until #193 "a warp's own" was
 only ever spelled `32 * warp_id()`. That spelling is not the hardware's rule and
 it agrees with the hardware's rule for exactly as long as a launch has one
 warpgroup. The rule is `warp_id() % 4` — `tmem::warp_lanes()` — and the two
