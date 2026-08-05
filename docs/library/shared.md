@@ -197,10 +197,36 @@ is the whole reason the method exists.
 
 `tma_load_2d_multicast_cg2` is the genuine replication form, which is why its
 mask is the caller's. The charge it hands back is one tile — what a single
-destination receives, which is the whole of it for the own-bit mask and the only
-mask any kernel here uses. A caller replicating into several CTAs owns the
-question of whether the one barrier it named sees that once or once per
-destination; that has not been answered against hardware.
+destination receives — and that is the right unit, because the completion is
+per destination too.
+
+### Where a replicating multicast's bytes are counted
+
+This used to end "that has not been answered against hardware". It has been,
+on a B200, by oxide-train#80's `mcast_probe` — five variants over one 4-CTA
+cluster, every wait against a `globaltimer` deadline so a wrong answer came back
+as a row of a table instead of a launch that never returned:
+
+> The copy landing in CTA `d` completes on the barrier at the supplied
+> **offset**, in whichever CTA of `d`'s own cta_group::2 pair the supplied
+> address's rank *parity* names.
+
+An `n`-bit mask therefore produces `n` completions of one tile each, at `n`
+different barriers. Two things follow that no amount of reading the ISA gives
+you:
+
+**An even-rank address means "each destination's pair leader", not "rank 0".**
+Mask `{1, 3}` with `sem.at_rank(0)` charges ranks 0 *and* 2 — one tile each.
+The absolute rank in the address is not what is read; its parity is. So a
+cluster of several pairs can be fed and accounted for by one multicast while
+keeping one barrier per pair, which is what lets oxide-train's GEMM run two
+`cta_group::2` pairs on adjacent tiles of a tile-row sharing one `A` fetch, at
+the wide tile's arithmetic intensity and the narrow tile's wave quantization.
+
+**The named barrier is not charged once per destination.** Charging one barrier
+`n` tiles for an `n`-bit mask over-charges it and hangs the block. That is the
+shape the mistake takes, and it is silent — which is why the question was worth
+a probe rather than a guess.
 
 ### Stacking boxes taller than the map's
 

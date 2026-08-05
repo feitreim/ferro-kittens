@@ -837,9 +837,31 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     /// [`Self::tma_load_2d_arriving_at`].
     ///
     /// The charge handed back is **one tile** — what a single destination
-    /// receives. A caller replicating into several CTAs owns the question of
-    /// whether the one barrier it named sees that once or once per destination;
-    /// it has not been answered against hardware.
+    /// receives — and that is the right unit, because the completion is per
+    /// destination too. oxide-train#80 measured this on a B200 against a 4-CTA
+    /// cluster, which is what the question was blocking:
+    ///
+    /// > The copy landing in CTA `d` completes on the barrier at `sem`'s
+    /// > **offset**, in whichever CTA of `d`'s own `cta_group::2` pair the
+    /// > supplied address's rank parity names.
+    ///
+    /// So a mask of `n` bits produces `n` completions of one tile each, at `n`
+    /// different barriers, and every destination charges its own for what it
+    /// receives — one instruction, `n` independent arrivals. Two consequences
+    /// worth stating, since neither is guessable:
+    ///
+    /// - An **even**-rank address means "each destination's pair leader", not
+    ///   "rank 0". A cluster of several pairs can therefore feed and account for
+    ///   all of them from one multicast while keeping one barrier per pair —
+    ///   `mask = {1, 3}` with `sem.at_rank(0)` charges ranks 0 *and* 2.
+    /// - The named barrier is **not** charged once per destination. Charging one
+    ///   barrier `n` tiles for an `n`-bit mask over-charges it and hangs the
+    ///   block, which is the shape the mistake takes.
+    ///
+    /// The instrument is `gpu/gemm/src/mcast_probe.rs` in oxide-train — five
+    /// variants over one 4-CTA cluster, every wait against a `globaltimer`
+    /// deadline so a wrong answer is a row of a table rather than a launch that
+    /// never returns.
     ///
     /// # Safety
     ///

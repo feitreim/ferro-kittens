@@ -405,12 +405,22 @@ nothing has asked for prefetch.
 
 ### 2.4 Cluster ops stop at cg2
 
-`commit_multicast_cg2`, `tma_load_2d_multicast_cg2` and `mma_walk_cg2` all
-hardcode the 2-CTA pair. TK's `tma_cluster.cuh` takes a general cluster mask.
-Larger clusters mostly matter for the GEMM shapes; the 2-CTA case is the one
-Blackwell flash kernels use. Filed as **#49**, which narrows the remaining ask
-to multicast as *replication* — the only thing a cluster larger than a pair
-buys, and the thing the `_cg2` suffix rules out by name.
+`commit_multicast_cg2` and `mma_walk_cg2` hardcode the 2-CTA pair. TK's
+`tma_cluster.cuh` takes a general cluster mask. Larger clusters mostly matter
+for the GEMM shapes; the 2-CTA case is the one Blackwell flash kernels use.
+Filed as **#49**, which narrows the remaining ask to multicast as *replication*
+— the only thing a cluster larger than a pair buys, and the thing the `_cg2`
+suffix rules out by name.
+
+**`tma_load_2d_multicast_cg2` is no longer part of the ask.** Its mask was
+always the caller's; what was missing was the semantics, and oxide-train#80
+measured them (`docs/library/shared.md`, "Where a replicating multicast's bytes
+are counted"). A replicating load completes at the given offset in each
+destination's own pair, selected by the address's rank parity, so an even-rank
+address charges every destination's *pair leader* — one instruction feeding and
+accounting for a cluster of several pairs. oxide-train's GEMM runs a 4-CTA
+cluster on that and needs nothing new here. The `_cg2` in the name describes the
+`cta_group` qualifier the instruction carries, not a limit on the mask.
 
 The barrier-addressing half is no longer part of it. **#50** replaced
 `multicast_alias` — which reached the peer's barrier by masking the rank bit
