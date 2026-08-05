@@ -3694,30 +3694,46 @@ pub mod kernels {
     /// [`BY_HAND`] and nothing else changes. The diagonal moves with the step
     /// so it cannot be folded into the coordinate map.
     ///
-    /// **What it measured** (`regcount`, sm_100a, no spills anywhere):
+    /// **What it measured** (`regcount`, sm_100a, no spills anywhere), before
+    /// and after #184 unrolled `RegTile::mask`:
     ///
     /// ```text
-    ///                        regs   stack
-    ///  32 unmasked             31     256
-    ///  32 causal               32     256
-    ///  32 by hand              32     256
-    /// 128 unmasked            157    1536
-    /// 128 causal               71    1536
-    /// 128 by hand              71    1536
+    ///                        regs   stack   st.local        after #184
+    ///  32 unmasked             31     256         72     31 /  256 /  72
+    ///  32 causal               32     256         72     32 /  256 /  72
+    ///  32 by hand              32     256         72     32 /  256 /  72
+    /// 128 unmasked            157    1536        536    157 / 1536 / 536
+    /// 128 causal               71    1536        556    255 / 1536 / 664
+    /// 128 by hand              71    1536        556     71 / 1536 / 556
     /// ```
     ///
-    /// The claim this probe exists for is the middle pair against the last:
-    /// `make_causal_at` and the loop it replaces compile to the same register
-    /// count at both widths, so the op costs nothing over the index math it
-    /// deletes. Against no mask at all it is one register at 32 — consistent
-    /// with #38's peak-liveness reading, since `mask` takes `&mut self` and
-    /// adds one `i32` per slot rather than a second band.
+    /// The claim this probe exists for is the middle pair against the last,
+    /// and **#184 ended it at 128 columns**: `make_causal_at` and the loop it
+    /// replaces no longer compile to the same thing, because only the op
+    /// unrolls. At 32 they still price alike, and against no mask at all the
+    /// op is still one register there — consistent with #38's peak-liveness
+    /// reading, since `mask` takes `&mut self` and adds one `i32` per slot
+    /// rather than a second band.
     ///
-    /// [`UNMASKED`] is *not* a lower bound at 128, and the 86-register gap is
-    /// the probe rather than the op: with no mask pass between them the load
-    /// loop and the exponential fuse into one wide batch and ptxas holds more
-    /// of the band live at once. Same reading as #27's — where the values are
-    /// defined, not how many there are.
+    /// The 128-column divergence is **this probe's frame, not more traffic**.
+    /// Its load walk is open-coded on purpose — it is what a kernel writes
+    /// without the movers — so it leaves the band in the 1536 B frame, and an
+    /// unrolled mask then reads that band into registers and writes it back:
+    /// 255 registers, and a static `st.local` count that rises because one
+    /// rolled store became 128 predicated ones at constant offsets. The frame
+    /// does not grow, the dynamic store count does not change, and the kernel
+    /// this op ships in — `flash_forward`, whose walks around the mask are
+    /// movers and already unroll — loses 256 B of frame and 84 static
+    /// `st.local` on the same change. A mask that unrolls inside a kernel
+    /// whose other walks do not is a round trip; that is the reading, and it
+    /// is why the shipped kernel and this probe move in opposite directions.
+    ///
+    /// [`UNMASKED`] is *not* a lower bound at 128, and the 86-register gap
+    /// against the pre-#184 masked forms was the probe rather than the op:
+    /// with no mask pass between them the load loop and the exponential fuse
+    /// into one wide batch and ptxas holds more of the band live at once. Same
+    /// reading as #27's — where the values are defined, not how many there
+    /// are.
     #[inline(always)]
     unsafe fn mask_probe<const N: usize, const FORM: u32>(
         scores: &[f32],

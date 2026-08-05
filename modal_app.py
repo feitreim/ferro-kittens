@@ -1898,6 +1898,10 @@ def _check_occupancy_step(measured: dict[tuple[str, str], dict[str, int]]) -> No
 # `__unroll_config::<0>()` and an inline-`const` bound — the backend's
 # trip-count analysis sees `M / 16` as a runtime division otherwise, warns,
 # and leaves the loop rolled — and every GEMM in both crates reads zero here.
+# `RegTile::mask` carries it too (#184): a masking write under a
+# data-dependent condition keeps the slot array addressable, so that walk
+# homed a whole band per *outer* iteration rather than per masked one, and
+# it cost oxide-train's tile classifier a 400 B frame off one `right_fill`.
 # The `reg.rs` map/reduce walks deliberately do **not**: unrolling them
 # blanket was measured (2026-08-03) at 255 registers and 208/208 ptxas
 # spill st/ld on `flash_forward` against the 1058-store depot it replaced,
@@ -1909,6 +1913,17 @@ def _check_occupancy_step(measured: dict[tuple[str, str], dict[str, int]]) -> No
 # is `flash_forward`, whose accumulator band is the algorithm's own live
 # state, and the arming condition is unchanged: flip the report to a raise
 # when the shipped set reads zero, which now waits on that one kernel.
+#
+# #184 is also where this table's two substrates part company, and a reader
+# diffing it should know which one they are reading. The `.local decl` and
+# stack columns are *bytes a kernel homes*; `st.local`/`ld.local` are
+# **static instruction counts**, and unrolling trades one rolled store for N
+# spelled-out ones at constant offsets without changing what runs. So a row
+# whose frame shrinks while its `st.local` grows has not got worse:
+# `flash_forward` went 1824 B/774 st to 1568/690 (the score band left the
+# frame), and `mask_probe_128_causal` — whose load walk is open-coded on
+# purpose, so its band stays in the frame the mask now round-trips through —
+# held 1536 B while its `st.local` went 556 to 664. Read the frame first.
 #
 # Substrings of the PTX text, counted per entry function the way the census
 # counts opcodes. The frame declaration is one column and its traffic is two
