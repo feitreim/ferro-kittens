@@ -167,6 +167,43 @@ The place an in-place form is worth registers is the **rescale**: `row_map::<Mul
 against a hand-written `scale_rows` is **87 registers/thread**, and
 `row_map_assign::<Mul>` reaches the hand-written number exactly.
 
+### 255 registers, and why this kernel can spend them (#184)
+
+`make_causal_at` used to be a rolled walk, which homed the `[32, 64]` score
+band to a `.local` frame — for the whole loop, not for the diagonal block. It
+unrolls now, the band comes back into registers, and this kernel is the one
+that pays for it:
+
+| | regs | ptxas spill st/ld | stack | `st.local` | `ld.local` | driver blocks/SM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| before | 165 | 0 / 0 | 1824 B | 774 | 451 | 1 |
+| after | **255** | **0 / 0** | 1568 B | 690 | 383 | **1** |
+
+255 is not a spill and it is not an occupancy step. It is not a spill because
+`ptxas` says so in the columns beside it. It is not a step because this
+kernel's **own shared plan is what holds it to one CTA per SM**: 147 532 B
+against the SM's 227 KiB admits exactly one, and the driver's
+`max_active_blocks_per_multiprocessor` answers 1 at both register counts.
+Registers would have to reach past two CTAs' worth to matter here and there is
+no second CTA to lose. `device-tests`' occupancy ladder makes the same point
+from the other side — the 1 CTA/SM is shared memory's, not the tcgen05
+allocator's.
+
+What it buys, on a B200, checked before timed, five warm-ups and the minimum
+of thirty:
+
+| | before | after | |
+| --- | ---: | ---: | ---: |
+| 1024 queries × 2 heads | 0.2135 ms | 0.1828 ms | **1.168x** |
+| 2048 queries × 4 heads | 0.3966 ms | 0.3347 ms | **1.185x** |
+
+So the register column ordered time backwards again, for the sixth time in
+this tree (#47, #63, #67, #76, #94): +90 registers, −15% wall clock, because
+the frame it replaced was being written and read in the innermost loop. The
+kernel that *would* read this differently is one with room to spare in shared
+memory, where the third CTA is real — which is why #184 is recorded here and
+not only in `docs/library/reg.md`.
+
 ### The epilogue
 
 fp32 straight out of registers through `kittens::global::store_rows`, with no

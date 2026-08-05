@@ -203,6 +203,42 @@ Lane-local throughout: the map hands a thread whole `(row, column)` pairs, so a
 mask is a select on registers it already holds and no lane learns anything from
 another.
 
+### `mask` is the one walk in this file that unrolls
+
+Both of its loops carry `__unroll_config::<0>()` and an inline-`const` bound —
+#166's pattern, applied here by #184. It is the only walk in `reg.rs` that
+does, and the asymmetry is the point.
+
+A conditional write is worse than a map, not the same. `self.set(slot, value,
+fill)` under a data-dependent `keep` keeps the slot array *addressable* across
+the branch, so the rolled form homes the whole tile to a `.local` frame — and
+it homes it on every iteration of whatever loop the mask sits in, not only on
+the iterations that mask anything. oxide-train's tile classifier paid a 400 B
+frame, 150 `st.local` and 104 `ld.local` for one `right_fill` on the
+vocabulary's ragged last chunk, one chunk in 786, with the stores inside the
+vocabulary loop. Nothing else here has that shape: a map writes every value
+unconditionally, and a reduction writes none.
+
+Two things were measured and rejected on the way in. Writing the mask as an
+unconditional select — `self.set(slot, value, if keep {old} else {fill})`, so
+there is no branch to keep the array addressable — does *not* fix it on its
+own: the walk stays rolled and the frame stays (`flash_forward` 165 → 167
+registers, 1824 B either way). With the unroll markers it compiles to exactly
+the byte-for-byte same PTX as the branch form, so the extra `get` buys nothing
+and the branch stays. Separately, replacing `BaseLdtm::column`'s `[0, 1, 8,
+9][value % 4]` — itself a local array in a rolled walk — with the equivalent
+`8 * (value / 2) + value % 2` moves register counts across half the probe
+table in both directions and takes four of `regcount`'s twenty timed rungs off
+their ladder twins. It is a real finding and it is not this change.
+
+The cost is that a tile the mask leaves in registers has to *be* in registers.
+`flash_forward`'s score band comes back from a 256 B frame and the kernel goes
+165 → 255 registers with no ptxas spill; it can afford that because its own
+147 532 B shared plan already holds it to one CTA per SM (the driver says 1
+before and after), so the register step from three CTAs to two is not the
+binding term. A kernel with room to spare in shared memory would read this
+differently, which is what `docs/kernels/flash_forward.md` records.
+
 ## A scalar operand is a `BinaryOp`
 
 `scalar_map::<Mul>(k)` is `scale`, `scalar_map::<Add>(k)` is `shift`. The

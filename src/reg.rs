@@ -26,6 +26,7 @@
 //! # }
 //! ```
 
+use cuda_device::thread::__unroll_config;
 use cuda_device::warp;
 
 /// NaN-free float max, as a comparison-select rather than a libdevice call.
@@ -1241,6 +1242,17 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     /// directions. That is the common case, not the edge one: a band wholly
     /// above the diagonal takes `keep` false everywhere.
     ///
+    /// **Both walks unroll**, which is not decoration: a masking write under a
+    /// data-dependent condition keeps the slot array addressable, so a rolled
+    /// walk here homes the whole tile to a `.local` frame — and it homes it on
+    /// every iteration of whatever loop the mask sits in, not only the masked
+    /// one. `#166`'s pattern, the marker plus an inline-`const` bound, is what
+    /// makes every `set` a constant slot and leaves the tile in registers.
+    /// This is the only walk in this file that carries it; the maps and
+    /// reductions are the same shape and are deliberately left rolled, because
+    /// a map walk's frame is a band that does not *fit* and unrolling it buys
+    /// a spill (`#166`'s measurement, `modal_app.py`'s census comment).
+    ///
     /// ```no_run
     /// # use kittens::lane;
     /// # use kittens::reg::{BaseLdtm, RegTile};
@@ -1254,10 +1266,12 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     #[inline(always)]
     pub fn mask(&mut self, lane: u32, fill: f32, keep: impl Fn(i32, i32) -> bool) {
         let mut slot = 0;
-        while slot < L::SLOTS {
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
             let row = L::row_of(lane, slot) as i32;
             let mut value = 0;
-            while value < L::VALUES {
+            while value < const { L::VALUES } {
+                __unroll_config::<0>();
                 let column = L::col_of(lane, value) as i32;
                 if !keep(row, column) {
                     self.set(slot, value, fill);
