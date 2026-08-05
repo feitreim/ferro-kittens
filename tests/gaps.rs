@@ -312,6 +312,25 @@ fn the_tmem_drain_has_both_widths<const M: usize, const N: usize>(
     }
 }
 
+/// §2.1 — the lane a drain is anchored at is the warp's *quadrant*, and the
+/// quadrant is nameable (#94's ask on oxide-train's side).
+///
+/// Named here because the thing that would rot is not the function but the
+/// distinction: `warp_lanes()` and `32 * warp_id()` agree inside one warpgroup,
+/// so a rename to something meaning the second would pass every test in this
+/// repository except `device-tests`' `tmem across warpgroups`, which needs a
+/// B200 to run at all.
+fn the_tmem_lane_map_is_the_warps_quadrant<const M: usize, const N: usize>(
+    accumulator: kittens::TmemTile<M, N>,
+) where
+    BaseLdtm: RowLayout<M> + ColLayout<N>,
+{
+    let _: u32 = kittens::tmem::LANE_QUADRANTS;
+    unsafe {
+        let _: RegTile<M, N, BaseLdtm> = accumulator.tile(kittens::tmem::warp_lanes(), 0);
+    }
+}
+
 /// §7 — the store ring's scope is in the type (#123), which is the one place in
 /// the crate where a collective's scope is named rather than baked into its
 /// index math.

@@ -37,11 +37,18 @@
 //! whatever it is handed — and `mma transpose control`, which is the same
 //! operands under the *untransposed* walk and is required to disagree.
 //!
-//! `block reduction` is the one case whose subject is more than one warp.
-//! Everything else here launches 32 or 128 threads and checks a claim about
-//! *one* warp's registers; a block reduction is the only thing in the library
-//! that no warp can compute alone, so it is the only case where the answer
-//! depends on four warps having met at a barrier in the right order.
+//! `block reduction` is the one case whose subject is more than one warp within
+//! a warpgroup. Most of what is here launches 32 or 128 threads and checks a
+//! claim about *one* warp's registers; a block reduction is the only thing in
+//! the library that no warp can compute alone, so it is the only case where the
+//! answer depends on four warps having met at a barrier in the right order.
+//!
+//! [`tmem_warpgroup`] is the one family that launches **two** warpgroups, and
+//! its subject is not a map but a *contract*: every TMEM drain in the library is
+//! documented as belonging to the warp that owns the lanes, and oxide-train#94
+//! needs a warp of the second warpgroup to read its opposite number's. That
+//! question has no answer inside one warpgroup, which is why nothing before it
+//! launched 256 threads.
 //!
 //! Run it with `modal run modal_app.py` (see `modal_app.py` at the repo root);
 //! it exits non-zero if any case fails.
@@ -69,6 +76,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 use cuda_device::DisjointSlice;
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
+use cuda_device::tcgen05::{tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync};
 use cuda_device::thread::__unroll_config;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cluster, cluster_launch, cuda_module, debug, kernel, thread, warp};
@@ -90,12 +98,13 @@ use kittens::shared::{
 };
 use kittens::sync::{Semaphore, block_reduce, block_reduce_sum};
 use kittens::tmem::{
-    TmemTile, alloc_block, alloc_cluster, dealloc_block, dealloc_cluster, store_wait,
+    TmemTile, alloc_block, alloc_cluster, dealloc_block, dealloc_cluster, store_wait, warp_lanes,
 };
 
 mod ladder_bench;
 mod tmem_occupancy;
 mod tmem_residency;
+mod tmem_warpgroup;
 
 /// Edge of the square tiles the swizzle and `stmatrix` cases use: 64 bf16
 /// columns is exactly one 128-byte swizzle atom per row, so these tiles are a
@@ -203,6 +212,35 @@ const COLUMNS: usize = 128;
 /// K of the probe MMA: one swizzle atom of bf16, four chained K=16 chunks.
 const DEPTH: usize = 64;
 
+/// Threads the cross-warpgroup cases launch: **two** warpgroups, which is the
+/// first launch in this harness wider than one. See [`tmem_warpgroup`] for what
+/// the second one is for.
+const WG_THREADS: u32 = 256;
+/// Warps in a warpgroup — and the modulus the tcgen05 lane map is stated over,
+/// which is the whole question those cases ask.
+const WG_WARPS: u32 = 4;
+/// Columns they allocate: `AccTmem`'s 128, the width flash's backward drain
+/// reads as one band.
+const WG_COLUMNS: usize = 128;
+/// Columns of one score chunk — `SCORE_CHUNK` in oxide-train's flash backward,
+/// the width its register pass reads a band at.
+const WG_CHUNK: u32 = 16;
+/// Chunks in one score tile, so `WG_CHUNK * WG_CHUNKS` is flash's 64-column
+/// score band and a split gives each warpgroup [`WG_CHUNKS`] / 2 of them.
+const WG_CHUNKS: u32 = 4;
+/// Column stride of the cell identity [`wg_cell`] encodes. Four times the
+/// allocation's own width, so a value written by the *second* warpgroup can
+/// carry a column identity no seeded cell can collide with.
+const WG_STRIDE: u32 = 512;
+/// Column identity a marked write adds, which is [`WG_STRIDE`] / 2: outside
+/// every column the seed uses and still exact in fp32.
+const WG_MARK: u32 = 256;
+/// Floats a thread of those cases writes — `RegTile<32, 128>`'s 4 slots by 32
+/// values, the widest band any of them drains. Bands narrower than that leave
+/// the tail of their thread's stride untouched, so one host layout reads them
+/// all.
+const WG_DUMP: usize = 128;
+
 /// The MMA operands and the tiles the swizzle cases move, as the library
 /// types. The shape-generic alias is what lets one probe body serve the narrow
 /// and wide cases, so a case cannot drift between widths.
@@ -293,6 +331,12 @@ const PROBE_SHARED: usize = AOperand::BYTES + 2 * BOperand::BYTES + 32;
 /// The STTM round trip touches no shared tile at all — its whole plan is the
 /// TMEM staging word.
 const STTM_SHARED: usize = 32;
+
+/// Shared plan of the MMA-seeded cross-warpgroup case: both zeroed operands,
+/// then a 32-byte tail holding its mbarrier and the TMEM staging word. Every
+/// other case in that family has [`STTM_SHARED`]'s plan, since none of them
+/// stages an operand.
+const WG_MMA_SHARED: usize = 2 * Tile::<ROWS, DEPTH>::BYTES + 32;
 
 /// The four operand orders' `A` staged K-major, `[M, K]`.
 type AKMajor = Tile<ROWS, DEPTH>;
@@ -603,6 +647,47 @@ const fn dump_index(
     values: usize,
 ) -> usize {
     ((warp * 32 + lane as usize) * slots + slot) * values + value
+}
+
+/// The value TMEM lane `lane`, column `column` carries in the cross-warpgroup
+/// cases — an exact fp32 integer naming its own cell.
+///
+/// [`dump_index`] identifies the *thread* that wrote a register, which is the
+/// right identity for a round trip through one warp's own lanes and the wrong
+/// one here: the claim under test is that a warp of the second warpgroup reads
+/// the cell another warp wrote, so the identity has to name the cell. A read
+/// that lands in the wrong quadrant then decodes to the lanes it actually
+/// reached rather than merely comparing unequal, which is the difference
+/// between "wrong" and an answer.
+/// The `+ 1` is what keeps `0.0` from being a cell. Lane 0 column 0 would
+/// otherwise carry the same value an untouched buffer does, and the one thing a
+/// read that reached nowhere must not decode to is a legitimate cell.
+const fn wg_cell(lane: u32, column: u32) -> f32 {
+    (lane * WG_STRIDE + column + 1) as f32
+}
+
+/// [`wg_cell`] inverted, for the host's diagnosis. `None` if the value names no
+/// cell at all — a read that returned something no thread ever wrote.
+fn wg_decode(value: f32) -> Option<(u32, u32)> {
+    let bits = value as u32;
+    if value <= 0.0 || value != bits as f32 || (bits - 1) / WG_STRIDE >= ROWS as u32 {
+        return None;
+    }
+    Some(((bits - 1) / WG_STRIDE, (bits - 1) % WG_STRIDE))
+}
+
+/// Where a cross-warpgroup case's `(warp, lane, slot, value)` lands, at the
+/// fixed [`WG_DUMP`] stride that lets one host layout read every band width.
+/// `base` offsets the bands a case drains more than one of.
+const fn wg_index(
+    warp: u32,
+    lane: u32,
+    base: usize,
+    slot: usize,
+    value: usize,
+    values: usize,
+) -> usize {
+    (warp * 32 + lane) as usize * WG_DUMP + base + slot * values + value
 }
 
 #[cuda_module]
@@ -1924,6 +2009,436 @@ pub mod kernels {
 
             thread::sync_threads();
             dealloc_block(tmem, COLUMNS as u32);
+        }
+    }
+
+    // ===================================================================
+    // Two warpgroups over one accumulator (`tmem_warpgroup`)
+    // ===================================================================
+
+    /// Fill lanes `32 * warp .. + 32` of `band`, every column, with
+    /// [`wg_cell`] — from the warp that owns them under the contract as
+    /// shipped, so the seed is never itself the thing in question.
+    ///
+    /// The store is left outstanding; [`wg_handoff`] is what retires it, under
+    /// the bit that says whether this row of the table retires it at all.
+    #[inline(always)]
+    unsafe fn wg_seed(band: TmemTile<ROWS, WG_COLUMNS>, warp_id: u32, lane: u32, mark: u32) {
+        unsafe {
+            type Seed = RegTile<32, WG_COLUMNS, BaseLdtm>;
+            let mut tile = Seed::zero();
+            let mut slot = 0usize;
+            while slot < Seed::SLOTS {
+                __unroll_config::<0>();
+                let mut value = 0usize;
+                while value < Seed::VALUES {
+                    __unroll_config::<0>();
+                    tile.set(
+                        slot,
+                        value,
+                        wg_cell(
+                            32 * warp_id + BaseLdtm::row(lane, slot),
+                            mark + BaseLdtm::column(lane, value),
+                        ),
+                    );
+                    value += 1;
+                }
+                slot += 1;
+            }
+            band.store_tile(32 * warp_id, 0, tile);
+        }
+    }
+
+    /// The rendezvous between the warpgroup that wrote the accumulator and the
+    /// one that reads it, with each ordering layer under its own bit of
+    /// `fences`.
+    ///
+    /// Bit 0 is `tmem::store_wait`, bit 1 `tcgen05.fence::before_thread_sync`,
+    /// bit 2 `tcgen05.fence::after_thread_sync`. The block sync itself is
+    /// unconditional: a hand-off without one is a race, and a race has no
+    /// answer to measure. Every other layer is a bit because
+    /// `tmem::TmemTile::store_fragment`'s own documentation says the pair is
+    /// **open** — the library uses neither on any path and does not claim they
+    /// are unnecessary — so the way to close it is to run the ladder and read
+    /// which layers the value survives without.
+    #[inline(always)]
+    unsafe fn wg_handoff(fences: u32) {
+        unsafe {
+            if fences & 1 != 0 {
+                store_wait();
+            }
+            if fences & 2 != 0 {
+                tcgen05_fence_before_thread_sync();
+            }
+            thread::sync_threads();
+            if fences & 4 != 0 {
+                tcgen05_fence_after_thread_sync();
+            }
+        }
+    }
+
+    /// [`dump_band`] at the fixed [`WG_DUMP`] stride — see [`wg_index`].
+    #[inline(always)]
+    unsafe fn wg_dump<const M: usize, const N: usize>(
+        tile: RegTile<M, N, BaseLdtm>,
+        warp_id: u32,
+        lane: u32,
+        base: usize,
+        out: &mut DisjointSlice<f32>,
+    ) where
+        BaseLdtm: FragmentLayout<M, N>,
+    {
+        unsafe {
+            let values = RegTile::<M, N, BaseLdtm>::VALUES;
+            let mut slot = 0usize;
+            while slot < RegTile::<M, N, BaseLdtm>::SLOTS {
+                __unroll_config::<0>();
+                let mut value = 0usize;
+                while value < values {
+                    __unroll_config::<0>();
+                    *out.get_unchecked_mut(wg_index(warp_id, lane, base, slot, value, values)) =
+                        tile.get(slot, value);
+                    value += 1;
+                }
+                slot += 1;
+            }
+        }
+    }
+
+    /// Warpgroup 0 seeds the accumulator; whichever warpgroups `readers` names
+    /// then read it back at the `[32, 16]` score chunk oxide-train's flash
+    /// backward register pass reads, and dump what they got.
+    ///
+    /// The reading warp of warpgroup `g` addresses TMEM lanes
+    /// `32 * ((warp + shift * g) % 4)`. At `shift = 0` that is its **opposite
+    /// number's** quadrant — warp 4 reading warp 0's lanes, which is the access
+    /// oxide-train#94's pass split is written against and the thing this whole
+    /// family exists to answer. At `shift = 1` it is a quadrant no reading of
+    /// the ISA gives that warp, which is the control that says whether the
+    /// restriction is real: if a warp can reach any quadrant, "opposite number"
+    /// was never the constraint.
+    ///
+    /// `split` at 1 gives each warpgroup half the chunks of one 64-column score
+    /// band — warpgroup 0 columns 0 and 16, warpgroup 1 columns 32 and 48 —
+    /// which is #94's remedy 3 exactly: same lanes, disjoint columns. At 0 both
+    /// read all four chunks, same lanes *and* same columns, which is the
+    /// stronger claim.
+    ///
+    /// Launch with [`WG_THREADS`] threads.
+    #[kernel]
+    pub unsafe fn warpgroup_chunk(
+        readers: u32,
+        shift: u32,
+        fences: u32,
+        split: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tmem = alloc_block(smem as *mut u32, WG_COLUMNS as u32);
+            let band = TmemTile::<ROWS, WG_COLUMNS>::from_raw(tmem);
+            let (warp_id, lane) = (warp::warp_id(), warp::lane_id());
+            let group = warp_id / WG_WARPS;
+
+            if group == 0 {
+                wg_seed(band, warp_id, lane, 0);
+            }
+            wg_handoff(fences);
+
+            if readers & (1 << group) != 0 {
+                // Open-coded rather than `tmem::warp_lanes()` on purpose:
+                // at `shift = 0` this *is* `warp_lanes()`, and the whole job of
+                // the parameter is to name a quadrant `warp_lanes()` never
+                // would. The other two kernels here call it.
+                let quadrant = (warp_id + shift * group) % WG_WARPS;
+                let (first, chunks) = if split != 0 {
+                    (group * WG_CHUNK * WG_CHUNKS / 2, WG_CHUNKS / 2)
+                } else {
+                    (0, WG_CHUNKS)
+                };
+                // No unroll marker: `chunks` is the row's own parameter, so
+                // this walk's trip count is genuinely dynamic. Nothing crosses
+                // an iteration — each band is dumped where it is read — so
+                // there is no aggregate for a rolled walk to home to `.local`.
+                let mut chunk = 0u32;
+                while chunk < chunks {
+                    wg_dump(
+                        band.tile::<32, { WG_CHUNK as usize }>(
+                            32 * quadrant,
+                            first + WG_CHUNK * chunk,
+                        ),
+                        warp_id,
+                        lane,
+                        (WG_CHUNK * chunk) as usize,
+                        &mut out,
+                    );
+                    chunk += 1;
+                }
+            }
+
+            tcgen05_fence_before_thread_sync();
+            thread::sync_threads();
+            dealloc_block(tmem, WG_COLUMNS as u32);
+        }
+    }
+
+    /// [`warpgroup_chunk`] at the shape the backward kernels *drain* rather
+    /// than the one they pass over: `TmemTile::tile_x8` at `[32, 128]`, four
+    /// `tcgen05.ld.16x256b.x8` issues covering a warp's whole output band.
+    ///
+    /// The chunk case reads 16 columns through the `.x1` path; this reads 128
+    /// through the `.x8` one. Same lanes, a different instruction and four
+    /// times the registers, and #94's drain is this one — so the answer the
+    /// chunk case gives is not assumed to carry over to it.
+    ///
+    /// Launch with [`WG_THREADS`] threads.
+    #[kernel]
+    pub unsafe fn warpgroup_drain(
+        readers: u32,
+        shift: u32,
+        fences: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tmem = alloc_block(smem as *mut u32, WG_COLUMNS as u32);
+            let band = TmemTile::<ROWS, WG_COLUMNS>::from_raw(tmem);
+            let (warp_id, lane) = (warp::warp_id(), warp::lane_id());
+            let group = warp_id / WG_WARPS;
+
+            if group == 0 {
+                wg_seed(band, warp_id, lane, 0);
+            }
+            wg_handoff(fences);
+
+            if readers & (1 << group) != 0 {
+                // Open-coded rather than `tmem::warp_lanes()` on purpose:
+                // at `shift = 0` this *is* `warp_lanes()`, and the whole job of
+                // the parameter is to name a quadrant `warp_lanes()` never
+                // would. The other two kernels here call it.
+                let quadrant = (warp_id + shift * group) % WG_WARPS;
+                wg_dump(
+                    band.tile_x8::<32, WG_COLUMNS>(32 * quadrant, 0),
+                    warp_id,
+                    lane,
+                    0,
+                    &mut out,
+                );
+            }
+
+            tcgen05_fence_before_thread_sync();
+            thread::sync_threads();
+            dealloc_block(tmem, WG_COLUMNS as u32);
+        }
+    }
+
+    /// The other direction: can the second warpgroup **write** its opposite
+    /// number's lanes?
+    ///
+    /// Warpgroup 0 seeds all 128 columns. Warpgroup 1 then does the forward
+    /// kernel's `rescale_half` against the *upper* half — `tile_x8` at
+    /// `[32, 64]` from column 64, dumped, then `store_tile` of a marked cell
+    /// back into the same 64 columns. After a second hand-off warpgroup 0 reads
+    /// both halves back: the lower one must be its own seed untouched, the
+    /// upper one must be warpgroup 1's mark.
+    ///
+    /// So one launch answers three things — the foreign `[32, 64]` read, the
+    /// foreign store, and that the foreign store hit only the columns it named.
+    /// The last matters because the failure that costs a kernel silently is not
+    /// a fault, it is a write that lands somewhere adjacent.
+    ///
+    /// Launch with [`WG_THREADS`] threads.
+    #[kernel]
+    pub unsafe fn warpgroup_store_back(fences: u32, mut out: DisjointSlice<f32>) {
+        unsafe {
+            const HALF: usize = WG_COLUMNS / 2;
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tmem = alloc_block(smem as *mut u32, WG_COLUMNS as u32);
+            let band = TmemTile::<ROWS, WG_COLUMNS>::from_raw(tmem);
+            let (warp_id, lane) = (warp::warp_id(), warp::lane_id());
+            let group = warp_id / WG_WARPS;
+            // `warp_lanes()` and not `32 * warp_id()`: warpgroup 1's warps are
+            // 4..8, and this is the whole difference the case is about.
+            let lanes = warp_lanes();
+
+            if group == 0 {
+                wg_seed(band, warp_id, lane, 0);
+            }
+            wg_handoff(fences);
+
+            if group == 1 {
+                let half: RegTile<32, HALF, BaseLdtm> = band.tile_x8(lanes, HALF as u32);
+                wg_dump(half, warp_id, lane, 0, &mut out);
+
+                let mut marked = RegTile::<32, HALF, BaseLdtm>::zero();
+                let mut slot = 0usize;
+                while slot < RegTile::<32, HALF, BaseLdtm>::SLOTS {
+                    __unroll_config::<0>();
+                    let mut value = 0usize;
+                    while value < RegTile::<32, HALF, BaseLdtm>::VALUES {
+                        __unroll_config::<0>();
+                        marked.set(
+                            slot,
+                            value,
+                            wg_cell(
+                                lanes + BaseLdtm::row(lane, slot),
+                                WG_MARK + HALF as u32 + BaseLdtm::column(lane, value),
+                            ),
+                        );
+                        value += 1;
+                    }
+                    slot += 1;
+                }
+                band.store_tile(lanes, HALF as u32, marked);
+            }
+            wg_handoff(fences);
+
+            if group == 0 {
+                wg_dump(
+                    band.tile_x8::<32, HALF>(lanes, 0),
+                    warp_id,
+                    lane,
+                    0,
+                    &mut out,
+                );
+                wg_dump(
+                    band.tile_x8::<32, HALF>(lanes, HALF as u32),
+                    warp_id,
+                    lane,
+                    HALF,
+                    &mut out,
+                );
+            }
+
+            tcgen05_fence_before_thread_sync();
+            thread::sync_threads();
+            dealloc_block(tmem, WG_COLUMNS as u32);
+        }
+    }
+
+    /// The same question inside **one** warpgroup: what does a warp get when it
+    /// addresses a lane past its own 32?
+    ///
+    /// `cross quadrant` asks this of warpgroup 1 and answers it, but a reader
+    /// could take the answer as something about the warpgroup boundary rather
+    /// than about the warp. It is about the warp: here warp 0 of warpgroup 0
+    /// reads the `[16, 16]` block at lane 0 and then the one at lane 32, and
+    /// the second is warp 1's.
+    ///
+    /// This is the row the `M <= 32` const assert on `TmemTile::tile` rests on.
+    /// The assert makes the composed spelling — a `[64, N]` band, whose upper
+    /// half is exactly this block — a compile error, so the measurement has to
+    /// be taken through `fragment_tile`, which takes its lane as a runtime
+    /// argument and cannot be guarded that way.
+    ///
+    /// Launch with [`WG_THREADS`] threads.
+    #[kernel]
+    pub unsafe fn warpgroup_past_quadrant(mut out: DisjointSlice<f32>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let tmem = alloc_block(smem as *mut u32, WG_COLUMNS as u32);
+            let band = TmemTile::<ROWS, WG_COLUMNS>::from_raw(tmem);
+            let (warp_id, lane) = (warp::warp_id(), warp::lane_id());
+
+            if warp_id < WG_WARPS {
+                wg_seed(band, warp_id, lane, 0);
+            }
+            wg_handoff(7);
+
+            if warp_id == 0 {
+                wg_dump(band.fragment_tile(0, 0), warp_id, lane, 0, &mut out);
+                wg_dump(band.fragment_tile(32, 0), warp_id, lane, 8, &mut out);
+            }
+
+            tcgen05_fence_before_thread_sync();
+            thread::sync_threads();
+            dealloc_block(tmem, WG_COLUMNS as u32);
+        }
+    }
+
+    /// [`warpgroup_drain`] over an accumulator the **MMA** wrote, not
+    /// `tcgen05.st`.
+    ///
+    /// #94's second warpgroup reads a tensor-core accumulator, and the whole
+    /// point of this family is not to infer one path from another: the store
+    /// path publishes through `tcgen05.wait::st` in the storing warp, the MMA
+    /// path through `tcgen05.commit` into an mbarrier every thread of the block
+    /// waits on. Those are different publications and only one of them has been
+    /// measured across a warpgroup boundary.
+    ///
+    /// The operands are **zero** and the MMA accumulates, so `D = D + 0` leaves
+    /// the seeded cells exactly where they were: the tensor core writes the
+    /// accumulator back and the host still has an absolute expectation for
+    /// every cell. A product would have needed a reference to check it against,
+    /// and the claim here is about *addressing and visibility*, which a
+    /// reference would not sharpen.
+    ///
+    /// Launch with [`WG_THREADS`] threads and `2 * Tile::<ROWS, DEPTH>::BYTES`
+    /// plus the barrier and the allocator's staging word of shared memory.
+    #[kernel]
+    pub unsafe fn warpgroup_mma(readers: u32, fences: u32, mut out: DisjointSlice<f32>) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let operands = Tile::<ROWS, DEPTH>::BYTES;
+            let (a, b) = (
+                Tile::<ROWS, DEPTH>::from_raw(smem),
+                Tile::<ROWS, DEPTH>::from_raw(smem.add(operands)),
+            );
+            let done = Semaphore::attach(smem.add(2 * operands) as *mut Barrier);
+            let tid = thread::threadIdx_x();
+
+            // Both operands zeroed by hand rather than staged: the MMA has to
+            // run, and what it multiplies is the one thing that must not
+            // disturb the seed.
+            let mut word = tid;
+            while word < (2 * operands / 4) as u32 {
+                *(smem as *mut u32).add(word as usize) = 0;
+                word += WG_THREADS;
+            }
+            if tid == 0 {
+                done.init(1);
+            }
+            // The operands are written by ordinary stores and read by the
+            // tensor core, which is a proxy crossing; without this the MMA
+            // could multiply something other than zero and the seeded cells
+            // would come back wrong for a reason that has nothing to do with
+            // the warpgroup the reader is in.
+            fence_proxy_async_shared_cta();
+            thread::sync_threads();
+
+            let tmem = alloc_block(smem.add(2 * operands + 8) as *mut u32, WG_COLUMNS as u32);
+            let band = TmemTile::<ROWS, WG_COLUMNS>::from_raw(tmem);
+            let (warp_id, lane) = (warp::warp_id(), warp::lane_id());
+            let group = warp_id / WG_WARPS;
+
+            if group == 0 {
+                wg_seed(band, warp_id, lane, 0);
+            }
+            wg_handoff(7);
+
+            if tid == 0 {
+                mma_abt(band.raw(), a, b, MmaShape::M128_N128, true);
+                mma::commit(done);
+            }
+            done.wait(0);
+            wg_handoff(fences);
+
+            if readers & (1 << group) != 0 {
+                wg_dump(
+                    band.tile_x8::<32, WG_COLUMNS>(warp_lanes(), 0),
+                    warp_id,
+                    lane,
+                    0,
+                    &mut out,
+                );
+            }
+
+            tcgen05_fence_before_thread_sync();
+            thread::sync_threads();
+            dealloc_block(tmem, WG_COLUMNS as u32);
+            if tid == 0 {
+                done.inval();
+            }
         }
     }
 
@@ -6725,6 +7240,16 @@ fn run() -> Result<usize, Box<dyn Error>> {
     cases.push((
         "clc work stealing",
         Box::new(|| check_clc(&context, stream, module)),
+    ));
+    // Two warpgroups over one accumulator (oxide-train#94), which is the only
+    // case here whose subject is a *contract* rather than a map: every drain in
+    // the library is documented as the owning warp's, and #94's pass split needs
+    // a warp of the second warpgroup to read its opposite number's lanes. Down
+    // here because its last row asks for a quadrant no document gives that warp,
+    // and a fault on that row is sticky on the context.
+    cases.push((
+        "tmem across warpgroups",
+        Box::new(|| tmem_warpgroup::check(stream, module)),
     ));
     // Last, and not because it is the least interesting: it is the only case
     // that can take the process down (see `finish_or_abort`), so everything

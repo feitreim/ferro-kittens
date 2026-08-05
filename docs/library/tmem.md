@@ -229,12 +229,89 @@ takes the `cvt` column to zero; the launch difference is then the convert's cost
 and nothing else. `experiments/`' `pack16` rung is that substitution, and it is
 on no correctness gate because it cannot be.
 
-## Open: fences around a store hand-off
+## A warp's lanes are its quadrant, and two warpgroups share them
 
-Whether a `tcgen05_fence_before_thread_sync` / `tcgen05_fence_after_thread_sync`
-pair is required around handing a `store_fragment`'s result to a consumer in
-another warp is **not established**. This crate uses neither on any path, and
-their absence is not a guarantee that they are unnecessary.
+Every drain and store here is a warp's own, and until #192 "a warp's own" was
+only ever spelled `32 * warp_id()`. That spelling is not the hardware's rule and
+it agrees with the hardware's rule for exactly as long as a launch has one
+warpgroup. The rule is `warp_id() % 4` — `tmem::warp_lanes()` — and the two
+differ the moment a second warpgroup exists.
+
+oxide-train#94 is what made the difference matter. Its flash backward is
+pass-bound (register pass 38–43% of a key-tile visit, MMA issue 42–49%, every
+wait under 100 ticks out of 4 300), and its remedy is to put a second warpgroup
+on the same accumulator's lanes. The library's contract said that was the owning
+warp's; the ISA suggested otherwise; a wrong guess is silently wrong gradients.
+
+### Measured
+
+`device-tests`' `tmem across warpgroups` — one accumulator, 256 threads, and a
+seed whose value at `(lane, column)` is the integer `lane * 512 + column + 1`, so
+a read that lands somewhere else decodes to *where*, and the case reports the
+offset rather than the word "wrong". B200, driver 580.95.05, `sm_100a`.
+
+| what varies | row | result |
+|---|---|---|
+| control | warpgroup 0 reads its own quadrant | every cell |
+| **who reads** | warpgroup 1 reads its opposite number's | **every cell** |
+| | both warpgroups read the same lanes at once | every cell |
+| **fences** | no `fence::after_thread_sync` | every cell |
+| | no `fence::before_thread_sync` | every cell |
+| | neither fence — `store_wait` and a block barrier | every cell |
+| **shape** | #94's split: half the columns each, same lanes | every cell |
+| | the backward drain, `tile_x8` at `[32, 128]` | every cell |
+| | the forward's `rescale_half`: foreign read *and* store | every cell |
+| | an accumulator the **MMA** wrote, not `tcgen05.st` | every cell |
+| **the bound** | warpgroup 1 reads a quadrant that is not its own | **every value aliased** |
+| | warp 0 reads the block at lane 32 | **every value aliased** |
+
+So: **yes**, and the contract that replaces the ownership language is one
+sentence — *a warp addresses the 32 lanes at `warp_lanes()`, which warpgroup it
+is in does not matter, and it addresses no others.*
+
+### What the bound does when you cross it
+
+Not a fault, and not garbage. **The lane it reaches is the one at the same offset
+inside its own quadrant** — the quadrant bits of the address are dropped and the
+low five kept:
+
+```
+warp 4 (quadrant 0) asked for lane 32 -> read lane 0
+                    asked for lane 40 -> read lane 8
+warp 7 (quadrant 3) asked for lane  0 -> read lane 96
+warp 0 (quadrant 0) asked for lane 32 -> read lane 0
+```
+
+Every one of the 8192 values warpgroup 1 read under a rotated quadrant decoded to
+a real cell at that offset, and the last line is inside one warpgroup, so this is
+a property of the *warp* and not of the warpgroup boundary.
+
+That is the worst shape a wrong answer could have taken. There is no fault to
+catch, no NaN to notice, and the values are plausible accumulator values that
+belong to somebody else — a kernel would simply compute the wrong thing. It is
+why `TmemTile::tile`, `tile_x8`, `tile_x8_batched` and `store_tile` now carry a
+`const { assert!(M <= 32) }`: the composed spelling of exactly this mistake is
+`[64, N]`, and it is worth a compile error. No caller in either repository ever
+passed more than 32.
+
+Three things that follow, none of them guessable from the first:
+
+- **The fence pair was never needed.** The question `store_fragment` carried as
+  **open** is closed in the direction the crate had already bet on, and it is now
+  closed against the hardest case rather than the easiest: the consumer is in the
+  other warpgroup. `store_wait` plus a block barrier is the whole publication.
+- **`store_wait` stays required anyway.** The row that dropped it also read every
+  cell — and that row is a race whose two sides happened to arrive in order,
+  which is not an ordering. It is reported and gates nothing. This is the one
+  place in the table where "it worked" is not evidence.
+- **`warp_lanes()` is the spelling the contract is stated in.** `32 * warp_id()`
+  is not wrong inside one warpgroup and is not the rule; the two agree there and
+  nowhere else, so a kernel that grows a second warpgroup silently stops being
+  correct. That is the case for the entry point existing at all — it is four
+  characters of arithmetic and the four characters are the whole finding.
+
+Not established: the same question under `cta_group::2`, where one allocation
+spans a CTA pair; and any of it on silicon other than a B200.
 
 ## Smaller notes
 
