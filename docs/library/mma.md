@@ -21,9 +21,20 @@ K=16 chunk is 32 bytes along a row, so a subtile row holds four chunks:
   rather than a step along the row. That is `SharedTile::mn_walk`, and every
   MN-major operand in the module is one.
 
-The leading-offset detail is what lets `mma_atb` cover a 128-wide MN in one
-instruction where `mma_ab` issues one per 64-wide band. A test pins it: a leading
-offset of 16 would read a `[64, 128]` operand as if MN stopped at 64.
+The leading-offset detail is what lets *every* MN-major walk cover a 128-wide MN
+in one instruction. A test pins it: a leading offset of 16 would read a
+`[64, 128]` operand as if MN stopped at 64.
+
+`mma_ab` used to be the exception, banding its `B` 64 wide with a 16-byte
+leading offset and taking the *band's* `N` as its shape — the one place in the
+module where `shape` was not the operands' logical product, and a foot-gun
+(#175) because passing the product silently overlapped the bands. Both
+descriptor spellings are right, but only one of them is stateable without a
+footnote, and it is also the faster one: a `[128, 64] × [64, 128]` product costs
+**48.2 ticks per `M128_N64_K16`-equivalent as two `N=64` bands and 32.1 as one
+`N=128` band** on a B200 (oxide-train#94) — a quarter-width MMA costs the tensor
+core what a half-width one costs. `B` is now bounded at two stacked subtiles,
+since one leading offset reaches exactly one of them.
 
 ## Walk and descriptor cannot disagree
 

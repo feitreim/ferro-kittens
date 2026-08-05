@@ -3281,8 +3281,10 @@ pub mod kernels {
         }
     }
 
-    /// `D = A·B` — `A` K-major, `B` MN-major. The banding walk: one `N = 64`
-    /// instruction per stacked `B` subtile, into `tmem + 64 * subtile`.
+    /// `D = A·B` — `A` K-major, `B` MN-major, `B` reaching its second stacked
+    /// subtile through the descriptor's leading offset, so one instruction per
+    /// K chunk covers the whole `[M, N]`. This case is what says the one-band
+    /// walk is the same product the two-band one gave.
     #[kernel]
     pub unsafe fn walk_ab(
         a_map: *const TmaDescriptor,
@@ -3292,7 +3294,7 @@ pub mod kernels {
         unsafe {
             let (a, b, tmem, tma, done) = walk_stage::<ROWS, DEPTH, DEPTH, COLUMNS>(a_map, b_map);
             if thread::threadIdx_x() == 0 {
-                mm_ab(tmem, a, b, MmaShape::M128_N64);
+                mm_ab(tmem, a, b, MmaShape::M128_N128);
                 mma::commit(done);
             }
             walk_drain(tmem, tma, done, &mut out);

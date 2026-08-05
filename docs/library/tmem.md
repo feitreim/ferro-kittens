@@ -165,9 +165,12 @@ in another order fails there rather than in a GEMM's tolerance.
 
 `.x8` returns 32 f32 a thread where `.x1` returns 4 — same bytes, same map, one
 eighth of the issues, and one eighth of the *waits*, which is the larger half of
-it. `fragment` waits after each of its two loads because the registers it waits
-on are its return value, so the `.x1` drain never has more than one load in
-flight and pays the full TMEM latency per four values.
+it. `fragment` used to wait after each of its two loads, so the `.x1` path never
+had more than one load in flight and paid the full TMEM latency per four values;
+it now issues both and waits once, which is the batching below at the two issues
+the `.x1` pair already is. That costs nothing in liveness — both arrivals are the
+call's return value either way — and it halves the waits of every `.x1` band,
+`TmemTile::tile` included.
 
 What it costs is liveness: 32 f32 arrive at once and all four blocks are live
 until the caller consumes them, where the `.x1` path lets the compiler fuse a

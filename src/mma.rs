@@ -101,6 +101,11 @@ const fn k_major_offset(k: usize, subtile_bytes: usize) -> usize {
 }
 
 /// Byte offset of K chunk `k` in a `transpose_b` operand (K along rows).
+///
+/// The walks reach it through [`SharedTile::mn_walk`]'s own chunk step now that
+/// `mma_ab` no longer bands its `B` by hand; this stays as the independent
+/// statement of the geometry that the tests hold that step against.
+#[cfg(test)]
 const fn k_rows_offset(k: usize, atom_bytes: usize) -> usize {
     k * K_CHUNK * atom_bytes
 }
@@ -167,24 +172,28 @@ pub unsafe fn mma_abt<
 }
 
 /// `D (+)= A·B` — a flash forward's `O = P·V` walk. `A` is K-major `[rows, K]`;
-/// `B` supplies K along its rows, so this sets `transpose_b`.
+/// `B` supplies K along its rows, so its walk carries the transpose bit.
 ///
-/// One 64-wide output band per `B` subtile, accumulated into
-/// `tmem + subtile * 64`; `accumulate` false starts every band fresh.
+/// **One instruction per K chunk, covering the whole `[M, N]`** — `B` goes
+/// through [`SharedTile::mn_walk`], which reaches MN columns 64..128 through
+/// the descriptor's *leading* offset rather than a step along the row, exactly
+/// as [`mma_atb`] reaches them. `shape` is therefore the operands' logical
+/// product, the same as every other walk in this module.
 ///
-/// **`shape`'s `N` is the band's width and not the tile's** — 64 under a
-/// 128-byte swizzle atom and a 2-byte element, for every `B` this walk accepts.
-/// The `[M, N]` the operands describe is the *whole* accumulation, which this
-/// walk reaches in `B::SUBTILES` instructions rather than one; passing it here
-/// makes every band overlap the next by half and the last run `N / 2` columns
-/// past the accumulator. That is a wrong `D` and not a fault, since the columns
-/// are usually still inside the allocation ([#175]).
+/// It used to be the one exception: a band per stacked `B` subtile, `N = 64`
+/// each, with `shape` naming the *band* and an `M128_N128` silently making
+/// band 1 overwrite half of band 0 ([#175]). The two spellings of an MN-major
+/// operand are both right and the crate uses both, but only one of them is a
+/// shape the caller can state without a footnote, and it is also the faster
+/// one: measured on a B200 at `[128, 64] × [64, 128]`, **48.2 ticks per
+/// `M128_N64_K16`-equivalent for the two bands against 32.1 for the one**
+/// (oxide-train#94). A quarter-width MMA costs the tensor core what a
+/// half-width one costs.
 ///
-/// It is the one place in this module where the shape is not the operands'
-/// logical product, and the reason it is an argument at all is [#128].
+/// `N` is bounded at two stacked subtiles because one leading offset reaches
+/// exactly one of them; a wider `B` is a compile error rather than a wrong `D`.
 ///
 /// [#175]: https://github.com/feitreim/ferro-kittens/issues/175
-/// [#128]: https://github.com/feitreim/ferro-kittens/issues/128
 ///
 /// ```no_run
 /// # use kittens::mma::{MmaShape, mma_ab};
@@ -194,16 +203,16 @@ pub unsafe fn mma_abt<
 /// #     p: SharedTile<Bf16, 128, 64, Swizzle128B>,
 /// #     v: SharedTile<Bf16, 64, 128, Swizzle128B>,
 /// # ) { unsafe {
-/// // `[128, 128]` of accumulator, in two `M128_N64` bands.
-/// mma_ab(tmem, p, v, MmaShape::M128_N64, true);
+/// // `[128, 128]` of accumulator, in one instruction per K chunk.
+/// mma_ab(tmem, p, v, MmaShape::M128_N128, true);
 /// # } }
 /// ```
 ///
 /// # Safety
 ///
 /// - As [`mma_abt`].
-/// - `shape`'s `N` is `B::SUBTILE_COLS`, per the paragraph above.
-/// - `tmem` owns `64 * B::SUBTILES` fp32 columns.
+/// - `shape` is the `[M, N]` the two tiles describe, and `tmem` owns its `N`
+///   fp32 columns.
 #[inline(always)]
 pub unsafe fn mma_ab<E: MmaElement, const AR: usize, const K: usize, const N: usize, S: Swizzle>(
     tmem: u32,
@@ -213,26 +222,28 @@ pub unsafe fn mma_ab<E: MmaElement, const AR: usize, const K: usize, const N: us
     accumulate: bool,
 ) {
     const { assert_two_byte_element::<E>() };
-    let instruction = descriptor::<E>(shape, false, true);
+    const {
+        assert!(
+            SharedTile::<E, K, N, S>::SUBTILES <= 2,
+            "an MN-major walk reaches one stacked subtile through the leading offset, so `B` is at most two of them wide"
+        )
+    };
+    let b = b.mn_walk();
+    let instruction = descriptor::<E>(shape, false, b.transposed());
     unsafe {
-        let mut band = 0;
-        while band < SharedTile::<E, K, N, S>::SUBTILES {
-            let band_base = band * SharedTile::<E, K, N, S>::SUBTILE_BYTES;
-            let mut chunk = 0;
-            while chunk < K / K_CHUNK {
-                E::mma(
-                    tmem + (band as u32) * 64,
-                    a.operand_descriptor(k_major_offset(
-                        chunk,
-                        SharedTile::<E, AR, K, S>::SUBTILE_BYTES,
-                    )),
-                    b.operand_descriptor(band_base + k_rows_offset(chunk, S::ATOM_BYTES)),
-                    instruction,
-                    accumulate || chunk > 0,
-                );
-                chunk += 1;
-            }
-            band += 1;
+        let mut chunk = 0;
+        while chunk < K / K_CHUNK {
+            E::mma(
+                tmem,
+                a.operand_descriptor(k_major_offset(
+                    chunk,
+                    SharedTile::<E, AR, K, S>::SUBTILE_BYTES,
+                )),
+                b.chunk_descriptor(chunk),
+                instruction,
+                accumulate || chunk > 0,
+            );
+            chunk += 1;
         }
     }
 }
@@ -410,13 +421,11 @@ pub unsafe fn mm_abt<
     unsafe { mma_abt(tmem, a, b, shape, false) }
 }
 
-/// `D = A·B` — [`mma_ab`] starting every output band fresh. See [`mm_abt`],
-/// and [`mma_ab`] for why `shape`'s `N` is the band's width rather than the
-/// tile's.
+/// `D = A·B` — [`mma_ab`] starting the accumulator fresh. See [`mm_abt`].
 ///
 /// # Safety
 ///
-/// As [`mma_ab`], including the band-width clause on `shape`.
+/// As [`mma_ab`].
 #[inline(always)]
 pub unsafe fn mm_ab<E: MmaElement, const AR: usize, const K: usize, const N: usize, S: Swizzle>(
     tmem: u32,
@@ -572,6 +581,25 @@ mod tests {
         }
     }
 
+    /// [`mma_ab`]'s `B` walk is the `mn_walk`, and what makes the one-band
+    /// form the *same sum* as the two-band one it replaced is that its chunk
+    /// addresses are unchanged: the second 64 columns move from a second
+    /// instruction's base address into the first's leading offset, and the K
+    /// step stays [`k_rows_offset`].
+    #[test]
+    fn the_wide_ab_walk_keeps_the_banded_walks_chunk_addresses() {
+        type Operand = SharedTile<Bf16, 64, 128, Swizzle128B>;
+        let base = 0x4000 as *mut u8;
+        let tile = unsafe { Operand::from_raw(base) };
+        let address = |descriptor: u64| (descriptor & 0x3fff) << 4;
+        for chunk in 0..4 {
+            assert_eq!(
+                address(tile.mn_walk().chunk_descriptor(chunk)),
+                address(tile.operand_descriptor(k_rows_offset(chunk, 128))),
+            );
+        }
+    }
+
     /// The transposed walks read their bits off [`OperandWalk::transposed`],
     /// so what this pins is that the four operand orders really are four
     /// distinct descriptors and not two spelled twice.
@@ -592,9 +620,9 @@ mod tests {
 
     /// An MN-major operand reaches its second stacked subtile through the
     /// descriptor's *leading* offset, never through the chunk step — which is
-    /// what lets [`mma_atb`] cover a 128-wide MN in one instruction where
-    /// [`mma_ab`] issues one per 64-wide band. A leading offset of 16 here
-    /// would read a `[64, 128]` operand as if MN stopped at 64.
+    /// what lets [`mma_atb`] and [`mma_ab`] cover a 128-wide MN in one
+    /// instruction apiece. A leading offset of 16 here would read a
+    /// `[64, 128]` operand as if MN stopped at 64.
     #[test]
     fn an_mn_major_walk_reaches_the_second_subtile_by_leading_offset() {
         type Operand = SharedTile<Bf16, 64, 128, Swizzle128B>;
