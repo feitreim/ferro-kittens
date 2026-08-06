@@ -323,13 +323,17 @@ impl<const LDTM_X8: bool, const STMATRIX_X4: bool> Drain<LDTM_X8, STMATRIX_X4> {
         };
         unsafe {
             let chunks = staging.chunk_writer();
-            let origin = BaseLdtm::WARP_ROWS as u32 * band;
+            // Both origins the band index moves, formed once: a kernel that
+            // wrote `32 * warp_id` into its row base had one loop-invariant
+            // value here and the walk is not the place to grow a second.
+            let lanes = BaseLdtm::WARP_ROWS as u32 * band;
+            let rows = row + lanes;
             let mut at = 0u32;
             while at < N as u32 {
                 let pass: RegTile<R, C, BaseLdtm> = if LDTM_X8 {
-                    accumulator.tile_x8(origin, at)
+                    accumulator.tile_x8(lanes, at)
                 } else {
-                    accumulator.tile(origin, at)
+                    accumulator.tile(lanes, at)
                 };
                 if STMATRIX_X4 {
                     store_tile_x4(chunks, 0, 0, lane, pass);
@@ -337,7 +341,7 @@ impl<const LDTM_X8: bool, const STMATRIX_X4: bool> Drain<LDTM_X8, STMATRIX_X4> {
                     store_tile(chunks, 0, 0, lane, pass);
                 }
                 // The warp's 32 threads carry the whole tile: `staging` is theirs.
-                store_shared_rows::<E, R, C, S, 32>(dest, row + origin, column + at, lane, staging);
+                store_shared_rows::<E, R, C, S, 32>(dest, rows, column + at, lane, staging);
                 Warp::converge();
                 at += C as u32;
             }

@@ -822,14 +822,18 @@ impl<const STAGES: usize> Tile<STAGES> {
     #[inline(always)]
     unsafe fn drain_staged<const WIDE: bool, const X4: bool>(&self, item: u32, stage: u32) {
         unsafe {
+            let tile = self.stage_tile();
+            let accumulator = self.accumulator(stage);
             let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, self.group);
+            let row_base = 2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank;
+            let column_base = BLOCK_N as u32 * tile_n;
             epilogue::Drain::<WIDE, X4>::staged(
-                self.accumulator(stage),
+                accumulator,
                 self.warp_id,
-                self.stage_tile(),
+                tile,
                 self.c,
-                2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank,
-                BLOCK_N as u32 * tile_n,
+                row_base,
+                column_base,
                 self.lane,
             );
         }
