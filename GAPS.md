@@ -653,11 +653,10 @@ square is closed at **cta_group::1 for the typed walks and cta_group::2 for the
 value walk**, and the other two quadrants do not exist: there is no `mma_abt_cg2`
 and no single-CTA `mma_walk`. No kernel has wanted either — `flash_forward`
 takes `mm_abt`/`mm_ab` and both GEMMs take `mma_walk_cg2` — so the hole is
-symmetrical on paper and unmotivated in practice. And the accumulator is a bare
-`u32` in all nine entry points, where `TmemTile<R, C>` exists and knows the
-shape the caller is passing separately as an `MmaShape`; that one *is* filed, as
-**#128**, because it is what `examples/src/gemm.rs`'s hand-written
-`pair_shape(block_n) -> MmaShape` lookup is standing in for.
+symmetrical on paper and unmotivated in practice. The other observation — that
+the accumulator was a bare `u32` in all nine entry points where `TmemTile<R, C>`
+existed and knew the shape being passed separately — was filed as **#128** and
+has landed; every walk takes the tile and derives its own shape.
 
 ### 3.4 Tile-shape utilities
 
@@ -992,14 +991,22 @@ ordered by size. The first of them has since closed.
 
 ### 7.5 Types that exist and are not used by the operation that needs them
 
-`TmemTile<R, C>` knows an accumulator's shape; all nine MMA entry points take a
-bare `u32` and a separately-passed `MmaShape`, which is what `gemm`'s
-hand-written `pair_shape(block_n) -> MmaShape` lookup stands in for.
-`tmem::alloc_block` takes a runtime `columns: u32` and checks nothing, so
-`flash_forward` asked for an illegal 192 columns from the day it was written and
-nothing in the type system was in a position to notice — the kernel now carries
-the ISA rule itself. Both are **#128**, and both are const-parameter work rather
-than design work.
+**Landed with #128.** All nine MMA entry points took a bare `u32` accumulator
+and a separately-passed `MmaShape` where `TmemTile<R, C>` already knew the
+shape, and `tmem::alloc_block` took a runtime `columns: u32` and checked
+nothing — which is why `flash_forward` asked for an illegal 192 columns from the
+day it was written with nothing in the type system in a position to notice. The
+allocators take `const COLUMNS: usize` and assert `tcgen05.alloc`'s
+power-of-two-in-`[32, 512]` rule at codegen; the walks take the tile and derive
+the shape through `mma::shape` / `mma::pair_shape`, which reject an `[M, N]` the
+ISA has no instruction for rather than rounding it. The hand-written
+`pair_shape(block_n) -> MmaShape` lookups in `examples/src/gemm.rs`,
+`examples/src/gemm_sol.rs` and `experiments/src/gemm.rs` are gone with it.
+
+Still open there: the accumulator has no element type, so fp32 accumulate stays
+hardcoded in `mma::descriptor`. #128 left that out deliberately — fp16
+accumulate is a `.kind::f16`-only mode with no caller — and the point of the
+change is that the type is now in a position to carry one.
 
 ---
 

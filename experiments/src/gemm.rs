@@ -323,7 +323,7 @@ use std::error::Error;
 use kittens::epilogue::{StoreRing, Warp};
 use kittens::global::{GlobalRows, store_rows, store_shared_rows};
 use kittens::ldst::{store_tile, store_tile_x4};
-use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
+use kittens::mma::{commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, ClcQueue, Job};
 use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, RegTile};
@@ -611,20 +611,6 @@ const fn shared_cursor(block_n: usize, block_k: usize, stages: usize) -> SharedP
 /// [`shared_cursor`]'s total — see there for why it is not [`shared`]'s.
 pub const fn shared_plan(block_n: usize, block_k: usize, stages: usize) -> usize {
     shared_cursor(block_n, block_k, stages).bytes()
-}
-
-/// The UMMA shape a pair tile of `block_n` columns issues.
-///
-/// `M` is 256 in both — the pair's rows, and the widest `M` tcgen05 has, which
-/// is why the tile sweep can only move `N`. A rung whose columns name no shape
-/// fails at codegen rather than issuing the wrong descriptor into the right
-/// accumulator, which does not fault and computes wrong numbers.
-const fn pair_shape(block_n: usize) -> MmaShape {
-    match block_n {
-        128 => MmaShape::M256_N128,
-        256 => MmaShape::M256_N256,
-        _ => panic!("no cta_group::2 MmaShape covers this pair tile's columns"),
-    }
 }
 
 /// Dynamic shared memory a **register-drain** launch must provide — `lcf`,
@@ -1250,12 +1236,12 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAG
     #[inline(always)]
     unsafe fn multiply<const MMA: bool>(&self) {
         unsafe {
-            // `MmaShape` is a re-export of `Tcgen05MmaShape` and `mma_walk_cg2`
-            // takes the shape as a value, so widening the pair tile needs
-            // nothing from `src/mma.rs`. In a `const` block so a rung whose
-            // columns name no shape is a codegen error rather than a `panic!`
-            // lowered into device code.
-            let shape = const { pair_shape(BLOCK_N) };
+            // The shape is `kittens::mma::pair_shape` of `Accumulator`: `M` is
+            // 256 in every rung — the pair's rows, and the widest `M` tcgen05
+            // has, which is why this sweep can only move `N` — and a rung whose
+            // columns name no shape is a codegen error rather than the wrong
+            // descriptor issued into the right accumulator, which does not
+            // fault and computes wrong numbers.
             let mut k = 0u32;
             while k < self.k_blocks {
                 self.load.wait(k);
@@ -1270,11 +1256,10 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAG
                     let (a, b) = (self.a_ring.tile(k), self.b_ring.tile(k));
                     let mut atom = 0usize;
                     while atom < ATile::<BLOCK_K>::SUBTILES {
-                        mma_walk_cg2::<Bf16, ATOM_CHUNKS>(
-                            self.accumulator.raw(),
+                        mma_walk_cg2::<Bf16, ATOM_CHUNKS, _, _>(
+                            self.accumulator,
                             Atom::<BLOCK_M>::from_raw(a.subtile(atom)).k_walk(),
                             Atom::<HALF_N>::from_raw(b.subtile(atom)).k_walk(),
-                            shape,
                             k > 0 || atom > 0,
                         );
                         atom += 1;
@@ -2763,9 +2748,8 @@ pub mod kernels {
                 done: shared.done,
                 a_map,
                 b_map,
-                accumulator: Accumulator::<BLOCK_N>::from_raw(alloc_cluster(
+                accumulator: Accumulator::<BLOCK_N>::from_raw(alloc_cluster::<BLOCK_N>(
                     shared.tmem_slot,
-                    BLOCK_N as u32,
                 )),
                 c: GlobalRows::<Bf16>::from_slice(c, ldc as usize),
                 tiles_m,
@@ -2902,7 +2886,7 @@ pub mod kernels {
         unsafe {
             tcgen05_fence_before_thread_sync();
             cluster::cluster_sync();
-            dealloc_cluster(tile.accumulator.raw(), BLOCK_N as u32);
+            dealloc_cluster::<BLOCK_N>(tile.accumulator.raw());
         }
     }
 

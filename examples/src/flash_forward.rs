@@ -37,7 +37,7 @@ use std::error::Error;
 
 use kittens::global::{GlobalRows, store_rows};
 use kittens::ldst::store_tile;
-use kittens::mma::{MmaShape, commit, mm_ab, mm_abt};
+use kittens::mma::{commit, mm_ab, mm_abt};
 use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, RegTile, RegVec, online_rescale};
 use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, Swizzle128B, publish_to_async_proxy};
@@ -71,13 +71,15 @@ type Rows = RegVec<32, BaseLdtm>;
 /// beside them. `KEYS + HEAD` is 192 and `tcgen05.alloc` takes a power of two
 /// in `[32, 512]`; rounding up is free, since the driver charges a CTA the SM's
 /// whole tensor memory at 32 columns exactly as at 512.
-const TMEM_COLUMNS: u32 = 256;
+///
+/// The power-of-two half of that used to be asserted here, because the count
+/// was an argument to an instruction and no type could see it. `alloc_block`
+/// takes it as a `const` parameter now (#128) and carries its own rule; what is
+/// left here is the half that is this kernel's, that the two segments fit.
+const TMEM_COLUMNS: usize = 256;
 const _: () = assert!(
-    TMEM_COLUMNS as usize >= KEYS + HEAD
-        && TMEM_COLUMNS.is_power_of_two()
-        && TMEM_COLUMNS >= 32
-        && TMEM_COLUMNS <= 512,
-    "tcgen05.alloc takes a power of two in [32, 512] that covers the scores and the output"
+    TMEM_COLUMNS >= KEYS + HEAD,
+    "the allocation must cover the scores and the output beside them"
 );
 
 struct Shared {
@@ -171,7 +173,7 @@ pub mod kernels {
                 publish_to_async_proxy();
             }
             thread::sync_threads();
-            let tmem = alloc_block(tmem_slot, TMEM_COLUMNS);
+            let tmem = alloc_block::<TMEM_COLUMNS>(tmem_slot);
             let scores = Scores::from_raw(tmem);
             let output: Output = scores.split_columns();
 
@@ -179,15 +181,12 @@ pub mod kernels {
                 q_loaded.expect_tx(q.tma_load(q_map, query_base as i32, head, q_loaded));
             }
 
-            let score_shape = MmaShape::M128_N64;
-            // The output is `[QUERIES, HEAD]` and `mm_ab` now reaches all of
-            // it in one instruction per K chunk, so the shape is the operands'
-            // own. It used to be the *band's* — `M128_N128` had band 1
+            // Neither MMA names a shape. `mm_abt` derives `M128_N64` from
+            // `Scores` and `mm_ab` derives `M128_N128` from `Output` (#128).
+            // The output's used to be the *band's* — `M128_N128` had band 1
             // overwrite half of band 0 (kittens #175) — and this kernel had it
             // wrong from the day it was written, which having no reference `O`
-            // is why (#85).
-            let output_shape = MmaShape::M128_N128;
-
+            // is why (#85). A shape read off the accumulator cannot be that.
             let mut running_max = Rows::splat(f32::NEG_INFINITY);
             let mut running_sum = Rows::splat(0.0);
             let mut out_acc = OutBand::zero();
@@ -213,7 +212,7 @@ pub mod kernels {
                 thread::sync_threads();
 
                 if leader {
-                    mm_abt(scores.raw(), q, k_ring.tile(block), score_shape);
+                    mm_abt(scores, q, k_ring.tile(block));
                     commit(scored);
                 }
                 scored.wait(block & 1);
@@ -236,7 +235,7 @@ pub mod kernels {
                 thread::sync_threads();
 
                 if leader {
-                    mm_ab(output.raw(), p, v_ring.tile(block), output_shape);
+                    mm_ab(output, p, v_ring.tile(block));
                     commit(accumulated);
                 }
                 accumulated.wait(block & 1);
@@ -271,7 +270,7 @@ pub mod kernels {
             // memory is: a kernel that exits holding them is a
             // `CUDA_ERROR_TENSOR_MEMORY_LEAK`, and the next CTA scheduled onto
             // the SM is the one that pays.
-            dealloc_block(tmem, TMEM_COLUMNS);
+            dealloc_block::<TMEM_COLUMNS>(tmem);
             if leader {
                 load.inval_all();
                 free.inval_all();

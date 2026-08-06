@@ -5487,15 +5487,16 @@ now made that promotion:
 - **The MMA layer.** `mma_abt`, `mma_ab` and `mma_walk_cg2` covered every
   multiply in four kernels, in the layouts they wanted, with no gaps. Each
   builds its own instruction descriptor from the walk it issues and the
-  operand element, so a kernel names only its accumulator band's `MmaShape`
-  and cannot pair a walk with transpose bits that disagree (#30). #12 has
-  since closed the operand-order square (`mma_atb`, `mma_atbt`) and given
-  every walk an `mm_*` twin that starts the accumulator fresh, which is the
-  form both of `flash_forward`'s MMAs now take. The one field still stated by
-  a caller is `mma_walk_cg2`'s element (`mma_walk_cg2::<Bf16, CHUNKS>`), and
-  it stays that way: since #12 the element routes tcgen05's `KIND` as well as
-  the operand format, so a walk that carried its element back would stop being
-  layout-only.
+  operand element, so a kernel cannot pair a walk with transpose bits that
+  disagree (#30). #12 has since closed the operand-order square (`mma_atb`,
+  `mma_atbt`) and given every walk an `mm_*` twin that starts the accumulator
+  fresh, which is the form both of `flash_forward`'s MMAs now take, and #128
+  took the `MmaShape` out of the call too: the accumulator is a `TmemTile` and
+  the shape is derived from its `[M, N]`. The one field still stated by a
+  caller is `mma_walk_cg2`'s element (`mma_walk_cg2::<Bf16, CHUNKS, _, _>`),
+  and it stays that way: since #12 the element routes tcgen05's `KIND` as well
+  as the operand format, so a walk that carried its element back would stop
+  being layout-only.
 - **TMEM segment carving.** Flash splits one allocation into its `[128, 64]`
   scores and `[128, 128]` output with `TmemTile::split_columns`, so no kernel
   here adds a column offset to a bare TMEM address (#28).

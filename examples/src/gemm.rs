@@ -37,7 +37,7 @@ use std::error::Error;
 
 use kittens::global::{GlobalRows, store_shared_rows};
 use kittens::ldst::store_tile_x4;
-use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
+use kittens::mma::{commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, Job};
 use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, RegTile};
@@ -74,14 +74,6 @@ type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
 
 const WARPS: usize = THREADS as usize / 32;
 type StageRun = SharedTileRing<Bf16, 32, STAGE_N, Swizzle128B, WARPS>;
-
-const fn pair_shape(block_n: usize) -> MmaShape {
-    match block_n {
-        128 => MmaShape::M256_N128,
-        256 => MmaShape::M256_N256,
-        _ => panic!("no cta_group::2 MmaShape covers this pair tile's columns"),
-    }
-}
 
 struct Shared {
     a_ring: ARing,
@@ -202,6 +194,12 @@ impl Tile {
         }
     }
 
+    /// The instruction is `M256_N256`, and this file no longer says so: the
+    /// walk reads it off [`Accumulator`] through [`kittens::mma::pair_shape`],
+    /// which is where the `const fn` from a pair tile's columns to a shape
+    /// belongs (#128). A kernel-side one had `panic!` for its default arm and
+    /// was the only thing checking a `[BLOCK_M, BLOCK_N]` against the ISA.
+    ///
     /// # Safety
     /// One thread of the leader rank, with the accumulator's previous contents
     /// already read: only the first chunk of the first stage of an item starts
@@ -209,18 +207,16 @@ impl Tile {
     #[inline(always)]
     unsafe fn multiply(&self) {
         unsafe {
-            let shape = const { pair_shape(BLOCK_N) };
             let mut k = 0u32;
             while k < self.k_blocks {
                 self.load.wait(k);
                 let (a, b) = (self.a_ring.tile(k), self.b_ring.tile(k));
                 let mut atom = 0usize;
                 while atom < ATile::SUBTILES {
-                    mma_walk_cg2::<Bf16, ATOM_CHUNKS>(
-                        self.accumulator.raw(),
+                    mma_walk_cg2::<Bf16, ATOM_CHUNKS, _, _>(
+                        self.accumulator,
                         Atom::<BLOCK_M>::from_raw(a.subtile(atom)).k_walk(),
                         Atom::<HALF_N>::from_raw(b.subtile(atom)).k_walk(),
-                        shape,
                         k > 0 || atom > 0,
                     );
                     atom += 1;
@@ -352,7 +348,7 @@ pub mod kernels {
                 done: shared.done,
                 a_map,
                 b_map,
-                accumulator: Accumulator::from_raw(alloc_cluster(shared.tmem_slot, BLOCK_N as u32)),
+                accumulator: Accumulator::from_raw(alloc_cluster::<BLOCK_N>(shared.tmem_slot)),
                 stage: run.tile(warp_id),
                 c: GlobalRows::<Bf16>::from_slice(c, ldc as usize),
                 tiles_m,
@@ -377,7 +373,7 @@ pub mod kernels {
             // a capped grid can leave having allocated and never looped.
             tcgen05_fence_before_thread_sync();
             cluster::cluster_sync();
-            dealloc_cluster(tile.accumulator.raw(), BLOCK_N as u32);
+            dealloc_cluster::<BLOCK_N>(tile.accumulator.raw());
         }
     }
 

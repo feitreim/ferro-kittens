@@ -389,7 +389,7 @@ use std::error::Error;
 
 use kittens::global::{GlobalRows, store_rows, store_shared_rows};
 use kittens::ldst::{store_tile, store_tile_x4};
-use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
+use kittens::mma::{commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, ClcQueue, Job};
 use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, RegTile};
@@ -421,7 +421,7 @@ const ACCUM_STAGES: u32 = 2;
 /// Columns [`alloc_cluster`] is asked for — both stages at once, because a CTA
 /// allocates tensor memory exactly once and a stage is a column offset into
 /// that allocation rather than an allocation of its own.
-const ACCUM_COLUMNS: u32 = ACCUM_STAGES * BLOCK_N as u32;
+const ACCUM_COLUMNS: usize = ACCUM_STAGES as usize * BLOCK_N;
 
 /// Warps that run the epilogue: 0..[`EPILOGUE_WARPS`], one per 32 accumulator
 /// rows, which is the `[32, N]` band [`kittens::tmem::TmemTile::tile`] drains.
@@ -739,11 +739,10 @@ impl<const STAGES: usize> Tile<STAGES> {
             let mut k = 0u32;
             while k < self.k_blocks {
                 self.load.wait(k);
-                mma_walk_cg2::<Bf16, CHUNKS>(
-                    accumulator.raw(),
+                mma_walk_cg2::<Bf16, CHUNKS, _, _>(
+                    accumulator,
                     self.a_ring.tile(k).k_walk(),
                     self.b_ring.tile(k).k_walk(),
-                    MmaShape::M256_N256,
                     k > 0,
                 );
                 commit_multicast_cg2(self.free.sem(k), PAIR);
@@ -1161,7 +1160,9 @@ pub mod kernels {
                 // Both stages in one allocation. The allocator's unit is the
                 // CTA, so a second stage is a column offset and never a second
                 // `tcgen05.alloc`.
-                accumulator: Accumulator::from_raw(alloc_cluster(shared.tmem_slot, ACCUM_COLUMNS)),
+                accumulator: Accumulator::from_raw(alloc_cluster::<ACCUM_COLUMNS>(
+                    shared.tmem_slot,
+                )),
                 c: GlobalRows::<Bf16>::from_slice(c, ldc as usize),
                 tiles_m,
                 tiles_n,
@@ -1193,7 +1194,7 @@ pub mod kernels {
         unsafe {
             tcgen05_fence_before_thread_sync();
             cluster::cluster_sync();
-            dealloc_cluster(tile.accumulator.raw(), ACCUM_COLUMNS);
+            dealloc_cluster::<ACCUM_COLUMNS>(tile.accumulator.raw());
         }
     }
 

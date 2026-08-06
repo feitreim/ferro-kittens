@@ -50,6 +50,27 @@ might be a half-share was the leading hypothesis for why `gemm` and
 `flash_forward` differ in residency, and it is refuted. The pair's two CTAs are
 on two different SMs in any case.
 
+## The column count is a `const` parameter
+
+`tcgen05.alloc` takes a power of two in `[32, 512]`, and until #128 nothing was
+in a position to check it: the count was a runtime `u32` argument to
+`alloc_block`, which passed it straight to an instruction operand. `flash_forward`
+asked for 192 — `KEYS + HEAD` — from the day it was written, and no launcher, no
+type and no `const` assertion ever saw it.
+
+`alloc_block::<COLUMNS>` / `alloc_cluster::<COLUMNS>` carry the rule in a
+post-monomorphization `const { assert!(..) }`, which fires at *codegen* and so is
+caught by tier 2 rather than by a device run. `dealloc_*` takes the same
+parameter, which makes the pair that has to agree type-checked instead of
+remembered.
+
+No runtime spelling was kept. The one caller in the tree that genuinely has no
+constant is `device-tests`' `tmem_ladder_runtime`, whose entire purpose is a
+column count `ptxas` cannot record; it writes `alloc_block`'s body out by hand,
+exactly as `tmem_ladder_none` writes it with the allocator removed. An escape
+hatch on the library entry point would be a hole in the assert for the sake of a
+probe whose point is to be illegible to it.
+
 ## Do not use the occupancy query to predict this
 
 `cuOccupancyMaxActiveBlocksPerMultiprocessor` returns **1** for any kernel whose
@@ -132,7 +153,7 @@ Retiring a `cta_group::2` accumulator's reads is
 ```rust,ignore
 tcgen05_fence_before_thread_sync();
 cluster::cluster_sync();
-dealloc_cluster(accumulator.raw(), COLUMNS);
+dealloc_cluster::<COLUMNS>(accumulator.raw());
 ```
 
 and welding the first two into a `kittens` entry point was rejected. The fence is

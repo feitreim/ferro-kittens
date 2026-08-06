@@ -45,14 +45,24 @@ so every walk builds its own descriptor from `MmaShape` plus
 
 That pairing used to be prose at the call sites, and getting it wrong does not
 fault: the MMA reads the operands under the wrong interpretation and fills the
-accumulator with wrong numbers. `shape` is the one descriptor field no walk can
-know, so it stays the caller's argument.
+accumulator with wrong numbers.
 
-The accumulator type is pinned to fp32 because a walk names TMEM by a bare `u32`
-and has no accumulator type to read one off. fp16 accumulation is a
-`.kind::f16`-only mode no kernel here uses, and threading a typed accumulator
-through belongs with whatever gives the walks a `tmem::TmemTile` instead of an
-address.
+`shape` used to be the one descriptor field no walk could know, and so the
+caller's argument. It is not, since #128: the accumulator is a
+`tmem::TmemTile<M, N>` and `mma::shape(M, N)` — `mma::pair_shape` under
+`cta_group::2`, where each rank holds 128 rows of the `M256` class — reads the
+instruction off it. The mapping **rejects** rather than rounds. The shape set is
+the ISA's, `M ∈ {32, 64, 128}` by `N ∈ {64, 128, 256}`, and an accumulator
+outside it is a codegen error; rounding a `[128, 192]` up to `M128_N256` would
+write 64 columns of whatever segment sits after it, which is #175's failure with
+a different origin. Three kernels carried their own `const fn` from a tile width
+to a shape, each with a `panic!` for its default arm, and all three are gone.
+
+The accumulator type is pinned to fp32 because `TmemTile` is an fp32 segment and
+carries no element to read one off. fp16 accumulation is a `.kind::f16`-only mode
+no kernel here uses, and threading a typed accumulator through belongs with
+whatever gives `TmemTile` an element — #128 gave the walks the tile and
+deliberately stopped there.
 
 ## `mm_*` versus `mma_*(.., false)`
 
@@ -74,7 +84,10 @@ and splitting it into two typed arms would duplicate the chain for no gain.
 
 The element is the one field the cluster walk cannot take from its operands: an
 `OperandWalk` has already erased it, so `E` is named by the caller
-(`mma_walk_cg2::<Bf16, CHUNKS>`) rather than derived as in `mma_abt`.
+(`mma_walk_cg2::<Bf16, CHUNKS, _, _>`) rather than derived as in `mma_abt`. The
+two `_` are the accumulator's `M` and `N`, which *are* derived — a const
+parameter cannot be elided from a turbofish that names any other, and writing
+them out would be the caller restating what the tile already says.
 
 It stays that way now that `E` routes the *instruction* as well as the operand
 format — `MmaElement::mma` selects tcgen05's `KIND` from the element. A walk that

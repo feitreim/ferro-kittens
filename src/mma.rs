@@ -21,21 +21,27 @@
 //! which also routes tcgen05's `KIND`; the chunk geometry is still 2-byte-only
 //! and asserted as such at every walk that depends on it.
 //!
+//! **The accumulator is a [`TmemTile`], not an address, and its `[M, N]` is the
+//! [`MmaShape`].** No walk takes a shape: [`shape`] reads it off the tile and
+//! rejects at codegen where the ISA has none, which is what a kernel-side
+//! lookup from a tile width to a shape used to do by hand (#128).
+//!
 //! A K loop, published to its consumers once:
 //!
 //! ```no_run
-//! # use kittens::mma::{MmaShape, commit, mma_abt};
+//! # use kittens::mma::{commit, mma_abt};
 //! # use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
+//! # use kittens::tmem::TmemTile;
 //! # use kittens::Semaphore;
 //! # unsafe fn demo(
-//! #     accumulator: u32,
+//! #     accumulator: TmemTile<128, 64>,
 //! #     a: SharedTile<Bf16, 128, 64, Swizzle128B>,
 //! #     b_ring: SharedTileRing<Bf16, 64, 64, Swizzle128B, 3>,
 //! #     done: Semaphore,
 //! # ) { unsafe {
 //! let mut block = 0u32;
 //! while block < 8 {
-//!     mma_abt(accumulator, a, b_ring.tile(block % 3), MmaShape::M128_N64, block > 0);
+//!     mma_abt(accumulator, a, b_ring.tile(block % 3), block > 0);
 //!     block += 1;
 //! }
 //! commit(done);
@@ -52,10 +58,11 @@ use cuda_device::tcgen05::{
 
 use crate::shared::{MmaElement, OperandWalk, SharedTile, Swizzle};
 use crate::sync::Semaphore;
+use crate::tmem::TmemTile;
 
 /// The `M`×`N` an MMA instruction covers — the accumulator band the caller
-/// allocated and, under `cta_group::2`, the pair's shared `M256` class. The one
-/// descriptor field no walk can derive from its operands.
+/// allocated and, under `cta_group::2`, the pair's shared `M256` class. Derived
+/// from the accumulator by [`shape`] and [`pair_shape`]; a walk never takes one.
 pub use cuda_device::tcgen05::Tcgen05MmaShape as MmaShape;
 
 /// K elements per chained-MMA chunk (one 16-bit core-matrix step).
@@ -76,12 +83,54 @@ const fn assert_two_byte_element<E: MmaElement>() {
     );
 }
 
-/// The instruction descriptor for a walk that reads its operands with the given
-/// transpose configuration: everything the walk and its element already fix,
-/// leaving `shape` as the caller's one degree of freedom.
+/// The [`MmaShape`] a `cta_group::1` accumulator of `[M, N]` fp32 names.
 ///
-/// The accumulator stays fp32 because a walk names TMEM by a bare `u32` and has
-/// no accumulator type to read one off.
+/// The set is the ISA's — `M` is 32, 64 or 128 and `N` is 64, 128 or 256 — and
+/// nothing rounds. A shape that is not the accumulator's does not fault; it
+/// writes the wrong columns and returns a wrong `D` ([#175]), so an `[M, N]`
+/// with no instruction is a codegen error.
+///
+/// [#175]: https://github.com/feitreim/ferro-kittens/issues/175
+pub const fn shape(m: usize, n: usize) -> MmaShape {
+    match (m, n) {
+        (32, 64) => MmaShape::M32_N64,
+        (32, 128) => MmaShape::M32_N128,
+        (32, 256) => MmaShape::M32_N256,
+        (64, 64) => MmaShape::M64_N64,
+        (64, 128) => MmaShape::M64_N128,
+        (64, 256) => MmaShape::M64_N256,
+        (128, 64) => MmaShape::M128_N64,
+        (128, 128) => MmaShape::M128_N128,
+        (128, 256) => MmaShape::M128_N256,
+        _ => panic!(
+            "no tcgen05 MMA shape covers this accumulator: M is 32, 64 or 128, N is 64, 128 or 256"
+        ),
+    }
+}
+
+/// [`shape`]'s `cta_group::2` twin, taking **one rank's** `[M, N]`.
+///
+/// The pair accumulates into the `M256` class and each CTA holds 128 of its
+/// lanes, so a `TmemTile<128, N>` is an `M256_N{N}` instruction and every other
+/// `M` is a codegen error — including the ones [`shape`] accepts, which is why
+/// this is a second lookup rather than `shape(2 * m, n)`.
+pub const fn pair_shape(m: usize, n: usize) -> MmaShape {
+    match (m, n) {
+        (128, 64) => MmaShape::M256_N64,
+        (128, 128) => MmaShape::M256_N128,
+        (128, 256) => MmaShape::M256_N256,
+        _ => panic!("a cta_group::2 accumulator is 128 rows a rank, and N is 64, 128 or 256"),
+    }
+}
+
+/// The instruction descriptor for a walk that reads its operands with the given
+/// transpose configuration: everything the walk, its element and its
+/// accumulator fix, in one word.
+///
+/// The accumulator stays fp32 because [`TmemTile`] is an fp32 segment and
+/// carries no element to read one off; fp16 accumulation is a `.kind::f16`-only
+/// mode no kernel here uses, and threading a typed accumulator through belongs
+/// with whatever gives [`TmemTile`] an element (#128 deliberately did not).
 #[inline(always)]
 fn descriptor<E: MmaElement>(shape: MmaShape, transpose_a: bool, transpose_b: bool) -> u32 {
     Tcgen05InstructionDescriptor::builder()
@@ -116,22 +165,25 @@ const fn k_rows_offset(k: usize, atom_bytes: usize) -> usize {
 /// One chained MMA per K=16 chunk, no transpose bits. `A` and `B` may stack
 /// different row counts; each walks its own subtile stride.
 ///
+/// The accumulator is `[AR, BR]` — the operands' own row counts — so the shape
+/// is [`shape`] of the tile and nothing states it twice.
+///
 /// ```no_run
-/// # use kittens::mma::{MmaShape, mma_abt};
+/// # use kittens::mma::mma_abt;
 /// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+/// # use kittens::tmem::TmemTile;
 /// # unsafe fn demo(
-/// #     tmem: u32,
+/// #     tmem: TmemTile<128, 64>,
 /// #     q: SharedTile<Bf16, 128, 64, Swizzle128B>,
 /// #     k: SharedTile<Bf16, 64, 64, Swizzle128B>,
 /// # ) { unsafe {
-/// mma_abt(tmem, q, k, MmaShape::M128_N64, false);
+/// mma_abt(tmem, q, k, false);
 /// # } }
 /// ```
 ///
 /// # Safety
 ///
 /// - Exactly one thread issues this.
-/// - `tmem` names an accumulator `shape` fits.
 /// - Both tiles hold committed operand data until the MMA's own commit is
 ///   observed.
 #[inline(always)]
@@ -142,19 +194,18 @@ pub unsafe fn mma_abt<
     const K: usize,
     S: Swizzle,
 >(
-    tmem: u32,
+    tmem: TmemTile<AR, BR>,
     a: SharedTile<E, AR, K, S>,
     b: SharedTile<E, BR, K, S>,
-    shape: MmaShape,
     accumulate: bool,
 ) {
     const { assert_two_byte_element::<E>() };
-    let instruction = descriptor::<E>(shape, false, false);
+    let instruction = descriptor::<E>(const { shape(AR, BR) }, false, false);
     unsafe {
         let mut chunk = 0;
         while chunk < K / K_CHUNK {
             E::mma(
-                tmem,
+                tmem.raw(),
                 a.operand_descriptor(k_major_offset(
                     chunk,
                     SharedTile::<E, AR, K, S>::SUBTILE_BYTES,
@@ -177,11 +228,11 @@ pub unsafe fn mma_abt<
 /// **One instruction per K chunk, covering the whole `[M, N]`** — `B` goes
 /// through [`SharedTile::mn_walk`], which reaches MN columns 64..128 through
 /// the descriptor's *leading* offset rather than a step along the row, exactly
-/// as [`mma_atb`] reaches them. `shape` is therefore the operands' logical
+/// as [`mma_atb`] reaches them. The shape is therefore the operands' logical
 /// product, the same as every other walk in this module.
 ///
 /// It used to be the one exception: a band per stacked `B` subtile, `N = 64`
-/// each, with `shape` naming the *band* and an `M128_N128` silently making
+/// each, with the shape naming the *band* and an `M128_N128` silently making
 /// band 1 overwrite half of band 0 ([#175]). The two spellings of an MN-major
 /// operand are both right and the crate uses both, but only one of them is a
 /// shape the caller can state without a footnote, and it is also the faster
@@ -196,29 +247,27 @@ pub unsafe fn mma_abt<
 /// [#175]: https://github.com/feitreim/ferro-kittens/issues/175
 ///
 /// ```no_run
-/// # use kittens::mma::{MmaShape, mma_ab};
+/// # use kittens::mma::mma_ab;
 /// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+/// # use kittens::tmem::TmemTile;
 /// # unsafe fn demo(
-/// #     tmem: u32,
+/// #     tmem: TmemTile<128, 128>,
 /// #     p: SharedTile<Bf16, 128, 64, Swizzle128B>,
 /// #     v: SharedTile<Bf16, 64, 128, Swizzle128B>,
 /// # ) { unsafe {
 /// // `[128, 128]` of accumulator, in one instruction per K chunk.
-/// mma_ab(tmem, p, v, MmaShape::M128_N128, true);
+/// mma_ab(tmem, p, v, true);
 /// # } }
 /// ```
 ///
 /// # Safety
 ///
-/// - As [`mma_abt`].
-/// - `shape` is the `[M, N]` the two tiles describe, and `tmem` owns its `N`
-///   fp32 columns.
+/// As [`mma_abt`].
 #[inline(always)]
 pub unsafe fn mma_ab<E: MmaElement, const AR: usize, const K: usize, const N: usize, S: Swizzle>(
-    tmem: u32,
+    tmem: TmemTile<AR, N>,
     a: SharedTile<E, AR, K, S>,
     b: SharedTile<E, K, N, S>,
-    shape: MmaShape,
     accumulate: bool,
 ) {
     const { assert_two_byte_element::<E>() };
@@ -229,12 +278,12 @@ pub unsafe fn mma_ab<E: MmaElement, const AR: usize, const K: usize, const N: us
         )
     };
     let b = b.mn_walk();
-    let instruction = descriptor::<E>(shape, false, b.transposed());
+    let instruction = descriptor::<E>(const { shape(AR, N) }, false, b.transposed());
     unsafe {
         let mut chunk = 0;
         while chunk < K / K_CHUNK {
             E::mma(
-                tmem,
+                tmem.raw(),
                 a.operand_descriptor(k_major_offset(
                     chunk,
                     SharedTile::<E, AR, K, S>::SUBTILE_BYTES,
@@ -258,24 +307,22 @@ pub unsafe fn mma_ab<E: MmaElement, const AR: usize, const K: usize, const N: us
 ///
 /// # Safety
 ///
-/// - As [`mma_abt`].
-/// - `shape` is the `[M, N]` the two tiles describe.
+/// As [`mma_abt`].
 #[inline(always)]
 pub unsafe fn mma_atb<E: MmaElement, const K: usize, const M: usize, const N: usize, S: Swizzle>(
-    tmem: u32,
+    tmem: TmemTile<M, N>,
     a: SharedTile<E, K, M, S>,
     b: SharedTile<E, K, N, S>,
-    shape: MmaShape,
     accumulate: bool,
 ) {
     const { assert_two_byte_element::<E>() };
     let (a, b) = (a.mn_walk(), b.mn_walk());
-    let instruction = descriptor::<E>(shape, a.transposed(), b.transposed());
+    let instruction = descriptor::<E>(const { shape(M, N) }, a.transposed(), b.transposed());
     unsafe {
         let mut chunk = 0;
         while chunk < K / K_CHUNK {
             E::mma(
-                tmem,
+                tmem.raw(),
                 a.chunk_descriptor(chunk),
                 b.chunk_descriptor(chunk),
                 instruction,
@@ -300,20 +347,19 @@ pub unsafe fn mma_atbt<
     const N: usize,
     S: Swizzle,
 >(
-    tmem: u32,
+    tmem: TmemTile<M, N>,
     a: SharedTile<E, K, M, S>,
     b: SharedTile<E, N, K, S>,
-    shape: MmaShape,
     accumulate: bool,
 ) {
     const { assert_two_byte_element::<E>() };
     let a = a.mn_walk();
-    let instruction = descriptor::<E>(shape, a.transposed(), false);
+    let instruction = descriptor::<E>(const { shape(M, N) }, a.transposed(), false);
     unsafe {
         let mut chunk = 0;
         while chunk < K / K_CHUNK {
             E::mma(
-                tmem,
+                tmem.raw(),
                 a.chunk_descriptor(chunk),
                 b.operand_descriptor(k_major_offset(
                     chunk,
@@ -337,17 +383,22 @@ pub unsafe fn mma_atbt<
 /// instruction together. `E` is named by the caller rather than derived, because
 /// an [`OperandWalk`] has already erased it.
 ///
+/// `tmem` is **this rank's** `[M, N]`, and the instruction's M is twice it —
+/// [`pair_shape`]. `M` and `N` are read off the tile, so a caller that
+/// turbofishes `E` and `CHUNKS` writes `_` for them.
+///
 /// ```no_run
-/// # use kittens::mma::{MmaShape, mma_walk_cg2};
+/// # use kittens::mma::mma_walk_cg2;
 /// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+/// # use kittens::tmem::TmemTile;
 /// # unsafe fn demo(
-/// #     tmem: u32,
+/// #     tmem: TmemTile<128, 128>,
 /// #     a: SharedTile<Bf16, 128, 64, Swizzle128B>,
 /// #     b: SharedTile<Bf16, 64, 128, Swizzle128B>,
 /// #     transposed: bool,
 /// # ) { unsafe {
 /// let a_walk = if transposed { a.mn_walk() } else { a.k_walk() };
-/// mma_walk_cg2::<Bf16, 4>(tmem, a_walk, b.mn_walk(), MmaShape::M256_N128, true);
+/// mma_walk_cg2::<Bf16, 4, _, _>(tmem, a_walk, b.mn_walk(), true);
 /// # } }
 /// ```
 ///
@@ -357,20 +408,19 @@ pub unsafe fn mma_atbt<
 /// - The cluster's peer holds its operand halves at the same shared offsets.
 /// - Both walks cover `CHUNKS` K=16 chunks of committed data, of `E`.
 #[inline(always)]
-pub unsafe fn mma_walk_cg2<E: MmaElement, const CHUNKS: usize>(
-    tmem: u32,
+pub unsafe fn mma_walk_cg2<E: MmaElement, const CHUNKS: usize, const M: usize, const N: usize>(
+    tmem: TmemTile<M, N>,
     a: OperandWalk,
     b: OperandWalk,
-    shape: MmaShape,
     accumulate: bool,
 ) {
     const { assert_two_byte_element::<E>() };
-    let instruction = descriptor::<E>(shape, a.transposed(), b.transposed());
+    let instruction = descriptor::<E>(const { pair_shape(M, N) }, a.transposed(), b.transposed());
     unsafe {
         let mut chunk = 0;
         while chunk < CHUNKS {
             E::mma_cg2(
-                tmem,
+                tmem.raw(),
                 a.chunk_descriptor(chunk),
                 b.chunk_descriptor(chunk),
                 instruction,
@@ -391,14 +441,15 @@ pub unsafe fn mma_walk_cg2<E: MmaElement, const CHUNKS: usize>(
 /// `k > 0`.
 ///
 /// ```no_run
-/// # use kittens::mma::{MmaShape, mm_abt};
+/// # use kittens::mma::mm_abt;
 /// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+/// # use kittens::tmem::TmemTile;
 /// # unsafe fn demo(
-/// #     tmem: u32,
+/// #     tmem: TmemTile<128, 64>,
 /// #     q: SharedTile<Bf16, 128, 64, Swizzle128B>,
 /// #     k: SharedTile<Bf16, 64, 64, Swizzle128B>,
 /// # ) { unsafe {
-/// mm_abt(tmem, q, k, MmaShape::M128_N64);
+/// mm_abt(tmem, q, k);
 /// # } }
 /// ```
 ///
@@ -413,12 +464,11 @@ pub unsafe fn mm_abt<
     const K: usize,
     S: Swizzle,
 >(
-    tmem: u32,
+    tmem: TmemTile<AR, BR>,
     a: SharedTile<E, AR, K, S>,
     b: SharedTile<E, BR, K, S>,
-    shape: MmaShape,
 ) {
-    unsafe { mma_abt(tmem, a, b, shape, false) }
+    unsafe { mma_abt(tmem, a, b, false) }
 }
 
 /// `D = A·B` — [`mma_ab`] starting the accumulator fresh. See [`mm_abt`].
@@ -428,12 +478,11 @@ pub unsafe fn mm_abt<
 /// As [`mma_ab`].
 #[inline(always)]
 pub unsafe fn mm_ab<E: MmaElement, const AR: usize, const K: usize, const N: usize, S: Swizzle>(
-    tmem: u32,
+    tmem: TmemTile<AR, N>,
     a: SharedTile<E, AR, K, S>,
     b: SharedTile<E, K, N, S>,
-    shape: MmaShape,
 ) {
-    unsafe { mma_ab(tmem, a, b, shape, false) }
+    unsafe { mma_ab(tmem, a, b, false) }
 }
 
 /// `D = Aᵀ·B` — [`mma_atb`] starting the accumulator fresh. See [`mm_abt`].
@@ -443,12 +492,11 @@ pub unsafe fn mm_ab<E: MmaElement, const AR: usize, const K: usize, const N: usi
 /// As [`mma_atb`].
 #[inline(always)]
 pub unsafe fn mm_atb<E: MmaElement, const K: usize, const M: usize, const N: usize, S: Swizzle>(
-    tmem: u32,
+    tmem: TmemTile<M, N>,
     a: SharedTile<E, K, M, S>,
     b: SharedTile<E, K, N, S>,
-    shape: MmaShape,
 ) {
-    unsafe { mma_atb(tmem, a, b, shape, false) }
+    unsafe { mma_atb(tmem, a, b, false) }
 }
 
 /// `D = Aᵀ·Bᵀ` — [`mma_atbt`] starting the accumulator fresh. See [`mm_abt`].
@@ -458,12 +506,11 @@ pub unsafe fn mm_atb<E: MmaElement, const K: usize, const M: usize, const N: usi
 /// As [`mma_atbt`].
 #[inline(always)]
 pub unsafe fn mm_atbt<E: MmaElement, const K: usize, const M: usize, const N: usize, S: Swizzle>(
-    tmem: u32,
+    tmem: TmemTile<M, N>,
     a: SharedTile<E, K, M, S>,
     b: SharedTile<E, N, K, S>,
-    shape: MmaShape,
 ) {
-    unsafe { mma_atbt(tmem, a, b, shape, false) }
+    unsafe { mma_atbt(tmem, a, b, false) }
 }
 
 /// [`mma_walk_cg2`] starting the pair's accumulator fresh. See [`mm_abt`].
@@ -472,13 +519,12 @@ pub unsafe fn mm_atbt<E: MmaElement, const K: usize, const M: usize, const N: us
 ///
 /// As [`mma_walk_cg2`].
 #[inline(always)]
-pub unsafe fn mm_walk_cg2<E: MmaElement, const CHUNKS: usize>(
-    tmem: u32,
+pub unsafe fn mm_walk_cg2<E: MmaElement, const CHUNKS: usize, const M: usize, const N: usize>(
+    tmem: TmemTile<M, N>,
     a: OperandWalk,
     b: OperandWalk,
-    shape: MmaShape,
 ) {
-    unsafe { mma_walk_cg2::<E, CHUNKS>(tmem, a, b, shape, false) }
+    unsafe { mma_walk_cg2::<E, CHUNKS, M, N>(tmem, a, b, false) }
 }
 
 /// Publish the issued MMA chain to `sem`: every consumer that `wait`s the
@@ -550,6 +596,36 @@ mod tests {
             descriptor::<Bf16>(MmaShape::M256_N128, true, true),
             bf16_f32_descriptor(256, 128, true, true)
         );
+    }
+
+    /// The shape a walk derives is the one its callers used to write down:
+    /// flash's scores and output, and the GEMM pair's two widths.
+    #[test]
+    fn a_tile_shape_derives_the_shape_its_callers_named() {
+        assert_eq!(shape(128, 64), MmaShape::M128_N64);
+        assert_eq!(shape(128, 128), MmaShape::M128_N128);
+        assert_eq!(shape(64, 64), MmaShape::M64_N64);
+        assert_eq!(pair_shape(128, 128), MmaShape::M256_N128);
+        assert_eq!(pair_shape(128, 256), MmaShape::M256_N256);
+    }
+
+    /// The rejection is the whole risk in deriving a shape rather than being
+    /// handed one. `[128, 192]` is an accumulator a kernel can allocate and no
+    /// instruction covers; rounding it up to `M128_N256` would write 64
+    /// columns of whatever segment sits after it.
+    #[test]
+    #[should_panic = "no tcgen05 MMA shape"]
+    fn an_accumulator_no_instruction_covers_is_rejected() {
+        let _ = shape(128, 192);
+    }
+
+    /// `cta_group::2` is a second lookup and not `shape(2 * m, n)` because
+    /// `M256` is its only class: a 32-row rank tile doubles to `M64`, which is
+    /// a legal shape for one CTA and no shape at all for a pair.
+    #[test]
+    #[should_panic = "cta_group::2"]
+    fn a_pair_accumulator_of_the_wrong_height_is_rejected() {
+        let _ = pair_shape(32, 128);
     }
 
     #[test]

@@ -44,7 +44,7 @@ use std::error::Error;
 
 use kittens::global::{GlobalLayout, GlobalRows, store_shared_rows};
 use kittens::ldst::{store_packed_x4, store_tile_x4};
-use kittens::mma::{MmaShape, commit_multicast_cg2, mma_walk_cg2};
+use kittens::mma::{commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, ClcCursor, ClcQueue, Harvest};
 use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{
@@ -222,6 +222,16 @@ const _: () = assert!(ITEMS >= ACCUMULATORS + 2, "steps 3 and 4 above");
 const DEADLINE: u64 = 1 << 30;
 const NARROW_N: usize = BLOCK_N / 2;
 const HALF_NARROW_N: usize = NARROW_N / 2;
+/// Tensor-memory columns a body allocates: [`ACCUMULATORS`] stages of an
+/// `[BLOCK_M, N]` tile, in one `alloc_cluster`.
+///
+/// [`small_body`] takes this as a parameter rather than computing it from its
+/// own `N`, for the reason `HALF_N` is a parameter beside `BLOCK_N`: a const
+/// argument cannot be arithmetic on a const parameter without
+/// `generic_const_exprs`, and `alloc_cluster` takes its count as one since
+/// #128. The assert inside that body is what keeps the two in step.
+pub const ACCUM_COLUMNS: usize = ACCUMULATORS * BLOCK_N;
+const NARROW_ACCUM_COLUMNS: usize = ACCUMULATORS * NARROW_N;
 /// TMEM rows one warp owns, and therefore how many epilogue warps **one
 /// warpgroup** can have: `tcgen05.ld` reaches only the 32 tensor-memory lanes of
 /// the issuing warp's own sub-partition, indexed within its warpgroup, so four
@@ -325,14 +335,6 @@ type BRing = SharedTileRing<F16, HALF_N, BLOCK_K, Swizzle128B, STAGES>;
 type NarrowBRing = SharedTileRing<F16, HALF_NARROW_N, BLOCK_K, Swizzle128B, STAGES>;
 type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
 type StageBand = RegTile<32, BAND_N, BaseLdtm>;
-
-const fn mma_shape(n: usize) -> MmaShape {
-    match n {
-        NARROW_N => MmaShape::M256_N128,
-        BLOCK_N => MmaShape::M256_N256,
-        _ => panic!("only the 128- and 256-wide cluster tiles are built"),
-    }
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1117,11 +1119,10 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
                     common.wait_load_at::<WATCH>(global_k);
                 }
                 if multiplies(ABLATE) {
-                    mma_walk_cg2::<F16, CHUNKS>(
-                        accumulator.raw(),
+                    mma_walk_cg2::<F16, CHUNKS, _, _>(
+                        accumulator,
                         self.a.tile(global_k).k_walk(),
                         self.b.tile(global_k).k_walk(),
-                        mma_shape(N),
                         k > 0,
                     );
                 }
@@ -1149,11 +1150,10 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
                     common.wait_load::<WATCH>(SLOT, parity);
                 }
                 if multiplies(ABLATE) {
-                    mma_walk_cg2::<F16, CHUNKS>(
-                        accumulator.raw(),
+                    mma_walk_cg2::<F16, CHUNKS, _, _>(
+                        accumulator,
                         self.a.tile(SLOT).k_walk(),
                         self.b.tile(SLOT).k_walk(),
-                        mma_shape(N),
                         accumulate,
                     );
                 }
@@ -1409,11 +1409,10 @@ impl<const BOX: usize> Large<BOX> {
                     common.wait_load_at::<WATCH>(global_k);
                 }
                 if multiplies(ABLATE) {
-                    mma_walk_cg2::<F16, CHUNKS>(
-                        self.accumulator.raw(),
+                    mma_walk_cg2::<F16, CHUNKS, _, _>(
+                        self.accumulator,
                         self.a0.tile(global_k).k_walk(),
                         self.b.tile(global_k).k_walk(),
-                        MmaShape::M256_N256,
                         k > 0,
                     );
                 }
@@ -1426,11 +1425,10 @@ impl<const BOX: usize> Large<BOX> {
                     common.wait_empty_at::<WATCH>(1, (sequence - 1) & 1);
                 }
                 if multiplies(ABLATE) {
-                    mma_walk_cg2::<F16, CHUNKS>(
-                        self.accumulator.columns_right(BLOCK_N as u32).raw(),
+                    mma_walk_cg2::<F16, CHUNKS, _, _>(
+                        self.accumulator.columns_right(BLOCK_N as u32),
                         self.a1.tile(global_k).k_walk(),
                         self.b.tile(global_k).k_walk(),
-                        MmaShape::M256_N256,
                         k > 0,
                     );
                 }
@@ -1458,11 +1456,10 @@ impl<const BOX: usize> Large<BOX> {
                     common.wait_load::<WATCH>(SLOT, parity);
                 }
                 if multiplies(ABLATE) {
-                    mma_walk_cg2::<F16, CHUNKS>(
-                        self.accumulator.raw(),
+                    mma_walk_cg2::<F16, CHUNKS, _, _>(
+                        self.accumulator,
                         self.a0.tile(SLOT).k_walk(),
                         self.b.tile(SLOT).k_walk(),
-                        MmaShape::M256_N256,
                         accumulate,
                     );
                 }
@@ -1475,11 +1472,10 @@ impl<const BOX: usize> Large<BOX> {
                     common.wait_empty_at::<WATCH>(1, (sequence - 1) & 1);
                 }
                 if multiplies(ABLATE) {
-                    mma_walk_cg2::<F16, CHUNKS>(
-                        self.accumulator.columns_right(BLOCK_N as u32).raw(),
+                    mma_walk_cg2::<F16, CHUNKS, _, _>(
+                        self.accumulator.columns_right(BLOCK_N as u32),
                         self.a1.tile(SLOT).k_walk(),
                         self.b.tile(SLOT).k_walk(),
-                        MmaShape::M256_N256,
                         accumulate,
                     );
                 }
@@ -1631,6 +1627,9 @@ impl<const BOX: usize> Large<BOX> {
 /// The width-generic device body every `[256, N]` entry and every ablation arm
 /// instantiates, so no arm can drift from the kernel it decomposes.
 ///
+/// `ACCUM_COLUMNS` is [`ACCUM_COLUMNS`] at the entry's own width, and a
+/// parameter for the reason `HALF` is one — see that constant.
+///
 /// # Safety
 ///
 /// As [`kernels::gemm_sol_m256`], at the entry's own width.
@@ -1638,6 +1637,7 @@ impl<const BOX: usize> Large<BOX> {
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn small_body<
     const N: usize,
+    const ACCUM_COLUMNS: usize,
     const HALF: usize,
     const BOX: usize,
     const STAGE: usize,
@@ -1661,6 +1661,7 @@ pub unsafe fn small_body<
 ) where
     BaseLdtm: kittens::reg::FragmentLayout<32, WIDE_BAND>,
 {
+    const { assert!(ACCUM_COLUMNS == ACCUMULATORS * N) };
     unsafe {
         let smem = DynamicSharedArray::<u8, 128>::get_raw();
         let common = Common::attach(smem, RINGS_END, tiles_m, tiles_n, k_blocks, group, ldc, c);
@@ -1669,9 +1670,8 @@ pub unsafe fn small_body<
             common,
             a: ARing::attach(smem.add(A0_OFFSET)),
             b: SharedTileRing::attach(smem.add(SMALL_B_OFFSET)),
-            accumulator: TmemTile::from_raw(alloc_cluster(
+            accumulator: TmemTile::from_raw(alloc_cluster::<ACCUM_COLUMNS>(
                 smem.add(tmem_offset(RINGS_END)).cast(),
-                2 * N as u32,
             )),
             a_map,
             b_map,
@@ -1686,7 +1686,7 @@ pub unsafe fn small_body<
         }
 
         common.retire();
-        dealloc_cluster(state.accumulator.raw(), 2 * N as u32);
+        dealloc_cluster::<ACCUM_COLUMNS>(state.accumulator.raw());
     }
 }
 
@@ -1737,9 +1737,8 @@ pub unsafe fn large_body<
             a0: ARing::attach(smem.add(A0_OFFSET)),
             a1: ARing::attach(smem.add(LARGE_A1_OFFSET)),
             b: BRing::attach(smem.add(LARGE_B_OFFSET)),
-            accumulator: Accumulator::from_raw(alloc_cluster(
+            accumulator: Accumulator::from_raw(alloc_cluster::<ACCUM_COLUMNS>(
                 smem.add(tmem_offset(LARGE_RINGS_END)).cast(),
-                2 * BLOCK_N as u32,
             )),
             a_map,
             b_map,
@@ -1754,7 +1753,7 @@ pub unsafe fn large_body<
         }
 
         common.retire();
-        dealloc_cluster(state.accumulator.raw(), 2 * BLOCK_N as u32);
+        dealloc_cluster::<ACCUM_COLUMNS>(state.accumulator.raw());
     }
 }
 
@@ -1789,6 +1788,7 @@ pub mod kernels {
             const { assert!(SMALL_SHARED_BYTES == 196_864) };
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 { BLOCK_N / TWO_WARPGROUPS as usize },
@@ -1831,6 +1831,7 @@ pub mod kernels {
             const { assert!(NARROW_SHARED_BYTES == 131_328) };
             small_body::<
                 NARROW_N,
+                NARROW_ACCUM_COLUMNS,
                 HALF_NARROW_N,
                 B_BOX,
                 NARROW_N,

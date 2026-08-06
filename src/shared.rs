@@ -1069,15 +1069,16 @@ impl<E: Element, const R: usize, const C: usize, S: Swizzle> SharedTile<E, R, C,
     /// linear step cannot cross stacked subtiles.
     ///
     /// ```no_run
-    /// # use kittens::mma::{MmaShape, mma_walk_cg2};
+    /// # use kittens::mma::mma_walk_cg2;
     /// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+    /// # use kittens::tmem::TmemTile;
     /// # unsafe fn demo(
     /// #     a: SharedTile<Bf16, 128, 64, Swizzle128B>,
     /// #     b: SharedTile<Bf16, 128, 64, Swizzle128B>,
-    /// #     acc: u32,
+    /// #     acc: TmemTile<128, 128>,
     /// # ) {
     /// let (a, b) = (a.k_walk(), b.k_walk());
-    /// unsafe { mma_walk_cg2::<Bf16, 4>(acc, a, b, MmaShape::M128_N128, false) };
+    /// unsafe { mma_walk_cg2::<Bf16, 4, _, _>(acc, a, b, false) };
     /// # }
     /// ```
     #[inline(always)]
