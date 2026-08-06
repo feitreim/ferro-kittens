@@ -36,7 +36,16 @@
 //! `softmax` and `layernorm` are the seam. Their kernels are the teaching
 //! crate's and are compiled from its files — `#[path]` below, not a copy — and
 //! their verify-then-time entry points are called from [`bench`], which is
-//! this crate's. Nothing in `examples/` is duplicated here.
+//! this crate's.
+//!
+//! **The two GEMMs are the other seam, and they are copies on purpose.**
+//! [`gemm`] and [`gemm_sol`] each hold the dialed body every arm instantiates;
+//! `examples/` ships the same entry points with the dials baked to one
+//! configuration. A `#[path]` cannot serve both — the teaching copy is supposed
+//! to have no dials in it — so the two crates emit the same kernel names from
+//! two files, and `regcount`'s opcode census compares them row for row. That
+//! comparison is the check that a shipped kernel and the arms it is measured
+//! against are still the same instructions.
 
 use std::process::ExitCode;
 
@@ -47,7 +56,10 @@ pub mod bench;
 #[cfg(feature = "cublas")]
 pub mod cublaslt;
 pub mod gemm;
-#[path = "../../examples/src/gemm_sol.rs"]
+/// The dialed `gemm_sol`: the shipped body with `ABLATE`, `DRAIN`, `WATCH`,
+/// `FOLD` and the warpgroup count still parameters, which is what
+/// [`sol_ablate`] and [`sol_watch`] take it apart through. `examples/` ships
+/// the same three entries with all five baked in.
 pub mod gemm_sol;
 /// The kernel [`gemm_sol`] is a port *of*, unported — upstream's device code
 /// byte for byte, on this crate's clock, so the port's distance from cuBLASLt
