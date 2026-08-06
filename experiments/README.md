@@ -2594,6 +2594,10 @@ for the same reason — it is still the one-cluster-one-item shape §7's item 3 
 about, but its microseconds are not comparable across the change, because the
 item it is one of has twice the columns.
 
+*(#105 gave that back. The constraint is the wide rung's rather than the file's
+since `gemm::plan_for` picks a tile from the shape, and `256x128x256` is a row
+of `GEMM_SIZES` again — see "the small end picks the other rung now" below.)*
+
 ##### and the denominator
 
 cuBLASLt, same device, same container, minutes apart, checked against the same
@@ -2642,6 +2646,225 @@ The bottom two ratios are also the reproducible ones and the top three are not �
 #92's finding that cuBLASLt's own variance dominates below 4096³ has not changed,
 and 0.354 should be read as "small, unstable, and worse" rather than to three
 digits.
+
+##### and the small end picks the other rung now, at a crossover somebody measured — #105
+
+#104 states its two costs — `n % 256 == 0`, and 18% at 1024³ — and leaves both
+of them where they land. Both rungs stayed launchable, so the material for a
+fix was already in the file; what was missing was anything choosing, and any
+measurement to choose by. The sweep above has the two tiles at 8192³ and
+16384³, and the crossover is somewhere below 2048³, which nothing had timed.
+
+`bench --case crossover` is that measurement — four rungs across the sizes
+`tile` does not visit. It is its own case rather than a fifth table there
+because `tile` is 8192³ and 16384³ dozens of times over and costs most of an
+hour, and **a measurement the next tile change has to re-take should cost a
+minute**. This one runs in 47–72 s.
+
+Four arms, and the middle two are instruments rather than candidates:
+
+| arm | what it is |
+| --- | --- |
+| `[256,128] k64 s3` | the kernel this file shipped through #102 — **the denominator, and the thing #105's acceptance is about** |
+| `[256,128] k64 s4` | that tile at the *wide* rung's residency: 2 CTAs an SM instead of 3, at unchanged tile count, waves and intensity. Prices the occupancy step alone |
+| `[256,256] k64 s3` | the tile moved at a fixed epilogue — #104's own arm |
+| `[256,256] k64 s3 staged84` | **what actually launches.** #119's epilogue exists only on the wide rung, so routing away from that tile gives up the epilogue too, and a rule set on the fused column would be a rule set on a launch nobody makes |
+
+One run, in full, losing rows kept — B200, driver 580.95.05, one container,
+`--features cublas`, every row checked element by element against the CPU
+reference before it was timed:
+
+| shape | rung | tiles | SMs | wave eff | CTA/SM | reached | min ms | TFLOP/s | vs #102 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512³ | [256,128] s3 | 8 | 16 | 3.6% | 3 | 1 | 0.0119 | 22.6 | — |
+| 512³ | [256,128] s4 | 8 | 16 | 5.4% | 2 | 1 | 0.0123 | 21.8 | −3.1% |
+| 512³ | [256,256] s3 | 4 | 8 | 2.7% | 2 | 1 | 0.0136 | 19.7 | −12.7% |
+| 512³ | **[256,256] s3 staged84** | 4 | 8 | 2.7% | 2 | 1 | 0.0138 | 19.5 | **−13.5%** |
+| 1024³ | [256,128] s3 | 32 | 64 | 14.4% | 3 | 1 | 0.0151 | 142.5 | — |
+| 1024³ | [256,128] s4 | 32 | 64 | 21.6% | 2 | 1 | 0.0151 | 142.5 | +0.0% |
+| 1024³ | [256,256] s3 | 16 | 32 | 10.8% | 2 | 1 | 0.0162 | 132.6 | −6.9% |
+| 1024³ | **[256,256] s3 staged84** | 16 | 32 | 10.8% | 2 | 1 | 0.0164 | 130.6 | **−8.4%** |
+| 1024x1152x1024 | [256,128] s3 | 36 | 72 | 16.2% | 3 | 1 | 0.0156 | 154.7 | — |
+| 1024x1152x1024 | [256,128] s4 | 36 | 72 | 24.3% | 2 | 1 | 0.0156 | 155.0 | +0.2% |
+| 1024x1152x1024 | [256,256] s3 | — | — | — | — | — | — | — | **`n % 256 != 0`** |
+| 1536³ | [256,128] s3 | 72 | 144 | 32.4% | 3 | 1 | 0.0191 | 379.4 | — |
+| 1536³ | [256,128] s4 | 72 | 144 | 48.6% | 2 | 1 | 0.0186 | 389.8 | +2.8% |
+| 1536³ | [256,256] s3 | 36 | 72 | 24.3% | 2 | 1 | 0.0202 | 358.4 | −5.5% |
+| 1536³ | **[256,256] s3 staged84** | 36 | 72 | 24.3% | 2 | 1 | 0.0193 | 375.6 | **−1.0%** |
+| 2048³ | [256,128] s3 | 128 | 148 | 57.7% | 3 | 2 | 0.0236 | 729.4 | — |
+| 2048³ | [256,128] s4 | 128 | 148 | 86.5% | 2 | 2 | 0.0237 | 725.5 | −0.5% |
+| 2048³ | [256,256] s3 | 64 | 128 | 43.2% | 2 | 1 | 0.0225 | 763.7 | +4.7% |
+| 2048³ | **[256,256] s3 staged84** | 64 | 128 | 43.2% | 2 | 1 | 0.0228 | 754.0 | **+3.4%** |
+| 3072³ | [256,128] s3 | 288 | 148 | 64.9% | 3 | 3 | 0.0561 | 1034.2 | — |
+| 3072³ | [256,128] s4 | 288 | 148 | 97.3% | 2 | 2 | 0.0519 | 1117.8 | +8.1% |
+| 3072³ | [256,256] s3 | 144 | 148 | 97.3% | 2 | 2 | 0.0440 | 1317.8 | +27.4% |
+| 3072³ | **[256,256] s3 staged84** | 144 | 148 | 97.3% | 2 | 2 | 0.0422 | **1373.7** | **+32.8%** |
+| 4096³ | [256,128] s3 | 512 | 148 | 76.9% | 3 | 3 | 0.1087 | 1264.0 | — |
+| 4096³ | [256,128] s4 | 512 | 148 | 86.5% | 2 | 2 | 0.1128 | 1218.4 | −3.6% |
+| 4096³ | [256,256] s3 | 256 | 148 | 86.5% | 2 | 2 | 0.0977 | 1407.3 | +11.3% |
+| 4096³ | **[256,256] s3 staged84** | 256 | 148 | 86.5% | 2 | 2 | 0.0953 | **1442.2** | **+14.1%** |
+| 4096x4224x4096 | [256,128] s3 | 528 | 148 | 79.3% | 3 | 3 | 0.1115 | 1271.7 | — |
+| 4096x4224x4096 | [256,128] s4 | 528 | 148 | 89.2% | 2 | 2 | 0.1163 | 1219.2 | −4.1% |
+| 4096x4224x4096 | [256,256] s3 | — | — | — | — | — | — | — | **`n % 256 != 0`** |
+
+`SMs` is `min(2·tiles, 148)` — SMs the launch puts a CTA on at all. `reached` is
+`ceil(CTAs / 148)`, the CTAs an SM must hold for the grid to be placed, against
+the `CTA/SM` the rung is *admitted* for. The two are what separate the mechanism
+below.
+
+###### the percentages below 2048³ do not reproduce, and the routing does
+
+This case was run three times in three containers. Those rows are 12–23 µs
+launches, and #98's 2.9% of drift is 10–12% down here:
+
+| shape | shipped vs #102, run 1 | run 2 | run 3 |
+| --- | ---: | ---: | ---: |
+| 512³ | — | −15.3% | −13.5% |
+| 1024³ | −11.9% | −10.6% | −8.4% |
+| 1536³ | +0.5% | −8.7% | −1.0% |
+| 2048³ | +5.2% | +0.5% | +3.4% |
+| 3072³ | +29.4% | +29.8% | +32.8% |
+| 4096³ | +14.6% | +12.3% | +14.1% |
+
+*(Run 1 was taken before the `paid` column was corrected and its 512³ rows were
+lost to a truncated capture; every other cell is one container each.)*
+
+**Read the sign column, not the digits.** 512³ and 1024³ lose on every run,
+2048³ and above win on every run, and 1536³ straddles zero — so the crossover is
+between 36 and 64 output tiles of the wide rung, and 1536³ is the tie. That is
+the whole of what these three runs establish and it is exactly what the rule
+needs. Anyone quoting "−8.4% at 1024³" from the table above is quoting one
+container.
+
+###### which of the two mechanisms it is: parallelism, and the occupancy step is not even reachable
+
+#105 asks which of quantization and residency dominates rather than for a fitted
+threshold, and the `[256,128] s3` against `s4` arm answers it directly — same
+tile, same tile count, same waves, same intensity, 3 CTAs an SM against 2:
+
+| shape | reached | run 1 | run 2 | run 3 |
+| --- | ---: | ---: | ---: | ---: |
+| 512³ | 1 | — | −11.5% | −3.1% |
+| 1024³ | 1 | −2.0% | **+11.1%** | +0.0% |
+| 1024x1152x1024 | 1 | −1.6% | +4.8% | +0.2% |
+| 1536³ | 1 | +0.2% | −7.5% | +2.8% |
+| 2048³ | 2 | −3.4% | −7.8% | −0.5% |
+| 3072³ | 2 (from 3) | +8.8% | +6.9% | +8.1% |
+| 4096³ | 2 (from 3) | −3.3% | −3.7% | −3.6% |
+| 4096x4224x4096 | 2 (from 3) | −5.1% | −6.4% | −4.1% |
+
+**Below 2048³ the occupancy step does not have a sign.** −2.0%, +11.1% and
++0.0% at 1024³ is not a small effect measured imprecisely, it is no effect at
+all — and the `reached` column says why before the clock does: at 32 clusters on
+148 SMs *no SM is being asked to hold a second CTA*, so a rung admitted for 3
+and a rung admitted for 2 run the identical schedule. #101's 14–16% is a price
+on a resource the small end is not spending.
+
+So the small-size loss is **mechanism 1, and all of it**: at 1024³ the wide tile
+puts 32 SMs to work where the narrow one puts 64, and loses 8.4–11.9%; at 512³
+it is 8 against 16, and 13.5–15.3%. The loss tracks the `SMs` column and not the
+`CTA/SM` column, and the arm built to price `CTA/SM` returns noise. Halving the
+tiles halves the *device* long before it costs a CTA per SM, which is the same
+sentence #104 wrote — "16 tiles over 148 clusters, one item each, nothing to
+amortize over" — with the second half of the confound removed rather than
+assumed away.
+
+Where the step *is* reachable it is worth −3.6 to −6.4% at 4096³ and above, and
+at 3072³ it is **worth +8.1%**: losing a CTA an SM shortens the persistent grid
+from 222 clusters to 148, and 288 tiles divide into that at 97.3% wave
+efficiency against 64.9%. An occupancy step whose sign is set by how the wave
+quantizes is not a 14–16% constant, and #101's figure should not be carried to
+sizes it was not taken at.
+
+###### the rule, and what it costs
+
+`gemm::plan_for` — host-side, from `m` and `n`, next to the grid arithmetic:
+
+```rust
+pub fn plan_for(m: usize, n: usize) -> Plan {
+    let wide = n.is_multiple_of(SHIPPED.block_n)
+        && tiles(m, n, SHIPPED.block_n) >= CROSSOVER_TILES;
+    ...
+}
+```
+
+`CROSSOVER_TILES` is **64**, and the three runs above are what set it. The
+crossover is bracketed at `36 < T <= 64` and 64 is the *upper* end: it is the
+smallest tile count measured to win, everything between is unmeasured, and a
+rule that has to guess should guess toward the rung that was already shipping.
+
+**Tiles, not `n`, and not the problem's volume.** The mechanism is tile count
+against SM count, so that is the quantity the threshold belongs on. A threshold
+on `n` would send 16384x512 — 32 wide tile-rows and a full grid — to the narrow
+rung.
+
+It picks an epilogue with the tile, because it has to: `staged84` is built on
+the wide rung only, so `[256, 128]` comes with #119's register drain and that
+cost is inside the numbers above rather than beside them. `bench_with` does
+*not* consult it — a control whose rung moved with the shape would not be one —
+which is what keeps `gemm_ws`' control arm and every A/B in `gemm.rs` reading
+the rung they name.
+
+The chooser's own row, from run 3, against the better of the two arms it was
+choosing between:
+
+| shape | chose | chosen ms | best ms | paid |
+| --- | --- | ---: | ---: | ---: |
+| 512³ | [256,128] s3 | 0.0119 | 0.0119 | 0.0% |
+| 1024³ | [256,128] s3 | 0.0151 | 0.0151 | 0.0% |
+| 1024x1152x1024 | [256,128] s3 | 0.0156 | 0.0156 | 0.0% |
+| 1536³ | [256,128] s3 | 0.0191 | 0.0191 | 0.0% |
+| 2048³ | [256,256] s3 staged84 | 0.0228 | 0.0228 | 0.0% |
+| 3072³ | [256,256] s3 staged84 | 0.0422 | 0.0422 | 0.0% |
+| 4096³ | [256,256] s3 staged84 | 0.0953 | 0.0953 | 0.0% |
+| 4096x4224x4096 | [256,128] s3 | 0.1115 | 0.1115 | 0.0% |
+
+Run 1's threshold left 0.5% on the table at 1536³ and run 2's left none; the
+column is zero or inside the drift at every row of every run.
+
+**#105's acceptance, and it does not rest on the table.** "No shape that worked
+before #104 is slower after this" holds *by construction* below the threshold:
+the rung the chooser falls back to is `gemm_256x128_s3`, which is not a
+reconstruction of the pre-#104 kernel but the entry point itself, kept
+launchable by #104 as its control. Below 64 wide tiles, and at every `n` the
+wide tile cannot divide, the launch is byte for byte the one that shipped. Above
+the threshold it is faster, on three runs.
+
+And the constraint #105 opens on is gone from the call site: `n = 1152` is a
+kernel and not an error, `4096x4224x4096` runs at 1271.7 TFLOP/s and 0.769 of
+cuBLASLt, and `GEMM_SIZES`' `256x128x256` row — the one-cluster-one-item floor
+that #87 had to delete because the tiling stopped admitting it — is back.
+
+###### and the denominator
+
+cuBLASLt in the same container, from run 3. It is not a flattering table and it
+is the one worth keeping: below 2048³ this kernel is 0.59–0.68 of a vendor GEMM
+whichever tile it picks, and the chooser moves the ratio at exactly the two
+sizes where it changes the rung.
+
+| shape | cuBLASLt ms | theirs TF/s | #102/theirs | chosen/theirs |
+| --- | ---: | ---: | ---: | ---: |
+| 512³ | 0.0081 | 33.3 | 0.677 | 0.677 |
+| 1024³ | 0.0099 | 216.5 | 0.658 | 0.658 |
+| 1024x1152x1024 | 0.0092 | 263.1 | 0.588 | 0.588 |
+| 1536³ | 0.0118 | 613.8 | 0.618 | 0.618 |
+| 2048³ | 0.0188 | 913.0 | 0.799 | **0.826** |
+| 3072³ | 0.0388 | 1493.8 | 0.692 | **0.920** |
+| 4096³ | 0.0837 | 1641.8 | 0.770 | **0.878** |
+| 4096x4224x4096 | 0.0857 | 1654.5 | 0.769 | 0.769 |
+
+#92's finding stands and this sharpens it: the small end is where a general
+library is far ahead, the chooser recovers none of that gap — it only stops
+#104 widening it — and the gap below 2048³ is now the whole of what the two
+tiles in this file have to say about small problems.
+
+###### what the next tile change has to re-measure
+
+`CROSSOVER_TILES` is a property of *this pair* of rungs on *this* device. Move
+either tile, move `SHIPPED_EPILOGUE`, or change `MAX_CLUSTERS` and the bracket
+moves with it. The instrument is `bench --case crossover`, it takes a minute,
+and the thing to read off it is which choosable arm wins at each size — not the
+percentage, which below 2048³ does not survive a change of container.
 
 ##### and the store stage was free to build and worth nothing — #15
 
@@ -4405,6 +4628,12 @@ was the question, and a tile sweep is another container's worth of work. It is
 **unranked** rather than ranked low, and at 4096³ and below — where the ratio is
 0.79–0.82 and the wave is 86% full — it is the obvious place to look next after
 the small-size denominator is stable enough to look with.
+
+*(#105 closed the selection half of that: below 64 output tiles of the wide
+rung, and at every `n` it cannot divide, the launch is the pre-#104 kernel
+again. The tile itself is still the one #87 chose against a budget that has
+moved, and re-sweeping it is still open — but `bench --case crossover` now
+bounds the range over which it is the wrong tile, at a minute a run.)*
 
 **Residency is unchanged and is not re-counted.** All four new staged probes
 declare the same 114 816 B as `staged84`, and `gemm_cg2_lcf8` declares the same

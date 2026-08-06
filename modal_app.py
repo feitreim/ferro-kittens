@@ -50,6 +50,12 @@ Local usage:
     modal run modal_app.py::bench --case tile
                                       # gemm's pair tile and pipeline depth,
                                       # traversal held fixed (#87)
+    modal run modal_app.py::bench --case crossover
+                                      # the same two tiles across the sizes
+                                      # below 2048^3 that nothing had timed,
+                                      # which is the rule gemm::plan_for picks
+                                      # by (#105). Minutes, not the hour
+                                      # --case tile costs
     modal run modal_app.py::bench --case staged
                                       # gemm's epilogue SHAPE: a register drain
                                       # against one staged through shared

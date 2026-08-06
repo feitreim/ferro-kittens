@@ -350,10 +350,16 @@ const BLOCK_M: usize = 128;
 /// and no registers, and `experiments/README.md` §7 has the four losing rungs and
 /// the control that separates the two mechanisms.
 ///
-/// **What it also costs is generality, and that is not free.** A launch must
-/// now have `n % 256 == 0` where 128 used to do, so this kernel computes a
-/// narrower set of shapes than it did — the direction #92 already named as
-/// where a like-for-like rate against a general library flatters us.
+/// **What it also costs is generality, and that is not free.** A launch on
+/// this rung must have `n % 256 == 0` where 128 used to do, so it computes a
+/// narrower set of shapes than the kernel it replaced — the direction #92
+/// already named as where a like-for-like rate against a general library
+/// flatters us.
+///
+/// That cost is the *rung's* since #105 and no longer the file's:
+/// [`plan_for`] picks a tile from the shape, `n = 1152` gets the narrow rung
+/// rather than an error, and the crossover it picks at is measured rather than
+/// assumed. What is left here is one rung of two.
 const BLOCK_N: usize = 256;
 /// This CTA's half of `B`.
 const HALF_N: usize = BLOCK_N / 2;
@@ -4248,6 +4254,21 @@ const ITEMS_M: usize = 4096;
 const ITEMS_N: usize = 4096;
 const ITEMS_K: usize = 256;
 
+/// A third correctness size, whose only job is to have an `N` **the wide tile
+/// cannot compute** — #105's fallback route.
+///
+/// 384 is three `[256, 128]` tile-columns and one and a half `[256, 256]` ones,
+/// so it is legal on the rung the chooser falls back to and on nothing else.
+/// Every other size in this file divides both tiles, which meant the one shape
+/// class the chooser exists for was on no gate at all.
+///
+/// `M` is [`M`]'s two clusters and `K` is [`K`]'s wrapping four stages, so the
+/// item map and the ring are exercised here for the same reasons they are
+/// there; the variable is `N` alone.
+const RAGGED_M: usize = 512;
+const RAGGED_N: usize = 384;
+const RAGGED_K: usize = 256;
+
 /// `A[m, k]` and `B[n, k]`: integers in `[-3, 3]` and `[-10, 10]`.
 ///
 /// Every operand is exact in bf16 (which holds every integer to 256) and every
@@ -4942,6 +4963,75 @@ impl Epilogue {
     }
 }
 
+/// Output tiles of the wide rung below which a launch is better off on the
+/// narrow one — **#105's crossover, and it is a measurement**.
+///
+/// `bench --case crossover` is the run that set it, three times in three
+/// containers, and `experiments/README.md` §7 carries the tables in full with
+/// the losing rows kept. The shipped launch — `[256, 256]` on `staged84` —
+/// against `[256, 128] @ s3`, the kernel this file shipped before #104:
+///
+/// | tiles | shape | run 1 | run 2 | run 3 |
+/// | ---: | --- | ---: | ---: | ---: |
+/// | 16 | 1024³ | −11.9% | −10.6% | −8.4% |
+/// | 36 | 1536³ | +0.5% | −8.7% | −1.0% |
+/// | 64 | 2048³ | **+5.2%** | **+0.5%** | **+3.4%** |
+///
+/// **The sign is what reproduces and the digits are not** — those rows are
+/// 12–23 µs launches and #98's 2.9% of drift is 10–12% down there. 1536³
+/// straddles zero on three runs and 2048³ wins on three, so the crossover is
+/// bracketed at `36 < T <= 64` and this is the **upper** end: 64 is the
+/// smallest tile count measured to win, everything between is unmeasured, and
+/// a rule that has to guess should guess toward the rung that was already
+/// shipping.
+///
+/// A tile change is a reason to re-run that case and not a reason to trust this
+/// line. It costs about a minute of B200, which is why the sweep is its own
+/// case rather than a fifth table on `tile` — and why it should be run more
+/// than once.
+///
+/// **Tiles and not `n`, and not the problem's volume.** The mechanism the
+/// measurement found is that below one wave a wider tile spends *parallelism*:
+/// 1024³ is 32 clusters on 64 SMs at `[256, 128]` and 16 on 32 at
+/// `[256, 256]`, and the sign flips at 2048³, the first size where the wide
+/// tile's own grid nearly fills the device. That is a fact about the tile
+/// count against the SM count and not about any one extent, so the tile count
+/// is what the rule is a threshold on. A threshold on `n` would route
+/// 16384x512 to the narrow rung, and that shape has 32 wide tile-rows and a
+/// full grid.
+pub const CROSSOVER_TILES: u32 = 64;
+
+/// The launch a shape gets: the pair tile, and with it the epilogue, chosen
+/// host-side from `m` and `n` — **#105's chooser**.
+///
+/// The two rungs are not interchangeable and the shape of this function says
+/// so in both directions:
+///
+/// - **`n % 256 != 0` has no wide launch at all.** #104 narrowed the set of
+///   shapes this kernel computes and nothing said so at the call site; here it
+///   is one branch, and `n = 1152` gets a kernel rather than an error.
+/// - **A tile carries an epilogue.** [`SHIPPED_EPILOGUE`] is `staged84` and
+///   the wide rung is the only one with a staged entry point, so routing to the
+///   narrow tile gives up #119's epilogue too. That is a cost of the route and
+///   it is measured as part of it — [`CROSSOVER_ARMS`]' fourth arm is the
+///   launch this returns, not a like-for-like control.
+///
+/// [`bench`] and [`grid`] read it, so the sweep's small rows are the chooser's
+/// rows. Callers wanting a *named* rung — every A/B in this file, and
+/// [`crate::gemm_ws`]' control arm — go through [`bench_with`], which does not
+/// consult this: a control that moved with the shape would not be one.
+pub fn plan_for(m: usize, n: usize) -> Plan {
+    let wide = n.is_multiple_of(SHIPPED.block_n) && tiles(m, n, SHIPPED.block_n) >= CROSSOVER_TILES;
+    let base = Plan::new(Scheduler::Static);
+    match wide {
+        true => base.with(SHIPPED_EPILOGUE),
+        false => Plan {
+            rung: CONTROL,
+            ..base
+        },
+    }
+}
+
 /// Blocks the launch asks for — [`MAX_CLUSTERS`] pairs, or fewer where the
 /// problem has fewer tiles than that.
 ///
@@ -4950,8 +5040,29 @@ impl Epilogue {
 /// also where the sweep stops growing: past 222 clusters the grid is flat and
 /// the extra tiles arrive as extra *items*, which is the whole difference
 /// between this kernel and the one that launched a pair per tile.
+///
+/// Since #105 it is the *chosen* rung's grid, because [`bench`] launches the
+/// chosen rung: a block count printed for a tile the harness did not run would
+/// be the sweep's most confusing column.
 pub fn grid(m: usize, n: usize) -> u32 {
-    grid_for(Scheduler::Static, m, n, SHIPPED, MAX_CLUSTERS)
+    let rung = plan_for(m, n).rung;
+    grid_for(Scheduler::Static, m, n, rung, assumed_max_clusters(rung))
+}
+
+/// [`Rung::max_clusters`] with no device to ask — 2 CTAs an SM at the wide rung
+/// ([`CTAS_PER_SM`]) and 3 at the narrow one, which is the occupancy step #104
+/// took and half of what #105 has to separate.
+///
+/// Every *launch* takes its cap from [`Rung::max_clusters`] on the driver's own
+/// `shared_per_sm` instead, and `bench --case crossover` prints that column
+/// beside these rows, so a device where the two disagree says so rather than
+/// quietly running a different grid. This exists because [`grid`] and
+/// [`wave_efficiency`] are called from the size table, which has no context.
+fn assumed_max_clusters(rung: Rung) -> u32 {
+    SMS * match rung.block_n {
+        128 => 3,
+        _ => CTAS_PER_SM,
+    } / RANKS
 }
 
 /// Blocks a `scheduler`'s launch asks for, which is the one host-visible
@@ -4985,9 +5096,11 @@ pub fn grid_for(scheduler: Scheduler, m: usize, n: usize, rung: Rung, cap: u32) 
 /// the clusters leaves a wave that divides the work much more evenly. That is a
 /// confound in #87's own sweep rather than a win to claim — #97 measured the
 /// ragged wave as worth ~1% of the *time* where it is 8% of the grid — and §7
-/// says so beside the table.
+/// says so beside the table, and since #105 so does the rung: this reads the
+/// chosen one, for the reason [`grid`] does.
 pub fn wave_efficiency(m: usize, n: usize) -> (u32, f64) {
-    wave_efficiency_of(m, n, SHIPPED, MAX_CLUSTERS)
+    let rung = plan_for(m, n).rung;
+    wave_efficiency_of(m, n, rung, assumed_max_clusters(rung))
 }
 
 /// [`wave_efficiency`] at a rung's own tile and grid cap — the two things #87
@@ -5683,6 +5796,29 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
             notes.push(label);
         }
     }
+    // #105's fallback route, which none of the sizes above reaches. Every check
+    // size in this file divides *both* tiles, so the one shape class the
+    // chooser exists for — `n` a multiple of 128 and not of 256 — had never
+    // been computed by anything: a wrong `B` extent, a wrong `ldc` or a ragged
+    // last tile-column on that route would have reached a caller before it
+    // reached a gate.
+    //
+    // The plan comes from [`plan_for`] rather than being written out, so this
+    // is a test of the chooser and not only of the rung it happens to pick.
+    for group in CHECK_GROUPS {
+        let plan = Plan {
+            group,
+            ..plan_for(RAGGED_M, RAGGED_N)
+        };
+        run(context, RAGGED_M, RAGGED_N, RAGGED_K, plan, nothing_after)?;
+    }
+    let chosen = plan_for(RAGGED_M, RAGGED_N);
+    notes.push(format!(
+        "{RAGGED_M}x{RAGGED_N}x{RAGGED_K} exact on {} at groups {CHECK_GROUPS:?} \
+         (n % {} != 0, so the chooser has no other rung)",
+        chosen.rung.name(),
+        SHIPPED.block_n
+    ));
     Ok(notes.join(", "))
 }
 
@@ -5698,11 +5834,26 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
 /// `staged84` and not `lcf`.** Every `bench --case gemm*` row published before
 /// that is against the register drain and is not comparable to one taken after
 /// it; `experiments/README.md` §7 says which tables moved.
+///
+/// **And since #105 the rung is [`plan_for`]'s and not [`SHIPPED`]**, which
+/// moves the small rows of this table again and for the same kind of reason:
+/// below [`CROSSOVER_TILES`] output tiles the launch is the narrow rung on the
+/// register drain, so those rows are not comparable to ones taken before that
+/// either. They are the rows #104 regressed, and the rule that picks them is
+/// measured by `bench --case crossover`.
 pub fn bench(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     shape: Shape,
 ) -> Result<Timings, Box<dyn Error>> {
-    bench_with(context, shape, SHIPPED_EPILOGUE)
+    run(
+        context,
+        shape.m,
+        shape.n,
+        shape.k,
+        plan_for(shape.m, shape.n),
+        time,
+    )
+    .map(|(_, timings)| timings)
 }
 
 /// [`bench`] on a named epilogue — the shipped rung and schedule, checked
@@ -5714,6 +5865,11 @@ pub fn bench(
 /// came within a paragraph of publishing a false +3.6% against a baseline that
 /// had moved under it. A control that is not moving is one measured beside the
 /// thing it controls, which means the other file needs a way to ask for one.
+///
+/// **It does not consult [`plan_for`]**, and that is the difference between it
+/// and [`bench`]: a control whose rung moved with the shape would not be one.
+/// A caller asking for a named epilogue is asking for the rung that epilogue is
+/// built at.
 pub fn bench_with(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     shape: Shape,
@@ -5832,6 +5988,131 @@ const HEADLINE: [Shape; 2] = [
         k: 16384,
     },
 ];
+
+/// The sizes #105 says nobody had timed — the small end, where #104's tile
+/// change is a regression rather than a win.
+///
+/// #104 swept `[256, 256]` against `[256, 128]` at 8192³ and 16384³ and left
+/// the crossover between "18% worse at 1024³" and "better at 2048³" unmeasured.
+/// These are the shapes that bracket it, and two of them are the other half of
+/// the issue: `n` a multiple of 128 and not of 256 is a shape the wide tile
+/// cannot compute at all, and there is one at each end of the range so the
+/// fallback is exercised where it is fast as well as where it is slow.
+///
+/// `m` is a multiple of 256 in every row and that is not the wide tile's doing:
+/// a cluster owns `2 · BLOCK_M` rows at both rungs, so the `M` constraint did
+/// not move at #104 and the only alignment this issue is about is `N`.
+const CROSSOVER: [Shape; 8] = [
+    Shape {
+        m: 512,
+        n: 512,
+        k: 512,
+    },
+    Shape {
+        m: 1024,
+        n: 1024,
+        k: 1024,
+    },
+    Shape {
+        m: 1024,
+        n: 1152,
+        k: 1024,
+    },
+    Shape {
+        m: 1536,
+        n: 1536,
+        k: 1536,
+    },
+    Shape {
+        m: 2048,
+        n: 2048,
+        k: 2048,
+    },
+    Shape {
+        m: 3072,
+        n: 3072,
+        k: 3072,
+    },
+    Shape {
+        m: 4096,
+        n: 4096,
+        k: 4096,
+    },
+    Shape {
+        m: 4096,
+        n: 4224,
+        k: 4096,
+    },
+];
+
+/// The four arms every row of [`crossover`] runs, and the design of the table.
+///
+/// The first is the kernel this file shipped through #102 and is the
+/// denominator: #105's acceptance is "no shape that worked before #104 is
+/// slower after this", and that shape's kernel is this rung.
+///
+/// The second and third are the two mechanisms #104 confounded, separated the
+/// way #87's own sweep separates them. `[256, 128] @ s4` is the control's tile
+/// at the wide rung's residency — 2 CTAs an SM instead of 3, at unchanged tile
+/// count, unchanged intensity and unchanged waves — so it prices the occupancy
+/// step alone. `[256, 256] @ s3` moves the tile as well, so the difference
+/// between them is the tile and nothing else.
+///
+/// The fourth is what actually launches: [`SHIPPED_EPILOGUE`] is `staged84`
+/// since #119 and the wide tile is the only rung with a staged entry point, so
+/// a chooser routing away from it gives up the epilogue too. A rule set on the
+/// fused column alone would be a rule set on a launch nobody makes.
+const CROSSOVER_ARMS: [(Rung, Epilogue); 4] = [
+    (CONTROL, Epilogue::Fused),
+    (
+        Rung {
+            block_n: 128,
+            block_k: 64,
+            stages: 4,
+            entry: Entry::N128S4,
+        },
+        Epilogue::Fused,
+    ),
+    (SHIPPED, Epilogue::Fused),
+    (SHIPPED, SHIPPED_EPILOGUE),
+];
+
+/// The two of [`CROSSOVER_ARMS`] the chooser is choosing *between* — the first
+/// and the last.
+///
+/// The middle two are instruments and not options. `[256, 128] @ s4` exists to
+/// price an occupancy step at a fixed tile and `[256, 256] @ lcf` exists to
+/// price the tile at a fixed epilogue; neither is a launch anything would ship,
+/// so a table ranking the rule against them would be scoring it on rungs it is
+/// not allowed to pick — and at the small end, where the two `[256, 128]` rungs
+/// differ by less than the clock can resolve, that is a column of noise
+/// presented as a verdict.
+const CHOOSABLE: [(Rung, Epilogue); 2] = [(CONTROL, Epilogue::Fused), (SHIPPED, SHIPPED_EPILOGUE)];
+
+/// SMs a launch puts a CTA on at all, which is the quantity a pair tile spends
+/// before any residency question arises.
+///
+/// A tile twice as wide halves the tiles, and below one wave that halves this:
+/// 1024³ is 32 tiles at `[256, 128]` and 16 at `[256, 256]`, so the wide rung
+/// leaves **two thirds of the device holding nothing** where the narrow one
+/// leaves a third. Neither figure is an occupancy step and no residency table
+/// shows either.
+fn sms_busy(m: usize, n: usize, rung: Rung, cap: u32) -> u32 {
+    (RANKS * tiles(m, n, rung.block_n).min(cap)).min(SMS)
+}
+
+/// CTAs an SM must hold for the grid to be placed at all — `ceil(CTAs / SMS)`,
+/// against the [`Rung::ctas_per_sm`] the rung is *admitted* for.
+///
+/// This is what makes the occupancy step falsifiable rather than assumed. A
+/// rung admitted for 2 CTAs an SM and needing 1 is not paying for the step it
+/// took: every CTA has an SM to itself and the second slot goes unused at both
+/// rungs alike. So wherever this column reads 1, a `[256, 128] @ s3` against
+/// `[256, 128] @ s4` row should read as a tie — and that is the prediction the
+/// second arm of [`CROSSOVER_ARMS`] exists to test.
+fn ctas_per_sm_reached(m: usize, n: usize, rung: Rung, cap: u32) -> u32 {
+    (RANKS * tiles(m, n, rung.block_n).min(cap)).div_ceil(SMS)
+}
 
 /// One checked, timed launch. The only way a number reaches any table below,
 /// which is what keeps [`crate::bench`]'s rule 1 in force here: `run` compares
@@ -5958,6 +6239,12 @@ const TILE_GROUPS: [u32; 4] = [1, 4, 8, 16];
 ///
 /// Every row is checked against the CPU reference before it is timed, by the
 /// same [`run`] the rest of the harness uses. The losers stay in the table.
+///
+/// **It holds the size fixed, and that is what it does not see.** Both sizes
+/// here are ones the wide tile wins at, so this sweep is where `[256, 256]`
+/// was chosen and not where the choice can be *bounded*. [`crossover`] is the
+/// other half — the same two tiles across the sizes below 2048³ — and #105 is
+/// what a sweep that had never been pointed there cost.
 pub fn tile_sweep(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     baseline: Option<crate::bench::Baseline>,
@@ -6142,6 +6429,220 @@ pub fn tile_sweep(
                 None => "—".to_string(),
             },
             match at(SHIPPED) {
+                Some(ours) => format!("{:.3}", theirs / ours),
+                None => "—".to_string(),
+            }
+        );
+    }
+    Ok(())
+}
+
+/// #105's crossover — `modal run modal_app.py::bench --case crossover`.
+///
+/// [`tile_sweep`] is this sweep's other half and holds the size fixed at the
+/// two every table in this repo is quoted at. This one holds the rungs fixed —
+/// four of them, [`CROSSOVER_ARMS`] — and moves the size across the range #104
+/// left unmeasured. It is a separate case rather than a fifth table there for a
+/// reason the rule it sets makes concrete: `tile` is 8192³ and 16384³ dozens of
+/// times over and costs most of an hour, and **a measurement the next tile
+/// change has to re-take should cost minutes**. The most expensive row here is
+/// 4096³.
+///
+/// # What it is trying to separate
+///
+/// #104 states two costs and #105 observes that they are the same fact seen
+/// twice — a bigger tile quantizes worse — but there are two mechanisms with
+/// that description and they do not have to cross over at the same size:
+///
+/// 1. **Parallelism.** Half the tiles is half the clusters, and below one wave
+///    that is half the *device*. [`sms_busy`] is the column.
+/// 2. **Residency.** `[256, 256]` is 2 CTAs an SM against `[256, 128]`'s 3,
+///    and #101 priced an occupancy step at 14–16%. [`ctas_per_sm_reached`] is
+///    the column, and the point of it is that a step is only paid where the
+///    grid is deep enough to need the slot.
+///
+/// The prediction, written down before the run: **below one wave these are not
+/// both live.** A launch with fewer clusters than the device has SMs needs one
+/// CTA an SM whatever the rung admits, so the occupancy step is not being paid
+/// at all there and the whole of the small-size loss is mechanism 1. If that is
+/// right, `[256, 128] @ s3` and `[256, 128] @ s4` — the same tile at the two
+/// residencies — read as a tie at 512³ and 1024³ and separate only once the
+/// tile count passes the grid. It is falsifiable on one column of one table,
+/// which is why the arm is in the sweep rather than the argument.
+///
+/// Every row is checked element by element against the CPU reference before it
+/// is timed, by the same [`run`] every other table here uses, and that is where
+/// the exactness of the fallback path is established: two rows have
+/// `n % 256 != 0` and only the narrow rung can compute them at all.
+pub fn crossover(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    baseline: Option<crate::bench::Baseline>,
+) -> Result<(), Box<dyn Error>> {
+    let per_sm = shared_per_sm(context)?;
+    println!(
+        "gemm pair tile below 2048³ (#105) — min ms over 30 timed launches, every row\n\
+         checked against the CPU reference first, static schedule at group {GROUP}\n\
+         throughout. `vs #102` is against `[256,128] k64 s3`, the kernel this file\n\
+         shipped before #104 moved the tile, so a negative number in that column at a\n\
+         shape that shipped is exactly what #105 is about.\n\
+         `SMs` is min(2·tiles, {SMS}) — SMs the launch puts a CTA on at all. `CTA/SM` is\n\
+         the rung's admitted residency and `reached` is ceil(CTAs / {SMS}), what the grid\n\
+         needs. Where reached is below CTA/SM the occupancy step is not being paid,\n\
+         whatever the residency says, and the two `[256,128]` rungs — same tile, 3 CTAs\n\
+         an SM against 2 — are the arm that tests it.\n\
+         **Run this more than once.** The rows below 2048³ are 13-22 µs launches and\n\
+         #98's 2.9% of drift between containers is 10-12% here: two runs of this case\n\
+         disagreed on the sign of the `[256,128] s3` against `s4` arm at both 1024³ and\n\
+         1536³. What reproduced is which of the two *choosable* arms won, and that is\n\
+         all `gemm::CROSSOVER_TILES` is set on. A percentage off one container at these\n\
+         sizes is a number, not a measurement — which is why this case costs a minute."
+    );
+    println!(
+        "{:<18}{:<26}{:>7}{:>6}{:>7}{:>9}{:>8}{:>9}{:>11}{:>11}{:>10}",
+        "shape",
+        "rung",
+        "tiles",
+        "SMs",
+        "waves",
+        "wave eff",
+        "CTA/SM",
+        "reached",
+        "min ms",
+        "TFLOP/s",
+        "vs #102"
+    );
+    let mut measured: Vec<(Rung, Epilogue, Shape, f64)> = Vec::new();
+    for &shape in &CROSSOVER {
+        for (rung, epilogue) in CROSSOVER_ARMS {
+            let label = match epilogue {
+                Epilogue::Fused => rung.name(),
+                other => format!("{} {}", rung.name(), other.name()),
+            };
+            // The whole of the alignment cost, printed rather than skipped: a
+            // row the wide tile cannot compute is the argument #105 makes
+            // against requiring `n % 256`, and a table that omitted it would
+            // read as though the constraint were free.
+            if !shape.n.is_multiple_of(rung.block_n) {
+                println!(
+                    "{:<18}{:<26}{:>7}{:>6}{:>7}{:>9}{:>8}{:>9}{:>11}{:>11}{:>10}",
+                    shape, label, "—", "—", "—", "—", "—", "—", "n % 256", "≠ 0", "—"
+                );
+                continue;
+            }
+            let cap = rung.max_clusters(per_sm);
+            let plan = Plan {
+                scheduler: Scheduler::Static,
+                group: GROUP,
+                rung,
+                epilogue,
+                ablation: Ablation::Whole,
+            };
+            eprintln!("{shape} on {label}: staging and checking");
+            let (_, timings) = run(context, shape.m, shape.n, shape.k, plan, time)?;
+            let milliseconds = timings.min();
+            measured.push((rung, epilogue, shape, milliseconds));
+            let (waves, efficiency) = wave_efficiency_of(shape.m, shape.n, rung, cap);
+            let reference = measured
+                .iter()
+                .find(|row| row.0 == CONTROL && row.1 == Epilogue::Fused && same(row.2, shape))
+                .map(|row| row.3);
+            println!(
+                "{:<18}{:<26}{:>7}{:>6}{:>7}{:>8.1}%{:>8}{:>9}{:>11.4}{:>11.1}{:>10}",
+                shape,
+                label,
+                tiles(shape.m, shape.n, rung.block_n),
+                sms_busy(shape.m, shape.n, rung, cap),
+                waves,
+                100.0 * efficiency,
+                rung.ctas_per_sm(per_sm),
+                ctas_per_sm_reached(shape.m, shape.n, rung, cap),
+                milliseconds,
+                tflops(shape, milliseconds),
+                match reference {
+                    Some(before) => format!("{:+.1}%", 100.0 * (before / milliseconds - 1.0)),
+                    None => "—".to_string(),
+                }
+            );
+        }
+    }
+
+    println!(
+        "\n2. the rule this sets, applied to the same rows.\n\
+         `chose` is what `gemm::plan_for` picks at each shape and `paid` is what that\n\
+         choice costs against the better of the two arms it was choosing between — so a\n\
+         zero column is a chooser picking the winner everywhere and a nonzero entry is a\n\
+         row where the rule is wrong, by that much. The two control arms are not in the\n\
+         comparison: neither is a launch anything would ship, and scoring a rule against\n\
+         a rung it may not pick measures nothing."
+    );
+    println!(
+        "{:<18}{:<26}{:>12}{:>12}{:>10}",
+        "shape", "chose", "chosen ms", "best ms", "paid"
+    );
+    for &shape in &CROSSOVER {
+        let chosen = plan_for(shape.m, shape.n);
+        let at = |rung: Rung, epilogue: Epilogue| {
+            measured
+                .iter()
+                .find(|row| row.0 == rung && row.1 == epilogue && same(row.2, shape))
+                .map(|row| row.3)
+        };
+        let Some(ours) = at(chosen.rung, chosen.epilogue) else {
+            continue;
+        };
+        let best = CHOOSABLE
+            .into_iter()
+            .filter_map(|(rung, epilogue)| at(rung, epilogue))
+            .fold(f64::INFINITY, f64::min);
+        println!(
+            "{:<18}{:<26}{:>12.4}{:>12.4}{:>10}",
+            shape,
+            match chosen.epilogue {
+                Epilogue::Fused => chosen.rung.name(),
+                other => format!("{} {}", chosen.rung.name(), other.name()),
+            },
+            ours,
+            best,
+            format!("{:.1}%", 100.0 * (ours / best - 1.0))
+        );
+    }
+
+    println!(
+        "\n3. against cuBLASLt on the same device in the same container — the denominator,\n\
+         and the only column that says whether the rule is worth anything to a caller\n\
+         rather than only to the row above it."
+    );
+    println!(
+        "{:<18}{:>14}{:>14}{:>16}{:>16}",
+        "shape", "cuBLASLt ms", "theirs TF/s", "#102/theirs", "chosen/theirs"
+    );
+    for &shape in &CROSSOVER {
+        let Some(baseline) = baseline else {
+            println!(
+                "no cuBLASLt column: built without --features cublas. modal_app.py::bench\n\
+                 turns it on, and a ratio is the point of this table."
+            );
+            break;
+        };
+        eprintln!("{shape}: staging and checking {}", baseline.name);
+        let theirs = (baseline.bench)(context, shape)?.0.min();
+        let chosen = plan_for(shape.m, shape.n);
+        let at = |rung: Rung, epilogue: Epilogue| {
+            measured
+                .iter()
+                .find(|row| row.0 == rung && row.1 == epilogue && same(row.2, shape))
+                .map(|row| row.3)
+        };
+        println!(
+            "{:<18}{:>14.4}{:>14.1}{:>16}{:>16}",
+            shape,
+            theirs,
+            tflops(shape, theirs),
+            match at(CONTROL, Epilogue::Fused) {
+                Some(ours) => format!("{:.3}", theirs / ours),
+                None => "—".to_string(),
+            },
+            match at(chosen.rung, chosen.epilogue) {
                 Some(ours) => format!("{:.3}", theirs / ours),
                 None => "—".to_string(),
             }
