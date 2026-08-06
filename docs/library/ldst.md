@@ -228,6 +228,93 @@ ships, `.x4` is in the library as the measured alternative, and the two
 directions differ on purpose — the store side's `.x4` removed a wait, and this
 one had none to remove.
 
+## What orders an `stmatrix` before the `ldmatrix` that reads it
+
+`load_fragment`'s safety contract asked the caller for
+`fence.proxy.async.shared::cta` before an `ldmatrix` read a tile `stmatrix` had
+written. That fence orders the *generic* proxy's writes so the **async** proxy
+can see them — the TMA engine, a tcgen05 MMA — and it is what `store_fragment`
+and `tma_store` correctly owe. `stmatrix` and `ldmatrix` are both generic-proxy
+accesses, warp-level shared-memory stores and loads executed by threads, so
+between them that fence orders nothing at all. `publish_to_async_proxy`'s doc
+states the rule and names a generic-write/generic-read pair as one of the two
+cases where no fence is owed; this pair is that case.
+
+What such a pair owes across threads is a **barrier**, which the contract did
+not say — so the sentence was either a redundant demand or an understated
+obligation, and those are very different mistakes. Nothing in tree could tell
+them apart: every load in the repo — `load_fragment`, `load_tile` and the `.x4`
+forms of both — reads a TMA-staged tile, and every `stmatrix` write is read back
+by plain `ld.shared`, by the TMA store engine, or by an MMA. The two directions
+had never met.
+
+The question is the same one at both widths, and so is the answer. `.x2` and
+`.x4` differ in how many addresses the warp supplies and in nothing that touches
+a proxy or a barrier, so the obligation below is `load_fragment`'s and
+`load_fragment_x4` inherits it verbatim. The case runs `.x2`, which is what
+ships.
+
+### Measured
+
+`device-tests`' `stmatrix into ldmatrix`. Warp 0 fills a `[64, 64]` tile twice —
+from a *stale* generation of position identities, published with a fence and a
+barrier so every warp is known to hold it, and then from the *fresh* one — and a
+reader warp reads all sixteen blocks back. The two generations are the same
+addresses carrying identities **37 columns apart**: odd, so the rotation is a
+bijection on the tile's columns, and not a multiple of 16, so no misaddressed
+`ldmatrix` block can produce that displacement. A value therefore names the
+generation that reached it rather than merely failing to match, and an
+addressing failure is a third answer rather than a second one. B200, `sm_100a`;
+4096 values a row.
+
+| what varies | row | result |
+|---|---|---|
+| control | the read runs before the store, barrier-ordered | **every value stale** |
+| **same warp** | nothing between them | every value fresh |
+| | the proxy fence only | every value fresh |
+| | `bar.sync` only | every value fresh |
+| | both — what the contract demanded | every value fresh |
+| **cross warp** | `bar.sync` only | **every value fresh** |
+| | both — what the contract demanded | every value fresh |
+| | nothing between them | **256 of 4096 stale** |
+| | the proxy fence only | **128 of 4096 stale** |
+
+So: the fence is redundant and the barrier is the whole of it. Within one warp
+the two instructions are that warp's own program order and nothing is owed
+between them; across warps `bar.sync` alone is enough, and it is the only thing
+that was ever load-bearing. `load_fragment`'s contract now names the barrier,
+scopes it to a writer that is not the reading warp, and cites the rule.
+
+Three things worth reading off the table rather than out of the verdict:
+
+- **The two ungated rows fired.** They are races and gate nothing, but they came
+  back with real stale values rather than the polite nothing a negative control
+  usually returns — so the hazard is not hypothetical and this case observes it
+  outside the arrangement built to force it.
+- **`the proxy fence only` reading stale is the direct half of the answer.** The
+  fence the contract demanded was in the kernel, in the position the contract
+  named, and the read still saw the previous generation. That is not an
+  inference from which proxy the instructions use; it is the fence failing to
+  order the pair, measured. The two rows above it — `bar.sync` alone, clean over
+  4096 values — are the other half.
+- **The control cannot decline to fire, and that is the point of it.** It reads
+  before the store with a barrier making that the order that happens, so it is
+  an ordering rather than a race. A dropped-wait style control that merely
+  *hopes* to observe a hazard can come back clean and prove nothing — which is
+  exactly what happened to `sttm into mma`'s, and to `tmem across warpgroups`'
+  before it. The two race rows here happened to fire; the control was never
+  going to have to.
+
+The race rows' counts are the only numbers in the table that are not
+reproducible. An earlier run of the same nine rows had `nothing between them` at
+128 stale and `the proxy fence only` clean — the same verdict, since a race that
+resolves in order is not an ordering either way, and since nothing gated rests
+on either. What does not move between runs is the seven gated rows.
+
+Not established: the same question with the reading warp in another CTA of a
+cluster, across a warpgroup boundary at 256 threads, and any of it on silicon
+that is not a B200.
+
 ## `store_packed_x4` computes nothing correct in tree
 
 Nothing in tree computes a right answer with `store_packed_x4`, and that is not

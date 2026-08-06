@@ -308,6 +308,21 @@ has none to remove, and on `softmax` — three passes, every one a `load_tile` �
 the wide form is unordered at 64 and 512 blocks and **1.1% slower** at 8192,
 on 40 registers a thread against 32. `docs/library/ldst.md` has the table.
 
+**And what has to sit between the two directions is a barrier, not a fence**
+(#136). `load_fragment`'s contract asked for `fence.proxy.async.shared::cta`
+before an `ldmatrix` read a tile `stmatrix` wrote — but both are generic-proxy
+accesses, so that fence orders nothing between them, and what a
+generic-write/generic-read pair owes across threads is a `bar.sync` the contract
+never named. Nothing in tree could say which mistake it was: every load in the
+repo, at either width, reads a TMA-staged tile, and every `stmatrix` write is
+read by `ld.shared`, the TMA engine or an MMA, so the two directions had never
+met. `stmatrix into ldmatrix` runs the hand-off at every layer, with the reader
+in the writing warp and in another one, against a control that reads before the
+store and is required to come back stale. The fence is redundant — the row
+carrying it without a barrier read the previous generation of the tile — and the
+barrier is the whole of it, and only across warps. `docs/library/ldst.md` has
+the table.
+
 ### 2.2 Global ↔ register — done (#11)
 
 TK's `global_to_register.cuh` (`load`/`store`): `global::load_rows` and

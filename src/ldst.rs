@@ -79,6 +79,10 @@ pub const fn fragment_address(row: u32, column: u32, lane: u32, slot: usize) -> 
 /// - The caller owes a [`crate::shared::publish_to_async_proxy`] before any MMA
 ///   or TMA reads the tile, and a barrier after it to carry this thread's
 ///   ordering to whichever thread issues the read.
+/// - A reader that is another warp's [`load_fragment`] owes the **barrier and
+///   not the fence**: `ldmatrix` reads through the same generic proxy this
+///   writes through, so the fence orders nothing between them. Measured; see
+///   [`load_fragment`].
 #[inline(always)]
 pub unsafe fn store_fragment<E: Element<Unpacked = [f32; 2]>>(
     chunks: SwizzledChunks<E>,
@@ -238,14 +242,32 @@ pub unsafe fn store_tile_x4<E: Element<Unpacked = [f32; 2]>, const M: usize, con
 /// # }
 /// ```
 ///
+/// **What publishes the block is a barrier, not a fence** (#136). This contract
+/// asked for `fence.proxy.async.shared::cta` until it was run: that fence orders
+/// the generic proxy's writes for the *async* proxy to read, and `stmatrix` and
+/// `ldmatrix` are both generic-proxy accesses, so between them it orders
+/// nothing. [`publish_to_async_proxy`](crate::shared::publish_to_async_proxy)
+/// states the rule and this pair is exactly the case it excludes. Measured on a
+/// B200 with each layer present and absent (`device-tests`'
+/// `stmatrix into ldmatrix`): within one warp the read is the store's own
+/// program order and needs nothing between them; across warps `bar.sync` alone
+/// is clean over 4096 values; and the row carrying the fence and no barrier read
+/// the previous generation of the tile, which is the fence failing to order the
+/// pair rather than an inference about it. `docs/library/ldst.md` has the table.
+///
 /// # Safety
 ///
 /// - All 32 lanes of the warp must call this together.
 /// - `chunks` must belong to a tile at least `row + 16` rows tall into which
 ///   `column + 16` fits.
-/// - Its bytes must already be visible to the generic proxy: a TMA load needs
-///   its barrier waited on, a `stmatrix` needs
-///   `fence.proxy.async.shared::cta`.
+/// - Its bytes must already be visible to the generic proxy, which is a
+///   different obligation for each writer:
+///   - a **TMA load** writes through the async proxy, and what publishes it is
+///     the load's own mbarrier, waited on;
+///   - an **`stmatrix`** writes through the generic proxy — the one this load
+///     reads — so no proxy fence is owed. What is owed is a **barrier**, and
+///     only when the writing warp is not this one: `bar.sync` for a tile the
+///     block shares, `bar.warp.sync` for one a warp owns.
 #[inline(always)]
 pub unsafe fn load_fragment<E: Element<Unpacked = [f32; 2]>>(
     chunks: SwizzledChunks<E>,
@@ -313,7 +335,11 @@ pub unsafe fn load_fragment<E: Element<Unpacked = [f32; 2]>>(
 /// - All 32 lanes of the warp must call this together.
 /// - `chunks` must belong to a tile at least `row + 16` rows tall into which
 ///   `column + 16` fits.
-/// - Its bytes must already be visible to the generic proxy.
+/// - Its bytes must already be visible to the generic proxy, by whichever of
+///   [`load_fragment`]'s two routes the writer took: a TMA load's own mbarrier,
+///   waited on, or a barrier if an `stmatrix` in another warp wrote them. The
+///   two widths differ in how many addresses the warp supplies and in nothing
+///   that touches a proxy, so the obligation is the same one.
 #[inline(always)]
 pub unsafe fn load_fragment_x4<E: Element<Unpacked = [f32; 2]>>(
     chunks: SwizzledChunks<E>,
@@ -367,7 +393,9 @@ pub unsafe fn load_fragment_x4<E: Element<Unpacked = [f32; 2]>>(
 /// - All 32 lanes of the warp must call this together.
 /// - `chunks` must belong to a tile at least `row + M` rows tall into which
 ///   `column + N` fits.
-/// - Its bytes must already be visible to the generic proxy.
+/// - Its bytes must already be visible to the generic proxy, by whichever of
+///   [`load_fragment`]'s two routes the writer took: a TMA load's own mbarrier,
+///   waited on, or a barrier if an `stmatrix` in another warp wrote them.
 #[inline(always)]
 pub unsafe fn load_tile<E: Element<Unpacked = [f32; 2]>, const M: usize, const N: usize>(
     chunks: SwizzledChunks<E>,
@@ -420,7 +448,11 @@ where
 /// - All 32 lanes of the warp must call this together.
 /// - `chunks` must belong to a tile at least `row + M` rows tall into which
 ///   `column + N` fits.
-/// - Its bytes must already be visible to the generic proxy.
+/// - Its bytes must already be visible to the generic proxy, by whichever of
+///   [`load_fragment`]'s two routes the writer took: a TMA load's own mbarrier,
+///   waited on, or a barrier if an `stmatrix` in another warp wrote them. The
+///   two widths differ in how many addresses the warp supplies and in nothing
+///   that touches a proxy, so the obligation is the same one.
 #[inline(always)]
 pub unsafe fn load_tile_x4<E: Element<Unpacked = [f32; 2]>, const M: usize, const N: usize>(
     chunks: SwizzledChunks<E>,
