@@ -53,8 +53,8 @@ use crate::global::{GlobalRows, store_shared_rows};
 use crate::ldst::{store_tile, store_tile_x4};
 use crate::reg::{BaseLdtm, FragmentLayout, RegTile};
 use crate::shared::{
-    Element, SharedTile, Swizzle, publish_to_async_proxy, tma_store_commit, tma_store_wait,
-    tma_store_wait_read,
+    Element, SharedTile, Swizzle, SwizzledChunks, publish_to_async_proxy, tma_store_commit,
+    tma_store_wait, tma_store_wait_read,
 };
 use crate::tmem::TmemTile;
 
@@ -197,27 +197,262 @@ impl Scope for Warp {
     }
 }
 
+/// Which `tcgen05.ld` a drain's pass issues — the TMEM half of [`Drain`].
+///
+/// Every rung returns *the same band*: `device-tests`' `ldtm x8 map` is the
+/// assertion that [`TmemTile::tile`] and [`TmemTile::tile_x8`] agree at every
+/// shape both accept, which is what puts all of them on one correctness gate
+/// and makes this an instruction axis rather than a semantic one. What differs
+/// is how many issues carry it and how many waits are exposed behind them
+/// (#117): the wait is the larger half, which is why the axis exists.
+///
+/// A future rung is an impl and not an edit to [`Drain::staged`]'s walk.
+///
+/// # `fragments_pack16_x8` is deliberately not a rung
+///
+/// [`TmemTile::fragments_pack16_x8`] returns packed b16 words rather than an
+/// fp32 [`RegTile`], so it is not a width of this axis but a different route
+/// through the drain: the only thing that can store its product is
+/// [`crate::ldst::store_packed_x4`], which by its own doc computes a wrong `C`
+/// — it exists so `experiments`' `pack16` rung can hold every other instruction
+/// fixed and take the `cvt` column to zero. Admitting it would make this
+/// trait's product an associated type and bind [`FragmentStore`] to it, so the
+/// two axes would stop being independent for the sake of one ablation that
+/// never ships. A packed drain is its own entry point when something needs one.
+pub trait TmemRead {
+    /// This warp's `[R, C]` band of `accumulator` at `(row, column)`, in
+    /// registers.
+    ///
+    /// # Safety
+    ///
+    /// As the underlying read on [`TmemTile`]: all 32 lanes of one warp call it
+    /// together after the MMA writing them has committed, `row..row + R` lies
+    /// inside that warp's own [`crate::tmem::warp_lanes`] quadrant, and
+    /// `column + C` fits the allocation.
+    unsafe fn band<const M: usize, const N: usize, const R: usize, const C: usize>(
+        accumulator: TmemTile<M, N>,
+        row: u32,
+        column: u32,
+    ) -> RegTile<R, C, BaseLdtm>
+    where
+        BaseLdtm: FragmentLayout<R, C>;
+}
+
+/// `tcgen05.ld.16x256b.x1`: two issues per `[16, 16]` block and a wait after
+/// each, because the registers the wait covers *are* the load's return value.
+/// A `[32, 64]` band is 16 loads and 16 fully exposed tensor-memory latencies.
+#[derive(Clone, Copy)]
+pub struct X1;
+
+impl TmemRead for X1 {
+    #[inline(always)]
+    unsafe fn band<const M: usize, const N: usize, const R: usize, const C: usize>(
+        accumulator: TmemTile<M, N>,
+        row: u32,
+        column: u32,
+    ) -> RegTile<R, C, BaseLdtm>
+    where
+        BaseLdtm: FragmentLayout<R, C>,
+    {
+        unsafe { accumulator.tile::<R, C>(row, column) }
+    }
+}
+
+/// `tcgen05.ld.16x256b.x8`: 64 columns and 32 f32 a thread per issue, so the
+/// same `[32, 64]` band is two loads and two waits. #117's width, and what
+/// [`Drain`] ships.
+#[derive(Clone, Copy)]
+pub struct X8;
+
+impl TmemRead for X8 {
+    #[inline(always)]
+    unsafe fn band<const M: usize, const N: usize, const R: usize, const C: usize>(
+        accumulator: TmemTile<M, N>,
+        row: u32,
+        column: u32,
+    ) -> RegTile<R, C, BaseLdtm>
+    where
+        BaseLdtm: FragmentLayout<R, C>,
+    {
+        unsafe { accumulator.tile_x8::<R, C>(row, column) }
+    }
+}
+
+/// [`X8`] with the band's issues **in flight behind one wait** rather than a
+/// wait per issue — [`TmemTile::tile_x8_batched`], whose `ISSUES` is the count
+/// the instruction cannot derive and a `bool` could never have carried.
+///
+/// `ISSUES` is the band's `.x8` count, `(R / 16) * (C / 64)`, and at most
+/// [`crate::tmem::ISSUE_LIMIT`] — the register file rather than a convenience.
+/// Two behind one wait cost no registers and are worth +0.9% of `gemm_sol`'s
+/// launch at 8192³; four cost 176 registers against 96 and are a loss. The
+/// const asserts on the underlying read are what keep a caller from stating it
+/// wrong.
+///
+/// ```no_run
+/// # use kittens::epilogue::{Drain, X4, X8Batched};
+/// # use kittens::global::GlobalRows;
+/// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+/// # use kittens::tmem::TmemTile;
+/// # use kittens::{lane, warp_id};
+/// # unsafe fn epilogue(
+/// #     accumulator: TmemTile<128, 256>,
+/// #     staging: SharedTile<Bf16, 32, 64, Swizzle128B>,
+/// #     c: GlobalRows<Bf16>,
+/// # ) { unsafe {
+/// // A `[32, 64]` band is two `.x8` issues, and this puts both in flight
+/// // before the one `tcgen05.wait::ld`.
+/// Drain::<X8Batched<2>, X4>::staged(accumulator, warp_id(), staging, c, 0, 0, lane());
+/// # } }
+/// ```
+#[derive(Clone, Copy)]
+pub struct X8Batched<const ISSUES: usize>;
+
+impl<const ISSUES: usize> TmemRead for X8Batched<ISSUES> {
+    #[inline(always)]
+    unsafe fn band<const M: usize, const N: usize, const R: usize, const C: usize>(
+        accumulator: TmemTile<M, N>,
+        row: u32,
+        column: u32,
+    ) -> RegTile<R, C, BaseLdtm>
+    where
+        BaseLdtm: FragmentLayout<R, C>,
+    {
+        unsafe { accumulator.tile_x8_batched::<R, C, ISSUES>(row, column) }
+    }
+}
+
+/// Which `stmatrix` a drain's pass issues — the shared half of [`Drain`].
+///
+/// Both rungs write the same bytes to the same addresses; what differs is how
+/// many instructions carry them. A [`crate::reg::Fragment`] is four `8x8` b16
+/// matrices, and the width is how many of them one `stmatrix` names.
+///
+/// # Why there is no `.x1` rung and no scattered one
+///
+/// `stmatrix.m8n8.x1` exists in the ISA and the library has no entry point for
+/// it: it would be four instructions per block where [`X2`] is two and [`X4`]
+/// is one, at identical addresses, and #117 measured this axis in the
+/// fewer-and-wider direction. Adding it is an `ldst` entry point *and* an impl
+/// here — the impl is the cheap half, which is the point of the trait.
+///
+/// [`crate::ldst::scatter_tile`] is the store direction for the elements
+/// `stmatrix` cannot move at all, and [`Drain::staged`]'s
+/// `Element<Unpacked = [f32; 2]>` bound is what excludes them: an fp32 staging
+/// tile is a different epilogue, not a width of this one.
+pub trait FragmentStore {
+    /// Write `band` into the staging tile at `(row, column)`.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::ldst::store_tile`]: every lane of the warp calls it together
+    /// and the rectangle it writes is inside the tile `chunks` describes.
+    unsafe fn store<E: Element<Unpacked = [f32; 2]>, const R: usize, const C: usize>(
+        chunks: SwizzledChunks<E>,
+        row: u32,
+        column: u32,
+        lane: u32,
+        band: RegTile<R, C, BaseLdtm>,
+    ) where
+        BaseLdtm: FragmentLayout<R, C>;
+}
+
+/// `stmatrix.m8n8.x2`: two of a fragment's four matrices per issue, so two
+/// instructions per `[16, 16]` block ([`crate::ldst::store_tile`]).
+#[derive(Clone, Copy)]
+pub struct X2;
+
+impl FragmentStore for X2 {
+    #[inline(always)]
+    unsafe fn store<E: Element<Unpacked = [f32; 2]>, const R: usize, const C: usize>(
+        chunks: SwizzledChunks<E>,
+        row: u32,
+        column: u32,
+        lane: u32,
+        band: RegTile<R, C, BaseLdtm>,
+    ) where
+        BaseLdtm: FragmentLayout<R, C>,
+    {
+        unsafe { store_tile(chunks, row, column, lane, band) }
+    }
+}
+
+/// `stmatrix.m8n8.x4`: all four matrices in one issue, at the same 32 addresses
+/// ([`crate::ldst::store_tile_x4`]). #117's width, and what [`Drain`] ships.
+#[derive(Clone, Copy)]
+pub struct X4;
+
+impl FragmentStore for X4 {
+    #[inline(always)]
+    unsafe fn store<E: Element<Unpacked = [f32; 2]>, const R: usize, const C: usize>(
+        chunks: SwizzledChunks<E>,
+        row: u32,
+        column: u32,
+        lane: u32,
+        band: RegTile<R, C, BaseLdtm>,
+    ) where
+        BaseLdtm: FragmentLayout<R, C>,
+    {
+        unsafe { store_tile_x4(chunks, row, column, lane, band) }
+    }
+}
+
 /// A drain at one pair of instruction widths — [`Drain::staged`] is the
 /// epilogue, and this type is how a call names the widths and nothing else.
+///
+/// `R` is the [`TmemRead`] rung and `W` the [`FragmentStore`] one, so
+/// `Drain::<X8, X4>` is the pair that ships and every other combination is a
+/// rung `experiments/` sweeps. They are *types* and not `bool`s for two
+/// reasons, one per axis: [`X8Batched`] carries an `ISSUES` count no `bool`
+/// can hold, and a third rung on either axis is then an impl rather than an
+/// arm added to the walk and to every dial that reaches it.
 ///
 /// A generic *function* would be the obvious shape and Rust will not have it:
 /// naming any of a function's generic arguments means naming all of them, so
 /// the widths would drag the element, the two tile shapes and the swizzle to
 /// every call site, which are exactly the four the arguments already carry.
-/// Naming them on a type leaves the function's own eight to inference.
-pub struct Drain<const LDTM_X8: bool, const STMATRIX_X4: bool>;
+/// Naming them on a type leaves the function's own six to inference.
+///
+/// # What the walk still cannot say, and it is not a width
+///
+/// [`Drain::staged`] ties one band to one staging tile: a pass reads `COLS`
+/// columns, writes them, and stores the tile. `gemm_sol`'s drain is the same
+/// instructions in a different walk, and three things separate them — none of
+/// which is a rung on either axis:
+///
+/// - **The band and the staging tile are different widths there, on purpose.**
+///   Two of its three shipped entries fill a 128-wide staging tile out of two
+///   64-wide bands, because a `[32, 128]` band is four `.x8` issues and
+///   [`crate::tmem::TmemTile::tile_x8_batched`] measures four at 176 registers
+///   against 96 — the batching wins at two and loses at four. Saying that needs
+///   a band width beside `COLS`, which is a parameter on the walk.
+/// - **It drains a column *span* of a wider accumulator**, because two
+///   warpgroups split the tile between them (#197). The walk covers all `N` of
+///   the [`TmemTile`] it is handed and there is no `[M, SPAN]` view to hand it —
+///   [`TmemTile::columns_right`] shifts the base and keeps the width.
+/// - **It converges twice a pass**, where this walk converges once and leans on
+///   `stmatrix.sync.aligned` for the other edge.
+///
+/// So [`X8Batched`] closes the axis question and the migration is now a
+/// measurement — of a band-width parameter and of the second convergence —
+/// rather than a design one. It is still not a refactor: `gemm_sol` is the
+/// tightest register count in the repo and moving its codegen is a
+/// measurement's job.
+pub struct Drain<R: TmemRead, W: FragmentStore> {
+    _widths: PhantomData<(R, W)>,
+}
 
-impl<const LDTM_X8: bool, const STMATRIX_X4: bool> Drain<LDTM_X8, STMATRIX_X4> {
+impl<R: TmemRead, W: FragmentStore> Drain<R, W> {
     /// TMEM → registers → `stmatrix` → global, a band at a time: the epilogue
     /// that ships, with the band loop's own convergence inside it.
     ///
-    /// One warp drains its own [`BaseLdtm::WARP_ROWS`] rows of `accumulator`, `C`
-    /// columns a pass, where `C` is `staging`'s width. A pass reads the band into
-    /// registers, writes it into `staging` with `stmatrix`, and copies `staging`
-    /// out to `dest` in 16-byte accesses ([`store_shared_rows`]). Every instruction
-    /// in that is a call elsewhere in the crate; what lives here is the loop, the
-    /// widths, and the one thing in it that is not a call — the [`Warp::converge`]
-    /// each pass owes the next.
+    /// One warp drains its own [`BaseLdtm::WARP_ROWS`] rows of `accumulator`,
+    /// `staging`'s width a pass. A pass reads the band into registers (`R`),
+    /// writes it into `staging` with `stmatrix` (`W`), and copies `staging` out
+    /// to `dest` in 16-byte accesses ([`store_shared_rows`]). Every instruction
+    /// in that is a call elsewhere in the crate; what lives here is the loop and
+    /// the one thing in it that is not a call — the [`Warp::converge`] each pass
+    /// owes the next.
     ///
     /// # `band`, and why it is not a row
     ///
@@ -232,19 +467,17 @@ impl<const LDTM_X8: bool, const STMATRIX_X4: bool> Drain<LDTM_X8, STMATRIX_X4> {
     /// ([`crate::tmem::warp_lanes`], #193), and its rows of `C` are its own. For a
     /// one-warpgroup epilogue — every kernel in tree — both are `warp_id()`.
     ///
-    /// # The widths, one per half (#117)
+    /// # The two axes, one per half (#117)
     ///
-    /// `LDTM_X8` is the TMEM half: [`TmemTile::tile`] issues
-    /// `tcgen05.ld.16x256b.x1` twice per `[16, 16]` block and waits after each,
-    /// where [`TmemTile::tile_x8`] takes 64 columns and 32 f32 a thread per issue —
-    /// two issues and two waits for a `[32, 64]` band against sixteen of each, and
-    /// the waits are the larger half. `STMATRIX_X4` is the `stmatrix` half:
-    /// [`store_tile`] issues `stmatrix.m8n8.x2` twice per block and
-    /// [`store_tile_x4`] names all four matrices in one, at the same addresses.
+    /// [`TmemRead`] is the TMEM half and [`FragmentStore`] the `stmatrix` half,
+    /// and each rung's own doc carries what its instruction costs. Neither moves
+    /// a byte — every read returns the same band and every write puts it at the
+    /// same addresses, which is what puts all of them on the same correctness
+    /// gate — and neither touches the global half, where `store_shared_rows`
+    /// issues the same 32 × 16 B stores whatever the pair is.
     ///
-    /// Neither moves a byte — both widths return the same band and write the same
-    /// staging tile, which is what puts every combination on the same correctness
-    /// gate — and neither touches the global half.
+    /// The walk itself knows none of this. A rung the ISA has and this crate
+    /// does not is an impl on one of the two traits.
     ///
     /// # There is no proxy fence here and its absence is not a bug
     ///
@@ -259,12 +492,12 @@ impl<const LDTM_X8: bool, const STMATRIX_X4: bool> Drain<LDTM_X8, STMATRIX_X4> {
     ///
     /// `staging` is one warp's tile and nobody else's, so the convergence is
     /// `bar.warp.sync` and the destination rectangle is this warp's rows. The CTA
-    /// arrangement — one `[128, C]` tile, `store_shared_rows::<.., 128>`, a
+    /// arrangement — one `[128, COLS]` tile, `store_shared_rows::<.., 128>`, a
     /// `bar.sync` a pass — is what `crate::global`'s docs describe and nothing in
     /// tree uses; it is a second function when something does.
     ///
     /// ```no_run
-    /// # use kittens::epilogue::Drain;
+    /// # use kittens::epilogue::{Drain, X4, X8};
     /// # use kittens::global::GlobalRows;
     /// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
     /// # use kittens::tmem::TmemTile;
@@ -276,7 +509,7 @@ impl<const LDTM_X8: bool, const STMATRIX_X4: bool> Drain<LDTM_X8, STMATRIX_X4> {
     /// #     row: u32,
     /// #     column: u32,
     /// # ) { unsafe {
-    /// Drain::<true, true>::staged(accumulator, warp_id(), staging, c, row, column, lane());
+    /// Drain::<X8, X4>::staged(accumulator, warp_id(), staging, c, row, column, lane());
     /// # } }
     /// ```
     ///
@@ -286,38 +519,38 @@ impl<const LDTM_X8: bool, const STMATRIX_X4: bool> Drain<LDTM_X8, STMATRIX_X4> {
     ///   and fenced and nothing in flight that will overwrite it.
     /// - `staging` is this warp's alone, and no other warp reads or writes it until
     ///   this returns.
-    /// - The rectangle `row..row + R` of `dest`, `column..column + N`, lies inside
-    ///   the buffer `dest` names.
+    /// - The rectangle `row..row + ROWS` of `dest`, `column..column + N`, lies
+    ///   inside the buffer `dest` names.
     #[inline(always)]
     pub unsafe fn staged<
         E: Element<Unpacked = [f32; 2]>,
         const M: usize,
         const N: usize,
-        const R: usize,
-        const C: usize,
+        const ROWS: usize,
+        const COLS: usize,
         S: Swizzle,
     >(
         accumulator: TmemTile<M, N>,
         band: u32,
-        staging: SharedTile<E, R, C, S>,
+        staging: SharedTile<E, ROWS, COLS, S>,
         dest: GlobalRows<E>,
         row: u32,
         column: u32,
         lane: u32,
     ) where
-        BaseLdtm: FragmentLayout<R, C>,
+        BaseLdtm: FragmentLayout<ROWS, COLS>,
     {
         const {
             assert!(
-                R == BaseLdtm::WARP_ROWS,
+                ROWS == BaseLdtm::WARP_ROWS,
                 "a warp's band is BaseLdtm::WARP_ROWS rows, so the staging tile is that tall"
             );
             assert!(
-                C <= BaseLdtm::WIDEST_BAND,
+                COLS <= BaseLdtm::WIDEST_BAND,
                 "a pass holds the whole band in registers; BaseLdtm::WIDEST_BAND is what fits"
             );
             assert!(
-                N.is_multiple_of(C),
+                N.is_multiple_of(COLS),
                 "the walk is whole staging tiles, so the accumulator's columns are a multiple of them"
             );
         };
@@ -330,20 +563,12 @@ impl<const LDTM_X8: bool, const STMATRIX_X4: bool> Drain<LDTM_X8, STMATRIX_X4> {
             let rows = row + lanes;
             let mut at = 0u32;
             while at < N as u32 {
-                let pass: RegTile<R, C, BaseLdtm> = if LDTM_X8 {
-                    accumulator.tile_x8(lanes, at)
-                } else {
-                    accumulator.tile(lanes, at)
-                };
-                if STMATRIX_X4 {
-                    store_tile_x4(chunks, 0, 0, lane, pass);
-                } else {
-                    store_tile(chunks, 0, 0, lane, pass);
-                }
+                let pass = R::band::<M, N, ROWS, COLS>(accumulator, lanes, at);
+                W::store(chunks, 0, 0, lane, pass);
                 // The warp's 32 threads carry the whole tile: `staging` is theirs.
-                store_shared_rows::<E, R, C, S, 32>(dest, rows, column + at, lane, staging);
+                store_shared_rows::<E, ROWS, COLS, S, 32>(dest, rows, column + at, lane, staging);
                 Warp::converge();
-                at += C as u32;
+                at += COLS as u32;
             }
         }
     }

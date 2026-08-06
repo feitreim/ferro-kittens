@@ -318,9 +318,10 @@ use cuda_device::{
 
 // Host side: the launcher's error type, and the benchmark's size and clock.
 use crate::bench::{Shape, Timings, time};
+use core::marker::PhantomData;
 use std::error::Error;
 
-use kittens::epilogue::{self, StoreRing, Warp};
+use kittens::epilogue::{Drain, FragmentStore, StoreRing, TmemRead, Warp, X1, X2, X4, X8};
 use kittens::global::{GlobalRows, store_rows, store_shared_rows};
 use kittens::ldst::{store_tile, store_tile_x4};
 use kittens::mma::{commit_multicast_cg2, mma_walk_cg2};
@@ -1399,15 +1400,19 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAG
     /// [`kittens::epilogue::Drain::staged`] puts between passes, and why it is a
     /// warp barrier and not a block one.
     ///
-    /// # `WIDE` and `X4` are the two instruction widths, one per half (#117)
+    /// # `R` and `W` are the two instruction widths, one per half (#117)
     ///
-    /// [`kittens::epilogue::Drain::staged`]'s `LDTM_X8` and `STMATRIX_X4`, whose
-    /// doc is where the two instructions are derived. Both default off, and
-    /// both leave every byte of this loop where it was — same bands, same
-    /// staging tile, same 114 816 B envelope, same order of writes to `C`.
-    /// What changes is how many instructions carry them: a `[32, 64]` band
-    /// costs 16 LDTM issues and 16 exposed waits at `.x1` against 2 and 2 at
-    /// `.x8`, and 16 `stmatrix.m8n8.x2` against 8 `.x4`.
+    /// [`TmemRead`] and [`FragmentStore`], whose rungs' own docs are where the
+    /// instructions are derived. Every combination leaves every byte of this
+    /// loop where it was — same bands, same staging tile, same 114 816 B
+    /// envelope, same order of writes to `C`. What changes is how many
+    /// instructions carry them: a `[32, 64]` band costs 16 LDTM issues and 16
+    /// exposed waits at [`X1`] against 2 and 2 at [`X8`], and 16
+    /// `stmatrix.m8n8.x2` at [`X2`] against 8 at [`X4`].
+    ///
+    /// The rungs this file sweeps are the four combinations of those; [`X8`]
+    /// with its issues batched behind one wait is a fifth the library can
+    /// express and nothing here has measured.
     ///
     /// Neither touches the global half, which is the half #116 already moved:
     /// `store_shared_rows` issues the same 32 × 16 B stores on the same four
@@ -1420,10 +1425,10 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAG
     /// As [`Self::drain`], plus: `stage` must be 4096 B of shared memory no
     /// other warp writes.
     #[inline(always)]
-    unsafe fn drain_staged<const WIDE: bool, const X4: bool>(&self, item: u32, stage: StageTile) {
+    unsafe fn drain_staged<R: TmemRead, W: FragmentStore>(&self, item: u32, stage: StageTile) {
         unsafe {
             let (row_base, column_base) = self.cta_origin(item);
-            epilogue::Drain::<WIDE, X4>::staged(
+            Drain::<R, W>::staged(
                 self.accumulator,
                 self.warp_id,
                 stage,
@@ -2308,14 +2313,19 @@ impl Job for Idle {
 /// clean in a way #116's was not, since that one had to price a 16 424-byte
 /// envelope change before it could price the epilogue.
 #[derive(Clone, Copy)]
-struct Staged<const DRAIN: bool, const WIDE: bool, const X4: bool> {
+struct Staged<const DRAIN: bool, R: TmemRead, W: FragmentStore> {
     tile: Tile<BLOCK_N, HALF_N, BLOCK_K, STAGES>,
     /// This warp's 4096 B of the staging run — see [`StageTile`] for why it is
     /// the warp's and not the CTA's.
     stage: StageTile,
+    /// The rung, and the whole of what a launch site below is choosing. A
+    /// selector holds no bytes, so this is the type's parameters and nothing
+    /// else — `Staged::<true, X8, X2>` is a name for a row of the table where
+    /// `Staged::<true, true, false>` was a position in it.
+    widths: PhantomData<(R, W)>,
 }
 
-impl<const DRAIN: bool, const WIDE: bool, const X4: bool> Job for Staged<DRAIN, WIDE, X4> {
+impl<const DRAIN: bool, R: TmemRead, W: FragmentStore> Job for Staged<DRAIN, R, W> {
     const RANKS: u32 = crate::gemm::RANKS;
 
     /// # Safety
@@ -2352,7 +2362,7 @@ impl<const DRAIN: bool, const WIDE: bool, const X4: bool> Job for Staged<DRAIN, 
             tile.done.wait(0);
             thread::sync_threads();
             if DRAIN {
-                tile.drain_staged::<WIDE, X4>(item, self.stage);
+                tile.drain_staged::<R, W>(item, self.stage);
             }
         }
     }
@@ -2475,7 +2485,7 @@ impl Job for StagedHot {
             }
             tile.done.wait(0);
             thread::sync_threads();
-            tile.drain_staged::<true, true>(self.home, self.stage);
+            tile.drain_staged::<X8, X4>(self.home, self.stage);
         }
     }
 }
@@ -3029,7 +3039,11 @@ pub mod kernels {
         unsafe {
             let (tile, stage) =
                 attach_staged(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
-            let mut job = Staged::<true, false, false> { tile, stage };
+            let mut job = Staged::<true, X1, X2> {
+                tile,
+                stage,
+                widths: PhantomData,
+            };
             pipeline::run(&mut job, tiles_m * tiles_n);
             release(&job.tile);
         }
@@ -3070,7 +3084,11 @@ pub mod kernels {
         unsafe {
             let (tile, stage) =
                 attach_staged(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
-            let mut job = Staged::<true, true, false> { tile, stage };
+            let mut job = Staged::<true, X8, X2> {
+                tile,
+                stage,
+                widths: PhantomData,
+            };
             pipeline::run(&mut job, tiles_m * tiles_n);
             release(&job.tile);
         }
@@ -3109,7 +3127,11 @@ pub mod kernels {
         unsafe {
             let (tile, stage) =
                 attach_staged(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
-            let mut job = Staged::<true, false, true> { tile, stage };
+            let mut job = Staged::<true, X1, X4> {
+                tile,
+                stage,
+                widths: PhantomData,
+            };
             pipeline::run(&mut job, tiles_m * tiles_n);
             release(&job.tile);
         }
@@ -3150,7 +3172,11 @@ pub mod kernels {
         unsafe {
             let (tile, stage) =
                 attach_staged(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
-            let mut job = Staged::<true, true, true> { tile, stage };
+            let mut job = Staged::<true, X8, X4> {
+                tile,
+                stage,
+                widths: PhantomData,
+            };
             pipeline::run(&mut job, tiles_m * tiles_n);
             release(&job.tile);
         }
@@ -3542,7 +3568,11 @@ pub mod kernels {
         unsafe {
             let (tile, stage) =
                 attach_staged(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
-            let mut job = Staged::<false, false, false> { tile, stage };
+            let mut job = Staged::<false, X1, X2> {
+                tile,
+                stage,
+                widths: PhantomData,
+            };
             pipeline::run(&mut job, tiles_m * tiles_n);
             release(&job.tile);
         }

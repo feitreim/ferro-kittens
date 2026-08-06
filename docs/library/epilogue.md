@@ -23,15 +23,82 @@ allocate over.
 
 Two decisions are in the type rather than at the call sites.
 
-**The widths are the type's const parameters and everything else is inferred.**
-`LDTM_X8` and `STMATRIX_X4` are #117's two instruction widths, one per half of
-the drain, and a call has to name them. Naming any of a generic *function*'s
-arguments in Rust means naming all of them, which would drag the element, both
-tile shapes and the swizzle to every call site — the four that the `SharedTile`
-argument already carries. So the widths sit on a type, `Drain<LDTM_X8,
-STMATRIX_X4>`, and the function's own six parameters are inferred from its
-arguments. `Scope::store_once` is a trait method for the same reason: the scope
-is the one thing a call has to say.
+**The widths are the type's parameters and everything else is inferred.** A
+call has to name #117's two instruction widths, one per half of the drain, and
+nothing else. Naming any of a generic *function*'s arguments in Rust means
+naming all of them, which would drag the element, both tile shapes and the
+swizzle to every call site — the four that the `SharedTile` argument already
+carries. So the widths sit on a type, `Drain<R, W>`, and the function's own six
+parameters are inferred from its arguments. `Scope::store_once` is a trait
+method for the same reason: the scope is the one thing a call has to say.
+
+**Each width is a type, not a `bool`, because neither axis has two rungs.** The
+pair started as `Drain<const LDTM_X8: bool, const STMATRIX_X4: bool>` and that
+shape is wrong twice over. The TMEM axis has three instructions the drain can
+issue, not two — `.x1`, `.x8`, and `.x8` with the band's issues batched behind
+one wait — and the third carries an `ISSUES` count that no `bool` can hold. And
+a `bool` puts the rung in the *walk*: every arm of it is an `if` inside the loop
+and a position in every dial that reaches it, so the fourth rung edits the
+epilogue and five call sites rather than adding an impl.
+
+So the axes are traits — `TmemRead` with `X1`, `X8`, `X8Batched<ISSUES>`, and
+`FragmentStore` with `X2`, `X4` — in the same idiom as `Swizzle` and `Scope`:
+a unit struct per rung, the instruction on the impl, and the walk knowing none
+of them. `Drain::<X8, X4>` is the pair that ships, and it says which pair at the
+launch site where `Drain::<true, true>` said only where in a table it sat. That
+is the complaint `gemm_ws`' own doc makes about `Ws::<STAGES, true, false,
+false, true>`, answered on this axis.
+
+An `adt_const_params` enum would express the same set and is unstable; the
+crate takes no incomplete features. The trait needs none.
+
+### What is on the axes, and what is deliberately not
+
+`stmatrix.m8n8.x1` exists in the ISA and the library has no entry point for it:
+four instructions per `[16, 16]` block where `X2` is two and `X4` is one, at
+identical addresses, in the direction #117 measured as losing. It is an `ldst`
+entry point plus an impl if anyone wants it priced — the impl is the cheap half,
+which is the point.
+
+`TmemTile::fragments_pack16_x8` is **not** a rung on the read axis, and this is
+the one judgement call in the set. It returns packed b16 words rather than an
+fp32 `RegTile`, so it is not a width of the same axis but a different route: the
+only thing that can store its product is `ldst::store_packed_x4`, which by its
+own doc computes a wrong `C` — it exists so `experiments`' `pack16` rung can
+hold every other instruction fixed and take the `cvt` column to zero. Admitting
+it would make `TmemRead`'s product an associated type and bind `FragmentStore`
+to it, so the two axes would stop being independent, for one ablation that never
+ships. A packed drain is its own entry point when something needs one.
+
+`ldst::scatter_tile` is not on the write axis either, and that one needs no
+judgement: it is the store direction for the elements `stmatrix` cannot move,
+and `Drain::staged`'s `Element<Unpacked = [f32; 2]>` bound already excludes
+them.
+
+### What the walk still cannot say, which is where `gemm_sol` sits
+
+`X8Batched` is the rung `gemm_sol`'s drain reads with, and a doctest on it
+compiles `Drain::<X8Batched<2>, X4>::staged` so the claim is checked rather than
+asserted. It is not enough to migrate that kernel, and what is left is three
+things about the *walk* — none of them a rung:
+
+- **The band and the staging tile are different widths there, on purpose.** Two
+  of the three shipped entries fill a 128-wide staging tile out of two 64-wide
+  bands, because a `[32, 128]` band is four `.x8` issues and `tmem`'s own ladder
+  puts four at 176 registers against 96. The batching wins at two and loses at
+  four, so the band width is a knob and `Drain::staged` ties it to `COLS`.
+- **It drains a column span of a wider accumulator**, because two warpgroups
+  split the tile between them (#197). The walk covers all `N` of the `TmemTile`
+  it is handed and there is no `[M, SPAN]` view to hand it — `columns_right`
+  shifts the base and keeps the width.
+- **It converges twice a pass**, where this walk converges once and leans on
+  `stmatrix.sync.aligned` for the other edge.
+
+The third shipped entry (`gemm_sol_m512`, at a 64-wide staging tile) needs only
+the second of those. So the axis question is closed and the migration is a
+measurement — of a band-width parameter, of a span, and of the second
+convergence — rather than a design one. It is still not a refactor: `gemm_sol`
+is the tightest register count in the repo.
 
 **The band index is one number and it means the same thing at both ends.** TMEM
 rows `WARP_ROWS * band` land in destination rows `row + WARP_ROWS * band`, so
@@ -47,6 +114,10 @@ proxy accesses — `stmatrix` writes, `ld.shared` reads — and
 here. The scope is `Warp` and not a parameter, because the staging tile is one
 warp's; the CTA arrangement is `store_shared_rows::<.., 128>` over a `[128, N]`
 tile, which `global`'s docs describe and nothing in tree uses.
+
+#126 moved the loop in and the follow-up made the widths types. Both are pure
+API changes: the opcode census and every shipped kernel's registers, spills and
+frame are identical across the second one.
 
 ## `Scope::store_once`, the no-ring TMA store
 
