@@ -251,9 +251,9 @@ pub unsafe fn store_tile_x4<E: Element<Unpacked = [f32; 2]>, const M: usize, con
 /// B200 with each layer present and absent (`device-tests`'
 /// `stmatrix into ldmatrix`): within one warp the read is the store's own
 /// program order and needs nothing between them; across warps `bar.sync` alone
-/// is enough; and the row with no barrier is the only one that ever read a
-/// stale block. `docs/library/ldst.md` has the table and what the fence-only
-/// row does *not* say.
+/// is clean over 4096 values; and the row carrying the fence and no barrier read
+/// the previous generation of the tile, which is the fence failing to order the
+/// pair rather than an inference about it. `docs/library/ldst.md` has the table.
 ///
 /// # Safety
 ///

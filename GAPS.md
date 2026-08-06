@@ -318,8 +318,10 @@ repo, at either width, reads a TMA-staged tile, and every `stmatrix` write is
 read by `ld.shared`, the TMA engine or an MMA, so the two directions had never
 met. `stmatrix into ldmatrix` runs the hand-off at every layer, with the reader
 in the writing warp and in another one, against a control that reads before the
-store and is required to come back stale. The fence is redundant; the barrier is
-the whole of it, and only across warps. `docs/library/ldst.md` has the table.
+store and is required to come back stale. The fence is redundant — the row
+carrying it without a barrier read the previous generation of the tile — and the
+barrier is the whole of it, and only across warps. `docs/library/ldst.md` has
+the table.
 
 ### 2.2 Global ↔ register — done (#11)
 

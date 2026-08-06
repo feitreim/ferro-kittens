@@ -276,8 +276,8 @@ addressing failure is a third answer rather than a second one. B200, `sm_100a`;
 | | both — what the contract demanded | every value fresh |
 | **cross warp** | `bar.sync` only | **every value fresh** |
 | | both — what the contract demanded | every value fresh |
-| | nothing between them | **128 of 4096 stale** |
-| | the proxy fence only | every value fresh |
+| | nothing between them | **256 of 4096 stale** |
+| | the proxy fence only | **128 of 4096 stale** |
 
 So: the fence is redundant and the barrier is the whole of it. Within one warp
 the two instructions are that warp's own program order and nothing is owed
@@ -287,27 +287,33 @@ scopes it to a writer that is not the reading warp, and cites the rule.
 
 Three things worth reading off the table rather than out of the verdict:
 
-- **The hazard is real and this case sees it.** `cross warp, nothing between
-  them` came back with 128 stale values — a genuine firing, not the deliberate
-  control. Every one of them was the stale *generation* rather than another
-  position's identity, which is what says the failure is an ordering and not an
-  address.
+- **The two ungated rows fired.** They are races and gate nothing, but they came
+  back with real stale values rather than the polite nothing a negative control
+  usually returns — so the hazard is not hypothetical and this case observes it
+  outside the arrangement built to force it.
+- **`the proxy fence only` reading stale is the direct half of the answer.** The
+  fence the contract demanded was in the kernel, in the position the contract
+  named, and the read still saw the previous generation. That is not an
+  inference from which proxy the instructions use; it is the fence failing to
+  order the pair, measured. The two rows above it — `bar.sync` alone, clean over
+  4096 values — are the other half.
 - **The control cannot decline to fire, and that is the point of it.** It reads
   before the store with a barrier making that the order that happens, so it is
-  an ordering rather than a race. A dropped-`store_wait` style control that
-  merely *hopes* to observe a hazard can come back clean and prove nothing —
-  which is exactly what happened to `sttm into mma`'s, and to `tmem across
-  warpgroups`' before it.
-- **`cross warp, the proxy fence only` came back clean, and that is not
-  evidence.** It has no barrier in it; it is the same race as the row above with
-  one more instruction of delay in the writer, and it resolved in order. A race
-  that resolved is not an ordering. It is reported by the case and gates
-  nothing, and no contract rests on it.
+  an ordering rather than a race. A dropped-wait style control that merely
+  *hopes* to observe a hazard can come back clean and prove nothing — which is
+  exactly what happened to `sttm into mma`'s, and to `tmem across warpgroups`'
+  before it. The two race rows here happened to fire; the control was never
+  going to have to.
+
+The race rows' counts are the only numbers in the table that are not
+reproducible. An earlier run of the same nine rows had `nothing between them` at
+128 stale and `the proxy fence only` clean — the same verdict, since a race that
+resolves in order is not an ordering either way, and since nothing gated rests
+on either. What does not move between runs is the seven gated rows.
 
 Not established: the same question with the reading warp in another CTA of a
 cluster, across a warpgroup boundary at 256 threads, and any of it on silicon
 that is not a B200.
->>>>>>> 0088bff (The fence between an `stmatrix` and an `ldmatrix` is a barrier, and `load_fragment` says so)
 
 ## `store_packed_x4` computes nothing correct in tree
 
