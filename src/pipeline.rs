@@ -64,10 +64,38 @@ use crate::sync::{Semaphore, TransactionBytes};
 /// TMEM allocation stays outside the loop — it spans items — so a job may also
 /// end `work` with its accumulator undrained and drain it at the top of the
 /// next item, which is a load-compute-**store**-finish pipeline written inside
-/// a job rather than a second scaffold. Doing that moves two obligations to the
-/// job: the cross-item drain needs a rendezvous covering every CTA the next
-/// item's MMA writes, and the last item's deferred store needs a drain after
-/// [`run`] returns.
+/// a job rather than a second scaffold. Doing that moves one obligation to the
+/// job — the cross-item drain needs a rendezvous covering every CTA the next
+/// item's MMA writes — and one to [`Job::finish`], which is where the last
+/// item's deferred store goes and which both loops call for the job.
+///
+/// # What this trait deliberately cannot express
+///
+/// A **warp-asynchronous item stream**: warp groups of the same cluster sitting
+/// at *different* items at once. `work` is entered by every thread with one
+/// `item`, so every warp is always on the same item and a job's whole slack is
+/// one item — an epilogue can lag its MMA by exactly one, which is what
+/// [`Job::finish`] then owes. A kernel that publishes `(row, column)` to its
+/// consumers through a shared word and an mbarrier of its own, and runs three
+/// warp groups two items apart, is not a `Job` and cannot be made into one by
+/// anything in this file.
+///
+/// That is the price of the guarantee the scaffold exists for, and it is the
+/// same fact from both ends: the item boundary is where every mbarrier is
+/// re-armed, and it is a rendezvous of the whole cluster, so the producer warps
+/// provably cannot run ahead into the next item. Take the boundary away and
+/// phase parity has to be threaded from item to item by hand; leave it and the
+/// warps are in lockstep. There is no third position, so a scaffold admitting a
+/// warp-asynchronous stream is a *second* scaffold beside this one rather than a
+/// change to it — different barrier lifecycle, and a job written against either
+/// cannot run under the other.
+///
+/// It is a decision and not an omission because the thing given up is priced:
+/// #90 and #94 measured the item boundary at a fifth to a third of the launch,
+/// which is what a design with more slack is competing for, and
+/// `docs/library/pipeline.md` carries the table. The limit was found by porting
+/// a warp-specialized reference kernel onto this trait and recorded here by
+/// #132.
 pub trait Job {
     /// CTAs of the cluster that share this job's barrier set, and so the scope
     /// [`run`]'s item boundary has to be taken at. The default is the block-scope
@@ -110,6 +138,32 @@ pub trait Job {
     ///
     /// Kernel-specific: whatever the item's barrier protocol requires.
     unsafe fn work(&mut self, item: u32);
+
+    /// Whatever the job's last item still owes, once there is no next item to
+    /// overlap it with. Called by [`run`] and [`run_stealing`] after their item
+    /// loops, by every thread that called them, exactly once — including in a
+    /// cluster that got no items at all, which owes nothing and is why the
+    /// default is empty.
+    ///
+    /// A job that defers its last item's store — see this trait's own doc, and
+    /// `Lcsf` in `experiments/` — owes one drain here, and it is a whole output
+    /// tile computed by nobody if it is forgotten. That is the reason this hook
+    /// is on the trait rather than on the entry point: before #132 one kernel's
+    /// nine entry points were nine places to forget it, and forgetting it is a
+    /// wrong `C` that no type said anything about.
+    ///
+    /// It runs *after* the loop's last `inval` — the barrier set the job
+    /// re-arms per item is retired by then, and a store that outlives the last
+    /// item cannot be one of its readers — and **before** the caller's
+    /// `dealloc_*`, since the tensor memory a deferred drain reads is memory the
+    /// caller is about to give back.
+    ///
+    /// # Safety
+    ///
+    /// Kernel-specific, as [`Self::work`]'s. The default does nothing and has
+    /// no contract.
+    #[inline(always)]
+    unsafe fn finish(&mut self) {}
 }
 
 /// Map a work item to a `(row, column)` of a `rows`x`columns` tile grid,
@@ -177,7 +231,9 @@ fn boundary<J: Job>() {
 /// returns with its MMAs committed, the harness fences them before the boundary.
 /// TMEM allocation stays with the caller, since it spans items and
 /// [`crate::tmem::alloc_cluster`] is a whole-cluster collective that must not be
-/// inside the loop.
+/// inside the loop — so a job deferring its last item's store owes that drain to
+/// [`Job::finish`], which this calls before returning and the caller therefore
+/// cannot forget.
 ///
 /// # Safety
 ///
@@ -211,6 +267,7 @@ pub unsafe fn run<J: Job>(job: &mut J, items: u32) {
         if leader && initialized {
             job.inval();
         }
+        job.finish();
     }
 }
 
@@ -597,6 +654,7 @@ pub unsafe fn run_stealing<J: Job>(job: &mut J, queue: ClcQueue) {
         if leader {
             queue.disarm();
         }
+        job.finish();
     }
 }
 

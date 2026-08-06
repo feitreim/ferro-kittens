@@ -2121,26 +2121,6 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAG
             pending: Self::NONE,
         }
     }
-
-    /// Store the last item's accumulator, which no later item is coming to
-    /// overlap. Called once, after the loop and before the pair gives its
-    /// tensor memory back.
-    ///
-    /// A cluster that ran no items at all owes nothing, which is the
-    /// [`Scheduler::Static`] case where `MAX_CLUSTERS` exceeds the tile count.
-    ///
-    /// # Safety
-    ///
-    /// Every thread of the CTA, after [`pipeline::run`] has returned and before
-    /// `release`.
-    #[inline(always)]
-    unsafe fn finish(&self) {
-        unsafe {
-            if self.pending != Self::NONE {
-                self.tile.drain::<false>(self.pending);
-            }
-        }
-    }
 }
 
 impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAGES: usize> Job
@@ -2213,6 +2193,26 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAG
             }
             tile.done.wait(0);
             self.pending = item;
+        }
+    }
+
+    /// Store the last item's accumulator, which no later item is coming to
+    /// overlap — so it pays an un-hidden epilogue, one per cluster over the
+    /// whole launch against one per *item* under the fused shape.
+    ///
+    /// A cluster that ran no items at all owes nothing, which is the
+    /// [`Scheduler::Static`] case where `MAX_CLUSTERS` exceeds the tile count.
+    ///
+    /// # Safety
+    ///
+    /// As [`Tile::drain`], and [`pipeline::run`]'s: every thread of the CTA,
+    /// after the item loop and before `release` gives the tensor memory back.
+    #[inline(always)]
+    unsafe fn finish(&mut self) {
+        unsafe {
+            if self.pending != Self::NONE {
+                self.tile.drain::<false>(self.pending);
+            }
         }
     }
 }
@@ -2586,8 +2586,8 @@ impl<const STAGE: u32> Job for StagedTwice<STAGE> {
 /// item `k` is still being read out of shared memory when item `k + 1`'s first
 /// `stmatrix` wants the buffer, and `acquire` is what stands between them. At
 /// depth 1 the cursor never moves, so what the field really carries is the
-/// obligation — which is why the entry point drains it after the item loop and
-/// not inside one.
+/// obligation — which is why it is discharged in [`Job::finish`], after the item
+/// loop and not inside one.
 ///
 /// `TWICE` is [`Tile::drain_staged_tma`]'s doubling instrument; at `true` it
 /// computes a wrong `C` and is never checked.
@@ -2641,6 +2641,20 @@ impl<const TWICE: bool> Job for StagedTma<TWICE> {
             tile.drain_staged_tma::<TWICE>(item, self.home, &mut self.ring, self.c_map);
         }
     }
+
+    /// Wait out the last item's outstanding store group. It is the one
+    /// obligation the ring cannot discharge incrementally, and the only thing
+    /// that makes the last bands' bytes readable at all — not the kernel
+    /// ending, and not the `cluster_sync` in `release`.
+    ///
+    /// # Safety
+    ///
+    /// As [`kittens::epilogue::StoreRing::drain`]: every thread of the ring's
+    /// scope, with no further `acquire` to come.
+    #[inline(always)]
+    unsafe fn finish(&mut self) {
+        unsafe { self.ring.drain() }
+    }
 }
 
 /// [`Epilogue::StagedTmaCta`]'s job: [`StagedTma`] with the four staging tiles
@@ -2691,6 +2705,17 @@ impl Job for StagedTmaCta {
             thread::sync_threads();
             tile.drain_staged_tma_cta(item, &mut self.ring, self.c_map);
         }
+    }
+
+    /// As [`StagedTma::finish`], at CTA scope.
+    ///
+    /// # Safety
+    ///
+    /// As [`kittens::epilogue::StoreRing::drain`], whose `converge` here is a
+    /// `bar.sync` and therefore wants every thread of the CTA.
+    #[inline(always)]
+    unsafe fn finish(&mut self) {
+        unsafe { self.ring.drain() }
     }
 }
 
@@ -3000,11 +3025,9 @@ pub mod kernels {
                 a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c,
             );
             let mut job = Lcsf::new(tile);
+            // The last item's deferred store is `Lcsf::finish`, which `run`
+            // calls for us before this returns.
             pipeline::run(&mut job, tiles_m * tiles_n);
-            // The last item has no successor to overlap its store with, so it
-            // pays an un-hidden epilogue — one per cluster over the whole
-            // launch, against one per *item* under the fused shape.
-            job.finish();
             release(&job.tile);
         }
     }
@@ -3224,10 +3247,6 @@ pub mod kernels {
                 home: 0,
             };
             pipeline::run(&mut job, tiles_m * tiles_n);
-            // The one obligation the ring cannot discharge incrementally, and
-            // the only thing that makes the last bands' bytes readable at all —
-            // not the kernel ending, and not the `cluster_sync` in `release`.
-            job.ring.drain();
             release(&job.tile);
         }
     }
@@ -3272,7 +3291,6 @@ pub mod kernels {
             );
             let mut job = StagedTmaCta { tile, ring, c_map };
             pipeline::run(&mut job, tiles_m * tiles_n);
-            job.ring.drain();
             release(&job.tile);
         }
     }
@@ -3320,7 +3338,6 @@ pub mod kernels {
                 home: cluster::cluster_idx().min(tiles_m * tiles_n - 1),
             };
             pipeline::run(&mut job, tiles_m * tiles_n);
-            job.ring.drain();
             release(&job.tile);
         }
     }
