@@ -14,8 +14,12 @@ pass. #123 measured the engine against exactly this on `gemm` and the engine
 lost, so the library's only epilogue abstraction was for a while the route that
 lost, while the route that ships was written out by hand in both GEMMs and in
 `gemm_ws`. #126 is that loop moving in, and the three copies becoming three
-calls with no PTX moving: `regcount` reads the same registers, the same spills
-and the same opcode census on every kernel that has one.
+calls. No instruction moves with it: `regcount`'s opcode census is identical for
+every `gemm_*` entry point, and the shipped `gemm_cg2_staged_x8x4` reads the
+same registers, spills and frame in both crates. What did move is `ptxas`'
+allocation on two of `gemm_ws`' staged rungs, which spill where the
+hand-written loop did not — same PTX instruction mix, a different schedule to
+allocate over.
 
 Two decisions are in the type rather than at the call sites.
 
