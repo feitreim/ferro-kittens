@@ -106,8 +106,8 @@ use kittens::reg::{
     RowLayout, Sub, online_rescale,
 };
 use kittens::shared::{
-    Bf16, F32, SharedTile, SharedVec, Swizzle128B, tma_store_commit, tma_store_wait,
-    tma_store_wait_read,
+    Bf16, F32, SharedTile, SharedVec, Swizzle128B, publish_to_async_proxy, tma_store_commit,
+    tma_store_wait, tma_store_wait_read,
 };
 use kittens::sync::{Semaphore, block_reduce, block_reduce_sum};
 use kittens::tmem::{
@@ -115,6 +115,7 @@ use kittens::tmem::{
 };
 
 mod ladder_bench;
+mod ldst_fence;
 mod tmem_occupancy;
 mod tmem_rescale;
 mod tmem_residency;
@@ -351,6 +352,37 @@ const ROW_POISON: f32 = -1.0;
 /// register where `row_of` claims it is.
 const fn row_cell(lane: u32, slot: usize) -> f32 {
     cell(lane as usize, slot)
+}
+
+/// How far the *stale* generation of the `stmatrix`→`ldmatrix` hand-off rotates
+/// its column identities from the fresh generation's (#136).
+///
+/// Odd, so the rotation is a bijection on the tile's columns and a stale value
+/// decodes to a column that exists; and **not a multiple of 16**, which is what
+/// keeps it from being confusable with a misaddressed read. `ldmatrix` lands on
+/// whole `[16, 16]` blocks, so a block read at the wrong row or column returns
+/// an identity displaced by a multiple of 16 and never by this. A read that
+/// comes back stale therefore names the generation it read rather than merely
+/// failing to match, and the two ways a hand-off case can fail — a missing
+/// ordering and a wrong address — are different answers.
+const HANDOFF_ROTATE: usize = 37;
+/// The warp that writes the hand-off tile. Warp 0, so a row naming warp 0 as
+/// its reader is the same-warp arm and any other warp is the cross-warp one.
+const HANDOFF_WRITER: u32 = 0;
+/// Threads a hand-off row launches: the writing warp and one more to read it.
+const HANDOFF_THREADS: u32 = 64;
+/// Bit 0 of a hand-off row's `sync`: [`publish_to_async_proxy`] after the store
+/// — the `fence.proxy.async.shared::cta` `load_fragment`'s contract asks for.
+const HANDOFF_FENCE: u32 = 0b01;
+/// Bit 1: `bar.sync` after the store — what the rule
+/// [`publish_to_async_proxy`] itself states a generic-write/generic-read pair
+/// is owed instead.
+const HANDOFF_BARRIER: u32 = 0b10;
+
+/// The identity the hand-off tile's `(row, column)` carries in the generation
+/// `rotate` names: [`HANDOFF_ROTATE`] the stale one, `0` the fresh one.
+const fn handoff_cell(row: usize, column: usize, rotate: usize) -> f32 {
+    cell(row, (column + rotate) % TILE)
 }
 
 /// Bytes a swizzle case's plan needs: its tile plus a scratch tail for the TMA
@@ -1594,6 +1626,165 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn ldmatrix_x4_map_wide(source: *const TmaDescriptor, mut out: DisjointSlice<f32>) {
         unsafe { ldmatrix_probe::<TILE, WIDE, true>(source, &mut out) }
+    }
+
+    /// Fill every `[16, 16]` block of the hand-off tile from the generation
+    /// `rotate` names, through the [`store_fragment`] path [`stmatrix_probe`]
+    /// already pins against silicon.
+    #[inline(always)]
+    unsafe fn fill_handoff(tile: Tile<TILE, TILE>, lane: u32, rotate: usize) {
+        unsafe {
+            let chunks = tile.chunk_writer();
+            let mut row_block = 0usize;
+            while row_block < TILE / 16 {
+                let mut column_block = 0usize;
+                while column_block < TILE / 16 {
+                    let mut fragment = Fragment::zero();
+                    let mut slot = 0usize;
+                    while slot < Fragment::SLOTS {
+                        let row = 16 * row_block + BaseLdtm::row(lane, slot) as usize;
+                        let mut value = 0usize;
+                        while value < Fragment::VALUES {
+                            let column = 16 * column_block + BaseLdtm::column(lane, value) as usize;
+                            fragment.set(slot, value, handoff_cell(row, column, rotate));
+                            value += 1;
+                        }
+                        slot += 1;
+                    }
+                    store_fragment::<Bf16>(
+                        chunks,
+                        (16 * row_block) as u32,
+                        (16 * column_block) as u32,
+                        lane,
+                        fragment,
+                    );
+                    column_block += 1;
+                }
+                row_block += 1;
+            }
+        }
+    }
+
+    /// Read every block of the hand-off tile back with `ldmatrix` and dump it by
+    /// `(block, lane, slot, value)` — [`ldmatrix_probe`]'s dump exactly, so the
+    /// host applies [`BaseLdtm`]'s map here as it does there.
+    #[inline(always)]
+    unsafe fn read_handoff(tile: Tile<TILE, TILE>, lane: u32, out: &mut DisjointSlice<f32>) {
+        unsafe {
+            let chunks = tile.chunk_writer();
+            let mut row_block = 0usize;
+            while row_block < TILE / 16 {
+                let mut column_block = 0usize;
+                while column_block < TILE / 16 {
+                    let fragment = load_fragment::<Bf16>(
+                        chunks,
+                        (16 * row_block) as u32,
+                        (16 * column_block) as u32,
+                        lane,
+                    );
+                    dump_band(
+                        fragment,
+                        (row_block * (TILE / 16) + column_block) as u32,
+                        lane,
+                        out,
+                    );
+                    column_block += 1;
+                }
+                row_block += 1;
+            }
+        }
+    }
+
+    /// The hand-off #136 asks about: a tile `stmatrix` wrote, read back by
+    /// `ldmatrix` — and what has to sit between them.
+    ///
+    /// `load_fragment`'s contract asks the caller for
+    /// `fence.proxy.async.shared::cta`. Both instructions are generic-proxy
+    /// accesses, and the rule [`publish_to_async_proxy`] states is that a
+    /// generic-write/generic-read pair owes no proxy fence at all — what it owes
+    /// across threads is a barrier. Nothing in tree pairs the two directions on
+    /// one tile, so neither reading has ever been run.
+    ///
+    /// **The instrument.** Warp [`HANDOFF_WRITER`] fills all sixteen blocks
+    /// twice: once from the *stale* generation, published with a fence and a
+    /// barrier so that every warp is known to hold it, and then from the *fresh*
+    /// one. Warp `reader` reads the whole tile back. The two generations are the
+    /// same addresses carrying identities [`HANDOFF_ROTATE`] columns apart, so a
+    /// value the host reads names which generation reached the register:
+    ///
+    /// | what came back | what it says |
+    /// | --- | --- |
+    /// | the fresh identity | the read saw the store. The claim. |
+    /// | the stale identity | it did not — this row's synchronization is not enough |
+    /// | another position's | a misaddressed block, which is not a fence question |
+    /// | no identity at all | nothing was ever written there |
+    ///
+    /// **The axes.** `sync` is the two layers under test —
+    /// [`HANDOFF_FENCE`] and [`HANDOFF_BARRIER`], each present or absent — and
+    /// `reader` is the warp that reads, [`HANDOFF_WRITER`] for the same-warp
+    /// hand-off and any other warp for the cross-warp one. A row with no barrier
+    /// and a reader that is not the writer is a race rather than a contract; the
+    /// host reports those and gates nothing on them.
+    ///
+    /// `EARLY` is the control. The read runs *before* the fresh store, with a
+    /// barrier between them making that order the one that happens, so its dump
+    /// is required to be the stale generation everywhere — which is what says a
+    /// stale read is visible to this case at all. A case whose two readings were
+    /// indistinguishable would pass whatever the hardware did.
+    ///
+    /// Launch with [`HANDOFF_THREADS`] threads and `tile_shared::<TILE, TILE>()`
+    /// bytes.
+    #[inline(always)]
+    unsafe fn handoff_probe<const EARLY: bool>(
+        sync: u32,
+        reader: u32,
+        out: &mut DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let tile = Tile::<TILE, TILE>::from_raw(DynamicSharedArray::<u8, 128>::get_raw());
+            let (warp_id, lane) = (warp::warp_id(), warp::lane_id());
+
+            if warp_id == HANDOFF_WRITER {
+                fill_handoff(tile, lane, HANDOFF_ROTATE);
+            }
+            publish_to_async_proxy();
+            thread::sync_threads();
+
+            if EARLY {
+                if warp_id == reader {
+                    read_handoff(tile, lane, out);
+                }
+                thread::sync_threads();
+            }
+
+            if warp_id == HANDOFF_WRITER {
+                fill_handoff(tile, lane, 0);
+            }
+            if sync & HANDOFF_FENCE != 0 {
+                publish_to_async_proxy();
+            }
+            if sync & HANDOFF_BARRIER != 0 {
+                thread::sync_threads();
+            }
+            if !EARLY && warp_id == reader {
+                read_handoff(tile, lane, out);
+            }
+        }
+    }
+
+    /// [`handoff_probe`] as the case's rows run it: the fresh store, then the
+    /// row's synchronization, then the read.
+    #[kernel]
+    pub unsafe fn stmatrix_handoff(sync: u32, reader: u32, mut out: DisjointSlice<f32>) {
+        unsafe { handoff_probe::<false>(sync, reader, &mut out) }
+    }
+
+    /// [`handoff_probe`] with the read moved in front of the fresh store — the
+    /// control whose dump is the stale generation, so that the two generations
+    /// are known to read differently before any row asserts which one arrived.
+    #[kernel]
+    pub unsafe fn stmatrix_handoff_early(sync: u32, reader: u32, mut out: DisjointSlice<f32>) {
+        unsafe { handoff_probe::<true>(sync, reader, &mut out) }
     }
 
     /// The composed shared movers, both directions in one trip: `load_tile`
@@ -7935,6 +8126,13 @@ fn run() -> Result<usize, Box<dyn Error>> {
     cases.push((
         "clc work stealing",
         Box::new(|| check_clc(&context, stream, module)),
+    ));
+    // What orders an `stmatrix` before the `ldmatrix` that reads it (#136).
+    // Down here with the other contract cases for the same reason `sttm into
+    // mma` is: its last two rows are races on purpose.
+    cases.push((
+        "stmatrix into ldmatrix",
+        Box::new(|| ldst_fence::check(stream, module)),
     ));
     // An MMA reading a segment `tcgen05.st` wrote (#177). Down here with the
     // other contract cases rather than beside `sttm restage`, because its last
