@@ -316,6 +316,70 @@ Three things that follow, none of them guessable from the first:
 Not established: the same question under `cta_group::2`, where one allocation
 spans a CTA pair; and any of it on silicon other than a B200.
 
+## An MMA reads what `tcgen05.st` wrote into its accumulator
+
+The store path had three cases and all three read the segment back with another
+LDTM, so what they established is that STTM is the drain's exact inverse. The one
+consumer a kernel hands a stored segment to is an **MMA**, and nothing read it
+back that way — which is why `store_fragment`'s contract carried the fence
+question as open for the reader that matters most.
+
+The kernel that wanted the answer is oxide-train#68's flash forward. Its output
+accumulator is a `RegTile<32, 128>` — 128 registers a thread and 1136 B of local
+depot, resident for the whole key stream — and it is register-resident for one
+reason: the conditional correction has to rescale `O = P·V`, and with no way to
+write TMEM that meant draining it first. As a read-modify-write of the segment
+the accumulator stops being loop-resident entirely.
+
+### Measured
+
+`device-tests`' `sttm into mma` — `mm_abt` writes the segment, each warp drains
+its own quadrant, scales it by 4 and `store_tile`s it back at the same columns,
+and a second `mm_abt` with `accumulate = true` takes the same segment. Both MMAs
+multiply the same operands, so every value is a multiple of the cell identity
+`A·Bᵀ` already carries and a wrong one names the term that is missing: **5×** is
+a segment the MMA read after the rescale, **2×** is the accumulator as it stood
+before it. B200, driver 580.95.05, `sm_100a`; 16384 values a row.
+
+| what varies | row | result |
+|---|---|---|
+| control | no store at all — the stale reading | **every cell at 2×** |
+| **fences** | both fences, the issuer stored too | every cell at 5× |
+| | both fences, the issuer is a warp that stored elsewhere | **every cell at 5×** |
+| | neither fence — what ships | every cell at 5× |
+| | neither fence, the issuer is another warp | **every cell at 5×** |
+| | no `fence::after_thread_sync` | every cell at 5× |
+| | no `fence::before_thread_sync` | every cell at 5× |
+| **the wait** | no `store_wait` | every cell at 5× |
+
+So: **yes**, and with `store_wait` and the block barrier alone. The fence pair is
+not required of the tensor core any more than it was of the second warpgroup, and
+`store_fragment` says so as a rule.
+
+Two things worth reading off the table rather than out of the verdict:
+
+- **The control is what makes the rest mean anything.** A case whose two readings
+  were indistinguishable would pass whatever the hardware did. `no store` is
+  required to come back at 2× and does, so 5× is positive evidence that the MMA
+  read the stored band and not merely that the numbers were plausible.
+- **The `no store_wait` row did not fire, and it was the negative control.** It
+  was written to observe the hazard the wait excludes, and it observed nothing —
+  every cell was exact. That is the same non-answer `tmem across warpgroups` got
+  from its own dropped-wait row, and it means neither case is evidence about the
+  wait: a race that resolved in order is not an ordering. `store_wait` stays
+  required on the strength of what it is, and this measurement does not
+  strengthen it.
+
+The issuer axis is what carries the cross-warp half. Each row's MMA is issued by
+one warp's lane 0 while all four warps store their own quadrants, so the issuer's
+own quadrant is the same-warp hand-off and the other three are the arrangement a
+kernel really has — the issuer is not the warp that owns the lanes. Moving the
+issuer between rows is what would make an answer that depended on *which*
+quadrant was the issuer's show up as a failure that moved with it.
+
+Not established: the store's visibility to a `cta_group::2` MMA, an MMA in
+another CTA of a cluster, and any of it on silicon other than a B200.
+
 ## Smaller notes
 
 - **Stores go through `_raw` and `to_bits`.** There is no `_pure` store to mirror
