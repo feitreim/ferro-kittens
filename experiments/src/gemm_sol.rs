@@ -296,7 +296,7 @@ pub const ALL_LANES: bool = false;
 /// at two warpgroups and 8 at one. oxide-train's `gemm_sol_final` releases this
 /// way.
 pub const ONE_LANE: bool = true;
-/// The scope the three entries ship, and it changed in #211: table 7 has the
+/// The scope the three entries ship, and it changed in #218: table 7 has the
 /// A/B.
 pub const SHIPPED_RELEASE: bool = ONE_LANE;
 

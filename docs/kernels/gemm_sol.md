@@ -265,7 +265,7 @@ it. What the split buys is not more sub-partitions but more warps issuing
 against them, and that was worth nothing while each warp was also driving a
 band through local memory.
 
-### The accumulator release's arrival scope, which is a null
+### The accumulator release's arrival scope, which is a null (#218)
 
 `release_accumulator` had every lane of every epilogue warp arrive on `empty`,
 for a fact that is one per warp: a warp is done with the accumulator when its
