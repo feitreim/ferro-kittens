@@ -1,7 +1,7 @@
 # ferro-kittens
 
 <p align="center">
-  <img src="assets/ferris_w_cat_ears.png" alt="Ferris the crab wearing cat ears" width="400">
+  <img src="assets/ferris.png" alt="Ferris the crab wearing cat ears" width="400">
   <br>
   <em>Ferris trying his best to fit in with the other kittens</em>
 </p>
