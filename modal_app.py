@@ -1661,7 +1661,7 @@ GATED_KERNELS = (
     # other resource was going to catch this.
     ("groupnorm_tile", "examples", "examples/src/layernorm.rs"),
     ("groupnorm_tile", "experiments", "examples/src/layernorm.rs"),
-    # The three `gemm_sol` entries, here since #196 took the two 256-wide ones
+    # The three `gemm_sol` entries, here since #197 took the two 256-wide ones
     # from six warps to ten. Their residency is fixed by the shared plan and no
     # register count can raise it, so what this gate watches is the *other*
     # direction: `_ctas_by_registers` returning zero. At 320 threads that step

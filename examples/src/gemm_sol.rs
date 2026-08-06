@@ -234,7 +234,7 @@ pub const ONE_WARPGROUP: u32 = 1;
 /// [`ONE_WARPGROUP`]'s twin: eight epilogue warps splitting the columns. Kept as
 /// a rung — it is exact, and it loses.
 pub const TWO_WARPGROUPS: u32 = 2;
-/// What the two 256-wide entries ship, and it changed in #196.
+/// What the two 256-wide entries ship, and it changed in #197.
 ///
 /// The split was measured at one CTA per SM through a `.local` frame the library
 /// no longer emits: `store_tile_x4` homed each drained band to a depot until the

@@ -136,7 +136,7 @@
 //!   **3.35 → 3.10 µs at 4096³ and 4.72 → 3.05 µs at 8192³** and the launch is
 //!   +0.8% and +2.1%, both reproduced in two passes. The lane ceiling is still
 //!   there; it was simply never the term this table was reaching. Both 256-wide
-//!   entries ship the split as of #196, and the arms in this file stay pinned to
+//!   entries ship the split as of #197, and the arms in this file stay pinned to
 //!   [`ONE_WARPGROUP`] so the ladder keeps comparing against what it always did.
 //!
 //! So the drain is bound by something other than the store path, and it is not

@@ -241,7 +241,7 @@ still identical to the 192-thread one (0.5157 against 0.5155 ms), so the two
 extra warps remain free when they do nothing and the whole difference is the
 drain.
 
-Both 256-wide entries ship the split as of #196. `[256, 128]` does not, and
+Both 256-wide entries ship the split as of #197. `[256, 128]` does not, and
 that is a gap in the measurement rather than a result: table 6 has arms at
 `[256, 256]` and `[512, 256]` only, so the narrow entry has no A/B of its own
 and keeps one warpgroup until it does.
