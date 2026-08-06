@@ -567,17 +567,29 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     ///   warp-private write would need besides.
     ///
     /// A `tcgen05_fence_before_thread_sync` / `tcgen05_fence_after_thread_sync`
-    /// pair around such a hand-off is **not** additionally required — measured
-    /// on a B200, each layer removed on its own and both together, with the
-    /// consumer in the *other warpgroup* so that the hand-off crosses every
-    /// boundary there is (`device-tests`' `tmem across warpgroups`). This crate
-    /// used neither on any path before that was known; now it is known.
+    /// pair around such a hand-off is **not** additionally required, for either
+    /// consumer. Measured on a B200, each layer removed on its own and both
+    /// together:
     ///
-    /// [`store_wait`] is a different matter and stays required. The row that
-    /// dropped it read every cell correctly too, but what that row tested is a
-    /// race whose two sides happened to arrive in order, and a race that
-    /// resolved is not an ordering. It is reported by the case and gates
-    /// nothing.
+    /// - a **drain**, with the consumer in the *other warpgroup* so that the
+    ///   hand-off crosses every boundary there is (`device-tests`'
+    ///   `tmem across warpgroups`);
+    /// - an **MMA taking the segment as its accumulator** (`device-tests`'
+    ///   `sttm into mma`) — the in-place rescale, where the reader is the tensor
+    ///   core and not a thread at all. Exact with neither fence, with the store
+    ///   and the MMA issued by the same warp and by different ones, against a
+    ///   control that stores nothing and comes back stale, so the two readings
+    ///   are known to differ before either is asserted.
+    ///
+    /// So [`store_wait`] and whatever rendezvous publishes the write to the
+    /// consumer are the whole of it. This crate uses neither fence on any path,
+    /// and that is now a measurement rather than an omission.
+    ///
+    /// [`store_wait`] is a different matter and stays required. The rows that
+    /// dropped it read every cell correctly too, but what they tested is a race
+    /// whose two sides happened to arrive in order, and a race that resolved is
+    /// not an ordering. Both cases report it and gate nothing — neither is
+    /// evidence about the wait.
     #[inline(always)]
     pub unsafe fn store_fragment(self, row: u32, column: u32, low: TmemRegs4, high: TmemRegs4) {
         unsafe {

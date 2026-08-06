@@ -269,6 +269,20 @@ the other direction too: a warp cannot reach a quadrant that is not its own, so
 warpgroups` is the standing gate; `docs/library/tmem.md` has the table and what
 is still unestablished (`cta_group::2`, and silicon that is not a B200).
 
+**And the consumer a kernel actually hands a stored segment to is an MMA**
+(#177). Every STTM case before this one read the segment back with another LDTM,
+which establishes the store is the drain's inverse and says nothing about the
+tensor core reading it as an accumulator — the shape an in-place accumulator
+rescale has, and the reason oxide-train#68's flash forward keeps 128 registers
+and 1136 B of frame it does not need. `sttm into mma` runs that hand-off: an MMA
+writes the segment, each warp rescales its own quadrant through `store_tile`, and
+a second MMA accumulates onto it. Exact at every fence configuration, with the
+store and the MMA issued by the same warp and by different ones, against a
+control that stores nothing and is required to come back stale. So the rule in
+`store_fragment` now covers both readers, and both cases' dropped-`store_wait`
+rows came back clean — which is not evidence about the wait, and neither is
+treated as any.
+
 ### 2.1a Shared ↔ register — done (#21)
 
 TK's `shared_to_register.cuh`. `ldst::store_fragment` (`stmatrix`) and
