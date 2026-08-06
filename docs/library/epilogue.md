@@ -1,21 +1,86 @@
-# `epilogue` — the shared→global staging ring
-
-`StoreRing` is the shared→global half of an epilogue: `DEPTH` staging tiles that
-a drained accumulator is written into and the TMA engine reads out of.
+# `epilogue` — how a finished accumulator leaves a kernel
 
 A kernel whose result is computed in registers has no way to hand it to the TMA
-engine directly — the engine reads shared memory — so the last move of such a
-kernel is `stmatrix` into a swizzled tile (`ldst::store_tile`) and
-`cp.async.bulk.tensor` out of it (`SharedTile::tma_store`). `StoreRing` is that
-tile, `DEPTH` of them, with the fence and the two waits those two instructions
-owe each other stated once instead of at every call site.
+engine directly — the engine reads shared memory — so every route here goes
+through a staging tile that `stmatrix` fills (`ldst::store_tile`). What differs
+is how that tile reaches global memory, and the module is three items:
+`Drain::staged`, `Scope::store_once` and `StoreRing`.
+
+## `Drain::staged`, which is the route that ships
+
+`stmatrix` into a per-warp staging tile and ordinary 16-byte stores out of it —
+no engine — walking a warp's whole band of the accumulator, `STAGE_N` columns a
+pass. #123 measured the engine against exactly this on `gemm` and the engine
+lost, so the library's only epilogue abstraction was for a while the route that
+lost, while the route that ships was written out by hand in both GEMMs and in
+`gemm_ws`. #126 is that loop moving in, and the three copies becoming three
+calls. No instruction moves with it: `regcount`'s opcode census is identical for
+every `gemm_*` entry point, and the shipped `gemm_cg2_staged_x8x4` reads the
+same registers, spills and frame in both crates. What did move is `ptxas`'
+allocation on two of `gemm_ws`' staged rungs, which spill where the
+hand-written loop did not — same PTX instruction mix, a different schedule to
+allocate over.
+
+Two decisions are in the type rather than at the call sites.
+
+**The widths are the type's const parameters and everything else is inferred.**
+`LDTM_X8` and `STMATRIX_X4` are #117's two instruction widths, one per half of
+the drain, and a call has to name them. Naming any of a generic *function*'s
+arguments in Rust means naming all of them, which would drag the element, both
+tile shapes and the swizzle to every call site — the four that the `SharedTile`
+argument already carries. So the widths sit on a type, `Drain<LDTM_X8,
+STMATRIX_X4>`, and the function's own six parameters are inferred from its
+arguments. `Scope::store_once` is a trait method for the same reason: the scope
+is the one thing a call has to say.
+
+**The band index is one number and it means the same thing at both ends.** TMEM
+rows `WARP_ROWS * band` land in destination rows `row + WARP_ROWS * band`, so
+the origin passed in is the *CTA's* and the warp's own rows are added once,
+inside. `32 * warp_id` written twice — once against the accumulator, once
+against `C` — is what every kernel did before, and it is two places for one
+fact to drift. The `32` itself is `BaseLdtm::WARP_ROWS` now.
+
+The convergence between passes is `Warp::converge`. It is the write-after-read
+the loop owes itself and nothing more: both ends of a staged pass are generic
+proxy accesses — `stmatrix` writes, `ld.shared` reads — and
+`stmatrix.sync.aligned` is already a convergence, so no proxy fence belongs
+here. The scope is `Warp` and not a parameter, because the staging tile is one
+warp's; the CTA arrangement is `store_shared_rows::<.., 128>` over a `[128, N]`
+tile, which `global`'s docs describe and nothing in tree uses.
+
+## `Scope::store_once`, the no-ring TMA store
+
+`StoreRing` without the ring: the proxy fence, one `cp.async.bulk.tensor`, its
+commit, and the `cp.async.bulk.wait_group` that makes the bytes visible. It is
+the shape `softmax` and `layernorm` open-coded — a kernel that stores one whole
+`[R, C]` box per item has no next band to overlap the store with, so a ring's
+`acquire` would have nothing to wait on and its `drain` would follow the commit
+immediately.
+
+The one thing it deliberately does not have is a convergence *after* the wait.
+The wait is per thread and falls to the issuing one; the others are not held
+past it, exactly as in the hand-written sequence. A caller that writes the tile
+again owes itself that barrier.
+
+## `StoreRing`, and why the route that lost stays
+
+`DEPTH` staging tiles that a drained accumulator is written into and the TMA
+engine reads out of, with the fence and the two waits those instructions owe
+each other stated once instead of at every call site.
+
+#123's measurement is `gemm`-shaped: one item's four bands, `IN_FLIGHT` forced
+to 0 by a 1920 B envelope, so band `k + 1`'s `stmatrix` waits out band `k`'s
+store reads and the engine's latency is exposed rather than covered. That says
+nothing about a kernel that stores a whole box per item, which is what the
+engine is for, and it is not a reason to delete the type.
 
 ## Why the depth is a parameter, and what it buys
 
 At depth 1 there is one buffer: band `k + 1`'s `stmatrix` cannot start until band
 `k`'s store has finished *reading* that buffer, so the register→shared move and
-the shared→global move strictly alternate. `examples/src/softmax.rs` is that
-shape written by hand, and it is the right shape for a kernel that stores once.
+the shared→global move strictly alternate. That is `Scope::store_once` with a
+buffer that gets reused, and it is the right shape for a kernel that stores
+once.
 
 At depth 2 the two overlap: band `k + 1` writes the other buffer while the engine
 is still draining band `k`'s. What the extra buffer costs is one whole tile of

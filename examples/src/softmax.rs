@@ -31,13 +31,11 @@ use cuda_device::{cuda_module, kernel, thread};
 use crate::bench::{Shape, Timings, time};
 use std::error::Error;
 
+use kittens::epilogue::{Cta, Scope};
 use kittens::ldst::{load_tile, load_tile_x4, store_tile};
 use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, RegTile, RegVec};
-use kittens::shared::{
-    Bf16, SharedTile, Swizzle128B, SwizzledChunks, publish_to_async_proxy, tma_store_commit,
-    tma_store_wait,
-};
+use kittens::shared::{Bf16, SharedTile, Swizzle128B, SwizzledChunks, publish_to_async_proxy};
 use kittens::sync::Semaphore;
 use kittens::{lane, warp_id};
 
@@ -160,19 +158,16 @@ pub(crate) unsafe fn rows<const X4: bool>(
             store_tile(chunks, row_base, column, lane, x);
             chunk += 1;
         }
-        // `stmatrix` writes through the generic proxy; the TMA engine reads
-        // through the async one.
-        publish_to_async_proxy();
-        thread::sync_threads();
-
+        // The proxy fence, the issue, the commit and the wait for the bytes to
+        // be visible: `store_once` is all four, and this kernel stores its tile
+        // exactly once.
+        Cta::store_once(
+            tile,
+            destination,
+            (ROWS as u32 * thread::blockIdx_x()) as i32,
+            plane,
+        );
         if thread::threadIdx_x() == 0 {
-            tile.tma_store(
-                destination,
-                (ROWS as u32 * thread::blockIdx_x()) as i32,
-                plane,
-            );
-            tma_store_commit();
-            tma_store_wait::<0>();
             loaded.inval();
         }
     }

@@ -382,14 +382,14 @@
 use cuda_device::cluster;
 use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 use cuda_device::tma::TmaDescriptor;
-use cuda_device::{DisjointSlice, cluster_launch, cuda_module, kernel, launch_contract, warp};
+use cuda_device::{DisjointSlice, cluster_launch, cuda_module, kernel, launch_contract};
 
 use crate::bench::{Baseline, Shape, Timings, time};
 use crate::gemm::{Scheduler, a_value, b_value, check_c, stage};
 use std::error::Error;
 
-use kittens::global::{GlobalRows, store_rows, store_shared_rows};
-use kittens::ldst::{store_tile, store_tile_x4};
+use kittens::epilogue;
+use kittens::global::{GlobalRows, store_rows};
 use kittens::mma::{commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, ClcQueue, Job};
 use kittens::plan::SharedPlan;
@@ -439,13 +439,11 @@ pub const THREADS: u32 = 32 * WARPS;
 
 /// Accumulator columns one warp drains in a single band.
 ///
-/// A `RegTile<32, N, BaseLdtm>` is `32 * N / 32` fp32 values a thread, so 256
-/// columns at once would want 256 registers before any of the kernel's own
-/// live state — past the 255 the architecture has, at any occupancy. The
-/// register headroom this design buys does not move this number; 128 is the
-/// widest band that fits and a 256-column stage drains in two of them, exactly
-/// as [`crate::gemm`] does.
-const DRAIN_N: usize = 128;
+/// [`BaseLdtm::WIDEST_BAND`] carries the derivation, and the register headroom
+/// this design buys does not move it: it is the architecture's 255 registers
+/// against one fp32 a thread per column, at any occupancy. A 256-column stage
+/// therefore drains in two bands, exactly as [`crate::gemm`] does.
+const DRAIN_N: usize = BaseLdtm::WIDEST_BAND;
 /// Accumulator columns one warp drains in a single band of the **staged**
 /// epilogue — see [`crate::gemm`]'s `STAGE_N`, which this is a copy of and for
 /// the same two reasons: `SharedTile::WIDTH_OK` wants a whole swizzle subtile,
@@ -458,10 +456,9 @@ const DRAIN_N: usize = 128;
 /// register file and the tile shape, not the plan.
 const STAGE_N: usize = 64;
 /// One epilogue warp's staging tile — [`crate::gemm`]'s `StageTile`, at this
-/// kernel's four epilogue warps.
-type StageTile = SharedTile<Bf16, 32, STAGE_N, Swizzle128B>;
-/// The band a staged pass drains: 64 fp32 a thread against [`Band`]'s 128.
-type StagedBand = RegTile<32, STAGE_N, BaseLdtm>;
+/// kernel's four epilogue warps. Its band is 64 fp32 a thread against
+/// [`Band`]'s 128.
+type StageTile = SharedTile<Bf16, { BaseLdtm::WARP_ROWS }, STAGE_N, Swizzle128B>;
 /// CTAs in the cluster, and the multiplier on a stage's transaction charge.
 const RANKS: u32 = 2;
 /// The CTA mask naming every half of the pair.
@@ -795,26 +792,21 @@ impl<const STAGES: usize> Tile<STAGES> {
     ///
     /// # `WIDE` and `X4` are #117's two instruction widths, one per half
     ///
-    /// [`crate::gemm::Tile::drain_staged`] is where both are derived; this is
-    /// the same two levers on a kernel that exposes the epilogue differently,
-    /// which is the whole reason they are worth measuring twice.
+    /// [`kittens::epilogue::Drain::staged`] is where both instructions are
+    /// derived; this is the same two levers on a kernel that exposes the
+    /// epilogue differently, which is the whole reason they are worth measuring
+    /// twice.
     ///
-    /// **`WIDE` is the LDTM half.** [`TmemTile::tile`] issues
-    /// `tcgen05.ld.16x256b.x1` twice per `[16, 16]` block and waits after each
-    /// one, because the registers it waits on *are* the load's return value —
-    /// so a `[32, 64]` band is 16 loads and 16 fully exposed tensor-memory
-    /// latencies, and never two in flight. [`TmemTile::tile_x8`] is 2 and 2.
-    /// **The win #117 measured was the wait and not the issue**, and this
-    /// kernel is where that claim gets its second reading: here the epilogue
-    /// is already one item behind and already on warps of its own, so a
-    /// latency the producer is covering ought to cost less to begin with.
+    /// **`WIDE` is the LDTM half**, and 16 issues and 16 exposed tensor-memory
+    /// latencies a `[32, 64]` band against 2 and 2. **The win #117 measured was
+    /// the wait and not the issue**, and this kernel is where that claim gets
+    /// its second reading: here the epilogue is already one item behind and
+    /// already on warps of its own, so a latency the producer is covering ought
+    /// to cost less to begin with.
     ///
-    /// **`X4` is the `stmatrix` half.** A [`kittens::reg::Fragment`] is four
-    /// `8x8` b16 matrices and `stmatrix.m8n8.x2` names two, so
-    /// [`kittens::ldst::store_tile`] issues two per block;
-    /// [`kittens::ldst::store_tile_x4`] names all four in one, at the same 32
-    /// addresses. In [`crate::gemm`] it was a clean null alone (−0.6% to
-    /// −1.1%) and bought 14 registers back in composition.
+    /// **`X4` is the `stmatrix` half**, and half the issues at the same 32
+    /// addresses. In [`crate::gemm`] it was a clean null alone (−0.6% to −1.1%)
+    /// and bought 14 registers back in composition.
     ///
     /// Neither touches the global half — `store_shared_rows` issues the same
     /// 32 × 16 B stores on the same four contiguous 128 B runs whatever these
@@ -833,32 +825,17 @@ impl<const STAGES: usize> Tile<STAGES> {
             let tile = self.stage_tile();
             let accumulator = self.accumulator(stage);
             let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, self.group);
-            let row_base =
-                2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank + 32 * self.warp_id;
+            let row_base = 2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank;
             let column_base = BLOCK_N as u32 * tile_n;
-            let chunks = tile.chunk_writer();
-            let mut column = 0u32;
-            while column < BLOCK_N as u32 {
-                let band: StagedBand = if WIDE {
-                    accumulator.tile_x8(32 * self.warp_id, column)
-                } else {
-                    accumulator.tile(32 * self.warp_id, column)
-                };
-                if X4 {
-                    store_tile_x4(chunks, 0, 0, self.lane, band);
-                } else {
-                    store_tile(chunks, 0, 0, self.lane, band);
-                }
-                store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
-                    self.c,
-                    row_base,
-                    column_base + column,
-                    self.lane,
-                    tile,
-                );
-                warp::sync_mask(u32::MAX);
-                column += STAGE_N as u32;
-            }
+            epilogue::Drain::<WIDE, X4>::staged(
+                accumulator,
+                self.warp_id,
+                tile,
+                self.c,
+                row_base,
+                column_base,
+                self.lane,
+            );
         }
     }
 

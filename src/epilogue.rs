@@ -1,14 +1,24 @@
-//! The shared→global half of an epilogue: a staging ring a drained
-//! accumulator is written into and the TMA engine reads out of.
+//! How a finished accumulator leaves a kernel: a band at a time through a
+//! staging tile, in one box through the TMA engine, or through a ring of
+//! staging tiles the engine reads out of.
 //!
-//! The engine reads shared memory, so a result computed in registers leaves a
-//! kernel as `stmatrix` into a swizzled tile ([`crate::ldst::store_tile`]) and
-//! `cp.async.bulk.tensor` out of it ([`SharedTile::tma_store`]). [`StoreRing`]
-//! is that tile, [`StoreRing::DEPTH`] of them, with the fence and the two waits
-//! those instructions owe each other stated once instead of at every call site.
+//! A result computed in registers cannot be handed to the engine directly — the
+//! engine reads shared memory — so every route here goes through a staging tile
+//! that `stmatrix` fills ([`crate::ldst::store_tile`]). What differs is how the
+//! tile reaches global memory, and the three ways are three items:
 //!
-//! Prefer [`Cta`]: the [`Warp`]-scope arm measured 0.6–1.6% slower. That
-//! measurement, what a depth buys, and why this is not a
+//! - [`Drain::staged`] copies it with ordinary 16-byte stores
+//!   ([`crate::global::store_shared_rows`]), walking a warp's whole band of the
+//!   accumulator. **The route that ships**: #123 measured the engine against it
+//!   on `gemm` and the engine lost.
+//! - [`Scope::store_once`] hands it to the engine once, for a kernel that stores a
+//!   whole `[R, C]` box per item and has nothing to overlap it with.
+//! - [`StoreRing`] is [`StoreRing::DEPTH`] of them cycled, with the fence and
+//!   the two waits those instructions owe each other stated once instead of at
+//!   every call site.
+//!
+//! Prefer [`Cta`] where a ring has the choice: the [`Warp`]-scope arm measured
+//! 0.6–1.6% slower. That measurement, what a depth buys, and why this is not a
 //! [`crate::shared::SharedTileRing`] are in `docs/library/epilogue.md`.
 //!
 //! ```no_run
@@ -39,10 +49,14 @@ use cuda_device::{thread, warp};
 
 use cuda_device::tma::TmaDescriptor;
 
+use crate::global::{GlobalRows, store_shared_rows};
+use crate::ldst::{store_tile, store_tile_x4};
+use crate::reg::{BaseLdtm, FragmentLayout, RegTile};
 use crate::shared::{
     Element, SharedTile, Swizzle, publish_to_async_proxy, tma_store_commit, tma_store_wait,
     tma_store_wait_read,
 };
+use crate::tmem::TmemTile;
 
 /// The set of threads that fills one staging buffer: how they converge, and
 /// which of them owns the buffer's store groups.
@@ -64,6 +78,68 @@ pub trait Scope {
     /// to the issuing thread, and what releases the non-issuing threads past a
     /// group wait they did not take.
     fn converge();
+
+    /// One staging tile to global memory through the TMA engine, once — the
+    /// fence, the issue, the commit and the visibility wait a kernel that
+    /// stores a whole `[R, C]` box per item owes.
+    ///
+    /// [`StoreRing`] without the ring: an `acquire` with nothing to wait on, a
+    /// `commit`, and the [`StoreRing::drain`] that follows it immediately. That
+    /// is the right shape when there is no next band to overlap the store with
+    /// — `softmax` and `layernorm` each write their tile once and are done —
+    /// and the wait is for global *visibility* rather than for the engine's
+    /// read, because nothing here recycles the buffer.
+    ///
+    /// It hangs off the scope rather than taking one because a call has to name
+    /// the scope and nothing else: naming any of a generic function's arguments
+    /// means naming all of them, and the element, the tile shape and the
+    /// swizzle are already in the `tile` argument.
+    ///
+    /// `row` and `plane` go to [`SharedTile::tma_store`] as it takes them.
+    ///
+    /// ```no_run
+    /// # use cuda_device::tma::TmaDescriptor;
+    /// # use kittens::epilogue::{Cta, Scope};
+    /// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+    /// # unsafe fn epilogue(
+    /// #     tile: SharedTile<Bf16, 128, 128, Swizzle128B>,
+    /// #     map: *const TmaDescriptor,
+    /// #     row: i32,
+    /// # ) { unsafe {
+    /// Cta::store_once(tile, map, row, 0);
+    /// # } }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// - Every thread of the scope calls this together, with all of its writes
+    ///   into `tile` already issued.
+    /// - `map` describes a live global buffer whose box shape matches
+    ///   `[R, SUBTILE_COLS]`.
+    /// - Only the issuing thread is held past the store: there is a convergence
+    ///   *before* the engine reads and none after it, exactly as the
+    ///   hand-written sequence this replaces had none. A caller that writes
+    ///   `tile` again owes itself the barrier that orders that against the
+    ///   wait.
+    #[inline(always)]
+    unsafe fn store_once<E: Element, const R: usize, const C: usize, S: Swizzle>(
+        tile: SharedTile<E, R, C, S>,
+        map: *const TmaDescriptor,
+        row: i32,
+        plane: i32,
+    ) {
+        unsafe {
+            // The fence orders the writes of the thread executing it, and the
+            // convergence is what carries them to the thread that issues.
+            publish_to_async_proxy();
+            Self::converge();
+            if Self::issuing() {
+                tile.tma_store(map, row, plane);
+                tma_store_commit();
+                tma_store_wait::<0>();
+            }
+        }
+    }
 }
 
 /// The whole block writes a buffer: `bar.sync`, and thread 0 issues. The
@@ -118,6 +194,158 @@ impl Scope for Warp {
     #[inline(always)]
     fn converge() {
         warp::sync_mask(u32::MAX);
+    }
+}
+
+/// A drain at one pair of instruction widths — [`Drain::staged`] is the
+/// epilogue, and this type is how a call names the widths and nothing else.
+///
+/// A generic *function* would be the obvious shape and Rust will not have it:
+/// naming any of a function's generic arguments means naming all of them, so
+/// the widths would drag the element, the two tile shapes and the swizzle to
+/// every call site, which are exactly the four the arguments already carry.
+/// Naming them on a type leaves the function's own eight to inference.
+pub struct Drain<const LDTM_X8: bool, const STMATRIX_X4: bool>;
+
+impl<const LDTM_X8: bool, const STMATRIX_X4: bool> Drain<LDTM_X8, STMATRIX_X4> {
+    /// TMEM → registers → `stmatrix` → global, a band at a time: the epilogue
+    /// that ships, with the band loop's own convergence inside it.
+    ///
+    /// One warp drains its own [`BaseLdtm::WARP_ROWS`] rows of `accumulator`, `C`
+    /// columns a pass, where `C` is `staging`'s width. A pass reads the band into
+    /// registers, writes it into `staging` with `stmatrix`, and copies `staging`
+    /// out to `dest` in 16-byte accesses ([`store_shared_rows`]). Every instruction
+    /// in that is a call elsewhere in the crate; what lives here is the loop, the
+    /// widths, and the one thing in it that is not a call — the [`Warp::converge`]
+    /// each pass owes the next.
+    ///
+    /// # `band`, and why it is not a row
+    ///
+    /// It names the same thing at both ends: TMEM rows `WARP_ROWS * band` and the
+    /// [`WARP_ROWS`](BaseLdtm::WARP_ROWS) after them land in `dest` rows
+    /// `row + WARP_ROWS * band` and the [`WARP_ROWS`](BaseLdtm::WARP_ROWS) after
+    /// those. So `row` and `column` are the **CTA's** origin in `C`, not the warp's,
+    /// and the two cannot drift apart the way `32 * warp_id` written twice can.
+    ///
+    /// It is a band index rather than a warp index because the two differ across
+    /// warpgroups: which TMEM lanes a warp reaches is `warp_id() % LANE_QUADRANTS`
+    /// ([`crate::tmem::warp_lanes`], #193), and its rows of `C` are its own. For a
+    /// one-warpgroup epilogue — every kernel in tree — both are `warp_id()`.
+    ///
+    /// # The widths, one per half (#117)
+    ///
+    /// `LDTM_X8` is the TMEM half: [`TmemTile::tile`] issues
+    /// `tcgen05.ld.16x256b.x1` twice per `[16, 16]` block and waits after each,
+    /// where [`TmemTile::tile_x8`] takes 64 columns and 32 f32 a thread per issue —
+    /// two issues and two waits for a `[32, 64]` band against sixteen of each, and
+    /// the waits are the larger half. `STMATRIX_X4` is the `stmatrix` half:
+    /// [`store_tile`] issues `stmatrix.m8n8.x2` twice per block and
+    /// [`store_tile_x4`] names all four matrices in one, at the same addresses.
+    ///
+    /// Neither moves a byte — both widths return the same band and write the same
+    /// staging tile, which is what puts every combination on the same correctness
+    /// gate — and neither touches the global half.
+    ///
+    /// # There is no proxy fence here and its absence is not a bug
+    ///
+    /// `fence.proxy.async.shared::cta` orders a generic-proxy write against an
+    /// *async*-proxy read, which is what [`StoreRing`] needs. Both ends of this one
+    /// are generic — `stmatrix` writes and `ld.shared` reads — and
+    /// `stmatrix.sync.aligned` is itself a convergence, so nothing stands between
+    /// them. The one hazard left is the *next* pass overwriting a tile this pass is
+    /// still reading, which is what [`Warp::converge`] is for.
+    ///
+    /// # Warp scope, and no other
+    ///
+    /// `staging` is one warp's tile and nobody else's, so the convergence is
+    /// `bar.warp.sync` and the destination rectangle is this warp's rows. The CTA
+    /// arrangement — one `[128, C]` tile, `store_shared_rows::<.., 128>`, a
+    /// `bar.sync` a pass — is what `crate::global`'s docs describe and nothing in
+    /// tree uses; it is a second function when something does.
+    ///
+    /// ```no_run
+    /// # use kittens::epilogue::Drain;
+    /// # use kittens::global::GlobalRows;
+    /// # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
+    /// # use kittens::tmem::TmemTile;
+    /// # use kittens::{lane, warp_id};
+    /// # unsafe fn epilogue(
+    /// #     accumulator: TmemTile<128, 256>,
+    /// #     staging: SharedTile<Bf16, 32, 64, Swizzle128B>,
+    /// #     c: GlobalRows<Bf16>,
+    /// #     row: u32,
+    /// #     column: u32,
+    /// # ) { unsafe {
+    /// Drain::<true, true>::staged(accumulator, warp_id(), staging, c, row, column, lane());
+    /// # } }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// - Every lane of one warp calls this together, with `accumulator` complete
+    ///   and fenced and nothing in flight that will overwrite it.
+    /// - `staging` is this warp's alone, and no other warp reads or writes it until
+    ///   this returns.
+    /// - The rectangle `row..row + R` of `dest`, `column..column + N`, lies inside
+    ///   the buffer `dest` names.
+    #[inline(always)]
+    pub unsafe fn staged<
+        E: Element<Unpacked = [f32; 2]>,
+        const M: usize,
+        const N: usize,
+        const R: usize,
+        const C: usize,
+        S: Swizzle,
+    >(
+        accumulator: TmemTile<M, N>,
+        band: u32,
+        staging: SharedTile<E, R, C, S>,
+        dest: GlobalRows<E>,
+        row: u32,
+        column: u32,
+        lane: u32,
+    ) where
+        BaseLdtm: FragmentLayout<R, C>,
+    {
+        const {
+            assert!(
+                R == BaseLdtm::WARP_ROWS,
+                "a warp's band is BaseLdtm::WARP_ROWS rows, so the staging tile is that tall"
+            );
+            assert!(
+                C <= BaseLdtm::WIDEST_BAND,
+                "a pass holds the whole band in registers; BaseLdtm::WIDEST_BAND is what fits"
+            );
+            assert!(
+                N.is_multiple_of(C),
+                "the walk is whole staging tiles, so the accumulator's columns are a multiple of them"
+            );
+        };
+        unsafe {
+            let chunks = staging.chunk_writer();
+            // Both origins the band index moves, formed once: a kernel that
+            // wrote `32 * warp_id` into its row base had one loop-invariant
+            // value here and the walk is not the place to grow a second.
+            let lanes = BaseLdtm::WARP_ROWS as u32 * band;
+            let rows = row + lanes;
+            let mut at = 0u32;
+            while at < N as u32 {
+                let pass: RegTile<R, C, BaseLdtm> = if LDTM_X8 {
+                    accumulator.tile_x8(lanes, at)
+                } else {
+                    accumulator.tile(lanes, at)
+                };
+                if STMATRIX_X4 {
+                    store_tile_x4(chunks, 0, 0, lane, pass);
+                } else {
+                    store_tile(chunks, 0, 0, lane, pass);
+                }
+                // The warp's 32 threads carry the whole tile: `staging` is theirs.
+                store_shared_rows::<E, R, C, S, 32>(dest, rows, column + at, lane, staging);
+                Warp::converge();
+                at += C as u32;
+            }
+        }
     }
 }
 
