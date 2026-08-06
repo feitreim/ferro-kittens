@@ -7,7 +7,8 @@ intrinsics and hand-threaded index math.
 
 The MMA layer is tcgen05 — no wmma/wgmma backends, no arch dispatch.
 
-Right now GEMM performance is at about 98.9% of cuBLASLt @ 16,384^3.
+Right now GEMM performance is at about ~90% of cublasLT and/or the upstream cuda-oxide example.
+There are examples in `/examples/`
 
 ## Modules
 
