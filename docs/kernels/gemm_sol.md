@@ -189,7 +189,7 @@ tile its rows exactly and a fifth warp of the same warpgroup has no rows left to
 own. That is hardware arithmetic, and it is why the epilogue cannot be widened
 along the row axis at all.
 
-### The warpgroup split, which lost
+### The warpgroup split, which lost and now wins
 
 The axis that *is* open is columns: warp 4 is warpgroup 1's warp 0 and owns the
 same rows 0–31 warp 0 owns, so a second warpgroup can only split the
@@ -203,25 +203,53 @@ and doubling the warps halves each one's staging width, so the shared plan is
 **byte-identical** at every entry (asserted in the source at all three widths).
 That is also what lets one `no drain` control serve both spellings.
 
-**It does not pay.** Two round-robin passes each, at 320 threads against 192:
+**It did not pay, and the reason was a `.local` depot rather than the
+hardware.** The original table, two round-robin passes each at 320 threads
+against 192:
 
 | | 4096³ | 8192³ |
 | --- | --- | --- |
 | launch | −1.4%, −1.8% | +0.3%, +0.4% |
 | drain alone | −9% | +3% |
 
-The `no drain` control at its own 320 threads is identical to the 192-thread
-one, so the two extra warps are free when they do nothing and the loss is the
-drain being slower once it is split — at twice the warps for the same total
-work. The mechanism is the same resource that fixes the row axis: warps 0 and 4
-own the *same* 32 tensor-memory lanes, so a column split does not spread the
-LDTM traffic over more sub-partitions, it puts **two requesters on each of the
-same four**. The axis that is free to split is not the axis the hardware
-parallelizes, and there is no third axis.
+That was read as the drain being slower once split, and the mechanism offered
+was the resource that fixes the row axis: warps 0 and 4 own the *same* 32
+tensor-memory lanes, so a column split does not spread the LDTM traffic over
+more sub-partitions, it puts **two requesters on each of the same four**.
 
-The rung is kept, and it is exact at both entries over 1 048 576 BF16 outputs —
-which is what says the split itself is right and the null is about the hardware
-rather than about the code.
+The lane argument is still true. It was not what the table was measuring.
+Every one of those rows was taken through a `.local` depot that no longer
+exists: `store_tile_x4` homed each drained band to local memory until the
+rolled walks were marked (#166, landed in #180/#181/#184), and a band *is* the
+frame — a `RegTile<32, 64>` is 64 f32 is 256 B, which is the staged family's
+frame exactly. The split pays that frame **twice per accumulator** where one
+warpgroup pays it once, so the arm that did more of the thing that was broken
+looked like the arm that was worse.
+
+Re-run at `f64a27b`, same table, same two round-robin passes, `regcount`
+reporting **zero stack and zero spill on every `gemm_sol` rung**:
+
+| | 4096³ `[256, 256]` | 8192³ `[512, 256]` |
+| --- | --- | --- |
+| launch | **+0.8%, +0.9%** | **+2.1%, +2.1%** |
+| drain alone | 3.35 → 3.10 µs, 3.28 → 3.17 µs | 4.72 → 3.05 µs, 4.70 → 3.04 µs |
+
+The sign is the other way at both entries and both passes, and the term that
+was blamed is now the term that moves: the drain gets **35% cheaper** at
+`[512, 256]`, not slower. The `no drain` control at its own 320 threads is
+still identical to the 192-thread one (0.5157 against 0.5155 ms), so the two
+extra warps remain free when they do nothing and the whole difference is the
+drain.
+
+Both 256-wide entries ship the split as of #196. `[256, 128]` does not, and
+that is a gap in the measurement rather than a result: table 6 has arms at
+`[256, 256]` and `[512, 256]` only, so the narrow entry has no A/B of its own
+and keeps one warpgroup until it does.
+
+The lane ceiling is presumably still there — it is just above this, not below
+it. What the split buys is not more sub-partitions but more warps issuing
+against them, and that was worth nothing while each warp was also driving a
+band through local memory.
 
 ### The drain rungs
 
@@ -245,11 +273,31 @@ next band owes itself.
   nothing besides. `SHIPPED_DRAIN` names the winner in one place, so a rung that
   wins its A/B ships by moving that line — which is what `paired` did.
 - **`wide`** — a 128-column band, all four issues in flight before one wait: a
-  quarter of `per issue`'s waits per byte of `C`, at 128 f32 a thread live. **It
-  loses** — −1.1 to −1.3% at 4096³, +0.2 to +0.3% at 8192³ — and is kept because
-  a rung that loses is the evidence for the one that wins. It is also the only
-  rung that is not free: the wider band takes registers to 176/168 and the stack
-  frame from 256 B to 512, and the loss is not separated from that frame.
+  quarter of `per issue`'s waits per byte of `C`, at 128 f32 a thread live. It
+  first measured −1.1 to −1.3% at 4096³ and +0.2 to +0.3% at 8192³, and the note
+  on that reading was that the rung is the only one not free: the wider band
+  took registers to 176/168 and the stack frame from 256 B to 512, **and the
+  loss was not separated from that frame**.
+
+  It is separated now, because the frame is gone — #166's walk marking landed in
+  #180/#181/#184 and `regcount` reads **zero stack and zero spill** on every
+  `gemm_sol` rung, `wide` included (130 registers at `[256, 256]`, 182 at
+  `[512, 256]`, against 91 and 80 for `paired`). Re-run, two round-robin passes:
+  **1.001 / 0.998 of `paired` at 4096³ `[256, 256]`, and 1.004 / 1.007 at 8192³
+  `[512, 256]`**, where the epilogue alone goes 4.56/4.80 µs to 4.21/4.25. So
+  about a point and a quarter of the original loss was the frame, and what is
+  left is neutral at the wide-staging entry and a genuine +0.4 to +0.7% at the
+  narrow-staging one.
+
+  That split is the mechanism, and it is why this rung is *not* what shipped.
+  `wide` widens the register band only — `drain_dial` hands it the entry's own
+  `STAGE_N` — so at `[256, 256]`, whose staging tile is already 256 columns, it
+  changes the wait count and nothing else and measures as nothing. At
+  `[512, 256]`, whose staging tile is 128, a 128-column band makes the drain one
+  lift and one store per pass, and that is worth the half point. The warpgroup
+  split above is worth four times as much at the same entry and the two do not
+  compose: at two warpgroups `[512, 256]`'s per-warp tile is 64 columns, which a
+  128-column band does not divide. The bigger win took the slot.
 - **`nocvt`** — the shipped drain with the `cvt` pass removed and nothing else:
   same LDTM count, same wait count, same `stmatrix` count, same `ld.shared`,
   same `st.global`, same shared plan, `cvt` zero. Half the band's words go
