@@ -182,6 +182,20 @@ the way in and the quotient rounds again: the check's worst relative error goes
 check with 12% of its headroom left is the wrong trade, and a tolerance sitting
 on its own rounding floor is not a check.
 
+**Reading the band with `ldmatrix.x4`.** Every pass here is a `load_tile`, so
+this kernel is the instrument #131 used to price the load side's wide form:
+one `ldmatrix.m8n8.x4` per `[16, 16]` block instead of two `.x2`s. The body is
+the same body — `examples/src/softmax.rs` takes the load width as a `const`
+parameter and `experiments/src/softmax_x4.rs` emits the other value as a second
+entry in one bundle — so the arms are paired and adjacent in time
+(`scripts/modal-run bench --case ldmatrix`). Four paired measurements at each of
+three sizes: unordered at 64 and 512 blocks, and **1.1% slower** at 8192, where
+all four pairs agree — 4235.6 GB/s against 4281.0, on 40 registers a thread
+against 32 and the same 6 CTAs an SM. Halving the instruction count buys issue
+slots and pays for them in liveness, and on this kernel that trade is very
+slightly negative. The full table and what it says about the store side's `.x4`
+are in `docs/library/ldst.md`.
+
 ### A register claim upstream is not a speed claim
 
 `src/reg.rs`'s module header says of the two `exp2`s that "the measurement does

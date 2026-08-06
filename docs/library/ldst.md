@@ -8,12 +8,15 @@ one derivation — `fragment_address` — with the data flowing opposite ways, a
 they cannot drift apart. A second derivation for the store side is exactly the
 thing that could disagree with the load side, and there is not one.
 
-That includes the wide store. `stmatrix.m8n8.x4` takes 32 addresses from all
+That includes both wide forms. `stmatrix.m8n8.x4` takes 32 addresses from all
 lanes, eight per matrix, its four matrices being the two slots' two halves in
 order; `.x2` takes 16 from lanes 0..15 and is issued twice, once per slot. Lane
 `l` of the `.x4` therefore supplies what lane `l % 16` supplied for slot
 `l / 16`, which is what the test
-`stmatrix_x4_addresses_are_the_x2_addresses_restacked` pins.
+`x4_addresses_are_the_x2_addresses_restacked` pins. `ldmatrix.m8n8.x4` takes
+its addresses the same way, so that one test is the derivation for
+`store_fragment_x4` and `load_fragment_x4` alike, and the wide pair can no more
+drift apart than the narrow pair can.
 
 Because a symmetric derivation feeds both, an accumulating MMA reads a stored
 operand exactly like a TMA-loaded tile, and a load sees a TMA-loaded tile
@@ -157,6 +160,73 @@ amortize the pass; that kernel's operand rings leave 18 344 B for four warps,
 which at fp32 is not. **The staged drain is a trade against pass count, not
 against element width** — an epilogue that can spend `[32, 64]` fp32 of shared
 memory is the one to re-measure this on.
+
+## The load side's `.x4` is a wash, and the asymmetry is now chosen
+
+`load_fragment_x4` / `load_tile_x4` are the load direction at the store side's
+width: one `ldmatrix.m8n8.x4` per `[16, 16]` block instead of two `.x2`s a slot
+apart. They needed no addressing of their own, per the first section of this
+file — one restacking serves both wide forms — and the four destination
+registers are the four matrices in the order `store_fragment_x4` supplies them.
+The `ldmatrix x4 map` and `ldmatrix x4 map wide` device cases pin that order
+against the same host expectation the narrow pair answers to, so a wide load
+returning its registers rotated is a named tile position arriving in the wrong
+one rather than a tolerance somewhere downstream.
+
+**They are not what ships, and after #131 that is a decision rather than an
+omission.** #116's `.x4` and #117's `.x8` both paid by removing *waits*. An
+`ldmatrix` has none to remove — it is a plain shared read — so halving the
+instruction count can only buy issue slots, and what it costs is liveness of
+the shape the drain's `.x8` carries: four matrices arrive at once where two let
+the compiler fuse a slot through to its consumer.
+
+The instrument is `softmax`, whose three passes are all `load_tile` and whose
+only other work is two `ex2.approx` an element.
+`experiments/src/softmax_x4.rs` emits the teaching crate's own device body at
+the other load width as a second entry in the same bundle, so the two arms are
+one binary and every pair of measurements is adjacent in time rather than two
+containers apart — `scripts/modal-run bench --case ldmatrix`, four whole
+measurements of each arm round-robin, each the minimum of 30 timed launches
+after 5 warm-up, every one of them checked against the CPU reference first.
+
+| rows × 128 × 2 planes | blocks | `.x2` ms | `.x4` ms | `.x2` GB/s | `.x4` GB/s | `.x4`/`.x2` | lowest | highest |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4096 | 64 | 0.0106 | 0.0105 | 397.2 | 398.4 | 1.0124 | 0.9758 | 1.0249 |
+| 32768 | 512 | 0.0166 | 0.0168 | 2020.4 | 1993.5 | 1.0176 | 0.9904 | 1.0212 |
+| 524288 | 8192 | 0.1254 | 0.1268 | 4281.0 | 4235.6 | **1.0110** | 1.0097 | 1.0148 |
+
+The last three columns are the four *paired* ratios of `.x4`'s milliseconds to
+`.x2`'s, so above 1.000 is the narrow load ahead; the millisecond and GB/s
+columns are each arm's own median and can disagree with the pairing, which is
+what the first row does. Read that row and the second as unordered: a ratio
+below 1.000 is among the four in both, which is the only honest reading of a
+difference this size at this sample count. The third row is ordered — all four
+pairs land in 1.0097–1.0148 — and it says the wide load is **1.1% slower**
+where the kernel is bandwidth-bound, at 4236 GB/s against 4281.
+
+**The liveness cost is the one that showed up**, off
+`scripts/modal-run regcount`:
+
+| kernel | regs | spill | frame |
+| --- | ---: | ---: | ---: |
+| `softmax_rows` (`.x2`, both crates) | 32 | 0 | 0 |
+| `softmax_rows_x4` | 40 | 0 | 0 |
+| `ldmatrix_map`, `ldmatrix_x4_map`, and both `_wide` | 32 | 0 | 0 |
+
+Eight registers a thread, no spill and no frame either way — and *not* an
+occupancy step: the kernel's 32,776 B shared plan fixes it at 6 CTAs an SM, and
+40 registers over 128 threads is nowhere near what would move that. The four
+`device-tests` probes read identical because a probe that dumps each block as it
+arrives holds nothing; the cost is only visible where a real kernel keeps
+statistics live across the walk, which is the same thing `docs/kernels/softmax.md`'s
+rung ladder says about `CHUNK`.
+
+So the prediction landed on the wrong side of zero rather than on it, and 1.1%
+is small enough that what this rules out is worth more than what it says: there
+is no issue-slot win here to go looking for on a kernel of this shape. `.x2`
+ships, `.x4` is in the library as the measured alternative, and the two
+directions differ on purpose — the store side's `.x4` removed a wait, and this
+one had none to remove.
 
 ## `store_packed_x4` computes nothing correct in tree
 

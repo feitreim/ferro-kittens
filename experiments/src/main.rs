@@ -18,7 +18,8 @@
 //! scripts/modal-run examples                   # the correctness gate, both crates
 //! scripts/modal-run bench --case gemm-depth    # or tile, staged, widths,
 //! scripts/modal-run clc_bench                  #    residual, swizzle, repro,
-//! scripts/modal-run ws_bench                   #    ablation, epilogue, sol
+//! scripts/modal-run ws_bench                   #    ablation, epilogue, sol,
+//!                                              #    ldmatrix
 //! ```
 //!
 //! **Every rung here is on a correctness gate**, which is [`gemm::check`] and
@@ -72,6 +73,9 @@ pub mod gemm_sol;
 #[cfg(feature = "gemm-sol-upstream")]
 pub mod gemm_sol_upstream;
 pub mod gemm_ws;
+/// `softmax` with its loads at `ldmatrix.m8n8.x4` — #131's arm, off the
+/// teaching crate's own device body with the load width as its only parameter.
+pub mod softmax_x4;
 pub mod sol;
 pub mod sol_ablate;
 pub mod sol_watch;
@@ -136,6 +140,13 @@ fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> ExitCode {
         (
             "gemm_sol_drains",
             sol_ablate::check(context).map_err(|error| error.to_string()),
+        ),
+        // `load_tile_x4`'s gate (#131). The teaching crate checks the shipped
+        // load width and this is the other one, on the same reference — an arm
+        // whose numbers are quoted has to be an arm that computes a softmax.
+        (
+            "softmax_x4",
+            softmax_x4::check(context).map_err(|error| error.to_string()),
         ),
     ];
     // Only when the vendored upstream copy is compiled in, which is only under
