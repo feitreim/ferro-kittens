@@ -225,13 +225,19 @@ const GEMM_SOL_SIZES: &[Shape] = &[
 ];
 
 const GEMM_SIZES: &[Shape] = &[
-    // The smallest shape that is **one cluster running exactly one item**, and
-    // therefore §7's "the small-size floor is one item boundary" row. It was
-    // `256x128x256` through #102; #87 widened the pair tile to `[256, 256]`, so
-    // `n = 128` no longer divides the tiling and the one-item shape is now this
-    // one. The row measures the same thing — a single item's cost, undivided —
-    // and the absolute microseconds are not comparable across that change,
-    // because the item it is one of has twice the columns.
+    // §7's "the small-size floor is one item boundary" row, **back since
+    // #105**. It was `256x128x256` through #102, then #87 widened the pair tile
+    // to `[256, 256]` and `n = 128` stopped dividing the tiling at all; the
+    // chooser gives it a kernel again, and it is the row that says so. One
+    // cluster, one item, and the item is the narrow tile's.
+    Shape {
+        m: 256,
+        n: 128,
+        k: 256,
+    },
+    // The same floor at the wide tile, kept beside it: the item this one is one
+    // of has twice the columns, so the two rows are the same measurement of two
+    // different items and neither is comparable to the other's microseconds.
     Shape {
         m: 256,
         n: 256,
@@ -1143,6 +1149,24 @@ pub fn main() -> ExitCode {
         && name == "tile"
     {
         return match gemm::tile_sweep(&context, CUBLASLT) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    // `bench crossover` is `tile`'s other half: `tile` holds the size at the
+    // two every table here is quoted at and sweeps the rungs, this holds four
+    // rungs and sweeps the size across the range #104 left unmeasured. It is
+    // its own case rather than a fifth table there because the rule it sets is
+    // one the next tile change has to re-take, and `tile` costs most of an
+    // hour where this costs minutes.
+    if let Some((name, _)) = &selected
+        && name == "crossover"
+    {
+        return match gemm::crossover(&context, CUBLASLT) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 println!("FAIL  {error}");
