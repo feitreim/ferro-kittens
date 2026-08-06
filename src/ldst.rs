@@ -335,7 +335,11 @@ pub unsafe fn load_fragment<E: Element<Unpacked = [f32; 2]>>(
 /// - All 32 lanes of the warp must call this together.
 /// - `chunks` must belong to a tile at least `row + 16` rows tall into which
 ///   `column + 16` fits.
-/// - Its bytes must already be visible to the generic proxy.
+/// - Its bytes must already be visible to the generic proxy, by whichever of
+///   [`load_fragment`]'s two routes the writer took: a TMA load's own mbarrier,
+///   waited on, or a barrier if an `stmatrix` in another warp wrote them. The
+///   two widths differ in how many addresses the warp supplies and in nothing
+///   that touches a proxy, so the obligation is the same one.
 #[inline(always)]
 pub unsafe fn load_fragment_x4<E: Element<Unpacked = [f32; 2]>>(
     chunks: SwizzledChunks<E>,
@@ -389,7 +393,9 @@ pub unsafe fn load_fragment_x4<E: Element<Unpacked = [f32; 2]>>(
 /// - All 32 lanes of the warp must call this together.
 /// - `chunks` must belong to a tile at least `row + M` rows tall into which
 ///   `column + N` fits.
-/// - Its bytes must already be visible to the generic proxy.
+/// - Its bytes must already be visible to the generic proxy, by whichever of
+///   [`load_fragment`]'s two routes the writer took: a TMA load's own mbarrier,
+///   waited on, or a barrier if an `stmatrix` in another warp wrote them.
 #[inline(always)]
 pub unsafe fn load_tile<E: Element<Unpacked = [f32; 2]>, const M: usize, const N: usize>(
     chunks: SwizzledChunks<E>,
@@ -442,7 +448,11 @@ where
 /// - All 32 lanes of the warp must call this together.
 /// - `chunks` must belong to a tile at least `row + M` rows tall into which
 ///   `column + N` fits.
-/// - Its bytes must already be visible to the generic proxy.
+/// - Its bytes must already be visible to the generic proxy, by whichever of
+///   [`load_fragment`]'s two routes the writer took: a TMA load's own mbarrier,
+///   waited on, or a barrier if an `stmatrix` in another warp wrote them. The
+///   two widths differ in how many addresses the warp supplies and in nothing
+///   that touches a proxy, so the obligation is the same one.
 #[inline(always)]
 pub unsafe fn load_tile_x4<E: Element<Unpacked = [f32; 2]>, const M: usize, const N: usize>(
     chunks: SwizzledChunks<E>,
