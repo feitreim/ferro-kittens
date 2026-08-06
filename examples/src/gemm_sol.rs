@@ -319,6 +319,11 @@ impl Common {
         }
     }
 
+    /// Arm every barrier, and the two counts a caller has to get right are the
+    /// two it passes: `free_arrivals` is MMA commits a stage (one per `A` ring,
+    /// so 1 at the `[256, N]` entries and 2 at `[512, 256]`), `empty_arrivals`
+    /// is [`Common::release_accumulator`]'s signallers — one per epilogue warp
+    /// per rank.
     #[inline(always)]
     unsafe fn initialize(self, free_arrivals: u32, empty_arrivals: u32) {
         unsafe {
@@ -393,10 +398,26 @@ impl Common {
         }
     }
 
+    /// Hand an accumulator slot back to the MMA warp: **one arrival a warp**,
+    /// from its lane 0, on the leader rank's copy of the barrier.
+    ///
+    /// The count [`Common::initialize`] arms `empty` with is this call's
+    /// arithmetic and nothing else — `RANKS * epilogue_warps(GROUPS)`, so 16 at
+    /// the 256-wide entries and 8 at the narrow one. A lane guard that the count
+    /// does not follow is a kernel that never launches a second item.
+    ///
+    /// What makes the guard legal is [`Common::drain`]'s closing
+    /// `warp::sync_mask`: `tcgen05.wait::ld` retires every load the *warp* has
+    /// outstanding, so by the time lane 0 is through that sync no lane of it
+    /// still has the accumulator in flight. Nothing else in the drain reads
+    /// tensor memory.
     #[inline(always)]
-    unsafe fn release_accumulator(self, sequence: u32) {
+    unsafe fn release_accumulator(self, slot: u32) {
         unsafe {
-            let empty = self.empty.sem(sequence);
+            if self.lane != 0 {
+                return;
+            }
+            let empty = self.empty.sem(slot);
             if self.rank == LEADER {
                 empty.arrive();
             } else {
@@ -839,12 +860,7 @@ impl Large {
                         info.row * 512 + half * 256,
                         info.column * BLOCK_N as u32,
                     );
-                    let empty = common.empty.sem(half);
-                    if common.rank == LEADER {
-                        empty.arrive();
-                    } else {
-                        empty.at_rank(LEADER).arrive();
-                    }
+                    common.release_accumulator(half);
                     half += 1;
                 }
                 sequence += 1;
@@ -884,7 +900,7 @@ unsafe fn small_body<
     unsafe {
         let smem = DynamicSharedArray::<u8, 128>::get_raw();
         let common = Common::attach(smem, RINGS_END, tiles_m, tiles_n, k_blocks, group, ldc, c);
-        common.initialize(1, RANKS * epilogue_warps(GROUPS) * 32);
+        common.initialize(1, RANKS * epilogue_warps(GROUPS));
         let state = Small::<N, HALF, STAGE> {
             common,
             a: ARing::attach(smem.add(A0_OFFSET)),
@@ -938,7 +954,7 @@ unsafe fn large_body(
             ldc,
             c,
         );
-        common.initialize(2, RANKS * epilogue_warps(WARPGROUPS) * 32);
+        common.initialize(2, RANKS * epilogue_warps(WARPGROUPS));
         let state = Large {
             common,
             a0: ARing::attach(smem.add(A0_OFFSET)),

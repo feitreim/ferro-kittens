@@ -77,7 +77,7 @@ use kittens::shared::F16;
 
 use crate::bench::Shape;
 use crate::gemm_sol::{
-    ACCUM_COLUMNS, ATile, B_BOX, BLOCK_N, BPanel, HALF_N, ONE_WARPGROUP, REPORT_FIELDS,
+    ACCUM_COLUMNS, ALL_LANES, ATile, B_BOX, BLOCK_N, BPanel, HALF_N, ONE_WARPGROUP, REPORT_FIELDS,
     REPORT_ROWS, REPORT_SLOTS, SHIPPED_DRAIN, SMALL_RINGS_END, SMALL_SHARED_BYTES, WATCH_DEEP,
     WATCH_ONE_DEEP, WHOLE, a_value, b_value, check_output, default_group, site_name, small_body,
     stage_f16, threads,
@@ -131,6 +131,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_DEEP,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -174,6 +175,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_ONE_DEEP,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)

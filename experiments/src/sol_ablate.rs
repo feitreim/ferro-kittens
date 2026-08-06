@@ -86,7 +86,9 @@
 //! Nine more arms decompose the drain rather than the launch: a **doubling
 //! ladder** (`twice global`/`twice shared`/`twice all`), four **drain rungs**
 //! (`per issue`, `paired`, `wide`, and the `nocvt` oracle), the never-launched
-//! `pack16`, and the **warpgroup split** (`two warpgroups` and its own control).
+//! `pack16`, the **warpgroup split** (`two warpgroups` and its own control), and
+//! the **accumulator release's arrival scope** (`one lane a warp` against the
+//! same launch releasing from all 32).
 //!
 //! Each ladder rung repeats one more pass of the drain per band, with the extra
 //! global stores aimed at the cluster's own first output tile so they stay in L2.
@@ -138,6 +140,16 @@
 //!   there; it was simply never the term this table was reaching. Both 256-wide
 //!   entries ship the split as of #197, and the arms in this file stay pinned to
 //!   [`ONE_WARPGROUP`] so the ladder keeps comparing against what it always did.
+//! - *The accumulator release's arrival scope.* `release_accumulator` had all 32
+//!   lanes of every epilogue warp arrive on `empty` — 512 a slot once the split
+//!   doubled the warps — for a fact that is one per warp, and it is on the
+//!   critical path between a drain and the next item's MMA. Guarded to one lane a
+//!   warp, with `empty` armed at 16 instead of 512, table 7 reads **1.001 and
+//!   0.989 at 4096³, 1.000 and 1.000 at 8192³**. The two 4096³ passes disagree in
+//!   sign by less than that shape's own spread on a fixed arm, so it is a null:
+//!   an arrival is one atomic increment on a shared word, a warp issues its 32 in
+//!   one instruction, and the waiter is a parity spin that does not care how many
+//!   ended it. It ships guarded because one a warp is what the code means.
 //!
 //! So the drain is bound by something other than the store path, and it is not
 //! bytes: 262 144 B into shared per cluster per
@@ -219,11 +231,11 @@ use kittens::shared::F16;
 
 use crate::bench::{Shape, Timings, time};
 use crate::gemm_sol::{
-    ACCUM_COLUMNS, ATile, B_BOX, BAND_N, BLOCK_N, BPanel, DRAIN_NOCVT, DRAIN_PACK16, DRAIN_PAIRED,
-    DRAIN_PER_ISSUE, DRAIN_WIDE, FEED_ONLY, HALF_N, ISSUE_ONLY, LARGE_STAGE_N, MMA_ONLY, NO_DRAIN,
-    ONE_WARPGROUP, SHIPPED_DRAIN, SMALL_RINGS_END, TWICE_ALL, TWICE_GLOBAL, TWICE_SHARED,
-    TWO_WARPGROUPS, Variant, WATCH_OFF, WHOLE, WIDE_B_BOX, WideBPanel, clusters, default_group,
-    large_body, small_body, threads,
+    ACCUM_COLUMNS, ALL_LANES, ATile, B_BOX, BAND_N, BLOCK_N, BPanel, DRAIN_NOCVT, DRAIN_PACK16,
+    DRAIN_PAIRED, DRAIN_PER_ISSUE, DRAIN_WIDE, FEED_ONLY, HALF_N, ISSUE_ONLY, LARGE_STAGE_N,
+    MMA_ONLY, NO_DRAIN, ONE_LANE, ONE_WARPGROUP, SHIPPED_DRAIN, SMALL_RINGS_END, TWICE_ALL,
+    TWICE_GLOBAL, TWICE_SHARED, TWO_WARPGROUPS, Variant, WATCH_OFF, WHOLE, WIDE_B_BOX, WideBPanel,
+    clusters, default_group, empty_arrivals, large_body, small_body, threads,
 };
 
 /// SMs on the B200 this file's arithmetic is for, and CTAs one of them holds at
@@ -284,6 +296,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -327,6 +340,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -370,6 +384,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -414,6 +429,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -459,6 +475,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -503,6 +520,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -548,6 +566,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -592,6 +611,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -630,6 +650,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -669,6 +690,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -708,6 +730,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -747,6 +770,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -788,6 +812,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -827,6 +852,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -867,6 +893,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -906,6 +933,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -951,6 +979,7 @@ pub mod kernels {
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -994,6 +1023,7 @@ pub mod kernels {
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1037,6 +1067,7 @@ pub mod kernels {
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1081,6 +1112,7 @@ pub mod kernels {
                 DRAIN_PAIRED,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1124,6 +1156,7 @@ pub mod kernels {
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1167,6 +1200,7 @@ pub mod kernels {
                 DRAIN_WIDE,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1211,6 +1245,7 @@ pub mod kernels {
                 DRAIN_NOCVT,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1255,6 +1290,7 @@ pub mod kernels {
                 DRAIN_PACK16,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1294,6 +1330,7 @@ pub mod kernels {
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1333,6 +1370,7 @@ pub mod kernels {
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1372,6 +1410,7 @@ pub mod kernels {
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1412,6 +1451,7 @@ pub mod kernels {
                 DRAIN_PAIRED,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1451,6 +1491,7 @@ pub mod kernels {
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1490,6 +1531,7 @@ pub mod kernels {
                 DRAIN_WIDE,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1530,6 +1572,7 @@ pub mod kernels {
                 DRAIN_NOCVT,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1570,6 +1613,7 @@ pub mod kernels {
                 DRAIN_PACK16,
                 WATCH_OFF,
                 ONE_WARPGROUP,
+                ALL_LANES,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1614,6 +1658,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 TWO_WARPGROUPS,
+                ALL_LANES,
                 BAND_N,
                 2,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1658,6 +1703,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 TWO_WARPGROUPS,
+                ALL_LANES,
                 BAND_N,
                 2,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1695,6 +1741,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 TWO_WARPGROUPS,
+                ALL_LANES,
                 { LARGE_STAGE_N / 2 },
                 BAND_N,
                 2,
@@ -1733,9 +1780,185 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 TWO_WARPGROUPS,
+                ALL_LANES,
                 { LARGE_STAGE_N / 2 },
                 BAND_N,
                 2,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
+        }
+    }
+
+    /// [`gemm_sol_m256_wg2`] releasing its accumulator from **one lane a warp**
+    /// instead of all 32: the shipped geometry at [`ONE_LANE`], and the only
+    /// thing between it and the arm above.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m256`], **at 320 threads**.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (320, 1, 1),
+        dynamic_shared = 196_864,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m256_wg2_lane(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            small_body::<
+                BLOCK_N,
+                ACCUM_COLUMNS,
+                HALF_N,
+                B_BOX,
+                { BLOCK_N / 2 },
+                SMALL_RINGS_END,
+                WHOLE,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                TWO_WARPGROUPS,
+                ONE_LANE,
+                BAND_N,
+                2,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
+        }
+    }
+
+    /// [`gemm_sol_m256_wg2_lane`] at the `[512, 256]` entry.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m512`], **at 320 threads**.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (320, 1, 1),
+        dynamic_shared = 229_632,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m512_wg2_lane(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            large_body::<
+                B_BOX,
+                WHOLE,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                TWO_WARPGROUPS,
+                ONE_LANE,
+                { LARGE_STAGE_N / 2 },
+                BAND_N,
+                2,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
+        }
+    }
+
+    /// The whole kernel at the geometry every ladder in this file is held at:
+    /// one epilogue warpgroup, 192 threads, [`ALL_LANES`].
+    ///
+    /// [`Arm::Whole`] used to launch `crate::gemm_sol`'s shipped entry directly,
+    /// and that stopped working the moment the shipped one moved off this
+    /// geometry — #197 took it to 320 threads and the arm kept asking for 192,
+    /// which the launch contract rejects rather than runs. The shipped kernel's
+    /// own row is [`Arm::Wg2`], which is what it now is; this is the control it
+    /// is read against, and it is pinned here for the reason every other probe
+    /// is.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m256`], **at 192 threads**.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 196_864,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m256_whole(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            small_body::<
+                BLOCK_N,
+                ACCUM_COLUMNS,
+                HALF_N,
+                B_BOX,
+                BLOCK_N,
+                SMALL_RINGS_END,
+                WHOLE,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                ONE_WARPGROUP,
+                ALL_LANES,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
+        }
+    }
+
+    /// [`gemm_sol_m256_whole`] at the `[512, 256]` entry.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m512`], **at 192 threads**.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 229_632,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m512_whole(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            large_body::<
+                B_BOX,
+                WHOLE,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                ONE_WARPGROUP,
+                ALL_LANES,
+                LARGE_STAGE_N,
+                128,
+                4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
         }
     }
@@ -1762,10 +1985,13 @@ pub enum Arm {
     PerIssue,
     Wide,
     NoCvt,
-    /// Eight epilogue warps splitting the accumulator's columns.
+    /// Eight epilogue warps splitting the accumulator's columns — the shipped
+    /// geometry, releasing its accumulator from all 32 lanes of every warp.
     Wg2,
     /// [`Arm::Wg2`]'s own control, at its own thread count.
     Wg2NoDrain,
+    /// [`Arm::Wg2`] releasing from one lane a warp instead of 32.
+    Wg2Lane,
     /// **Never launched.** `.pack::16b` faults on the device against an fp32
     /// accumulator — `Xid 13, Out Of Range Address` on every SM — so this arm
     /// exists for its opcode census and has no timed row. See
@@ -1804,11 +2030,21 @@ impl Arm {
     const DRAINS: [Arm; 4] = [Arm::Paired, Arm::PerIssue, Arm::Wide, Arm::NoCvt];
     /// The drain rungs that compute a right `C` and are therefore on [`check`].
     /// `NoCvt` and `Pack16` are not among them and cannot be.
-    const EXACT_DRAINS: [Arm; 4] = [Arm::Paired, Arm::PerIssue, Arm::Wide, Arm::Wg2];
+    const EXACT_DRAINS: [Arm; 5] = [
+        Arm::Paired,
+        Arm::PerIssue,
+        Arm::Wide,
+        Arm::Wg2,
+        Arm::Wg2Lane,
+    ];
     /// The warpgroup split and the pair of controls it is read against. Each arm
     /// subtracts the `no drain` at **its own** thread count, because the split
     /// changes the launch geometry and a shared control would carry that with it.
     const WARPGROUPS: [Arm; 4] = [Arm::Paired, Arm::NoDrain, Arm::Wg2, Arm::Wg2NoDrain];
+    /// The accumulator release's arrival scope, both arms at the shipped
+    /// geometry and reading against the one `no drain` control that geometry
+    /// has. They differ in one const and compute the same `C`.
+    const RELEASES: [Arm; 3] = [Arm::Wg2, Arm::Wg2Lane, Arm::Wg2NoDrain];
     /// Every arm the depth table turns into a rate. The two levers under test
     /// come last, because they are not phases removed.
     const LADDER: [Arm; 7] = [
@@ -1845,6 +2081,7 @@ impl Arm {
             Arm::NoCvt => "nocvt",
             Arm::Wg2 => "two warpgroups",
             Arm::Wg2NoDrain => "two wg, no drain",
+            Arm::Wg2Lane => "one lane a warp",
             Arm::Pack16 => "pack16",
         }
     }
@@ -1869,6 +2106,7 @@ impl Arm {
             Arm::NoCvt => "the shipped drain minus the cvt; WRONG C",
             Arm::Wg2 => "8 epilogue warps, columns split, 320 threads",
             Arm::Wg2NoDrain => "the same launch with the drain removed",
+            Arm::Wg2Lane => "the same launch releasing from lane 0 only",
             Arm::Pack16 => ".pack::16b; FAULTS ON THE DEVICE, never launched",
         }
     }
@@ -1877,9 +2115,23 @@ impl Arm {
     /// everything else is 192, and getting this wrong is a launch that either
     /// deadlocks on an arrival count or leaves warps out of the epilogue.
     fn threads(self) -> u32 {
+        threads(self.warpgroups())
+    }
+
+    /// Arrivals this arm's `empty` barrier is armed with, which is exactly what
+    /// its `release_accumulator` signals — the count table 7 is about, derived
+    /// here so the table can be read without the source beside it.
+    fn empty_arrivals(self) -> u32 {
+        empty_arrivals(self.warpgroups(), self == Arm::Wg2Lane)
+    }
+
+    /// Epilogue warpgroups this arm runs, which is what [`Arm::threads`] is a
+    /// function of and cannot be divided back out of — `threads` is affine in the
+    /// warpgroups, not linear, because the TMA and MMA warps are in it too.
+    fn warpgroups(self) -> u32 {
         match self {
-            Arm::Wg2 | Arm::Wg2NoDrain => threads(TWO_WARPGROUPS),
-            _ => threads(ONE_WARPGROUP),
+            Arm::Wg2 | Arm::Wg2NoDrain | Arm::Wg2Lane => TWO_WARPGROUPS,
+            _ => ONE_WARPGROUP,
         }
     }
 
@@ -1937,7 +2189,6 @@ pub fn measure(
         return Err(format!("{shape} violates {}'s tile contract", variant.name()).into());
     }
     let stream = context.default_stream();
-    let shipped = unsafe { crate::gemm_sol::kernels::load(context)? };
     let ablated = unsafe { kernels::load(context)? };
 
     let a = DeviceBuffer::<u16>::zeroed(&stream, m * k)?;
@@ -2005,6 +2256,20 @@ pub fn measure(
         }
         (Variant::M512xN256, Arm::Wg2) => {
             launcher!(&ablated, prepare_gemm_sol_m512_wg2, gemm_sol_m512_wg2)
+        }
+        (Variant::M256xN256, Arm::Wg2Lane) => {
+            launcher!(
+                &ablated,
+                prepare_gemm_sol_m256_wg2_lane,
+                gemm_sol_m256_wg2_lane
+            )
+        }
+        (Variant::M512xN256, Arm::Wg2Lane) => {
+            launcher!(
+                &ablated,
+                prepare_gemm_sol_m512_wg2_lane,
+                gemm_sol_m512_wg2_lane
+            )
         }
         (Variant::M512xN256, Arm::Wg2NoDrain) => {
             launcher!(
@@ -2094,7 +2359,7 @@ pub fn measure(
             );
         }
         (Variant::M256xN256, Arm::Whole) => {
-            launcher!(&shipped, prepare_gemm_sol_m256, gemm_sol_m256)
+            launcher!(&ablated, prepare_gemm_sol_m256_whole, gemm_sol_m256_whole)
         }
         (Variant::M256xN256, Arm::NoDrain) => {
             launcher!(
@@ -2137,7 +2402,7 @@ pub fn measure(
             )
         }
         (Variant::M512xN256, Arm::Whole) => {
-            launcher!(&shipped, prepare_gemm_sol_m512, gemm_sol_m512)
+            launcher!(&ablated, prepare_gemm_sol_m512_whole, gemm_sol_m512_whole)
         }
         (Variant::M512xN256, Arm::NoDrain) => {
             launcher!(
@@ -2598,6 +2863,54 @@ fn warpgroup_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The accumulator release's arrival scope, both arms at the shipped geometry.
+///
+/// `release_accumulator` is on the critical path between an accumulator's drain
+/// and the next item's MMA, and it had every lane of every epilogue warp arrive
+/// on `empty` — 512 arrivals a slot at two warpgroups — for a fact that is one
+/// per warp. Two whole passes, because what is being looked for is a barrier's
+/// micro-cost and one pass of that is not a number.
+fn release_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
+    println!(
+        "\n7. the accumulator release's arrival scope — 32 arrivals a warp against one, at\n\
+         the shipped geometry and the shipped drain, differing in one const. `empty` is\n\
+         armed with what the guard signals either way: 512 arrivals a slot at all lanes,\n\
+         16 at one a warp. both arms compute the same `C` and `check` runs both.\n\
+         `epilogue` is `arm - no drain` in µs per tile per cluster, against the one `no\n\
+         drain` control this geometry has; `vs all lanes` above 1.00 is the guard ahead."
+    );
+    for (shape, variant) in HEADLINE {
+        let (_, waves, _) = quantization(shape, variant);
+        for pass in 1..=2 {
+            println!("\n  {shape} — {}, pass {pass}", variant.name());
+            let minima = arm_rows(context, shape, variant, &Arm::RELEASES, Arm::Wg2)?;
+            let (all_lanes, control) = (minima[0], minima[2]);
+            println!(
+                "  {:<16}{:>9}{:>11}{:>13}{:>14}",
+                "release", "arrivals", "min ms", "epilogue", "vs all lanes"
+            );
+            for (&arm, &min) in Arm::RELEASES.iter().zip(minima.iter()) {
+                if arm == Arm::Wg2NoDrain {
+                    continue;
+                }
+                println!(
+                    "  {:<16}{:>9}{min:>11.4}{:>10.2} µs{:>14.3}",
+                    arm.name(),
+                    arm.empty_arrivals(),
+                    1e3 * (min - control) / waves as f64,
+                    all_lanes / min,
+                );
+            }
+            println!(
+                "  {:<16}{:>9}{control:>11.4}       the control both rows above subtract",
+                "no drain",
+                Arm::Wg2NoDrain.empty_arrivals(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The drain rungs that compute a right `C`, against the reference
 /// `gemm_sol::check` uses, at the size it uses.
 ///
@@ -2673,6 +2986,9 @@ pub fn check(context: &Arc<CudaContext>) -> Result<String, Box<dyn Error>> {
                 (Variant::M256xN256, Arm::Wg2) => {
                     launch!(prepare_gemm_sol_m256_wg2, gemm_sol_m256_wg2)
                 }
+                (Variant::M256xN256, Arm::Wg2Lane) => {
+                    launch!(prepare_gemm_sol_m256_wg2_lane, gemm_sol_m256_wg2_lane)
+                }
                 (Variant::M256xN256, _) => {
                     launch!(prepare_gemm_sol_m256_wide, gemm_sol_m256_wide)
                 }
@@ -2684,6 +3000,9 @@ pub fn check(context: &Arc<CudaContext>) -> Result<String, Box<dyn Error>> {
                 }
                 (Variant::M512xN256, Arm::Wg2) => {
                     launch!(prepare_gemm_sol_m512_wg2, gemm_sol_m512_wg2)
+                }
+                (Variant::M512xN256, Arm::Wg2Lane) => {
+                    launch!(prepare_gemm_sol_m512_wg2_lane, gemm_sol_m512_wg2_lane)
                 }
                 (Variant::M512xN256, _) => {
                     launch!(prepare_gemm_sol_m512_wide, gemm_sol_m512_wide)
@@ -2876,6 +3195,7 @@ pub fn decompose(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
     chain_table(context)?;
     drain_table(context)?;
     warpgroup_table(context)?;
+    release_table(context)?;
     depth_table(context)?;
     upstream_depth_table(context)?;
     println!(

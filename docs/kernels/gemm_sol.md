@@ -265,6 +265,56 @@ it. What the split buys is not more sub-partitions but more warps issuing
 against them, and that was worth nothing while each warp was also driving a
 band through local memory.
 
+### The accumulator release's arrival scope, which is a null (#218)
+
+`release_accumulator` had every lane of every epilogue warp arrive on `empty`,
+for a fact that is one per warp: a warp is done with the accumulator when its
+last `tcgen05.wait::ld` has retired, and that instruction retires the *warp's*
+loads and not the lane's. The split doubled the epilogue's warps and so doubled
+the count with them — 256 arrivals a slot before #197 and 512 after — against
+oxide-train's 8, and it sits on the critical path between an accumulator's drain
+and the next item's MMA. It looked like the most concrete follow-up #197 left,
+and it is worth nothing.
+
+The guard is a lane test, and the count `empty` is armed with is the same
+statement read from the other end. Both entries:
+
+| | arrivals a slot, before | after |
+| --- | ---: | ---: |
+| `[256, 256]` and `[512, 256]`, `RANKS · epilogue_warps(2)` | 2 · 8 · 32 = **512** | 2 · 8 = **16** |
+| `[256, 128]`, `RANKS · epilogue_warps(1)` | 2 · 4 · 32 = **256** | 2 · 4 = **8** |
+
+Nothing else arrives on `empty`, at either entry: the `[512, 256]` epilogue's
+two halves are two slots of the same ring signalled by the same call, and an
+item's release happens exactly once per warp per rank on the path that drains
+it. The epilogue and the MMA warp break their item loops on the same
+`has_work == 0`, so a launch's last item leaves no half-signalled slot behind.
+
+`bench sol-ablate` table 7, both arms in one container, round-robin, two passes,
+`epilogue` in µs per tile per cluster against the `no drain` control at the same
+320 threads:
+
+| | 4096³ `[256, 256]` | 8192³ `[512, 256]` |
+| --- | --- | --- |
+| launch, all lanes | 0.0980, 0.0969 ms | 0.5385, 0.5387 ms |
+| launch, one lane a warp | 0.0979, 0.0980 ms | 0.5384, 0.5387 ms |
+| ratio | **1.001, 0.989** | **1.000, 1.000** |
+| drain, all lanes → one lane | 3.46 → 3.42, 3.16 → 3.43 µs | 3.13 → 3.11, 3.19 → 3.19 µs |
+
+At `[512, 256]` the two arms agree to four figures in both passes. At
+`[256, 256]` the two passes disagree in sign, and by less than that shape's own
+pass-to-pass spread on a fixed arm — the all-lanes row alone moves 0.0980 to
+0.0969, 1.1%, which is larger than the 1.1% the second pass reads as a
+difference. So this is a measured null and not a small win.
+
+The reading is that 512 arrivals cost nothing because they are not serialized
+against anything: an `mbarrier.arrive` is a single atomic increment against a
+shared-memory word, the 32 lanes of a warp issue theirs in one instruction, and
+the MMA warp's `empty.wait` is a parity spin that the last arrival ends
+whichever lane it came from. The count was never the term. It ships guarded
+anyway, because one arrival a warp is what the code means and 512 was an
+accident of where the guard was not.
+
 ### The drain rungs
 
 The shipped drain is a band of 64 columns out of TMEM, `stmatrix` into the
