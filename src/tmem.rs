@@ -289,7 +289,7 @@ pub const LANE_QUADRANTS: u32 = 4;
 /// accumulator spans a CTA pair, and any of it on silicon other than a B200.
 #[inline(always)]
 pub fn warp_lanes() -> u32 {
-    32 * (crate::warp_id() % LANE_QUADRANTS)
+    BaseLdtm::WARP_ROWS as u32 * (crate::warp_id() % LANE_QUADRANTS)
 }
 
 /// Resolve a `16x256b` pair's eight registers into a fragment's

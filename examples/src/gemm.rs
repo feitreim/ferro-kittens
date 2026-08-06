@@ -29,18 +29,16 @@
 use cuda_device::cluster;
 use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 use cuda_device::tma::TmaDescriptor;
-use cuda_device::{
-    DisjointSlice, cluster_launch, cuda_module, kernel, launch_contract, thread, warp,
-};
+use cuda_device::{DisjointSlice, cluster_launch, cuda_module, kernel, launch_contract, thread};
 
 use std::error::Error;
 
-use kittens::global::{GlobalRows, store_shared_rows};
-use kittens::ldst::store_tile_x4;
+use kittens::epilogue;
+use kittens::global::GlobalRows;
 use kittens::mma::{commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, Job};
 use kittens::plan::SharedPlan;
-use kittens::reg::{BaseLdtm, RegTile};
+use kittens::reg::BaseLdtm;
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
@@ -59,8 +57,15 @@ pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32;
 /// The narrowest tile `Swizzle128B` admits at bf16, and the widest the shared
 /// budget leaves room for four of.
 const STAGE_N: usize = 64;
-type StageTile = SharedTile<Bf16, 32, STAGE_N, Swizzle128B>;
-type StagedBand = RegTile<32, STAGE_N, BaseLdtm>;
+/// One warp's staging tile: its own [`BaseLdtm::WARP_ROWS`] rows of `C` by
+/// [`STAGE_N`] columns, 4096 B, and nobody else's — which is what keeps the
+/// epilogue's barrier count at zero.
+type StageTile = SharedTile<Bf16, { BaseLdtm::WARP_ROWS }, STAGE_N, Swizzle128B>;
+/// #117's two instruction widths on the drain, both on: `tcgen05.ld.16x256b.x8`
+/// for the TMEM half and `stmatrix.m8n8.x4` for the shared half. The four
+/// combinations are `experiments/`' rungs; this is the one that ships.
+const LDTM_X8: bool = true;
+const STMATRIX_X4: bool = true;
 const RANKS: u32 = 2;
 const PAIR: u16 = ((1u32 << RANKS) - 1) as u16;
 const LEADER: u32 = 0;
@@ -73,7 +78,7 @@ type Atom<const R: usize> = SharedTile<Bf16, R, ATOM_K, Swizzle128B>;
 type Accumulator = TmemTile<BLOCK_M, BLOCK_N>;
 
 const WARPS: usize = THREADS as usize / 32;
-type StageRun = SharedTileRing<Bf16, 32, STAGE_N, Swizzle128B, WARPS>;
+type StageRun = SharedTileRing<Bf16, { BaseLdtm::WARP_ROWS }, STAGE_N, Swizzle128B, WARPS>;
 
 struct Shared {
     a_ring: ARing,
@@ -106,7 +111,7 @@ const fn shared(at: SharedPlan) -> Shared {
 
 #[inline(always)]
 const fn staged(at: SharedPlan) -> (StageRun, SharedPlan) {
-    at.tile_ring::<Bf16, 32, STAGE_N, Swizzle128B, WARPS>()
+    at.tile_ring::<Bf16, { BaseLdtm::WARP_ROWS }, STAGE_N, Swizzle128B, WARPS>()
 }
 
 const SHARED_BYTES: usize = shared(SharedPlan::sizing()).plan.bytes();
@@ -228,6 +233,10 @@ impl Tile {
         }
     }
 
+    /// [`kittens::epilogue::Drain::staged`] over this CTA's tile: the band walk,
+    /// the two instruction widths and the `bar.warp.sync` between passes are
+    /// the library's, and what stays here is where in `C` the tile goes.
+    ///
     /// # Safety
     /// Every thread of the CTA, with the accumulator complete and fenced, and
     /// nothing that will overwrite it in flight.
@@ -235,33 +244,27 @@ impl Tile {
     unsafe fn drain(&self, item: u32) {
         unsafe {
             let (row_base, column_base) = self.origin(item);
-            let chunks = self.stage.chunk_writer();
-            let mut column = 0u32;
-            while column < BLOCK_N as u32 {
-                let band: StagedBand = self.accumulator.tile_x8(32 * self.warp_id, column);
-                store_tile_x4(chunks, 0, 0, self.lane, band);
-                store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
-                    self.c,
-                    row_base,
-                    column_base + column,
-                    self.lane,
-                    self.stage,
-                );
-                // The write-after-read the loop owes itself, at warp scope
-                // because the tile is this warp's alone: `bar.warp.sync` orders
-                // memory among the lanes it synchronizes, so the next pass's
-                // `stmatrix` cannot overtake a lane still reading this one.
-                warp::sync_mask(u32::MAX);
-                column += STAGE_N as u32;
-            }
+            epilogue::Drain::<LDTM_X8, STMATRIX_X4>::staged(
+                self.accumulator,
+                self.warp_id,
+                self.stage,
+                self.c,
+                row_base,
+                column_base,
+                self.lane,
+            );
         }
     }
 
+    /// Where in `C` this **CTA's** tile of `item` starts. The warp's own rows
+    /// are not added here: the drain adds them to the accumulator's rows and to
+    /// these together, which is what keeps one band index from meaning two
+    /// different things.
     #[inline(always)]
     fn origin(&self, item: u32) -> (u32, u32) {
         let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, self.group);
         (
-            2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank + 32 * self.warp_id,
+            2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank,
             BLOCK_N as u32 * tile_n,
         )
     }

@@ -432,6 +432,26 @@ impl<const M: usize, const N: usize, L: RowLayout<M> + ColLayout<N>> FragmentLay
 pub struct BaseLdtm;
 
 impl BaseLdtm {
+    /// Rows of a tile one warp holds — the band origin every drain in the crate
+    /// is a multiple of.
+    ///
+    /// The layout gives a warp 32 consecutive rows, so `WARP_ROWS * warp_id()`
+    /// is where its band starts in a shared tile, in a TMEM accumulator
+    /// ([`crate::tmem::TmemTile::tile`]) and in the global rows a drain writes.
+    /// Every kernel in the repo spells that product out; this is the `32` in it.
+    pub const WARP_ROWS: usize = 32;
+
+    /// The widest band of [`Self::WARP_ROWS`] rows a warp can hold in registers
+    /// at once — why a 256-column accumulator drains in two passes and a
+    /// 128-column one in the single pass it always did.
+    ///
+    /// A `RegTile<WARP_ROWS, N, BaseLdtm>` is `WARP_ROWS * N / 32` = `N` fp32
+    /// values a thread, so 256 columns at once would want 256 registers before
+    /// any of the kernel's own live state — past the 255 the architecture has,
+    /// **at any occupancy**. It is an architectural bound and not a budget: no
+    /// launch bound, residency or register headroom moves it.
+    pub const WIDEST_BAND: usize = 128;
+
     /// The logical row `lane` holds in `slot` — the `lane/4` row of the
     /// slot's 16-row block, or its `+8` twin for odd slots.
     #[inline(always)]
@@ -537,6 +557,20 @@ base_ldtm_cols!(
     16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 272, 288, 304, 320,
     336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512,
 );
+
+/// [`BaseLdtm::WIDEST_BAND`]'s derivation, checked rather than asserted in
+/// prose: a thread holds one fp32 per column of its band, so the widest band is
+/// the one that fits the registers the architecture has and the next one up is
+/// past them before the kernel's own live state.
+const _: () = {
+    /// Registers a thread has, architecturally.
+    const REGISTERS: usize = 255;
+    type Widest = RegTile<{ BaseLdtm::WARP_ROWS }, { BaseLdtm::WIDEST_BAND }, BaseLdtm>;
+    type Twice = RegTile<{ BaseLdtm::WARP_ROWS }, { 2 * BaseLdtm::WIDEST_BAND }, BaseLdtm>;
+    assert!(Widest::SLOTS * Widest::VALUES == BaseLdtm::WIDEST_BAND);
+    assert!(Widest::SLOTS * Widest::VALUES <= REGISTERS);
+    assert!(Twice::SLOTS * Twice::VALUES > REGISTERS);
+};
 
 /// The named half of the op set: one line per exposed name, so a new op costs
 /// a [`scalar_ops`] line and one of these. `should_implement_trait` is allowed

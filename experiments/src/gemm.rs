@@ -320,7 +320,7 @@ use cuda_device::{
 use crate::bench::{Shape, Timings, time};
 use std::error::Error;
 
-use kittens::epilogue::{StoreRing, Warp};
+use kittens::epilogue::{self, StoreRing, Warp};
 use kittens::global::{GlobalRows, store_rows, store_shared_rows};
 use kittens::ldst::{store_tile, store_tile_x4};
 use kittens::mma::{commit_multicast_cg2, mma_walk_cg2};
@@ -407,15 +407,14 @@ pub const THREADS: u32 = (BLOCK_M / 32) as u32 * 32;
 /// which since #119 are the control rather than the default. [`STAGE_N`] is
 /// the shipped drain's band.
 ///
-/// A `RegTile<32, N, BaseLdtm>` is `32 * N / 32` fp32 values a thread, so a
-/// warp draining 256 columns at once would want **256 registers** before any
-/// of the kernel's own live state — past the 255 the architecture has, and the
-/// whole of what a `BLOCK_N = 256` pair tile costs that #87's table does not
-/// mention. 128 is the widest band that fits, so a 256-column tile drains in
-/// two of them and a 128-column tile drains in the one band it always did:
-/// the loop below is a single iteration at `BLOCK_N = 128` and the shipped
-/// kernel's codegen is unchanged, which `regcount` is what confirms.
-const DRAIN_N: usize = 128;
+/// [`BaseLdtm::WIDEST_BAND`] carries the derivation — a thread holds one fp32
+/// per column of the band, so 256 at once is past the 255 registers the
+/// architecture has — and it is the whole of what a `BLOCK_N = 256` pair tile
+/// costs that #87's table does not mention. A 256-column tile therefore drains
+/// in two bands and a 128-column tile in the one band it always did: the loop
+/// below is a single iteration at `BLOCK_N = 128` and the shipped kernel's
+/// codegen is unchanged, which `regcount` is what confirms.
+const DRAIN_N: usize = BaseLdtm::WIDEST_BAND;
 /// Accumulator columns one warp drains in a single band of the **staged**
 /// epilogue ([`Epilogue::Staged`] and #117's three widths on it, which is
 /// [`SHIPPED_EPILOGUE`]) — and not a swept parameter.
@@ -1396,29 +1395,19 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAG
     /// generic — `stmatrix` writes and `ld.shared` reads — so nothing but
     /// convergence stands between them, and `stmatrix.sync.aligned` is
     /// convergence. The one hazard left is the *next* pass overwriting a tile
-    /// this pass is still reading, which is why the `bar.warp.sync` below is
-    /// there and why it is a warp barrier and not a block one.
+    /// this pass is still reading, which is the `bar.warp.sync`
+    /// [`kittens::epilogue::Drain::staged`] puts between passes, and why it is a
+    /// warp barrier and not a block one.
     ///
     /// # `WIDE` and `X4` are the two instruction widths, one per half (#117)
     ///
-    /// Both default off, and both leave every byte of this loop where it was —
-    /// same bands, same staging tile, same 114 816 B envelope, same order of
-    /// writes to `C`. What changes is how many instructions carry them.
-    ///
-    /// **`WIDE` is the LDTM half.** [`TmemTile::tile`] issues
-    /// `tcgen05.ld.16x256b.x1` twice per `[16, 16]` block and waits after each
-    /// one, because the registers it waits on *are* the load's return value —
-    /// so a `[32, 64]` band costs 16 loads and 16 fully exposed TMEM
-    /// latencies. [`TmemTile::tile_x8`] is `.x8`: 64 columns and 32 f32 a
-    /// thread per issue, so the same band is **2 loads and 2 waits**. The
-    /// waits are the larger half of that and the reason this is worth a rung
-    /// at all.
-    ///
-    /// **`X4` is the `stmatrix` half.** A [`kittens::reg::Fragment`] is four
-    /// `8x8` b16 matrices and `stmatrix.m8n8.x2` names two, so
-    /// [`kittens::ldst::store_tile`] issues two per block;
-    /// [`kittens::ldst::store_tile_x4`] names all four in one. Half the
-    /// `stmatrix`, identical addresses.
+    /// [`kittens::epilogue::Drain::staged`]'s `LDTM_X8` and `STMATRIX_X4`, whose
+    /// doc is where the two instructions are derived. Both default off, and
+    /// both leave every byte of this loop where it was — same bands, same
+    /// staging tile, same 114 816 B envelope, same order of writes to `C`.
+    /// What changes is how many instructions carry them: a `[32, 64]` band
+    /// costs 16 LDTM issues and 16 exposed waits at `.x1` against 2 and 2 at
+    /// `.x8`, and 16 `stmatrix.m8n8.x2` against 8 `.x4`.
     ///
     /// Neither touches the global half, which is the half #116 already moved:
     /// `store_shared_rows` issues the same 32 × 16 B stores on the same four
@@ -1433,35 +1422,16 @@ impl<const BLOCK_N: usize, const HALF_N: usize, const BLOCK_K: usize, const STAG
     #[inline(always)]
     unsafe fn drain_staged<const WIDE: bool, const X4: bool>(&self, item: u32, stage: StageTile) {
         unsafe {
-            let (row_base, column_base) = self.origin(item);
-            let chunks = stage.chunk_writer();
-            let mut column = 0u32;
-            while column < BLOCK_N as u32 {
-                let band: StagedBand = if WIDE {
-                    self.accumulator.tile_x8(32 * self.warp_id, column)
-                } else {
-                    self.accumulator.tile(32 * self.warp_id, column)
-                };
-                if X4 {
-                    store_tile_x4(chunks, 0, 0, self.lane, band);
-                } else {
-                    store_tile(chunks, 0, 0, self.lane, band);
-                }
-                store_shared_rows::<Bf16, 32, STAGE_N, Swizzle128B, 32>(
-                    self.c,
-                    row_base,
-                    column_base + column,
-                    self.lane,
-                    stage,
-                );
-                // The write-after-read the loop owes itself, at warp scope
-                // because the tile is this warp's alone. `bar.warp.sync` orders
-                // memory among the lanes it synchronizes, so the next pass's
-                // `stmatrix` cannot overtake a lane still reading this one's
-                // chunks.
-                warp::sync_mask(u32::MAX);
-                column += STAGE_N as u32;
-            }
+            let (row_base, column_base) = self.cta_origin(item);
+            epilogue::Drain::<WIDE, X4>::staged(
+                self.accumulator,
+                self.warp_id,
+                stage,
+                self.c,
+                row_base,
+                column_base,
+                self.lane,
+            );
         }
     }
 

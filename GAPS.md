@@ -954,9 +954,11 @@ it too. Named in `tests/gaps.rs`.
 `warp::lane_id()` and `warp::warp_id()` are now called in exactly one place in
 the repo outside `device-tests`, which is the body of the two wrappers.
 `softmax`, `layernorm` and `flash_forward` dropped the `cuda_device::warp` and
-`cuda_device::barrier::fence_proxy_async_shared_cta` imports outright; the three
-GEMMs keep `cuda_device::warp` for `warp::sync_mask` and nothing else, which is
-the epilogue's inter-band convergence and **#126's**.
+`cuda_device::barrier::fence_proxy_async_shared_cta` imports outright; the
+GEMMs kept `cuda_device::warp` for `warp::sync_mask` and nothing else, which is
+the epilogue's inter-band convergence — and since #126 that convergence is
+`Warp::converge` inside `epilogue::Drain::staged`, so only the copies with a
+drain of their own still import it.
 
 What is *not* closed and was judged rather than deferred: the
 `tcgen05_fence_before_thread_sync` + `cluster_sync` pair three kernels write out
@@ -982,7 +984,7 @@ all, so `use kittens::*` yields types with no verbs. **#129.**
 ### 7.4 What a kernel still open-codes, which is the coverage question restated
 
 Three things every kernel wrote for itself when this section was written,
-ordered by size. The first of them has since closed.
+ordered by size. All three have since closed.
 
 - **The shared plan — landed (#125), with one half of it left standing.**
   `plan::SharedPlan` is a `Copy` cursor: it starts at the launch's base, hands
@@ -1000,27 +1002,31 @@ ordered by size. The first of them has since closed.
   The three kernels whose plan parameters are module constants have neither.
   That is a language limit (`generic_const_exprs`), and it is the only place in
   the repo a plan is still written twice.
-- **The epilogue.** `drain_staged`'s *loop* is the same program in
-  `experiments/src/gemm.rs:1371-1403` and `experiments/src/gemm_ws.rs:780-813`
-  — and, with the two const parameters resolved, in
-  `examples/src/gemm.rs:496-520` — same band selection on
+- **The epilogue — landed (#126).** `drain_staged`'s *loop* was the same
+  program in both GEMMs' `experiments/` copies and, with the two const
+  parameters resolved, in `examples/src/gemm.rs`: same band selection on
   `WIDE`/`X4`, same `store_tile{,_x4}` into the same `store_shared_rows`, same
-  warp-scope write-after-read, same `STAGE_N` stride — while the preambles
-  differ, because `gemm_ws` has two accumulator stages to select between and
-  resolves the tile origin inline where `gemm` has an `origin()`. The loop is
-  the part that would move. It is what `SHIPPED_EPILOGUE` selects, and every
-  instruction in it is a library call — what is missing is the loop and the
-  inter-band convergence. `epilogue::StoreRing` is the library's only epilogue
-  type and it covers the TMA route, which #123 measured *losing* to this one.
-  `softmax` and `layernorm` then open-code a third shape, the single-shot
-  `tma_store` + commit + `wait::<0>`. **#126.**
-- **The band origin.** `32 * warp_id` appears in every kernel in the repo, five
-  times inline in `flash_forward.rs`. The `32` is `BaseLdtm`'s rows per warp,
-  which the library never names, and `DRAIN_N = 128` — the widest band a thread
-  can drain before 256 fp32 crosses the 255-register ceiling — is derived
-  independently in both GEMMs' docs (`experiments/src/gemm.rs:412`,
-  `experiments/src/gemm_ws.rs:447`). Both are library facts living in
-  `examples/` and `experiments/`. Named in #126.
+  warp-scope write-after-read, same `STAGE_N` stride, while only the preambles
+  differed. `epilogue::Drain::staged` is that loop, with the two widths as the
+  type's const parameters and the inter-band `Warp::converge` inside it, and
+  the three copies are three calls. The single-shot `tma_store` + commit +
+  `wait::<0>` `softmax` and `layernorm` open-coded is `Scope::store_once` — the
+  same three obligations `StoreRing` states, for the kernel that stores its box
+  once and has nothing to overlap it with. `StoreRing` stays: #123's
+  measurement is `gemm`-shaped and the engine is still the right answer for a
+  kernel that stores a whole `[R, C]` box per item.
+  **What did not close**: `gemm_sol`'s drain, which walks sub-bands narrower
+  than its staging tile through `tile_x8_batched` and converges twice a pass.
+  Migrating it is a codegen change on the kernel with the tightest register
+  count in the repo, so it is a measurement rather than a refactor.
+- **The band origin — landed (#126).** `32 * warp_id` appeared in every kernel
+  in the repo, five times inline in `flash_forward.rs`. The `32` is
+  `BaseLdtm::WARP_ROWS` now, and `DRAIN_N = 128` — the widest band a thread can
+  drain before 256 fp32 crosses the 255-register ceiling — is
+  `BaseLdtm::WIDEST_BAND`, whose derivation a `const` block in `reg.rs` checks
+  rather than asserts in prose. Both GEMMs' `DRAIN_N` reads off it, and the
+  drain adds the band origin to the accumulator's rows and the destination's
+  together, so the product cannot be written twice and drift.
 
 ### 7.5 Types that exist and are not used by the operation that needs them
 
@@ -1064,7 +1070,6 @@ came off this table the same day it went on, which is the same argument again.
 | 42 | Reduction TMA stores — upstream rather than a local `ptx_asm!` | 2.3 |
 | 49 | Cluster geometry beyond the 2-CTA pair | 2.4 |
 | 124 | Scope is in the type once and spelled three other ways | 1.1, 7.1 |
-| 126 | The shipped epilogue is open-coded in both GEMMs | 7.4 |
 | 128 | TMEM columns unchecked; the MMA takes an address, not a tile | 3.3, 7.5 |
 | 129 | Two conventions each for constructors, `unsafe`, verbs, re-exports | 7.3 |
 | 130 | `RegVec` cannot reach memory; `SharedVec` cannot be sliced | 1.4, 2.2 |
