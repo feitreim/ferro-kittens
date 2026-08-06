@@ -43,6 +43,13 @@
 //! the library that no warp can compute alone, so it is the only case where the
 //! answer depends on four warps having met at a barrier in the right order.
 //!
+//! [`tmem_rescale`] is the one case whose reader is not a thread. Every other
+//! STTM case here reads the stored segment back with a drain, which says the
+//! store is the drain's inverse and nothing about the consumer a kernel
+//! actually hands a segment to — an MMA taking it as accumulator. It is the
+//! shape an in-place accumulator rescale has, and `TmemTile::store_fragment`'s
+//! contract is written against what it measures.
+//!
 //! [`tmem_warpgroup`] is the one family that launches **two** warpgroups, and
 //! its subject is not a map but a *contract*: every TMEM drain in the library is
 //! documented as belonging to the warp that owns the lanes, and oxide-train#94
@@ -103,6 +110,7 @@ use kittens::tmem::{
 
 mod ladder_bench;
 mod tmem_occupancy;
+mod tmem_rescale;
 mod tmem_residency;
 mod tmem_warpgroup;
 
@@ -331,6 +339,15 @@ const PROBE_SHARED: usize = AOperand::BYTES + 2 * BOperand::BYTES + 32;
 /// The STTM round trip touches no shared tile at all — its whole plan is the
 /// TMEM staging word.
 const STTM_SHARED: usize = 32;
+
+/// What [`kernels::mma_rescale`] multiplies the drained band by before storing
+/// it back, so that a correct segment comes back at `RESCALE + 1` times the
+/// cell identity and the accumulator the store never reached comes back at 2.
+///
+/// Four, because the four readings a dump can carry — `1`, `2`, `RESCALE` and
+/// `RESCALE + 1` — have to be distinct multiples and every one of them exact in
+/// fp32 against a cell identity that reaches 16383.
+const RESCALE: f32 = 4.0;
 
 /// Shared plan of the MMA-seeded cross-warpgroup case: both zeroed operands,
 /// then a 32-byte tail holding its mbarrier and the TMEM staging word. Every
@@ -3087,6 +3104,145 @@ pub mod kernels {
         mut out: DisjointSlice<f32>,
     ) {
         unsafe { fragment_probe::<32, 128, true>(a_map, b_map, &mut out) }
+    }
+
+    /// The hand-off #177 asks about: a `tcgen05.st` into a segment, and an
+    /// **MMA** — not another LDTM — reading it back as its accumulator.
+    ///
+    /// Every other STTM case here reads the segment back with a drain, which
+    /// establishes the store is the drain's inverse and says nothing about the
+    /// one consumer a kernel actually hands a stored segment to. So: `mm_abt`
+    /// writes the segment, each warp drains its own quadrant, scales it by
+    /// [`RESCALE`] in registers, `store_tile`s it back to the columns it came
+    /// from, and a second `mm_abt` with `accumulate = true` takes the same
+    /// segment. The host's reference is `(RESCALE + 1) · A·Bᵀ`.
+    ///
+    /// The second MMA's operands are the first's on purpose, so every value in
+    /// the dump is a multiple of the cell identity `A·Bᵀ` already carries and a
+    /// wrong one says *which term is missing* rather than merely comparing
+    /// unequal. `2×` is the accumulator as it stood **before** the rescale —
+    /// the hazard the case exists to exclude — and `STORE` at false produces it
+    /// deliberately, as the control that says the dump can tell the two apart.
+    ///
+    /// `issuer` is the warp whose lane 0 issues the second MMA. That warp's own
+    /// quadrant is the hand-off where one warp both stored and issued; the
+    /// other three are the arrangement a kernel really has, where the MMA
+    /// issuer is not the warp that owns the lanes. One launch measures both and
+    /// the host counts them apart.
+    ///
+    /// `fences` is [`wg_handoff`]'s three-bit ladder unchanged — bit 0
+    /// [`store_wait`], bit 1 `tcgen05.fence::before_thread_sync`, bit 2
+    /// `::after_thread_sync` — so the two families ask the fence question of
+    /// the same three layers and differ only in who reads.
+    ///
+    /// Launch with `ROWS` threads and [`PROBE_SHARED`] bytes.
+    #[inline(always)]
+    unsafe fn rescale_probe<const STORE: bool>(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        fences: u32,
+        issuer: u32,
+        out: &mut DisjointSlice<f32>,
+    ) {
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            let a = AOperand::from_raw(smem);
+            let b_low = BOperand::from_raw(smem.add(AOperand::BYTES));
+            let b_high = BOperand::from_raw(smem.add(AOperand::BYTES + BOperand::BYTES));
+            let scratch = smem.add(AOperand::BYTES + 2 * BOperand::BYTES);
+            let tma = Semaphore::attach(scratch as *mut Barrier);
+            let mma_done = Semaphore::attach(scratch.add(8) as *mut Barrier);
+            let tmem_slot = scratch.add(16) as *mut u32;
+
+            let tid = thread::threadIdx_x();
+            let (warp_id, lane) = (warp::warp_id(), warp::lane_id());
+
+            if tid == 0 {
+                tma.init(1);
+                mma_done.init(1);
+                fence_proxy_async_shared_cta();
+            }
+            thread::sync_threads();
+            let tmem = alloc_block(tmem_slot, COLUMNS as u32);
+            let accumulator = Accumulator::from_raw(tmem);
+
+            if tid == 0 {
+                let staged = a.tma_load(a_map, 0, 0, tma)
+                    + b_low.tma_load(b_map, 0, 0, tma)
+                    + b_high.tma_load(b_map, 0, 1, tma);
+                tma.expect_tx(staged);
+            }
+            tma.wait(0);
+            thread::sync_threads();
+
+            let shape = MmaShape::M128_N64;
+            let right = accumulator.columns_right(TILE as u32);
+            if tid == 0 {
+                mma_abt(accumulator.raw(), a, b_low, shape, false);
+                mma_abt(right.raw(), a, b_high, shape, false);
+                mma::commit(mma_done);
+            }
+            mma_done.wait(0);
+            thread::sync_threads();
+
+            // The read-modify-write a flash correction would do: the warp's own
+            // quadrant out, scaled, and back at the columns it came from.
+            if STORE {
+                let band: RegTile<32, COLUMNS, BaseLdtm> = accumulator.tile_x8(warp_lanes(), 0);
+                accumulator.store_tile(warp_lanes(), 0, band.scale(RESCALE));
+            }
+            wg_handoff(fences);
+
+            if tid == 32 * issuer {
+                mma_abt(accumulator.raw(), a, b_low, shape, true);
+                mma_abt(right.raw(), a, b_high, shape, true);
+                mma::commit(mma_done);
+            }
+            mma_done.wait(1);
+            thread::sync_threads();
+
+            dump_band(
+                accumulator.tile_x8::<32, COLUMNS>(warp_lanes(), 0),
+                warp_id,
+                lane,
+                out,
+            );
+
+            tcgen05_fence_before_thread_sync();
+            thread::sync_threads();
+            dealloc_block(tmem, COLUMNS as u32);
+            if tid == 0 {
+                tma.inval();
+                mma_done.inval();
+            }
+        }
+    }
+
+    /// [`rescale_probe`] as the case's rows run it: the band scaled and stored
+    /// back before the second MMA takes the segment.
+    #[kernel]
+    pub unsafe fn mma_rescale(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        fences: u32,
+        issuer: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { rescale_probe::<true>(a_map, b_map, fences, issuer, &mut out) }
+    }
+
+    /// [`rescale_probe`] with the store taken away — the control whose dump is
+    /// the stale reading, so that the two readings are known to differ before
+    /// any row asserts which one came back.
+    #[kernel]
+    pub unsafe fn mma_rescale_stale(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        fences: u32,
+        issuer: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { rescale_probe::<false>(a_map, b_map, fences, issuer, &mut out) }
     }
 
     /// Reductions against silicon: the `shuffle_xor` butterflies, which are
@@ -7242,6 +7398,14 @@ fn run() -> Result<usize, Box<dyn Error>> {
     cases.push((
         "clc work stealing",
         Box::new(|| check_clc(&context, stream, module)),
+    ));
+    // An MMA reading a segment `tcgen05.st` wrote (#177). Down here with the
+    // other contract cases rather than beside `sttm restage`, because its last
+    // row drops `store_wait` on purpose and a race is not a thing to run in
+    // front of the cases that assume the wait works.
+    cases.push((
+        "sttm into mma",
+        Box::new(|| tmem_rescale::check(stream, module)),
     ));
     // Two warpgroups over one accumulator (oxide-train#94), which is the only
     // case here whose subject is a *contract* rather than a map: every drain in
