@@ -231,7 +231,13 @@ pub mod kernels {
                 let s = s.sub_row(running_max).exp2();
                 running_sum.add_assign(s.row_sum());
 
+                // Each warp writes its own 32 rows of `P` with `stmatrix` and
+                // the leader hands the whole tile to an MMA — a generic write
+                // an *async* reader takes, which is the one hand-off that does
+                // owe the proxy fence. The barrier after it carries every
+                // warp's ordering to the leader; the barrier alone would not.
                 store_tile(p.chunk_writer(), 32 * warp_id, 0, lane, s);
+                publish_to_async_proxy();
                 thread::sync_threads();
 
                 if leader {
