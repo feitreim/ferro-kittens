@@ -3218,7 +3218,7 @@ pub mod kernels {
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
-            let tmem = alloc_block(tmem_slot, COLUMNS as u32);
+            let tmem = alloc_block::<COLUMNS>(tmem_slot);
             let accumulator = Accumulator::from_raw(tmem);
 
             if tid == 0 {
@@ -3230,11 +3230,11 @@ pub mod kernels {
             tma.wait(0);
             thread::sync_threads();
 
-            let shape = MmaShape::M128_N64;
-            let right = accumulator.columns_right(TILE as u32);
+            let left: TmemTile<ROWS, TILE> = accumulator.split_columns();
+            let right = left.columns_right(TILE as u32);
             if tid == 0 {
-                mma_abt(accumulator.raw(), a, b_low, shape, false);
-                mma_abt(right.raw(), a, b_high, shape, false);
+                mma_abt(left, a, b_low, false);
+                mma_abt(right, a, b_high, false);
                 mma::commit(mma_done);
             }
             mma_done.wait(0);
@@ -3249,8 +3249,8 @@ pub mod kernels {
             wg_handoff(fences);
 
             if tid == 32 * issuer {
-                mma_abt(accumulator.raw(), a, b_low, shape, true);
-                mma_abt(right.raw(), a, b_high, shape, true);
+                mma_abt(left, a, b_low, true);
+                mma_abt(right, a, b_high, true);
                 mma::commit(mma_done);
             }
             mma_done.wait(1);
@@ -3265,7 +3265,7 @@ pub mod kernels {
 
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
-            dealloc_block(tmem, COLUMNS as u32);
+            dealloc_block::<COLUMNS>(tmem);
             if tid == 0 {
                 tma.inval();
                 mma_done.inval();
