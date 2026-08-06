@@ -7,8 +7,10 @@
 //! `C = A·Bᵀ` for row-major FP16 `A [M, K]` and `B [N, K]` into packed
 //! row-major BF16 `C [M, N]`, with `k` a multiple of 256.
 //!
-//! One launch is one two-CTA cluster per output tile and one CTA per SM, at 192
-//! threads a CTA: four epilogue warps, one TMA warp, one MMA warp. The producer
+//! One launch is one two-CTA cluster per output tile and one CTA per SM, at 320
+//! threads a CTA at the two 256-wide entries and 192 at the narrow one: eight
+//! epilogue warps splitting the accumulator's columns (four at `[256, 128]`, see
+//! [`NARROW_GROUPS`]), one TMA warp, one MMA warp. The producer
 //! walks `K` in 64-deep blocks through four TMA/shared stages, the MMA warp
 //! issues `tcgen05.mma` at `cta_group::2` into two TMEM accumulator halves, and
 //! the epilogue lifts 64-column bands out of TMEM, `stmatrix`es them into a
@@ -232,7 +234,29 @@ pub const ONE_WARPGROUP: u32 = 1;
 /// [`ONE_WARPGROUP`]'s twin: eight epilogue warps splitting the columns. Kept as
 /// a rung — it is exact, and it loses.
 pub const TWO_WARPGROUPS: u32 = 2;
-pub const SHIPPED_GROUPS: u32 = ONE_WARPGROUP;
+/// What the two 256-wide entries ship, and it changed in #197.
+///
+/// The split was measured at one CTA per SM through a `.local` frame the library
+/// no longer emits: `store_tile_x4` homed each drained band to a depot until the
+/// rolled walks were marked (#166, landed in #180/#181/#184), and the band *is*
+/// the frame — a `RegTile<32, 64>` is 64 f32 is 256 B. Re-run against the same
+/// `bench sol-ablate` table 6 that recorded the loss, the sign is the other way
+/// at both entries and both passes, and the drain it was blamed on is now the
+/// part that gets faster: 4.72 µs to 3.05 µs an item at `[512, 256]`.
+///
+/// The hardware argument that made the loss plausible is unchanged and was never
+/// the whole story — warps 0 and 4 do own the same 32 tensor-memory lanes, so the
+/// column split puts two requesters on each of four sub-partitions rather than
+/// spreading them over eight. That ceiling is real; it just sat above the depot
+/// rather than below it.
+pub const SHIPPED_GROUPS: u32 = TWO_WARPGROUPS;
+/// The narrow entry keeps one warpgroup, and the reason is measurement rather
+/// than mechanism: `bench sol-ablate`'s warpgroup table has arms at `[256, 256]`
+/// and `[512, 256]` only, so `[256, 128]` has no A/B of its own. The split is
+/// legal there — the asserts below cover `NARROW_N` at both widths, and its
+/// per-warp band would be exactly [`BAND_N`] — and shipping it would be shipping
+/// a configuration nothing in this tree has timed.
+pub const NARROW_GROUPS: u32 = ONE_WARPGROUP;
 
 const fn epilogue_warps(groups: u32) -> u32 {
     EPILOGUE_ROWS * groups
@@ -247,6 +271,9 @@ const fn mma_warp(groups: u32) -> u32 {
 pub const fn threads(groups: u32) -> u32 {
     (mma_warp(groups) + 1) * 32
 }
+/// The two 256-wide entries' block. It is no longer every entry's, which is why
+/// the launcher asks [`Variant::threads`] instead of reading this: the narrow
+/// entry is at [`NARROW_GROUPS`] and takes 192 where these take 320.
 pub const THREADS: u32 = threads(SHIPPED_GROUPS);
 const RANKS: u32 = 2;
 const LEADER: u32 = 0;
@@ -265,7 +292,8 @@ pub const WIDE_B_BOX: usize = HALF_N;
 pub const LARGE_STAGE_N: usize = HALF_N;
 
 const _: () = {
-    assert!(THREADS == 192);
+    assert!(THREADS == 320);
+    assert!(threads(ONE_WARPGROUP) == 192);
     assert!(threads(TWO_WARPGROUPS) == 320);
     assert!(
         epilogue_warps(ONE_WARPGROUP) as usize * BLOCK_N
@@ -1743,7 +1771,7 @@ pub mod kernels {
     #[cluster_launch(2, 1, 1)]
     #[launch_contract(
         domain = 1,
-        block = (192, 1, 1),
+        block = (320, 1, 1),
         dynamic_shared = 196_864,
         dynamic_shared_alignment = 128
     )]
@@ -1763,15 +1791,15 @@ pub mod kernels {
                 BLOCK_N,
                 HALF_N,
                 B_BOX,
-                BLOCK_N,
+                { BLOCK_N / TWO_WARPGROUPS as usize },
                 SMALL_RINGS_END,
                 WHOLE,
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 SHIPPED_GROUPS,
-                128,
-                4,
+                BAND_N,
+                2,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c);
         }
     }
@@ -1811,7 +1839,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                NARROW_GROUPS,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c);
@@ -1825,7 +1853,7 @@ pub mod kernels {
     #[cluster_launch(2, 1, 1)]
     #[launch_contract(
         domain = 1,
-        block = (192, 1, 1),
+        block = (320, 1, 1),
         dynamic_shared = 229_632,
         dynamic_shared_alignment = 128
     )]
@@ -1848,9 +1876,9 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 SHIPPED_GROUPS,
-                LARGE_STAGE_N,
-                128,
-                4,
+                { LARGE_STAGE_N / TWO_WARPGROUPS as usize },
+                BAND_N,
+                2,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c);
         }
     }
@@ -1895,12 +1923,35 @@ impl Variant {
             Self::M512xN256 => LARGE_SHARED_BYTES,
         }
     }
+
+    /// The block this entry's `#[launch_contract]` states, which is no longer one
+    /// number for all three: the 256-wide entries run [`SHIPPED_GROUPS`] epilogue
+    /// warpgroups and the narrow one runs [`NARROW_GROUPS`]. It sits beside
+    /// [`Variant::shared_bytes`] because it is the same kind of fact — what the
+    /// host must pass to launch this entry and not another.
+    pub const fn threads(self) -> u32 {
+        match self {
+            Self::M256xN128 => threads(NARROW_GROUPS),
+            Self::M256xN256 | Self::M512xN256 => threads(SHIPPED_GROUPS),
+        }
+    }
 }
+
+/// CTAs of one entry an SM holds, and the residency `modal_app.py`'s occupancy
+/// gate reads this file for. It is fixed by the shared plan rather than by
+/// registers — the smallest of the three is 131 328 B of the 233 472 an SM
+/// divides and the two that ship are 196 864 and 229 632 — so no register count
+/// can move it *up*. It can be moved to zero: at [`THREADS`]' 320 a thread may
+/// have 168 registers before an SM cannot place one CTA at all, which is a
+/// launch that fails rather than a launch that is slow, and is what the gate
+/// watches now that the two 256-wide entries run ten warps instead of six.
+const CTAS_PER_SM: u32 = 1;
 
 /// Clusters this device holds at once: 148 SMs, one CTA per SM because every
 /// shared plan here declares more than half of the 233472 B an SM divides, and
 /// two CTAs to a cluster because a `cta_group::2` MMA needs its pair resident.
 const RESIDENT_CLUSTERS: usize = 74;
+const _: () = assert!(RESIDENT_CLUSTERS == (148 * CTAS_PER_SM / RANKS) as usize);
 
 /// The entry a shape gets; all three branches are wave arithmetic. A launch is one
 /// cluster per output tile and takes `ceil(tiles / RESIDENT_CLUSTERS)` waves of
@@ -2067,7 +2118,7 @@ fn run<T>(
     let tiles_n = (n / variant.n_tile()) as u32;
     let config = LaunchConfig1D::new(
         grid_for(crate::bench::Shape { m, n, k }, variant),
-        THREADS,
+        variant.threads(),
         variant.shared_bytes() as u32,
     );
     let (stream_ref, module_ref) = (&stream, &module);

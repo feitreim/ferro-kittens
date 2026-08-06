@@ -124,15 +124,23 @@
 //!   and `st.global.v4` is 16 bytes.
 //! - *Warps.* The split doubles the epilogue's warps at the same total work, the
 //!   same byte-identical shared plan, and a `no drain` control at its own 320
-//!   threads that matches the 192-thread one to a tenth of a percent — and the
-//!   drain moves **−9% at 4096³ and +3% at 8192³**. See
-//!   [`crate::gemm_sol::TWO_WARPGROUPS`] for why: warps 0 and 4 own the *same* 32
-//!   tensor-memory lanes, so a column split puts two requesters on each of four
-//!   sub-partitions rather than spreading over more of them. The axis that is free
-//!   to split is not the axis the hardware parallelizes.
+//!   threads that matches the 192-thread one to a tenth of a percent. It first
+//!   measured the drain **−9% at 4096³ and +3% at 8192³** and was read against
+//!   the lane argument in [`crate::gemm_sol::TWO_WARPGROUPS`] — warps 0 and 4 own
+//!   the *same* 32 tensor-memory lanes, so a column split puts two requesters on
+//!   each of four sub-partitions rather than spreading over more of them.
 //!
-//! So the drain is bound by something shared across warps rather than by
-//! per-warp latency, and it is not bytes: 262 144 B into shared per cluster per
+//!   **That reading did not survive #166.** Every row of it was taken through a
+//!   `.local` depot the library no longer emits, and the split pays a band's
+//!   frame twice where one warpgroup pays it once. Re-run, the drain goes
+//!   **3.35 → 3.10 µs at 4096³ and 4.72 → 3.05 µs at 8192³** and the launch is
+//!   +0.8% and +2.1%, both reproduced in two passes. The lane ceiling is still
+//!   there; it was simply never the term this table was reaching. Both 256-wide
+//!   entries ship the split as of #197, and the arms in this file stay pinned to
+//!   [`ONE_WARPGROUP`] so the ladder keeps comparing against what it always did.
+//!
+//! So the drain is bound by something other than the store path, and it is not
+//! bytes: 262 144 B into shared per cluster per
 //! tile in ~6 µs is 3.5 TB/s device-wide against an SM's ~230 GB/s of shared write
 //! bandwidth, under 10% of it. It is not bank conflicts either — `Swizzle128B`
 //! maps one `stmatrix.m8n8` matrix's eight rows onto eight chunks whose banks tile
@@ -213,7 +221,7 @@ use crate::bench::{Shape, Timings, time};
 use crate::gemm_sol::{
     ATile, B_BOX, BAND_N, BLOCK_N, BPanel, DRAIN_NOCVT, DRAIN_PACK16, DRAIN_PAIRED,
     DRAIN_PER_ISSUE, DRAIN_WIDE, FEED_ONLY, HALF_N, ISSUE_ONLY, LARGE_STAGE_N, MMA_ONLY, NO_DRAIN,
-    SHIPPED_DRAIN, SHIPPED_GROUPS, SMALL_RINGS_END, THREADS, TWICE_ALL, TWICE_GLOBAL, TWICE_SHARED,
+    ONE_WARPGROUP, SHIPPED_DRAIN, SMALL_RINGS_END, TWICE_ALL, TWICE_GLOBAL, TWICE_SHARED,
     TWO_WARPGROUPS, Variant, WATCH_OFF, WHOLE, WIDE_B_BOX, WideBPanel, clusters, default_group,
     large_body, small_body, threads,
 };
@@ -274,7 +282,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -316,7 +324,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -358,7 +366,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -401,7 +409,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -445,7 +453,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -488,7 +496,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -532,7 +540,7 @@ pub mod kernels {
                 false,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -575,7 +583,7 @@ pub mod kernels {
                 false,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -613,7 +621,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -652,7 +660,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -691,7 +699,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -730,7 +738,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -771,7 +779,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -810,7 +818,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -850,7 +858,7 @@ pub mod kernels {
                 false,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -889,7 +897,7 @@ pub mod kernels {
                 false,
                 SHIPPED_DRAIN,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -933,7 +941,7 @@ pub mod kernels {
                 true,
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -975,7 +983,7 @@ pub mod kernels {
                 true,
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1017,7 +1025,7 @@ pub mod kernels {
                 true,
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1060,7 +1068,7 @@ pub mod kernels {
                 true,
                 DRAIN_PAIRED,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1102,7 +1110,7 @@ pub mod kernels {
                 true,
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1144,7 +1152,7 @@ pub mod kernels {
                 true,
                 DRAIN_WIDE,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1187,7 +1195,7 @@ pub mod kernels {
                 true,
                 DRAIN_NOCVT,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1230,7 +1238,7 @@ pub mod kernels {
                 true,
                 DRAIN_PACK16,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -1269,7 +1277,7 @@ pub mod kernels {
                 true,
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1308,7 +1316,7 @@ pub mod kernels {
                 true,
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1347,7 +1355,7 @@ pub mod kernels {
                 true,
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1387,7 +1395,7 @@ pub mod kernels {
                 true,
                 DRAIN_PAIRED,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1426,7 +1434,7 @@ pub mod kernels {
                 true,
                 DRAIN_PER_ISSUE,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1465,7 +1473,7 @@ pub mod kernels {
                 true,
                 DRAIN_WIDE,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1505,7 +1513,7 @@ pub mod kernels {
                 true,
                 DRAIN_NOCVT,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1545,7 +1553,7 @@ pub mod kernels {
                 true,
                 DRAIN_PACK16,
                 WATCH_OFF,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 LARGE_STAGE_N,
                 128,
                 4,
@@ -1853,7 +1861,7 @@ impl Arm {
     fn threads(self) -> u32 {
         match self {
             Arm::Wg2 | Arm::Wg2NoDrain => threads(TWO_WARPGROUPS),
-            _ => THREADS,
+            _ => threads(ONE_WARPGROUP),
         }
     }
 
@@ -2558,7 +2566,7 @@ fn warpgroup_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
                 "warpgroups", "threads", "min ms", "epilogue", "of one wg"
             );
             for (name, whole, control, count) in [
-                ("one", minima[0], minima[1], THREADS),
+                ("one", minima[0], minima[1], threads(ONE_WARPGROUP)),
                 ("two", minima[2], minima[3], threads(TWO_WARPGROUPS)),
             ] {
                 println!(

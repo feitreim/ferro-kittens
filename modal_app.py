@@ -1661,6 +1661,17 @@ GATED_KERNELS = (
     # other resource was going to catch this.
     ("groupnorm_tile", "examples", "examples/src/layernorm.rs"),
     ("groupnorm_tile", "experiments", "examples/src/layernorm.rs"),
+    # The three `gemm_sol` entries, here since #197 took the two 256-wide ones
+    # from six warps to ten. Their residency is fixed by the shared plan and no
+    # register count can raise it, so what this gate watches is the *other*
+    # direction: `_ctas_by_registers` returning zero. At 320 threads that step
+    # is 168 registers a thread, against the 82/83 they read today — and the
+    # failure it would catch is a launch the driver refuses, not a slow one.
+    # The narrow entry is 192 threads and its own row for the same reason every
+    # copy of a gated kernel is a row: the geometries differ.
+    ("gemm_sol_m256", "examples", "examples/src/gemm_sol.rs"),
+    ("gemm_sol_m256_n128", "examples", "examples/src/gemm_sol.rs"),
+    ("gemm_sol_m512", "examples", "examples/src/gemm_sol.rs"),
 )
 
 _CONTRACT_BLOCK = re.compile(r"block\s*=\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)")

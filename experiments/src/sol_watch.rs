@@ -77,16 +77,17 @@ use kittens::shared::F16;
 
 use crate::bench::Shape;
 use crate::gemm_sol::{
-    ATile, B_BOX, BLOCK_N, BPanel, HALF_N, REPORT_FIELDS, REPORT_ROWS, REPORT_SLOTS, SHIPPED_DRAIN,
-    SHIPPED_GROUPS, SMALL_RINGS_END, SMALL_SHARED_BYTES, THREADS, WATCH_DEEP, WATCH_ONE_DEEP,
-    WHOLE, a_value, b_value, check_output, default_group, site_name, small_body, stage_f16,
+    ATile, B_BOX, BLOCK_N, BPanel, HALF_N, ONE_WARPGROUP, REPORT_FIELDS, REPORT_ROWS, REPORT_SLOTS,
+    SHIPPED_DRAIN, SMALL_RINGS_END, SMALL_SHARED_BYTES, WATCH_DEEP, WATCH_ONE_DEEP, WHOLE, a_value,
+    b_value, check_output, default_group, site_name, small_body, stage_f16, threads,
 };
 
 /// Depth one stage carries, per [`crate::sol_ablate`].
 const K_TILE: usize = 64;
 /// Warps a block has. Six roles are dispatched over
-/// [`crate::gemm_sol::THREADS`]' 192 threads; the report reserves eight slots.
-const WARPS: u32 = THREADS / 32;
+/// the watch kernels' 192 threads — they are pinned to one epilogue warpgroup,
+/// like every other probe here; the report reserves eight slots.
+const WARPS: u32 = threads(ONE_WARPGROUP) / 32;
 
 #[cuda_module]
 pub mod kernels {
@@ -127,7 +128,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_DEEP,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -169,7 +170,7 @@ pub mod kernels {
                 true,
                 SHIPPED_DRAIN,
                 WATCH_ONE_DEEP,
-                SHIPPED_GROUPS,
+                ONE_WARPGROUP,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
@@ -254,7 +255,7 @@ pub fn watch(context: &Arc<CudaContext>, shape: Shape, depth: Depth) -> Result<(
     // The report rows are why this allocation is not `m * n`.
     let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n + REPORT_ROWS * n)?;
 
-    let config = LaunchConfig1D::new(ctas, THREADS, SMALL_SHARED_BYTES as u32);
+    let config = LaunchConfig1D::new(ctas, threads(ONE_WARPGROUP), SMALL_SHARED_BYTES as u32);
     let (tiles_m, tiles_n) = ((m / 256) as u32, (n / tile_n) as u32);
     let (k_blocks, group, ldc) = ((k / K_TILE) as u32, default_group(m), n as u32);
     let (a_ptr, b_ptr) = (a_map.as_ptr(), b_map.as_ptr());
