@@ -142,7 +142,8 @@
 //! difference in the *slack* the two designs have — one item against two — and
 //! it is the part of `gemm_sol_final` this port does not reproduce. It is not a
 //! bug in the trait; it is the price of the trait's guarantee that barriers can
-//! be re-armed per item.
+//! be re-armed per item. #132 took that argument up into [`Job`]'s own doc,
+//! where a reader of the scaffold meets it without having to find this file.
 //!
 //! Which brings the second consequence, and it is in our favour: because every
 //! item re-arms its own barrier set behind the boundary, **every item starts at
@@ -1004,25 +1005,6 @@ impl<const STAGES: usize, const DRAIN: u8> Ws<STAGES, DRAIN> {
     fn pending_stage(&self) -> u32 {
         (self.sequence + 1) % ACCUM_STAGES
     }
-
-    /// Store the last item's accumulator, which no later item is coming to
-    /// overlap. Once, after [`pipeline::run`] returns and before the pair gives
-    /// its tensor memory back.
-    ///
-    /// A cluster that ran no items owes nothing, which is the static-schedule
-    /// case where [`MAX_CLUSTERS`] exceeds the tile count.
-    ///
-    /// # Safety
-    ///
-    /// Every thread of the CTA, before `release`.
-    #[inline(always)]
-    unsafe fn finish(&self) {
-        unsafe {
-            if self.pending != Self::NONE && self.tile.warp_id < EPILOGUE_WARPS {
-                self.epilogue(self.pending, self.pending_stage());
-            }
-        }
-    }
 }
 
 impl<const STAGES: usize, const DRAIN: u8> Job for Ws<STAGES, DRAIN> {
@@ -1107,6 +1089,26 @@ impl<const STAGES: usize, const DRAIN: u8> Job for Ws<STAGES, DRAIN> {
             tile.done.wait(0);
             self.pending = item;
             self.sequence += 1;
+        }
+    }
+
+    /// Store the last item's accumulator, which no later item is coming to
+    /// overlap — the drain the epilogue warps still owe once the item loop has
+    /// run out of items to hide it behind.
+    ///
+    /// A cluster that ran no items owes nothing, which is the static-schedule
+    /// case where [`MAX_CLUSTERS`] exceeds the tile count.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::epilogue`], and [`pipeline::run`]'s: every thread of the CTA,
+    /// after the item loop and before `release`.
+    #[inline(always)]
+    unsafe fn finish(&mut self) {
+        unsafe {
+            if self.pending != Self::NONE && self.tile.warp_id < EPILOGUE_WARPS {
+                self.epilogue(self.pending, self.pending_stage());
+            }
         }
     }
 }
@@ -1228,7 +1230,6 @@ pub mod kernels {
                 attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             let mut job = Ws::<STAGES, { drain::REGISTER }>::new(tile);
             pipeline::run(&mut job, tiles_m * tiles_n);
-            job.finish();
             release(&job.tile);
         }
     }
@@ -1272,7 +1273,6 @@ pub mod kernels {
                 attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             let mut job = Ws::<STAGES, { drain::REGISTER }>::new(tile);
             pipeline::run_stealing(&mut job, queue);
-            job.finish();
             release(&job.tile);
         }
     }
@@ -1320,7 +1320,6 @@ pub mod kernels {
                 attach::<6>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             let mut job = Ws::<6, { drain::REGISTER }>::new(tile);
             pipeline::run(&mut job, tiles_m * tiles_n);
-            job.finish();
             release(&job.tile);
         }
     }
@@ -1368,7 +1367,6 @@ pub mod kernels {
                 attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             let mut job = Ws::<STAGES, { drain::STAGED }>::new(tile);
             pipeline::run(&mut job, tiles_m * tiles_n);
-            job.finish();
             release(&job.tile);
         }
     }
@@ -1410,7 +1408,6 @@ pub mod kernels {
                 attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             let mut job = Ws::<STAGES, { drain::STAGED_X8 }>::new(tile);
             pipeline::run(&mut job, tiles_m * tiles_n);
-            job.finish();
             release(&job.tile);
         }
     }
@@ -1450,7 +1447,6 @@ pub mod kernels {
                 attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             let mut job = Ws::<STAGES, { drain::STAGED_X4 }>::new(tile);
             pipeline::run(&mut job, tiles_m * tiles_n);
-            job.finish();
             release(&job.tile);
         }
     }
@@ -1485,7 +1481,6 @@ pub mod kernels {
                 attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             let mut job = Ws::<STAGES, { drain::STAGED_X8_X4 }>::new(tile);
             pipeline::run(&mut job, tiles_m * tiles_n);
-            job.finish();
             release(&job.tile);
         }
     }
@@ -1528,7 +1523,6 @@ pub mod kernels {
                 attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             let mut job = Ws::<STAGES, { drain::REMOVED }>::new(tile);
             pipeline::run(&mut job, tiles_m * tiles_n);
-            job.finish();
             release(&job.tile);
         }
     }
@@ -1572,7 +1566,6 @@ pub mod kernels {
                 attach::<STAGES>(a_map, b_map, tiles_m, tiles_n, group, k_blocks, ldc, &mut c);
             let mut job = Ws::<STAGES, { drain::REMOVED }>::new(tile);
             pipeline::run(&mut job, tiles_m * tiles_n);
-            job.finish();
             release(&job.tile);
         }
     }
