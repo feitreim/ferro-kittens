@@ -1662,41 +1662,54 @@ impl<const M: usize, const N: usize, L: FragmentLayout<M, N>> RegTile<M, N, L> {
     /// at `(slot, value)` sees `cols` value `value`, i.e. the scalar for
     /// logical column [`ColVec::column`]`(lane, value)`. Also shuffle-free —
     /// but see [`ColVec`] on which operands carry a whole-column meaning.
+    ///
+    /// The column walk is the outer one, for [`Self::col_map_assign`]'s reason.
     #[inline(always)]
     pub fn col_map<Op: BinaryOp>(self, cols: ColVec<N, L>) -> Self {
         let mut out = self;
-        let mut slot = 0;
-        while slot < L::SLOTS {
-            let mut value = 0;
-            while value < L::VALUES {
-                out.set(
-                    slot,
-                    value,
-                    Op::apply(self.get(slot, value), cols.get(value)),
-                );
-                value += 1;
+        let mut value = 0;
+        while value < L::VALUES {
+            let col = cols.get(value);
+            let mut slot = 0;
+            while slot < L::SLOTS {
+                out.set(slot, value, Op::apply(self.get(slot, value), col));
+                slot += 1;
             }
-            slot += 1;
+            value += 1;
         }
         out
     }
 
     /// [`Self::col_map`] rewriting this tile — the column mirror of
-    /// [`Self::row_map_assign`].
+    /// [`Self::row_map_assign`], down to the loop order.
+    ///
+    /// The column walk is the *outer* one, so one column's scalar is read once
+    /// and spent before the next column's is formed — `L::VALUES` reads of the
+    /// operand rather than `L::SLOTS × L::VALUES` of them (#196). That is the
+    /// same trade [`Self::row_map_assign`] makes, and it matters here for a
+    /// reason that one does not have: `ColVec::get` indexes `[f32; N/4]` with
+    /// the loop variable, and these maps are the walks #166 measured *worse*
+    /// unrolled, so the index stays a runtime one and the array is a candidate
+    /// for the local depot rather than a register. Every element sees the same
+    /// operand under an elementwise, independent `Op`, so the result is
+    /// bit-identical and only the order the storage is walked in changes.
+    ///
+    /// **What the hoist is worth** (`device-tests`' `axis_map_probe`,
+    /// `regcount`, sm_100a): nothing at all on a `[32, 16]` chunk, where four
+    /// slots and four values price the same both ways down to the static
+    /// `.local` counts; 167 → 39 registers a thread and 600 → 519 `ld.local`
+    /// on a `[32, 128]` one, on an unchanged 2304-byte frame.
     #[inline(always)]
     pub fn col_map_assign<Op: BinaryOp>(&mut self, cols: ColVec<N, L>) {
-        let mut slot = 0;
-        while slot < L::SLOTS {
-            let mut value = 0;
-            while value < L::VALUES {
-                self.set(
-                    slot,
-                    value,
-                    Op::apply(self.get(slot, value), cols.get(value)),
-                );
-                value += 1;
+        let mut value = 0;
+        while value < L::VALUES {
+            let col = cols.get(value);
+            let mut slot = 0;
+            while slot < L::SLOTS {
+                self.set(slot, value, Op::apply(self.get(slot, value), col));
+                slot += 1;
             }
-            slot += 1;
+            value += 1;
         }
     }
 

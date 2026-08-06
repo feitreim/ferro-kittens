@@ -89,8 +89,8 @@ use kittens::global::{
 use kittens::ldst::{load_fragment, load_tile, load_vec, scatter_tile, store_fragment, store_tile};
 use kittens::mma::{self, MmaShape, mm_ab, mm_abt, mm_atb, mm_atbt, mma_abt};
 use kittens::reg::{
-    BaseLdtm, ColLayout, ColVec, Fragment, FragmentLayout, Max, Mul, RegTile, RegVec,
-    online_rescale,
+    BaseLdtm, BinaryOp, ColLayout, ColVec, Fragment, FragmentLayout, Max, Mul, RegTile, RegVec,
+    Sub, online_rescale,
 };
 use kittens::shared::{
     Bf16, F32, SharedTile, SharedVec, Swizzle128B, tma_store_commit, tma_store_wait,
@@ -587,6 +587,26 @@ const CAUSAL: u32 = 1;
 /// The same mask open-coded against `RegTile::coordinate`, which is what a
 /// kernel writes without #7 — and what `flash_forward`'s gap note describes.
 const BY_HAND: u32 = 2;
+
+/// Which axis [`kernels::axis_map_probe`] broadcasts its two statistics along,
+/// and how the column form spells the walk — issue #196. All three do the same
+/// elementwise ops in the same order over the same band, so a difference in the
+/// `regcount` table is the loop nesting and nothing else.
+///
+/// A `RegVec` operand through `sub_row_assign` / `mul_row_assign`: the row
+/// axis, whose maps have hoisted the operand read out of the inner loop since
+/// they were written.
+const ROW_AXIS: u32 = 0;
+/// The transposed band's spelling — a `ColVec` operand through
+/// `sub_col_assign` / `mul_col_assign`. At `[32, 16]` a `RegVec` and a `ColVec`
+/// both carry four `f32`, so this arm and [`ROW_AXIS`] are mirrors down to the
+/// size of the operand.
+const COL_AXIS: u32 = 1;
+/// [`COL_AXIS`] with the column walk written out as `col_map_assign` read
+/// before #196 — the operand read left in the *inner* loop. This is the pair
+/// the issue is scored on: same op, same operand, one loop order against the
+/// other.
+const COL_INNER_READ: u32 = 2;
 
 /// How [`kernels::global_copy_probe`] moves a band between global memory and
 /// registers — issue #11. Both arms read and write the same elements, so a
@@ -4383,6 +4403,253 @@ pub mod kernels {
         mut out: DisjointSlice<f32>,
     ) {
         unsafe { mask_probe::<128, BY_HAND>(scores, steps, query_base, &mut out) }
+    }
+
+    /// `col_map_assign` as it read before #196, open-coded: the operand read
+    /// left in the *inner* loop, so the `[f32; N/4]` is read `SLOTS × VALUES`
+    /// times where the hoisted form reads it `VALUES` times. Only
+    /// [`axis_map_probe`]'s [`COL_INNER_READ`] arm calls it, and it is here so
+    /// one build prices both loop orders rather than two builds a week apart.
+    #[inline(always)]
+    fn col_map_inner_read<const N: usize, Op: BinaryOp>(
+        tile: &mut RegTile<32, N, BaseLdtm>,
+        cols: ColVec<N, BaseLdtm>,
+    ) where
+        BaseLdtm: FragmentLayout<32, N>,
+    {
+        let mut slot = 0;
+        while slot < RegTile::<32, N, BaseLdtm>::SLOTS {
+            let mut value = 0;
+            while value < RegTile::<32, N, BaseLdtm>::VALUES {
+                tile.set(
+                    slot,
+                    value,
+                    Op::apply(tile.get(slot, value), cols.get(value)),
+                );
+                value += 1;
+            }
+            slot += 1;
+        }
+    }
+
+    /// **A codegen probe, not a test.** No host case launches it and it checks
+    /// nothing; it exists so `regcount` can price the loop nesting inside
+    /// `RegTile::col_map_assign` (#196), which is a claim about how many times
+    /// an operand is read and so has no host-visible consequence at all — the
+    /// three forms are bit-identical by construction.
+    ///
+    /// The shape is the register pass oxide-train's `flash_backward_kv` and
+    /// `flash_backward_q` share, at the `[32, 16]` chunk they share it on:
+    /// subtract a saved statistic, `exp2`, subtract a second statistic,
+    /// multiply by the first. The two kernels differ only in that one band is
+    /// transposed, which turns three `*_row_assign` into three `*_col_assign` —
+    /// and `FORM` is exactly that substitution:
+    ///
+    /// - [`ROW_AXIS`]: a `RegVec` operand, the axis that already hoists
+    /// - [`COL_AXIS`]: a `ColVec` operand through the library's column maps
+    /// - [`COL_INNER_READ`]: the same walk with the pre-#196 loop nesting,
+    ///   through [`col_map_inner_read`]
+    ///
+    /// Both statistics are read out of `stats` at this thread's own offset
+    /// rather than reduced out of the band, so no `row_reduce`/`col_reduce`
+    /// asymmetry sits between the forms — what differs is the map's loop order
+    /// and, between the two axes, nothing else at 16 columns, where a `RegVec`
+    /// and a `ColVec` both carry four `f32`. At 128 the column operand is eight
+    /// times the row one and only the [`COL_AXIS`] / [`COL_INNER_READ`] pair is
+    /// a fair reading.
+    ///
+    /// The accumulator is a `RegVec` and not a second band, for
+    /// [`mask_probe`]'s reason: at 128 columns two live bands put every form on
+    /// the 255-register ceiling, where a null result would mean nothing.
+    /// `steps` is a runtime bound so the walks stay rolled — these are the maps
+    /// #166 measured worse unrolled, and an unrolled walk would constant-fold
+    /// the operand index and delete the question.
+    ///
+    /// **What it measured** (`regcount`, sm_100a, no ptxas spill anywhere; the
+    /// last two columns are the depot census's, static instruction counts):
+    ///
+    /// ```text
+    ///                       regs   frame   st.local   ld.local
+    ///  16 row                 40     128         36         20
+    ///  16 col                 40     128         36         20
+    ///  16 col_inner_read      40     128         36         20
+    /// 128 row                168    2048        712        456
+    /// 128 col                 39    2304        840        519
+    /// 128 col_inner_read     167    2304        876        600
+    /// ```
+    ///
+    /// **At the issue's own `[32, 16]` chunk the loop order is free.** Sixteen
+    /// operand reads against four in the source, and the three forms agree on
+    /// every column of both tables — four slots and four values are small
+    /// enough that what the walk costs does not depend on which of them is
+    /// outer. Whatever #196 saw in oxide-train's transposed backward pass at
+    /// that shape, it is not this.
+    ///
+    /// At 128 columns it is worth 128 registers and 81 static `ld.local` on an
+    /// **identical** frame: the operand is 32 `f32` a thread there, and reading
+    /// it `SLOTS × VALUES` times rather than `VALUES` times is exactly what the
+    /// local-load column counts. The frame not moving is what says the band was
+    /// homed either way and the difference is the reads.
+    ///
+    /// The register column on its own would not settle it — #63's whole lesson
+    /// is that fewer registers on the same frame can be a band being *streamed*
+    /// rather than a band got cheaper — but the local traffic falls with it,
+    /// and the two columns disagreeing is what a streamed band looks like.
+    /// Nothing here puts a clock on it; the row arm is not the pair to time
+    /// against at 128 either, since its operand is an eighth the size.
+    #[inline(always)]
+    unsafe fn axis_map_probe<const N: usize, const FORM: u32>(
+        scores: &[f32],
+        stats: &[f32],
+        steps: u32,
+        out: &mut DisjointSlice<f32>,
+    ) where
+        BaseLdtm: FragmentLayout<32, N>,
+    {
+        unsafe {
+            let slots = RegTile::<32, N, BaseLdtm>::SLOTS;
+            let values = RegTile::<32, N, BaseLdtm>::VALUES;
+            let lane = warp::lane_id();
+
+            let mut acc = RegVec::<32, BaseLdtm>::splat(0.0);
+            let mut step = 0u32;
+            while step < steps {
+                let mut block = RegTile::<32, N, BaseLdtm>::zero();
+                let mut slot = 0usize;
+                while slot < slots {
+                    let mut value = 0usize;
+                    while value < values {
+                        let (row, column) =
+                            RegTile::<32, N, BaseLdtm>::coordinate(lane, slot, value);
+                        let index = step as usize * 32 * N + row as usize * N + column as usize;
+                        block.set(slot, value, *scores.get_unchecked(index));
+                        value += 1;
+                    }
+                    slot += 1;
+                }
+
+                // The second statistic lives a whole sweep past the first, so
+                // the offset stays a runtime value in every form.
+                let saved = steps as usize * 32;
+                if FORM == ROW_AXIS {
+                    let mut first = RegVec::<32, BaseLdtm>::splat(0.0);
+                    let mut second = RegVec::<32, BaseLdtm>::splat(0.0);
+                    let mut slot = 0usize;
+                    while slot < slots {
+                        let index = (step as usize * 32 + lane as usize) * slots + slot;
+                        first.set(slot, *stats.get_unchecked(index));
+                        second.set(slot, *stats.get_unchecked(index + saved * slots));
+                        slot += 1;
+                    }
+                    block.sub_row_assign(first);
+                    let mut probabilities = block.exp2();
+                    probabilities.sub_row_assign(second);
+                    probabilities.mul_row_assign(first);
+                    acc.add_assign(probabilities.row_sum());
+                } else {
+                    let mut first = ColVec::<N, BaseLdtm>::splat(0.0);
+                    let mut second = ColVec::<N, BaseLdtm>::splat(0.0);
+                    let mut value = 0usize;
+                    while value < values {
+                        let index = (step as usize * 32 + lane as usize) * values + value;
+                        first.set(value, *stats.get_unchecked(index));
+                        second.set(value, *stats.get_unchecked(index + saved * values));
+                        value += 1;
+                    }
+                    let mut probabilities;
+                    if FORM == COL_AXIS {
+                        block.sub_col_assign(first);
+                        probabilities = block.exp2();
+                        probabilities.sub_col_assign(second);
+                        probabilities.mul_col_assign(first);
+                    } else {
+                        col_map_inner_read::<N, Sub>(&mut block, first);
+                        probabilities = block.exp2();
+                        col_map_inner_read::<N, Sub>(&mut probabilities, second);
+                        col_map_inner_read::<N, Mul>(&mut probabilities, first);
+                    }
+                    acc.add_assign(probabilities.row_sum());
+                }
+                step += 1;
+            }
+
+            let base = lane as usize * slots;
+            let mut slot = 0usize;
+            while slot < slots {
+                *out.get_unchecked_mut(base + slot) = acc.get(slot);
+                slot += 1;
+            }
+        }
+    }
+
+    /// [`axis_map_probe`] at the transposed attention chunk's 16 columns, the
+    /// row axis — the mirror the column forms are read against.
+    #[kernel]
+    pub unsafe fn axis_map_probe_16_row(
+        scores: &[f32],
+        stats: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { axis_map_probe::<16, ROW_AXIS>(scores, stats, steps, &mut out) }
+    }
+
+    /// [`axis_map_probe`] at 16 columns, the library's column maps.
+    #[kernel]
+    pub unsafe fn axis_map_probe_16_col(
+        scores: &[f32],
+        stats: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { axis_map_probe::<16, COL_AXIS>(scores, stats, steps, &mut out) }
+    }
+
+    /// [`axis_map_probe`] at 16 columns, the pre-#196 column walk — the pair
+    /// against `axis_map_probe_16_col` that the issue is scored on.
+    #[kernel]
+    pub unsafe fn axis_map_probe_16_col_inner_read(
+        scores: &[f32],
+        stats: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { axis_map_probe::<16, COL_INNER_READ>(scores, stats, steps, &mut out) }
+    }
+
+    /// [`axis_map_probe`] at 128 columns, the row axis.
+    #[kernel]
+    pub unsafe fn axis_map_probe_128_row(
+        scores: &[f32],
+        stats: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { axis_map_probe::<128, ROW_AXIS>(scores, stats, steps, &mut out) }
+    }
+
+    /// [`axis_map_probe`] at 128 columns, the library's column maps — where a
+    /// thread's column operand is 32 `f32` and the walk reads it 128 times
+    /// before #196.
+    #[kernel]
+    pub unsafe fn axis_map_probe_128_col(
+        scores: &[f32],
+        stats: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { axis_map_probe::<128, COL_AXIS>(scores, stats, steps, &mut out) }
+    }
+
+    /// [`axis_map_probe`] at 128 columns, the pre-#196 column walk.
+    #[kernel]
+    pub unsafe fn axis_map_probe_128_col_inner_read(
+        scores: &[f32],
+        stats: &[f32],
+        steps: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        unsafe { axis_map_probe::<128, COL_INNER_READ>(scores, stats, steps, &mut out) }
     }
 
     /// The lane an op sees under `CONVENTION`: the caller's already-`hoisted`
