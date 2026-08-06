@@ -1,5 +1,11 @@
 # ferro-kittens
 
+<p align="center">
+  <img src="assets/ferris_w_cat_ears.png" alt="Ferris the crab wearing cat ears" width="400">
+  <br>
+  <em>Ferris trying his best to fit in with the other kittens</em>
+</p>
+
 A ThunderKittens-style tile library for [cuda-oxide](https://github.com/NVlabs/cuda-oxide),
 targeting Blackwell (`sm_100a`) exclusively. Kernels are written against typed
 shared/register/TMEM tiles with warp- and warpgroup-scoped ops instead of raw
