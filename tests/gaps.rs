@@ -184,7 +184,7 @@ fn global_movers_carry_an_element<E: Element, const M: usize, const N: usize, L>
         kittens::global::store_rows(rows, 0, 0, lane, tile);
         let _: RegTile<M, N, L> = kittens::global::load_rows(rows, 0, 0, lane);
         let _: ColVec<N, L> = kittens::global::load_cols(rows, 0, 0, lane);
-        let _: usize = kittens::global::access_width(rows, 0);
+        let _: kittens::global::AccessWidth = kittens::global::access_width(rows, 0);
         let _: bool = rows.runs_aligned(0, L::CONTIGUOUS_VALUES);
     }
 }
