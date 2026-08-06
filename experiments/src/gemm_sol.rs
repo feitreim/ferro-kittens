@@ -284,8 +284,30 @@ pub const SHIPPED_GROUPS: u32 = TWO_WARPGROUPS;
 /// a configuration nothing in this tree has timed.
 pub const NARROW_GROUPS: u32 = ONE_WARPGROUP;
 
+/// Every lane of every epilogue warp arrives on `empty` when an accumulator is
+/// released: 256 arrivals a slot at one warpgroup and 512 at two.
+///
+/// It is the scope the port carried, and it is one arrival per *thread* for a
+/// fact that is per *warp* — a warp is through its drain when its last
+/// `tcgen05.wait::ld` has retired, and `tcgen05.wait::ld` retires the warp's
+/// loads and not the lane's.
+pub const ALL_LANES: bool = false;
+/// [`ALL_LANES`]' twin: one arrival a warp, from its lane 0, which is 16 a slot
+/// at two warpgroups and 8 at one. oxide-train's `gemm_sol_final` releases this
+/// way.
+pub const ONE_LANE: bool = true;
+/// The scope the three entries ship, and it changed in #211: table 7 has the
+/// A/B.
+pub const SHIPPED_RELEASE: bool = ONE_LANE;
+
 const fn epilogue_warps(groups: u32) -> u32 {
     EPILOGUE_ROWS * groups
+}
+/// Arrivals `empty` is armed with, which is [`Common::release_accumulator`]'s
+/// signaller count and nothing else. Getting it out of step with the guard there
+/// is a launch that never reaches its second item.
+pub const fn empty_arrivals(groups: u32, one_lane: bool) -> u32 {
+    RANKS * epilogue_warps(groups) * if one_lane { 1 } else { 32 }
 }
 const fn tma_warp(groups: u32) -> u32 {
     epilogue_warps(groups)
@@ -702,10 +724,21 @@ impl Common {
         }
     }
 
+    /// Hand an accumulator slot back to the MMA warp, at [`ALL_LANES`] or
+    /// [`ONE_LANE`] scope. [`empty_arrivals`] is the same dial read from the
+    /// other end and the two have to agree.
+    ///
+    /// What makes [`ONE_LANE`] legal is the closing `warp::sync_mask` of
+    /// [`Common::drain_dial`]: `tcgen05.wait::ld` retires every load the *warp*
+    /// has outstanding, so past that sync no lane of it still has the
+    /// accumulator in flight, and nothing else in the drain reads tensor memory.
     #[inline(always)]
-    unsafe fn release_accumulator(self, sequence: u32) {
+    unsafe fn release_accumulator<const ONE_LANE: bool>(self, slot: u32) {
         unsafe {
-            let empty = self.empty.sem(sequence);
+            if ONE_LANE && self.lane != 0 {
+                return;
+            }
+            let empty = self.empty.sem(slot);
             if self.rank == LEADER {
                 empty.arrive();
             } else {
@@ -1263,6 +1296,7 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
         const DRAIN: u8,
         const WATCH: u8,
         const GROUPS: u32,
+        const RELEASE: bool,
         const WIDE_BAND: usize,
         const WIDE_ISSUES: usize,
     >(
@@ -1301,7 +1335,7 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
                         again,
                     );
                 }
-                common.release_accumulator(sequence);
+                common.release_accumulator::<RELEASE>(sequence);
                 sequence += 1;
             }
         }
@@ -1581,6 +1615,7 @@ impl<const BOX: usize> Large<BOX> {
         const DRAIN: u8,
         const WATCH: u8,
         const GROUPS: u32,
+        const RELEASE: bool,
         const WARP_STAGE: usize,
         const WIDE_BAND: usize,
         const WIDE_ISSUES: usize,
@@ -1626,12 +1661,7 @@ impl<const BOX: usize> Large<BOX> {
                             again,
                         );
                     }
-                    let empty = common.empty.sem(half);
-                    if common.rank == LEADER {
-                        empty.arrive();
-                    } else {
-                        empty.at_rank(LEADER).arrive();
-                    }
+                    common.release_accumulator::<RELEASE>(half);
                     half += 1;
                 }
                 sequence += 1;
@@ -1663,6 +1693,7 @@ pub unsafe fn small_body<
     const DRAIN: u8,
     const WATCH: u8,
     const GROUPS: u32,
+    const RELEASE: bool,
     const WIDE_BAND: usize,
     const WIDE_ISSUES: usize,
 >(
@@ -1681,7 +1712,7 @@ pub unsafe fn small_body<
     unsafe {
         let smem = DynamicSharedArray::<u8, 128>::get_raw();
         let common = Common::attach(smem, RINGS_END, tiles_m, tiles_n, k_blocks, group, ldc, c);
-        common.initialize(1, RANKS * epilogue_warps(GROUPS) * 32);
+        common.initialize(1, empty_arrivals(GROUPS, RELEASE));
         let state = Small::<N, HALF, BOX, STAGE> {
             common,
             a: ARing::attach(smem.add(A0_OFFSET)),
@@ -1698,7 +1729,7 @@ pub unsafe fn small_body<
         } else if common.warp_id == mma_warp(GROUPS) && common.lane == 0 {
             state.multiply::<ABLATE, FOLD, WATCH>();
         } else if common.warp_id < epilogue_warps(GROUPS) {
-            state.epilogue::<ABLATE, DRAIN, WATCH, GROUPS, WIDE_BAND, WIDE_ISSUES>();
+            state.epilogue::<ABLATE, DRAIN, WATCH, GROUPS, RELEASE, WIDE_BAND, WIDE_ISSUES>();
         }
 
         common.retire();
@@ -1720,6 +1751,7 @@ pub unsafe fn large_body<
     const DRAIN: u8,
     const WATCH: u8,
     const GROUPS: u32,
+    const RELEASE: bool,
     const WARP_STAGE: usize,
     const WIDE_BAND: usize,
     const WIDE_ISSUES: usize,
@@ -1747,7 +1779,7 @@ pub unsafe fn large_body<
             ldc,
             c,
         );
-        common.initialize(2, RANKS * epilogue_warps(GROUPS) * 32);
+        common.initialize(2, empty_arrivals(GROUPS, RELEASE));
         let state = Large::<BOX> {
             common,
             a0: ARing::attach(smem.add(A0_OFFSET)),
@@ -1765,7 +1797,7 @@ pub unsafe fn large_body<
         } else if common.warp_id == mma_warp(GROUPS) && common.lane == 0 {
             state.multiply::<ABLATE, FOLD, WATCH>();
         } else if common.warp_id < epilogue_warps(GROUPS) {
-            state.epilogue::<ABLATE, DRAIN, WATCH, GROUPS, WARP_STAGE, WIDE_BAND, WIDE_ISSUES>();
+            state.epilogue::<ABLATE, DRAIN, WATCH, GROUPS, RELEASE, WARP_STAGE, WIDE_BAND, WIDE_ISSUES>();
         }
 
         common.retire();
@@ -1814,6 +1846,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 SHIPPED_GROUPS,
+                SHIPPED_RELEASE,
                 BAND_N,
                 2,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c);
@@ -1857,6 +1890,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 NARROW_GROUPS,
+                SHIPPED_RELEASE,
                 128,
                 4,
             >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c);
@@ -1893,6 +1927,7 @@ pub mod kernels {
                 SHIPPED_DRAIN,
                 WATCH_OFF,
                 SHIPPED_GROUPS,
+                SHIPPED_RELEASE,
                 { LARGE_STAGE_N / TWO_WARPGROUPS as usize },
                 BAND_N,
                 2,

@@ -287,10 +287,12 @@ impl ClusterSemaphore {
     /// [`Semaphore::arrive`] cannot send, being `.shared::cta`. It carries no
     /// transaction bytes.
     ///
-    /// Nothing in this repo calls it yet. What it is for is the signal a
-    /// cluster barrier is the wrong shape for: one named rank telling another
-    /// that a specific thing has happened, while the rest of the cluster keeps
-    /// going. A whole-cluster rendezvous wants
+    /// What it is for is the signal a cluster barrier is the wrong shape for:
+    /// one named rank telling another that a specific thing has happened, while
+    /// the rest of the cluster keeps going. `gemm_sol`'s accumulator release is
+    /// that signal — the peer rank's epilogue warps arrive on the leader's
+    /// `empty` so the leader's MMA warp can reuse the tensor-memory slot, and no
+    /// other warp of either CTA waits. A whole-cluster rendezvous wants
     /// [`cuda_device::cluster::cluster_sync`] instead.
     ///
     /// # Safety
