@@ -96,11 +96,14 @@ use kittens::global::{
     GlobalLayout, GlobalRows, accumulate_shared_rows, encode_bf16_panels, load_col_vec, load_cols,
     load_rows, store_rows, store_shared_rows,
 };
-use kittens::ldst::{load_fragment, load_tile, load_vec, scatter_tile, store_fragment, store_tile};
+use kittens::ldst::{
+    load_fragment, load_row_vec, load_tile, load_vec, scatter_tile, store_fragment, store_row_vec,
+    store_tile,
+};
 use kittens::mma::{self, mm_ab, mm_abt, mm_atb, mm_atbt, mma_abt};
 use kittens::reg::{
     BaseLdtm, BinaryOp, ColLayout, ColVec, Fragment, FragmentLayout, Max, Mul, RegTile, RegVec,
-    Sub, online_rescale,
+    RowLayout, Sub, online_rescale,
 };
 use kittens::shared::{
     Bf16, F32, SharedTile, SharedVec, Swizzle128B, tma_store_commit, tma_store_wait,
@@ -328,6 +331,27 @@ type BlockBand = RegTile<32, BLOCK_BAND_COLUMNS, BaseLdtm>;
 const VECTOR_SHARED: u32 = (Params::BYTES + 32) as u32;
 /// Values one lane holds of a `ColVec<VECTOR, BaseLdtm>`.
 const VECTOR_VALUES: usize = <BaseLdtm as ColLayout<VECTOR>>::VALUES;
+
+/// Rows of the statistic the `RegVec` staging case moves — a warp's own 32,
+/// the shape a score block's running max and log-sum-exp have.
+const ROW_VECTOR: usize = 32;
+/// fp32 and never a TMA box, for [`Partials`]' reason: a statistic rounded on
+/// its way through shared memory is a wrong number, not a wrong layout, and
+/// this case is only about where the numbers land.
+type RowStat = SharedVec<F32, ROW_VECTOR>;
+/// Rows one lane holds of a `RegVec<ROW_VECTOR, BaseLdtm>`.
+const ROW_SLOTS: usize = <BaseLdtm as RowLayout<ROW_VECTOR>>::SLOTS;
+/// Nothing [`row_cell`] can produce, so a row no lane claimed is an unwritten
+/// row and not a plausible neighbour.
+const ROW_POISON: f32 = -1.0;
+/// The value lane `lane` stages for its slot `slot` — the *thread coordinate*,
+/// deliberately not the row. A value derived from `row_of` and stored at
+/// `row_of` would agree with itself whatever the map said; this one names the
+/// register it came out of, so the host checks the map by finding that
+/// register where `row_of` claims it is.
+const fn row_cell(lane: u32, slot: usize) -> f32 {
+    cell(lane as usize, slot)
+}
 
 /// Bytes a swizzle case's plan needs: its tile plus a scratch tail for the TMA
 /// barrier.
@@ -5204,6 +5228,65 @@ pub mod kernels {
         }
     }
 
+    /// The lane→row scatter a [`RegVec`] stages through, both directions, in
+    /// one launch: poison the vector, [`store_row_vec`] it, dump what shared
+    /// memory holds, and [`load_row_vec`] it back.
+    ///
+    /// **What this proves that the [`ColVec`] cases cannot.** A column depends
+    /// only on `lane % 4`, so `store_vec` is eight lanes agreeing on one
+    /// address and any of them could have written it. A row depends on
+    /// `lane / 4`, so this is `ROW_SLOTS` scattered elements per lane from one
+    /// lane of each quad, and every row has exactly one writer. Each register
+    /// carries its own [`row_cell`] — the `(lane, slot)` it came out of, *not*
+    /// the row it is destined for — so a scatter that permuted the rows lands
+    /// registers at indices that name where they actually came from, and no
+    /// permutation can pass.
+    ///
+    /// The read half is dumped by every lane, replicas included: the three
+    /// lanes of a quad that [`RowLayout::owns_row`] rejects for the store must
+    /// still come back holding what their owner wrote, which is what makes the
+    /// vector well-formed.
+    ///
+    /// Launch with one warp: the scatter is warp scope, and its 32 lanes
+    /// between them name each of the `ROW_VECTOR` rows exactly once.
+    #[kernel]
+    pub unsafe fn shared_row_vec_roundtrip(mut out: DisjointSlice<f32>) {
+        unsafe {
+            let vec = RowStat::from_raw(DynamicSharedArray::<u8, 128>::get_raw());
+            let lane = warp::lane_id();
+
+            let mut index = lane as usize;
+            while index < ROW_VECTOR {
+                vec.set(index, ROW_POISON);
+                index += 32;
+            }
+            thread::sync_threads();
+
+            let mut rows = RegVec::<ROW_VECTOR, BaseLdtm>::splat(0.0);
+            let mut slot = 0usize;
+            while slot < ROW_SLOTS {
+                rows.set(slot, row_cell(lane, slot));
+                slot += 1;
+            }
+            store_row_vec(vec, lane, rows);
+            thread::sync_threads();
+
+            index = lane as usize;
+            while index < ROW_VECTOR {
+                *out.get_unchecked_mut(index) = vec.get(index);
+                index += 32;
+            }
+
+            let read: RegVec<ROW_VECTOR, BaseLdtm> = load_row_vec(vec, lane);
+            slot = 0;
+            while slot < ROW_SLOTS {
+                *out.get_unchecked_mut(ROW_VECTOR + lane as usize * ROW_SLOTS + slot) =
+                    read.get(slot);
+                slot += 1;
+            }
+        }
+    }
+
     /// The block reduction against silicon: the one collective in this library
     /// that spans warps, and the only one no shuffle can implement.
     ///
@@ -6252,6 +6335,112 @@ fn check_shared_vec_row(
     } else {
         Err(format!("{mismatches} of {VECTOR} elements wrong{report}").into())
     }
+}
+
+/// Does a [`RegVec`] reach shared memory at the rows [`RowLayout::row_of`]
+/// names, and come back into every lane that holds them?
+///
+/// The scatter is the whole correctness question the [`ColVec`] pair does not
+/// ask: `store_vec`'s eight lanes issue one address, while this writes
+/// [`ROW_SLOTS`] rows from one lane of each quad, 8 rows apart. Two claims,
+/// each failing distinguishably:
+///
+/// - **The scatter.** Shared memory is dumped in logical order and each element
+///   carries the `(lane, slot)` it came out of, so a permuted row reports the
+///   register that landed there rather than a bare mismatch, and a row no owner
+///   claimed comes back [`ROW_POISON`].
+/// - **The broadcast.** Every lane reads, and the three replicas of each quad
+///   must come back holding what the quad's owner wrote — the property that
+///   makes the vector a *replicated* row statistic rather than four disagreeing
+///   copies.
+fn check_shared_row_vec(
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+) -> Result<String, Box<dyn Error>> {
+    let mut out = DeviceBuffer::<f32>::zeroed(stream, ROW_VECTOR + 32 * ROW_SLOTS)?;
+    unsafe {
+        module.shared_row_vec_roundtrip(
+            stream,
+            launch_config(32, RowStat::BYTES as u32),
+            &mut out,
+        )?
+    };
+    let observed = out.to_host_vec(stream)?;
+
+    // The one lane of each quad that owns a row, and the slot it holds it in.
+    let owner = |row: usize| {
+        (0..32u32)
+            .filter(|&lane| <BaseLdtm as RowLayout<ROW_VECTOR>>::owns_row(lane))
+            .flat_map(|lane| (0..ROW_SLOTS).map(move |slot| (lane, slot)))
+            .find(|&(lane, slot)| {
+                <BaseLdtm as RowLayout<ROW_VECTOR>>::row_of(lane, slot) as usize == row
+            })
+            .expect("every row of a band has an owner")
+    };
+
+    let mut report = String::new();
+    let mut mismatches = 0usize;
+    for (row, &got) in observed.iter().take(ROW_VECTOR).enumerate() {
+        let (lane, slot) = owner(row);
+        if got == row_cell(lane, slot) {
+            continue;
+        }
+        mismatches += 1;
+        if mismatches <= 8 {
+            let _ = match decode_cell(got) {
+                Some((wrote, its_slot)) => write!(
+                    report,
+                    "\n    row {row}: owned by lane {lane} slot {slot}, holds lane {wrote} \
+                     slot {its_slot}"
+                ),
+                None if got == ROW_POISON => write!(
+                    report,
+                    "\n    row {row}: owned by lane {lane} slot {slot}, never written"
+                ),
+                None => write!(
+                    report,
+                    "\n    row {row}: owned by lane {lane} slot {slot}, holds {got}, \
+                     which names no register"
+                ),
+            };
+        }
+    }
+    if mismatches > 0 {
+        return Err(format!("{mismatches} of {ROW_VECTOR} rows misplaced{report}").into());
+    }
+
+    for lane in 0..32u32 {
+        for slot in 0..ROW_SLOTS {
+            let row = <BaseLdtm as RowLayout<ROW_VECTOR>>::row_of(lane, slot) as usize;
+            let (wrote, its_slot) = owner(row);
+            let got = observed[ROW_VECTOR + lane as usize * ROW_SLOTS + slot];
+            if got == row_cell(wrote, its_slot) {
+                continue;
+            }
+            mismatches += 1;
+            if mismatches <= 8 {
+                let _ = match decode_cell(got) {
+                    Some((from, from_slot)) => write!(
+                        report,
+                        "\n    lane {lane} slot {slot}: holds row {row}, written by lane \
+                         {wrote} slot {its_slot}, was handed lane {from} slot {from_slot}"
+                    ),
+                    None => write!(
+                        report,
+                        "\n    lane {lane} slot {slot}: holds row {row}, was handed {got}, \
+                         which names no register"
+                    ),
+                };
+            }
+        }
+    }
+    if mismatches > 0 {
+        return Err(format!("{mismatches} of {} replicas wrong{report}", 32 * ROW_SLOTS).into());
+    }
+    Ok(format!(
+        "{ROW_VECTOR} rows scattered from {} owning lanes, and read back into all 32",
+        ROW_VECTOR / ROW_SLOTS
+    ))
 }
 
 /// A fold over the per-warp partials, read back as which slots it touched.
@@ -7500,6 +7689,13 @@ fn run() -> Result<usize, Box<dyn Error>> {
     cases.push((
         "shared vector row",
         Box::new(|| check_shared_vec_row(stream, module)),
+    ));
+    // The other axis (#130): a `RegVec` staged in shared memory, which is a
+    // scatter from one lane of each quad rather than the broadcast the two
+    // cases above walk.
+    cases.push((
+        "shared row statistic",
+        Box::new(|| check_shared_row_vec(stream, module)),
     ));
     // The fold no shuffle can do (#3): four warps, one shared vector, three
     // reductions in a row on it.

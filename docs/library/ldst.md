@@ -48,6 +48,24 @@ lanes of one quad, all with the same value. The redundancy is the layout's, not
 the loop's, and it is what keeps the write a plain store rather than a
 lane-masked one.
 
+## Why the row pair is not that pair transposed
+
+`load_row_vec` / `store_row_vec` share the vector pair's shape and none of its
+addressing. A `ColVec`'s column depends only on `lane % 4`, so its store is
+eight lanes issuing one address; a `RegVec`'s row depends on `lane / 4`, so its
+store is `M / 8` elements per lane, 8 rows apart — a scatter, with no run to
+widen and nothing for shared memory to broadcast.
+
+The replication is on the other side too, and it costs a lane mask the column
+direction does not need: the four lanes of a quad hold the *same* row, so only
+the one `RowLayout::owns_row` names writes. That predicate is on the trait for
+exactly this, and an impl returning `true` everywhere would turn one store into
+`M`-many.
+
+The load direction is symmetric after all. Every lane reads, replicas included,
+because one copy per lane holding the row is what makes a `RegVec` well-formed,
+and a quad's four identical addresses come out of one bank read.
+
 ## The `Element<Unpacked = [f32; 2]>` bound
 
 `stmatrix`/`ldmatrix` `.m8n8.x2` move two *b16* matrices, so the fragment path
