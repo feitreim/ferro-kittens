@@ -77,9 +77,10 @@ use kittens::shared::F16;
 
 use crate::bench::Shape;
 use crate::gemm_sol::{
-    ATile, B_BOX, BLOCK_N, BPanel, HALF_N, ONE_WARPGROUP, REPORT_FIELDS, REPORT_ROWS, REPORT_SLOTS,
-    SHIPPED_DRAIN, SMALL_RINGS_END, SMALL_SHARED_BYTES, WATCH_DEEP, WATCH_ONE_DEEP, WHOLE, a_value,
-    b_value, check_output, default_group, site_name, small_body, stage_f16, threads,
+    ACCUM_COLUMNS, ATile, B_BOX, BLOCK_N, BPanel, HALF_N, ONE_WARPGROUP, REPORT_FIELDS,
+    REPORT_ROWS, REPORT_SLOTS, SHIPPED_DRAIN, SMALL_RINGS_END, SMALL_SHARED_BYTES, WATCH_DEEP,
+    WATCH_ONE_DEEP, WHOLE, a_value, b_value, check_output, default_group, site_name, small_body,
+    stage_f16, threads,
 };
 
 /// Depth one stage carries, per [`crate::sol_ablate`].
@@ -120,6 +121,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -162,6 +164,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,

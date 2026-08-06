@@ -29,7 +29,7 @@
 //!
 //! ```no_run
 //! # use cuda_device::thread;
-//! # use kittens::mma::{MmaShape, commit, mm_abt};
+//! # use kittens::mma::{commit, mm_abt};
 //! # use kittens::shared::{Bf16, SharedTile, Swizzle128B};
 //! # use kittens::tmem::{TmemTile, alloc_block, dealloc_block, warp_lanes};
 //! # use kittens::{BaseLdtm, RegTile, Semaphore};
@@ -39,16 +39,16 @@
 //! #     b: SharedTile<Bf16, 128, 64, Swizzle128B>,
 //! #     done: Semaphore,
 //! # ) { unsafe {
-//! const COLUMNS: u32 = 128;
-//! let accumulator = TmemTile::<128, 128>::from_raw(alloc_block(slot, COLUMNS));
+//! const COLUMNS: usize = 128;
+//! let accumulator = TmemTile::<128, 128>::from_raw(alloc_block::<COLUMNS>(slot));
 //! if thread::threadIdx_x() == 0 {
-//!     mm_abt(accumulator.raw(), a, b, MmaShape::M128_N128);
+//!     mm_abt(accumulator, a, b);
 //!     commit(done);
 //! }
 //! done.wait(0);
 //! let band: RegTile<32, 128, BaseLdtm> = accumulator.tile(warp_lanes(), 0);
 //! thread::sync_threads();
-//! dealloc_block(accumulator.raw(), COLUMNS);
+//! dealloc_block::<COLUMNS>(accumulator.raw());
 //! # let _ = band;
 //! # } }
 //! ```
@@ -68,20 +68,37 @@ use cuda_device::{cluster, thread};
 
 use crate::reg::{BaseLdtm, Fragment, FragmentLayout, RegTile};
 
-/// Take `columns` of this CTA's tensor memory and return their base address.
+/// `tcgen05.alloc`'s legality rule: a power of two in `[32, 512]`.
+///
+/// The count is an immediate operand of an instruction, so a `const` parameter
+/// is the only thing that has ever been in a position to see it — `COLUMNS` was
+/// a runtime `u32` until #128, and `flash_forward` asked for 192 from the day it
+/// was written with no launcher, no assert and no runtime check able to say so.
+/// This fires at codegen, which is the class of failure tier 2 exists to catch.
+const fn assert_legal_columns<const COLUMNS: usize>() {
+    assert!(
+        COLUMNS.is_power_of_two() && COLUMNS >= 32 && COLUMNS <= 512,
+        "tcgen05.alloc takes a power of two of columns in [32, 512]"
+    );
+}
+
+/// Take `COLUMNS` of this CTA's tensor memory and return their base address.
 ///
 /// Warp 0 allocates into the shared staging word, a block sync publishes it,
 /// and every thread reads the address back. That warp also gives up the CTA's
 /// *allocation permit* — the right to call the allocator again, which is a
 /// different thing from giving back the columns ([`dealloc_block`]'s job).
 ///
+/// [`dealloc_block`] takes the same parameter, so the pair that has to agree is
+/// type-checked rather than remembered.
+///
 /// ```no_run
 /// # use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
 /// # unsafe fn demo(slot: *mut u32) { unsafe {
-/// const COLUMNS: u32 = 256;
-/// let accumulator = TmemTile::<128, 256>::from_raw(alloc_block(slot, COLUMNS));
+/// const COLUMNS: usize = 256;
+/// let accumulator = TmemTile::<128, 256>::from_raw(alloc_block::<COLUMNS>(slot));
 /// // ... MMA into `accumulator`, drain it ...
-/// dealloc_block(accumulator.raw(), COLUMNS);
+/// dealloc_block::<COLUMNS>(accumulator.raw());
 /// # } }
 /// ```
 ///
@@ -92,10 +109,11 @@ use crate::reg::{BaseLdtm, Fragment, FragmentLayout, RegTile};
 ///   illegal.
 /// - `slot` points to shared memory (a `SharedArray<u32, 1, 4>` static).
 #[inline(always)]
-pub unsafe fn alloc_block(slot: *mut u32, columns: u32) -> u32 {
+pub unsafe fn alloc_block<const COLUMNS: usize>(slot: *mut u32) -> u32 {
+    const { assert_legal_columns::<COLUMNS>() };
     unsafe {
         if crate::warp_id() == 0 {
-            tcgen05_alloc(slot, columns);
+            tcgen05_alloc(slot, COLUMNS as u32);
             tcgen05_relinquish_alloc_permit();
         }
         thread::sync_threads();
@@ -113,12 +131,13 @@ pub unsafe fn alloc_block(slot: *mut u32, columns: u32) -> u32 {
 ///
 /// - The caller's fence/sync has retired every outstanding read of the
 ///   allocation, and no thread touches it afterwards.
-/// - `address` and `columns` are the [`alloc_block`] result and argument.
+/// - `address` is the [`alloc_block`] result, at that call's own `COLUMNS`.
 #[inline(always)]
-pub unsafe fn dealloc_block(address: u32, columns: u32) {
+pub unsafe fn dealloc_block<const COLUMNS: usize>(address: u32) {
+    const { assert_legal_columns::<COLUMNS>() };
     unsafe {
         if crate::warp_id() == 0 {
-            tcgen05_dealloc(address, columns);
+            tcgen05_dealloc(address, COLUMNS as u32);
         }
     }
 }
@@ -132,15 +151,15 @@ pub unsafe fn dealloc_block(address: u32, columns: u32) {
 /// is what publishes those words across the pair, so a caller that stages
 /// barriers for its peer before allocating gets that publication for free.
 ///
-/// Each rank is charged `columns` against **its own SM's 512**, so the pair
+/// Each rank is charged `COLUMNS` against **its own SM's 512**, so the pair
 /// costs residency exactly as two independent [`alloc_block`] calls would; it is
 /// not a half-share of one SM's tensor memory.
 ///
 /// ```no_run
 /// # use kittens::tmem::{TmemTile, alloc_cluster};
 /// # unsafe fn demo(slot: *mut u32) { unsafe {
-/// const COLUMNS: u32 = 256;
-/// let pair_accumulator = TmemTile::<128, 256>::from_raw(alloc_cluster(slot, COLUMNS));
+/// const COLUMNS: usize = 256;
+/// let pair_accumulator = TmemTile::<128, 256>::from_raw(alloc_cluster::<COLUMNS>(slot));
 /// # let _ = pair_accumulator;
 /// # } }
 /// ```
@@ -150,10 +169,11 @@ pub unsafe fn dealloc_block(address: u32, columns: u32) {
 /// - Every thread of every CTA in the cluster calls this together, at most once.
 /// - `slot` is at the same shared offset in both CTAs.
 #[inline(always)]
-pub unsafe fn alloc_cluster(slot: *mut u32, columns: u32) -> u32 {
+pub unsafe fn alloc_cluster<const COLUMNS: usize>(slot: *mut u32) -> u32 {
+    const { assert_legal_columns::<COLUMNS>() };
     unsafe {
         if crate::warp_id() == 0 {
-            tcgen05_alloc_cg2(slot, columns);
+            tcgen05_alloc_cg2(slot, COLUMNS as u32);
         }
         thread::sync_threads();
         cluster::cluster_sync();
@@ -177,10 +197,10 @@ pub unsafe fn alloc_cluster(slot: *mut u32, columns: u32) -> u32 {
 /// # use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 /// # use kittens::tmem::{TmemTile, dealloc_cluster};
 /// # unsafe fn demo(accumulator: TmemTile<128, 256>) { unsafe {
-/// # const COLUMNS: u32 = 256;
+/// # const COLUMNS: usize = 256;
 /// tcgen05_fence_before_thread_sync();
 /// cluster::cluster_sync();
-/// dealloc_cluster(accumulator.raw(), COLUMNS);
+/// dealloc_cluster::<COLUMNS>(accumulator.raw());
 /// # } }
 /// ```
 ///
@@ -191,13 +211,14 @@ pub unsafe fn alloc_cluster(slot: *mut u32, columns: u32) -> u32 {
 ///
 /// - The fence/rendezvous pair above has retired the pair's reads, and no
 ///   thread of either CTA touches the allocation afterwards.
-/// - `address` and `columns` are *that* CTA's own [`alloc_cluster`] result and
-///   argument.
+/// - `address` is *that* CTA's own [`alloc_cluster`] result, at that call's own
+///   `COLUMNS`.
 #[inline(always)]
-pub unsafe fn dealloc_cluster(address: u32, columns: u32) {
+pub unsafe fn dealloc_cluster<const COLUMNS: usize>(address: u32) {
+    const { assert_legal_columns::<COLUMNS>() };
     unsafe {
         if crate::warp_id() == 0 {
-            tcgen05_dealloc_cg2(address, columns);
+            tcgen05_dealloc_cg2(address, COLUMNS as u32);
         }
     }
 }
@@ -486,12 +507,16 @@ impl<const R: usize, const C: usize> TmemTile<R, C> {
     /// *inside* this tile, and overlapping segments have no diagnostic — the two
     /// MMAs simply write each other's accumulator.
     ///
+    /// The allocation is not `C + C2`: `KEYS + HEAD` below is 192, and
+    /// `tcgen05.alloc` takes a power of two, so what the two segments are carved
+    /// out of is the next one up. [`alloc_block`]'s `COLUMNS` is what says so.
+    ///
     /// ```no_run
     /// # use kittens::tmem::{TmemTile, alloc_block};
     /// # unsafe fn demo(slot: *mut u32) { unsafe {
     /// const KEYS: usize = 64;
     /// const HEAD: usize = 128;
-    /// let scores = TmemTile::<128, KEYS>::from_raw(alloc_block(slot, (KEYS + HEAD) as u32));
+    /// let scores = TmemTile::<128, KEYS>::from_raw(alloc_block::<256>(slot));
     /// let output: TmemTile<128, HEAD> = scores.split_columns();
     /// # let _ = output;
     /// # } }

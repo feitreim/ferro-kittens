@@ -219,7 +219,7 @@ use kittens::shared::F16;
 
 use crate::bench::{Shape, Timings, time};
 use crate::gemm_sol::{
-    ATile, B_BOX, BAND_N, BLOCK_N, BPanel, DRAIN_NOCVT, DRAIN_PACK16, DRAIN_PAIRED,
+    ACCUM_COLUMNS, ATile, B_BOX, BAND_N, BLOCK_N, BPanel, DRAIN_NOCVT, DRAIN_PACK16, DRAIN_PAIRED,
     DRAIN_PER_ISSUE, DRAIN_WIDE, FEED_ONLY, HALF_N, ISSUE_ONLY, LARGE_STAGE_N, MMA_ONLY, NO_DRAIN,
     ONE_WARPGROUP, SHIPPED_DRAIN, SMALL_RINGS_END, TWICE_ALL, TWICE_GLOBAL, TWICE_SHARED,
     TWO_WARPGROUPS, Variant, WATCH_OFF, WHOLE, WIDE_B_BOX, WideBPanel, clusters, default_group,
@@ -274,6 +274,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -316,6 +317,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -358,6 +360,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -401,6 +404,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -445,6 +449,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 WIDE_B_BOX,
                 BLOCK_N,
@@ -488,6 +493,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 WIDE_B_BOX,
                 BLOCK_N,
@@ -532,6 +538,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -575,6 +582,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -933,6 +941,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -975,6 +984,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -1017,6 +1027,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -1060,6 +1071,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -1102,6 +1114,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -1144,6 +1157,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -1187,6 +1201,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -1230,6 +1245,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 BLOCK_N,
@@ -1588,6 +1604,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 { BLOCK_N / 2 },
@@ -1631,6 +1648,7 @@ pub mod kernels {
         unsafe {
             small_body::<
                 BLOCK_N,
+                ACCUM_COLUMNS,
                 HALF_N,
                 B_BOX,
                 { BLOCK_N / 2 },

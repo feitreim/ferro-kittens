@@ -397,33 +397,35 @@ fn a_cluster_stage_charges_one_barrier<E: Element, const R: usize, const C: usiz
 }
 
 /// §3.3 — the operand-order square, and the `mm_*` twin of each walk (#12).
+///
+/// Every walk names its accumulator as the [`kittens::tmem::TmemTile`] the
+/// operands imply and derives its `MmaShape` from it (#128), so the shape a
+/// caller could once get wrong is not in any of these signatures.
 fn every_operand_order_has_an_entry_point<
     E: kittens::MmaElement,
     const K: usize,
     const M: usize,
-    const N: usize,
 >(
-    tmem: u32,
+    accumulator: kittens::tmem::TmemTile<M, M>,
     k_major: kittens::SharedTile<E, M, K, kittens::Swizzle128B>,
-    mn_major: kittens::SharedTile<E, K, N, kittens::Swizzle128B>,
-    shape: kittens::mma::MmaShape,
+    mn_major: kittens::SharedTile<E, K, M, kittens::Swizzle128B>,
 ) {
     use kittens::mma::{mm_ab, mm_abt, mm_atb, mm_atbt, mma_ab, mma_abt, mma_atb, mma_atbt};
     unsafe {
-        mma_abt(tmem, k_major, k_major, shape, true);
-        mma_ab(tmem, k_major, mn_major, shape, true);
-        mma_atb(tmem, mn_major, mn_major, shape, true);
-        mma_atbt(tmem, mn_major, k_major, shape, true);
-        mm_abt(tmem, k_major, k_major, shape);
-        mm_ab(tmem, k_major, mn_major, shape);
-        mm_atb(tmem, mn_major, mn_major, shape);
-        mm_atbt(tmem, mn_major, k_major, shape);
+        mma_abt(accumulator, k_major, k_major, true);
+        mma_ab(accumulator, k_major, mn_major, true);
+        mma_atb(accumulator, mn_major, mn_major, true);
+        mma_atbt(accumulator, mn_major, k_major, true);
+        mm_abt(accumulator, k_major, k_major);
+        mm_ab(accumulator, k_major, mn_major);
+        mm_atb(accumulator, mn_major, mn_major);
+        mm_atbt(accumulator, mn_major, k_major);
 
         // The runtime-layout pair, whose walks carry their own transpose bits.
         let (a, b) = (k_major.k_walk(), mn_major.mn_walk());
         let _: [bool; 2] = [a.transposed(), b.transposed()];
-        kittens::mma::mma_walk_cg2::<E, 4>(tmem, a, b, shape, true);
-        kittens::mma::mm_walk_cg2::<E, 4>(tmem, a, b, shape);
+        kittens::mma::mma_walk_cg2::<E, 4, _, _>(accumulator, a, b, true);
+        kittens::mma::mm_walk_cg2::<E, 4, _, _>(accumulator, a, b);
     }
 }
 

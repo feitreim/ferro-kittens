@@ -83,7 +83,10 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 use cuda_device::DisjointSlice;
 use cuda_device::barrier::{Barrier, fence_proxy_async_shared_cta};
 use cuda_device::shared::DynamicSharedArray;
-use cuda_device::tcgen05::{tcgen05_fence_after_thread_sync, tcgen05_fence_before_thread_sync};
+use cuda_device::tcgen05::{
+    tcgen05_alloc, tcgen05_dealloc, tcgen05_fence_after_thread_sync,
+    tcgen05_fence_before_thread_sync, tcgen05_relinquish_alloc_permit,
+};
 use cuda_device::thread::__unroll_config;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cluster, cluster_launch, cuda_module, debug, kernel, thread, warp};
@@ -94,7 +97,7 @@ use kittens::global::{
     load_rows, store_rows, store_shared_rows,
 };
 use kittens::ldst::{load_fragment, load_tile, load_vec, scatter_tile, store_fragment, store_tile};
-use kittens::mma::{self, MmaShape, mm_ab, mm_abt, mm_atb, mm_atbt, mma_abt};
+use kittens::mma::{self, mm_ab, mm_abt, mm_atb, mm_atbt, mma_abt};
 use kittens::reg::{
     BaseLdtm, BinaryOp, ColLayout, ColVec, Fragment, FragmentLayout, Max, Mul, RegTile, RegVec,
     Sub, online_rescale,
@@ -1901,7 +1904,7 @@ pub mod kernels {
     pub unsafe fn sttm_roundtrip(mut out: DisjointSlice<f32>) {
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tmem = alloc_block(smem as *mut u32, COLUMNS as u32);
+            let tmem = alloc_block::<COLUMNS>(smem as *mut u32);
             let band = Accumulator::from_raw(tmem);
             let warp_id = warp::warp_id();
             let lane = warp::lane_id();
@@ -1930,7 +1933,7 @@ pub mod kernels {
             );
 
             thread::sync_threads();
-            dealloc_block(tmem, COLUMNS as u32);
+            dealloc_block::<COLUMNS>(tmem);
         }
     }
 
@@ -1965,7 +1968,7 @@ pub mod kernels {
     pub unsafe fn ldtm_x8_map(mut out: DisjointSlice<f32>) {
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tmem = alloc_block(smem as *mut u32, COLUMNS as u32);
+            let tmem = alloc_block::<COLUMNS>(smem as *mut u32);
             let band = Accumulator::from_raw(tmem);
             let warp_id = warp::warp_id();
             let lane = warp::lane_id();
@@ -1994,7 +1997,7 @@ pub mod kernels {
             );
 
             thread::sync_threads();
-            dealloc_block(tmem, COLUMNS as u32);
+            dealloc_block::<COLUMNS>(tmem);
         }
     }
 
@@ -2016,7 +2019,7 @@ pub mod kernels {
     pub unsafe fn ldtm_x8_batched_map(mut out: DisjointSlice<f32>) {
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tmem = alloc_block(smem as *mut u32, COLUMNS as u32);
+            let tmem = alloc_block::<COLUMNS>(smem as *mut u32);
             let band = Accumulator::from_raw(tmem);
             let warp_id = warp::warp_id();
             let lane = warp::lane_id();
@@ -2045,7 +2048,7 @@ pub mod kernels {
             );
 
             thread::sync_threads();
-            dealloc_block(tmem, COLUMNS as u32);
+            dealloc_block::<COLUMNS>(tmem);
         }
     }
 
@@ -2172,7 +2175,7 @@ pub mod kernels {
     ) {
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tmem = alloc_block(smem as *mut u32, WG_COLUMNS as u32);
+            let tmem = alloc_block::<WG_COLUMNS>(smem as *mut u32);
             let band = TmemTile::<ROWS, WG_COLUMNS>::from_raw(tmem);
             let (warp_id, lane) = (warp::warp_id(), warp::lane_id());
             let group = warp_id / WG_WARPS;
@@ -2215,7 +2218,7 @@ pub mod kernels {
 
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
-            dealloc_block(tmem, WG_COLUMNS as u32);
+            dealloc_block::<WG_COLUMNS>(tmem);
         }
     }
 
@@ -2238,7 +2241,7 @@ pub mod kernels {
     ) {
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tmem = alloc_block(smem as *mut u32, WG_COLUMNS as u32);
+            let tmem = alloc_block::<WG_COLUMNS>(smem as *mut u32);
             let band = TmemTile::<ROWS, WG_COLUMNS>::from_raw(tmem);
             let (warp_id, lane) = (warp::warp_id(), warp::lane_id());
             let group = warp_id / WG_WARPS;
@@ -2265,7 +2268,7 @@ pub mod kernels {
 
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
-            dealloc_block(tmem, WG_COLUMNS as u32);
+            dealloc_block::<WG_COLUMNS>(tmem);
         }
     }
 
@@ -2290,7 +2293,7 @@ pub mod kernels {
         unsafe {
             const HALF: usize = WG_COLUMNS / 2;
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tmem = alloc_block(smem as *mut u32, WG_COLUMNS as u32);
+            let tmem = alloc_block::<WG_COLUMNS>(smem as *mut u32);
             let band = TmemTile::<ROWS, WG_COLUMNS>::from_raw(tmem);
             let (warp_id, lane) = (warp::warp_id(), warp::lane_id());
             let group = warp_id / WG_WARPS;
@@ -2349,7 +2352,7 @@ pub mod kernels {
 
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
-            dealloc_block(tmem, WG_COLUMNS as u32);
+            dealloc_block::<WG_COLUMNS>(tmem);
         }
     }
 
@@ -2373,7 +2376,7 @@ pub mod kernels {
     pub unsafe fn warpgroup_past_quadrant(mut out: DisjointSlice<f32>) {
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tmem = alloc_block(smem as *mut u32, WG_COLUMNS as u32);
+            let tmem = alloc_block::<WG_COLUMNS>(smem as *mut u32);
             let band = TmemTile::<ROWS, WG_COLUMNS>::from_raw(tmem);
             let (warp_id, lane) = (warp::warp_id(), warp::lane_id());
 
@@ -2389,7 +2392,7 @@ pub mod kernels {
 
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
-            dealloc_block(tmem, WG_COLUMNS as u32);
+            dealloc_block::<WG_COLUMNS>(tmem);
         }
     }
 
@@ -2443,7 +2446,7 @@ pub mod kernels {
             fence_proxy_async_shared_cta();
             thread::sync_threads();
 
-            let tmem = alloc_block(smem.add(2 * operands + 8) as *mut u32, WG_COLUMNS as u32);
+            let tmem = alloc_block::<WG_COLUMNS>(smem.add(2 * operands + 8) as *mut u32);
             let band = TmemTile::<ROWS, WG_COLUMNS>::from_raw(tmem);
             let (warp_id, lane) = (warp::warp_id(), warp::lane_id());
             let group = warp_id / WG_WARPS;
@@ -2454,7 +2457,7 @@ pub mod kernels {
             wg_handoff(7);
 
             if tid == 0 {
-                mma_abt(band.raw(), a, b, MmaShape::M128_N128, true);
+                mma_abt(band, a, b, true);
                 mma::commit(done);
             }
             done.wait(0);
@@ -2472,7 +2475,7 @@ pub mod kernels {
 
             tcgen05_fence_before_thread_sync();
             thread::sync_threads();
-            dealloc_block(tmem, WG_COLUMNS as u32);
+            dealloc_block::<WG_COLUMNS>(tmem);
             if tid == 0 {
                 done.inval();
             }
@@ -2506,7 +2509,7 @@ pub mod kernels {
     pub unsafe fn relaunch_probe(mut out: DisjointSlice<f32>) {
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tmem = alloc_block(smem as *mut u32, RELAUNCH_COLUMNS as u32);
+            let tmem = alloc_block::<RELAUNCH_COLUMNS>(smem as *mut u32);
             let allocation = TmemTile::<ROWS, RELAUNCH_COLUMNS>::from_raw(tmem);
             let warp_id = warp::warp_id();
             // Each thread's registers carry their own index in the dump, so
@@ -2545,7 +2548,7 @@ pub mod kernels {
             }
 
             thread::sync_threads();
-            dealloc_block(tmem, RELAUNCH_COLUMNS as u32);
+            dealloc_block::<RELAUNCH_COLUMNS>(tmem);
         }
     }
 
@@ -2560,15 +2563,15 @@ pub mod kernels {
     /// that varies from rung to rung is the immediate operand of
     /// `tcgen05.alloc`.
     #[inline(always)]
-    unsafe fn tmem_ladder_probe(columns: u32, out: &mut DisjointSlice<u32>) {
+    unsafe fn tmem_ladder_probe<const COLUMNS: usize>(out: &mut DisjointSlice<u32>) {
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
-            let tmem = alloc_block(smem as *mut u32, columns);
+            let tmem = alloc_block::<COLUMNS>(smem as *mut u32);
             if thread::threadIdx_x() == 0 {
                 *out.get_unchecked_mut(0) = tmem;
             }
             thread::sync_threads();
-            dealloc_block(tmem, columns);
+            dealloc_block::<COLUMNS>(tmem);
         }
     }
 
@@ -2599,32 +2602,32 @@ pub mod kernels {
     /// [`tmem_ladder_probe`] at the allocator's smallest unit.
     #[kernel]
     pub unsafe fn tmem_ladder_32(mut out: DisjointSlice<u32>) {
-        unsafe { tmem_ladder_probe(32, &mut out) }
+        unsafe { tmem_ladder_probe::<32>(&mut out) }
     }
 
     /// [`tmem_ladder_probe`] at 64 columns.
     #[kernel]
     pub unsafe fn tmem_ladder_64(mut out: DisjointSlice<u32>) {
-        unsafe { tmem_ladder_probe(64, &mut out) }
+        unsafe { tmem_ladder_probe::<64>(&mut out) }
     }
 
     /// [`tmem_ladder_probe`] at 128 columns — a quarter of the SM's tensor
     /// memory, and `sttm_roundtrip`'s allocation.
     #[kernel]
     pub unsafe fn tmem_ladder_128(mut out: DisjointSlice<u32>) {
-        unsafe { tmem_ladder_probe(128, &mut out) }
+        unsafe { tmem_ladder_probe::<128>(&mut out) }
     }
 
     /// [`tmem_ladder_probe`] at 256 columns.
     #[kernel]
     pub unsafe fn tmem_ladder_256(mut out: DisjointSlice<u32>) {
-        unsafe { tmem_ladder_probe(256, &mut out) }
+        unsafe { tmem_ladder_probe::<256>(&mut out) }
     }
 
     /// [`tmem_ladder_probe`] at the whole SM's tensor memory.
     #[kernel]
     pub unsafe fn tmem_ladder_512(mut out: DisjointSlice<u32>) {
-        unsafe { tmem_ladder_probe(512, &mut out) }
+        unsafe { tmem_ladder_probe::<512>(&mut out) }
     }
 
     /// [`tmem_ladder_probe`] with the column count arriving as a kernel
@@ -2634,9 +2637,32 @@ pub mod kernels {
     /// column count `ptxas` recorded, and a driver that reserves tensor memory
     /// for any kernel that touches the allocator at all. Only the first can
     /// see a constant, and this rung has none to see.
+    ///
+    /// It is therefore the one caller in the tree that cannot go through
+    /// `tmem::alloc_block`, whose count is a `const` parameter since #128 —
+    /// having none is the whole rung. What is written out here is that
+    /// function's body verbatim, as [`tmem_ladder_none`] writes it with the
+    /// allocator taken out; a runtime escape hatch on the library entry point
+    /// would be a hole in the legality assert for the sake of one probe whose
+    /// point is to be illegible to it.
     #[kernel]
     pub unsafe fn tmem_ladder_runtime(columns: u32, mut out: DisjointSlice<u32>) {
-        unsafe { tmem_ladder_probe(columns, &mut out) }
+        unsafe {
+            let smem = DynamicSharedArray::<u8, 128>::get_raw();
+            if warp::warp_id() == 0 {
+                tcgen05_alloc(smem as *mut u32, columns);
+                tcgen05_relinquish_alloc_permit();
+            }
+            thread::sync_threads();
+            let tmem = *(smem as *const u32);
+            if thread::threadIdx_x() == 0 {
+                *out.get_unchecked_mut(0) = tmem;
+            }
+            thread::sync_threads();
+            if warp::warp_id() == 0 {
+                tcgen05_dealloc(tmem, columns);
+            }
+        }
     }
 
     /// Occupy this CTA's SM until the device's global nanosecond timer passes
@@ -2808,16 +2834,16 @@ pub mod kernels {
     /// throughput curve alone cannot distinguish from not being resident at
     /// all.
     #[inline(always)]
-    unsafe fn census_probe(columns: u32, hold_ns: u64, out: &mut DisjointSlice<u64>) {
+    unsafe fn census_probe<const COLUMNS: usize>(hold_ns: u64, out: &mut DisjointSlice<u64>) {
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
             let sm = thread::smid();
             let entered = debug::globaltimer();
-            let tmem = alloc_block(smem as *mut u32, columns);
+            let tmem = alloc_block::<COLUMNS>(smem as *mut u32);
             let allocated = debug::globaltimer();
             let left = census_spin(allocated + hold_ns);
             thread::sync_threads();
-            dealloc_block(tmem, columns);
+            dealloc_block::<COLUMNS>(tmem);
             census_record(sm, entered, allocated, left, out);
         }
     }
@@ -2849,27 +2875,27 @@ pub mod kernels {
     /// SM's 512 columns.
     #[kernel]
     pub unsafe fn residency_census_32(hold_ns: u64, mut out: DisjointSlice<u64>) {
-        unsafe { census_probe(32, hold_ns, &mut out) }
+        unsafe { census_probe::<32>(hold_ns, &mut out) }
     }
 
     /// [`census_probe`] at 64 columns; eight fit.
     #[kernel]
     pub unsafe fn residency_census_64(hold_ns: u64, mut out: DisjointSlice<u64>) {
-        unsafe { census_probe(64, hold_ns, &mut out) }
+        unsafe { census_probe::<64>(hold_ns, &mut out) }
     }
 
     /// [`census_probe`] at **`gemm`'s** column count. Four fit, and #51 timed
     /// that kernel above two clusters an SM.
     #[kernel]
     pub unsafe fn residency_census_128(hold_ns: u64, mut out: DisjointSlice<u64>) {
-        unsafe { census_probe(128, hold_ns, &mut out) }
+        unsafe { census_probe::<128>(hold_ns, &mut out) }
     }
 
     /// [`census_probe`] at **`flash_forward`'s** column count. Two fit, which
     /// is the number #78 exists to confirm or refute.
     #[kernel]
     pub unsafe fn residency_census_256(hold_ns: u64, mut out: DisjointSlice<u64>) {
-        unsafe { census_probe(256, hold_ns, &mut out) }
+        unsafe { census_probe::<256>(hold_ns, &mut out) }
     }
 
     /// [`census_probe`] at the whole SM's tensor memory — the rung where one
@@ -2877,7 +2903,7 @@ pub mod kernels {
     /// positive control.
     #[kernel]
     pub unsafe fn residency_census_512(hold_ns: u64, mut out: DisjointSlice<u64>) {
-        unsafe { census_probe(512, hold_ns, &mut out) }
+        unsafe { census_probe::<512>(hold_ns, &mut out) }
     }
 
     /// The rung that separates a driver's admission decision from the
@@ -2898,9 +2924,9 @@ pub mod kernels {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
             let sm = thread::smid();
             let entered = debug::globaltimer();
-            let tmem = alloc_block(smem as *mut u32, 512);
+            let tmem = alloc_block::<512>(smem as *mut u32);
             thread::sync_threads();
-            dealloc_block(tmem, 512);
+            dealloc_block::<512>(tmem);
             thread::sync_threads();
             let allocated = debug::globaltimer();
             let left = census_spin(allocated + hold_ns);
@@ -2916,17 +2942,20 @@ pub mod kernels {
     /// `%smid` still counts CTAs an SM — the census needs no special case for
     /// a cluster, only a grid that is a multiple of the cluster size.
     #[inline(always)]
-    unsafe fn census_cluster_probe(columns: u32, hold_ns: u64, out: &mut DisjointSlice<u64>) {
+    unsafe fn census_cluster_probe<const COLUMNS: usize>(
+        hold_ns: u64,
+        out: &mut DisjointSlice<u64>,
+    ) {
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
             let sm = thread::smid();
             let entered = debug::globaltimer();
-            let tmem = alloc_cluster(smem as *mut u32, columns);
+            let tmem = alloc_cluster::<COLUMNS>(smem as *mut u32);
             let allocated = debug::globaltimer();
             let left = census_spin(allocated + hold_ns);
             thread::sync_threads();
             cluster::cluster_sync();
-            dealloc_cluster(tmem, columns);
+            dealloc_cluster::<COLUMNS>(tmem);
             census_record(sm, entered, allocated, left, out);
         }
     }
@@ -2935,7 +2964,7 @@ pub mod kernels {
     #[kernel]
     #[cluster_launch(2, 1, 1)]
     pub unsafe fn residency_census_cluster_128(hold_ns: u64, mut out: DisjointSlice<u64>) {
-        unsafe { census_cluster_probe(128, hold_ns, &mut out) }
+        unsafe { census_cluster_probe::<128>(hold_ns, &mut out) }
     }
 
     /// [`census_cluster_probe`] at the 256 columns a `[256, 256]` pair tile
@@ -2953,7 +2982,7 @@ pub mod kernels {
     #[kernel]
     #[cluster_launch(2, 1, 1)]
     pub unsafe fn residency_census_cluster_256(hold_ns: u64, mut out: DisjointSlice<u64>) {
-        unsafe { census_cluster_probe(256, hold_ns, &mut out) }
+        unsafe { census_cluster_probe::<256>(hold_ns, &mut out) }
     }
 
     /// [`census_cluster_probe`] at the whole SM's tensor memory — the cluster
@@ -2962,7 +2991,7 @@ pub mod kernels {
     #[kernel]
     #[cluster_launch(2, 1, 1)]
     pub unsafe fn residency_census_cluster_512(hold_ns: u64, mut out: DisjointSlice<u64>) {
-        unsafe { census_cluster_probe(512, hold_ns, &mut out) }
+        unsafe { census_cluster_probe::<512>(hold_ns, &mut out) }
     }
 
     /// A cluster launch with no allocator in it at all — the control for the
@@ -3006,13 +3035,23 @@ pub mod kernels {
     /// applies `RegTile::coordinate` to it, so this kernel never encodes what
     /// the answer should be.
     #[inline(always)]
-    unsafe fn fragment_probe<const M: usize, const N: usize, const RESTAGE: bool>(
+    unsafe fn fragment_probe<
+        const M: usize,
+        const N: usize,
+        const RESTAGE: bool,
+        const HELD: usize,
+    >(
         a_map: *const TmaDescriptor,
         b_map: *const TmaDescriptor,
         out: &mut DisjointSlice<f32>,
     ) where
         BaseLdtm: FragmentLayout<M, N>,
     {
+        // `HELD` is a parameter rather than `if RESTAGE { 2 * COLUMNS }` because
+        // `alloc_block` takes its count as a const argument (#128) and a const
+        // argument cannot be arithmetic on a const parameter; this is what keeps
+        // the two in step.
+        const { assert!(HELD == if RESTAGE { 2 * COLUMNS } else { COLUMNS }) };
         unsafe {
             let smem = DynamicSharedArray::<u8, 128>::get_raw();
             let a = AOperand::from_raw(smem);
@@ -3037,8 +3076,7 @@ pub mod kernels {
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
-            let columns = (if RESTAGE { 2 * COLUMNS } else { COLUMNS }) as u32;
-            let tmem = alloc_block(tmem_slot, columns);
+            let tmem = alloc_block::<HELD>(tmem_slot);
             let accumulator = Accumulator::from_raw(tmem);
 
             if leader {
@@ -3050,16 +3088,13 @@ pub mod kernels {
             tma.wait(0);
             thread::sync_threads();
 
-            let shape = MmaShape::M128_N64;
             if leader {
-                mma_abt(accumulator.raw(), a, b_low, shape, false);
-                mma_abt(
-                    accumulator.columns_right(TILE as u32).raw(),
-                    a,
-                    b_high,
-                    shape,
-                    false,
-                );
+                // Two `M128_N64` instructions, each derived from the `[ROWS,
+                // TILE]` band it writes: the low band is the head of the
+                // allocation and the high one is `split_columns` past it.
+                let low = TmemTile::<ROWS, TILE>::from_raw(tmem);
+                mma_abt(low, a, b_low, false);
+                mma_abt(low.split_columns::<TILE>(), a, b_high, false);
                 mma::commit(mma_done);
             }
             mma_done.wait(0);
@@ -3075,7 +3110,7 @@ pub mod kernels {
             dump_band(tile, warp_id, lane, out);
 
             thread::sync_threads();
-            dealloc_block(tmem, columns);
+            dealloc_block::<HELD>(tmem);
             if leader {
                 tma.inval();
                 mma_done.inval();
@@ -3091,7 +3126,7 @@ pub mod kernels {
         b_map: *const TmaDescriptor,
         mut out: DisjointSlice<f32>,
     ) {
-        unsafe { fragment_probe::<16, 16, false>(a_map, b_map, &mut out) }
+        unsafe { fragment_probe::<16, 16, false, COLUMNS>(a_map, b_map, &mut out) }
     }
 
     /// [`fragment_probe`] over a warp's full 32 rows by two column blocks.
@@ -3101,7 +3136,7 @@ pub mod kernels {
         b_map: *const TmaDescriptor,
         mut out: DisjointSlice<f32>,
     ) {
-        unsafe { fragment_probe::<32, 32, false>(a_map, b_map, &mut out) }
+        unsafe { fragment_probe::<32, 32, false, COLUMNS>(a_map, b_map, &mut out) }
     }
 
     /// [`fragment_probe`] at the flash output accumulator's shape — a warp's
@@ -3112,7 +3147,7 @@ pub mod kernels {
         b_map: *const TmaDescriptor,
         mut out: DisjointSlice<f32>,
     ) {
-        unsafe { fragment_probe::<32, 128, false>(a_map, b_map, &mut out) }
+        unsafe { fragment_probe::<32, 128, false, COLUMNS>(a_map, b_map, &mut out) }
     }
 
     /// [`fragment_probe`] at the same shape, with the drained band restaged
@@ -3123,7 +3158,7 @@ pub mod kernels {
         b_map: *const TmaDescriptor,
         mut out: DisjointSlice<f32>,
     ) {
-        unsafe { fragment_probe::<32, 128, true>(a_map, b_map, &mut out) }
+        unsafe { fragment_probe::<32, 128, true, { 2 * COLUMNS }>(a_map, b_map, &mut out) }
     }
 
     /// The hand-off #177 asks about: a `tcgen05.st` into a segment, and an
@@ -3313,7 +3348,7 @@ pub mod kernels {
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
-            let tmem = alloc_block(tmem_slot, COLUMNS as u32);
+            let tmem = alloc_block::<COLUMNS>(tmem_slot);
             let accumulator = Accumulator::from_raw(tmem);
 
             if leader {
@@ -3325,16 +3360,13 @@ pub mod kernels {
             tma.wait(0);
             thread::sync_threads();
 
-            let shape = MmaShape::M128_N64;
             if leader {
-                mma_abt(accumulator.raw(), a, b_low, shape, false);
-                mma_abt(
-                    accumulator.columns_right(TILE as u32).raw(),
-                    a,
-                    b_high,
-                    shape,
-                    false,
-                );
+                // Two `M128_N64` instructions, each derived from the `[ROWS,
+                // TILE]` band it writes: the low band is the head of the
+                // allocation and the high one is `split_columns` past it.
+                let low = TmemTile::<ROWS, TILE>::from_raw(tmem);
+                mma_abt(low, a, b_low, false);
+                mma_abt(low.split_columns::<TILE>(), a, b_high, false);
                 mma::commit(mma_done);
             }
             mma_done.wait(0);
@@ -3361,7 +3393,7 @@ pub mod kernels {
                 narrow.tile_sum();
 
             thread::sync_threads();
-            dealloc_block(tmem, COLUMNS as u32);
+            dealloc_block::<COLUMNS>(tmem);
             if leader {
                 tma.inval();
                 mma_done.inval();
@@ -3398,7 +3430,7 @@ pub mod kernels {
                 fence_proxy_async_shared_cta();
             }
             thread::sync_threads();
-            let tmem = alloc_block(tmem_slot, COLUMNS as u32);
+            let tmem = alloc_block::<COLUMNS>(tmem_slot);
 
             if leader {
                 tma.expect_tx(a.tma_load(a_map, 0, 0, tma) + b.tma_load(b_map, 0, 0, tma));
@@ -3429,7 +3461,7 @@ pub mod kernels {
             dump_band(band, warp_id, warp::lane_id(), out);
 
             thread::sync_threads();
-            dealloc_block(tmem, COLUMNS as u32);
+            dealloc_block::<COLUMNS>(tmem);
             if thread::threadIdx_x() == 0 {
                 tma.inval();
                 mma_done.inval();
@@ -3450,7 +3482,7 @@ pub mod kernels {
         unsafe {
             let (a, b, tmem, tma, done) = walk_stage::<ROWS, DEPTH, COLUMNS, DEPTH>(a_map, b_map);
             if thread::threadIdx_x() == 0 {
-                mm_abt(tmem, a, b, MmaShape::M128_N128);
+                mm_abt(Accumulator::from_raw(tmem), a, b);
                 mma::commit(done);
             }
             walk_drain(tmem, tma, done, &mut out);
@@ -3470,7 +3502,7 @@ pub mod kernels {
         unsafe {
             let (a, b, tmem, tma, done) = walk_stage::<ROWS, DEPTH, DEPTH, COLUMNS>(a_map, b_map);
             if thread::threadIdx_x() == 0 {
-                mm_ab(tmem, a, b, MmaShape::M128_N128);
+                mm_ab(Accumulator::from_raw(tmem), a, b);
                 mma::commit(done);
             }
             walk_drain(tmem, tma, done, &mut out);
@@ -3489,7 +3521,7 @@ pub mod kernels {
         unsafe {
             let (a, b, tmem, tma, done) = walk_stage::<DEPTH, ROWS, DEPTH, COLUMNS>(a_map, b_map);
             if thread::threadIdx_x() == 0 {
-                mm_atb(tmem, a, b, MmaShape::M128_N128);
+                mm_atb(Accumulator::from_raw(tmem), a, b);
                 mma::commit(done);
             }
             walk_drain(tmem, tma, done, &mut out);
@@ -3506,7 +3538,7 @@ pub mod kernels {
         unsafe {
             let (a, b, tmem, tma, done) = walk_stage::<DEPTH, ROWS, COLUMNS, DEPTH>(a_map, b_map);
             if thread::threadIdx_x() == 0 {
-                mm_atbt(tmem, a, b, MmaShape::M128_N128);
+                mm_atbt(Accumulator::from_raw(tmem), a, b);
                 mma::commit(done);
             }
             walk_drain(tmem, tma, done, &mut out);
@@ -3536,7 +3568,7 @@ pub mod kernels {
         unsafe {
             let (a, b, tmem, tma, done) = walk_stage::<DEPTH, ROWS, DEPTH, COLUMNS>(a_map, b_map);
             if thread::threadIdx_x() == 0 {
-                mm_abt(tmem, a, b, MmaShape::M64_N64);
+                mm_abt(TmemTile::<CONTROL_EDGE, CONTROL_EDGE>::from_raw(tmem), a, b);
                 mma::commit(done);
             }
             walk_drain(tmem, tma, done, &mut out);

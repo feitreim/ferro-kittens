@@ -178,10 +178,13 @@ subtiles the tile is already stored as — the same bytes, the same chunk count,
 one barrier instead of several. At `BLOCK_K = ATOM_K` that loop is one iteration
 and folds away.
 
-`pair_shape` is evaluated in a `const` block so a tile whose columns name no
-shape is a codegen error rather than a `panic!` lowered into device code. The
-failure it prevents does not fault: the wrong descriptor into the right
-accumulator computes wrong numbers.
+The instruction shape is not written here at all. `mma_walk_cg2` reads it off
+`Accumulator` through `kittens::mma::pair_shape`, so a tile whose columns name no
+shape is a codegen error rather than a `panic!` lowered into device code, and one
+that names the wrong one is not expressible. The failure that prevents does not
+fault: the wrong descriptor into the right accumulator computes wrong numbers.
+This file used to carry its own `pair_shape(block_n) -> MmaShape` lookup, which
+is the whole of what #128 moved into the library.
 
 ## The epilogue is most of the speed
 
