@@ -3254,7 +3254,9 @@ pub mod kernels {
             tma.wait(0);
             thread::sync_threads();
 
-            let left: TmemTile<ROWS, TILE> = accumulator.split_columns();
+            // The two MMA halves are the accumulator's own columns — narrowed at
+            // its base, not `split_columns`, which names the segment *after* it.
+            let left = TmemTile::<ROWS, TILE>::from_raw(accumulator.raw());
             let right = left.columns_right(TILE as u32);
             if tid == 0 {
                 mma_abt(left, a, b_low, false);
