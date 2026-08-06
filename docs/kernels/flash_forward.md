@@ -115,7 +115,13 @@ must be a power of two in `[32, 512]` (cuda-oxide spells the set out as
 "32, 64, 128, 256, 512" on `TmemGuard`). This kernel asked for 192 from the day
 it was written and nothing caught it, because it has no launcher — the column
 count is an argument to an instruction, so no type and no `const` assertion was
-ever in a position to see it. The one in the file now is.
+ever in a position to see it.
+
+A `const` parameter is. Since #128 `alloc_block::<COLUMNS>` carries the rule
+itself, in a `const { assert!(..) }` that fires at codegen, and this file keeps
+only the half that is its own: that 256 covers `KEYS + HEAD`. The hand-written
+legality assert it grew after the audit is gone, because the entry point it was
+standing in front of now refuses the argument.
 
 Rounding up to 256 costs **nothing**, which is not obvious: the driver charges a
 CTA the SM's entire tensor memory the moment it touches the allocator, at 32
