@@ -1033,7 +1033,7 @@ fn mins(calls: &[Timings]) -> Vec<f64> {
     calls.iter().map(Timings::min).collect()
 }
 
-fn extremes(over: &[f64]) -> (f64, f64) {
+pub(crate) fn extremes(over: &[f64]) -> (f64, f64) {
     let fold = |start: f64, pick: fn(f64, f64) -> f64| over.iter().copied().fold(start, pick);
     (
         fold(f64::INFINITY, f64::min),
@@ -1041,7 +1041,7 @@ fn extremes(over: &[f64]) -> (f64, f64) {
     )
 }
 
-fn middle(of: &[f64]) -> f64 {
+pub(crate) fn middle(of: &[f64]) -> f64 {
     let mut sorted = of.to_vec();
     sorted.sort_by(f64::total_cmp);
     sorted[sorted.len() / 2]
@@ -1350,6 +1350,24 @@ pub fn main() -> ExitCode {
         return match (watched, laddered) {
             (Ok(()), Ok(())) => ExitCode::SUCCESS,
             _ => ExitCode::FAILURE,
+        };
+    }
+
+    // `bench ldmatrix` is the only one of these pointed at a kernel that is not
+    // a GEMM: #131's shared→register load width, on `softmax`, whose three
+    // passes are all `load_tile`. It is its own sweep for the reason `repro` is
+    // one — the difference under test is small enough that the interleave and
+    // the repeat count decide the answer, where a `Case` sweeps sizes with one
+    // kernel and never pairs two.
+    if let Some((name, _)) = &selected
+        && name == "ldmatrix"
+    {
+        return match crate::softmax_x4::compare(&context) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
         };
     }
 

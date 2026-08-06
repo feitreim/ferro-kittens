@@ -97,8 +97,8 @@ use kittens::global::{
     load_rows, store_rows, store_shared_rows,
 };
 use kittens::ldst::{
-    load_fragment, load_row_vec, load_tile, load_vec, scatter_tile, store_fragment, store_row_vec,
-    store_tile,
+    load_fragment, load_fragment_x4, load_row_vec, load_tile, load_vec, scatter_tile,
+    store_fragment, store_row_vec, store_tile,
 };
 use kittens::mma::{self, mm_ab, mm_abt, mm_atb, mm_atbt, mma_abt};
 use kittens::reg::{
@@ -1509,10 +1509,17 @@ pub mod kernels {
     /// separately, and only the shared [`kittens::ldst::fragment_address`]
     /// derivation is common to both.
     ///
+    /// `X4` reads each block with one [`load_fragment_x4`] instead of two
+    /// `.x2`s a slot apart. The two arms are held to the *same* host
+    /// expectation rather than to each other, so a wide load whose four
+    /// destination registers land in another order fails here — where the
+    /// value names the position it came from — rather than inside a kernel's
+    /// tolerance (#131).
+    ///
     /// Launch with one warp: `load_fragment` is warp-scope and takes its
     /// addresses from lanes 0..16.
     #[inline(always)]
-    unsafe fn ldmatrix_probe<const R: usize, const C: usize>(
+    unsafe fn ldmatrix_probe<const R: usize, const C: usize, const X4: bool>(
         source: *const TmaDescriptor,
         out: &mut DisjointSlice<f32>,
     ) {
@@ -1538,12 +1545,12 @@ pub mod kernels {
             while row_block < R / 16 {
                 let mut column_block = 0usize;
                 while column_block < C / 16 {
-                    let fragment = load_fragment::<Bf16>(
-                        chunks,
-                        (16 * row_block) as u32,
-                        (16 * column_block) as u32,
-                        lane,
-                    );
+                    let (row, column) = ((16 * row_block) as u32, (16 * column_block) as u32);
+                    let fragment = if X4 {
+                        load_fragment_x4::<Bf16>(chunks, row, column, lane)
+                    } else {
+                        load_fragment::<Bf16>(chunks, row, column, lane)
+                    };
                     // The dump is one band per block rather than per warp, so
                     // the block index takes the warp's place in `dump_index`.
                     dump_band(
@@ -1567,13 +1574,26 @@ pub mod kernels {
     /// [`ldmatrix_probe`] over one subtile.
     #[kernel]
     pub unsafe fn ldmatrix_map(source: *const TmaDescriptor, mut out: DisjointSlice<f32>) {
-        unsafe { ldmatrix_probe::<TILE, TILE>(source, &mut out) }
+        unsafe { ldmatrix_probe::<TILE, TILE, false>(source, &mut out) }
     }
 
     /// [`ldmatrix_probe`] over two stacked subtiles.
     #[kernel]
     pub unsafe fn ldmatrix_map_wide(source: *const TmaDescriptor, mut out: DisjointSlice<f32>) {
-        unsafe { ldmatrix_probe::<TILE, WIDE>(source, &mut out) }
+        unsafe { ldmatrix_probe::<TILE, WIDE, false>(source, &mut out) }
+    }
+
+    /// The same block map read through `ldmatrix.m8n8.x4` (#131).
+    #[kernel]
+    pub unsafe fn ldmatrix_x4_map(source: *const TmaDescriptor, mut out: DisjointSlice<f32>) {
+        unsafe { ldmatrix_probe::<TILE, TILE, true>(source, &mut out) }
+    }
+
+    /// [`ldmatrix_x4_map`] over two stacked subtiles: the wide load's addresses
+    /// cross a subtile stride like the narrow one's do.
+    #[kernel]
+    pub unsafe fn ldmatrix_x4_map_wide(source: *const TmaDescriptor, mut out: DisjointSlice<f32>) {
+        unsafe { ldmatrix_probe::<TILE, WIDE, true>(source, &mut out) }
     }
 
     /// The composed shared movers, both directions in one trip: `load_tile`
@@ -7599,6 +7619,26 @@ fn run() -> Result<usize, Box<dyn Error>> {
         Box::new(|| {
             check_ldmatrix::<TILE, WIDE>(stream, |config, map, out| unsafe {
                 module.ldmatrix_map_wide(stream, config, map, out)
+            })
+        }),
+    ));
+    // The same two maps read one `ldmatrix.m8n8.x4` per block (#131), against
+    // the same host expectation rather than against the `.x2` arm — so a wide
+    // load that returns its four registers in another order is a named
+    // position arriving in the wrong one, as `ldtm x8 map` is for the drain.
+    cases.push((
+        "ldmatrix x4 map",
+        Box::new(|| {
+            check_ldmatrix::<TILE, TILE>(stream, |config, map, out| unsafe {
+                module.ldmatrix_x4_map(stream, config, map, out)
+            })
+        }),
+    ));
+    cases.push((
+        "ldmatrix x4 map wide",
+        Box::new(|| {
+            check_ldmatrix::<TILE, WIDE>(stream, |config, map, out| unsafe {
+                module.ldmatrix_x4_map_wide(stream, config, map, out)
             })
         }),
     ));

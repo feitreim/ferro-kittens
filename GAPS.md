@@ -296,13 +296,17 @@ Same `[16, 16]` granularity as 2.1, composed into a band by `ldst::load_tile`
 and `ldst::store_tile` (#22) out of the same helpers the TMEM side uses, at any
 width the cursor can describe (#25).
 
-The two directions are no longer the same width. #116 gave the store side a
-`.x4` form — `store_fragment_x4`/`store_tile_x4`, one `stmatrix` per `[16, 16]`
-block instead of two — and it is what `gemm`'s shipped epilogue uses. The load
-side is still two `ldmatrix_x2` a block, though `ldmatrix_x4` is right there at
-the pin. Filed as **#131**, which asks for the measurement as much as the code:
-`.x8` on the TMEM side (#117) bought its 23.6% by removing *waits*, and a
-shared-memory load has none to remove.
+Both directions have both widths, and they ship at different ones on purpose
+(**#131**). #116 gave the store side a `.x4` form —
+`store_fragment_x4`/`store_tile_x4`, one `stmatrix` per `[16, 16]` block
+instead of two — and it is what `gemm`'s shipped epilogue uses;
+`load_fragment_x4`/`load_tile_x4` are the same width on the load side, on the
+same address derivation, checked against silicon by the `ldmatrix x4 map` cases.
+`load_tile` still issues `.x2`, because that is what the clock said: `.x8` on
+the TMEM side (#117) bought its 23.6% by removing *waits*, a shared-memory load
+has none to remove, and on `softmax` — three passes, every one a `load_tile` —
+the wide form is unordered at 64 and 512 blocks and **1.1% slower** at 8192,
+on 40 registers a thread against 32. `docs/library/ldst.md` has the table.
 
 ### 2.2 Global ↔ register — done (#11)
 
@@ -1049,7 +1053,6 @@ came off this table the same day it went on, which is the same argument again.
 | 128 | TMEM columns unchecked; the MMA takes an address, not a tile | 3.3, 7.5 |
 | 129 | Two conventions each for constructors, `unsafe`, verbs, re-exports | 7.3 |
 | 130 | `RegVec` cannot reach memory; `SharedVec` cannot be sliced | 1.4, 2.2 |
-| 131 | The load side is stuck at `ldmatrix.x2` | 2.1a |
 | 132 | `Job` has no teardown hook | 4 |
 
 Kernel-side issues not in this table because they are not library gaps: #81

@@ -18,6 +18,10 @@
 //!
 //!     modal run modal_app.py::examples
 //!
+//! The device body takes the width of its shared→register read as a `const`
+//! parameter and this crate emits only the shipped value; the other one is
+//! `experiments/src/softmax_x4.rs`, which is where #131 timed the two.
+//!
 //! The rung ladder, the `exp2` ablation, the tolerance argument and the seed's
 //! exhaustive error bounds are in `docs/kernels/softmax.md`.
 
@@ -27,17 +31,18 @@ use cuda_device::{cuda_module, kernel, thread};
 use crate::bench::{Shape, Timings, time};
 use std::error::Error;
 
-use kittens::ldst::{load_tile, store_tile};
+use kittens::ldst::{load_tile, load_tile_x4, store_tile};
 use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, RegTile, RegVec};
 use kittens::shared::{
-    Bf16, SharedTile, Swizzle128B, publish_to_async_proxy, tma_store_commit, tma_store_wait,
+    Bf16, SharedTile, Swizzle128B, SwizzledChunks, publish_to_async_proxy, tma_store_commit,
+    tma_store_wait,
 };
 use kittens::sync::Semaphore;
 use kittens::{lane, warp_id};
 
 const ROWS: usize = 128;
-const COLUMNS: usize = 128;
+pub(crate) const COLUMNS: usize = 128;
 /// Columns a warp holds in registers at once. Measured, not derived: 32 is the
 /// next rung up and 4.4x slower, at one register more and a 256-byte frame.
 const CHUNK: usize = 16;
@@ -67,6 +72,112 @@ const fn shared(at: SharedPlan) -> Shared {
 pub const SHARED_BYTES: usize = shared(SharedPlan::sizing()).plan.bytes();
 pub const THREADS: u32 = (ROWS / 32) as u32 * 32;
 
+/// A warp's `[32, CHUNK]` band of the shared tile, by whichever `ldmatrix`
+/// width the entry was compiled for.
+///
+/// The whole of what `X4` moves. Both spellings read the same block through the
+/// same [`kittens::ldst::fragment_address`] derivation; `.x4` takes its 32
+/// addresses from all lanes and issues one instruction per block where `.x2`
+/// takes 16 from the first half and issues two.
+#[inline(always)]
+unsafe fn band<const X4: bool>(
+    chunks: SwizzledChunks<Bf16>,
+    row: u32,
+    column: u32,
+    lane: u32,
+) -> Band {
+    unsafe {
+        if X4 {
+            load_tile_x4(chunks, row, column, lane)
+        } else {
+            load_tile(chunks, row, column, lane)
+        }
+    }
+}
+
+/// One CTA's three passes, with the width of the shared→register read as its
+/// only parameter.
+///
+/// **`X4` is not a dial this kernel ships.** `false` is the entry below and the
+/// only one `examples/` emits; `experiments/src/softmax_x4.rs` emits `true` as
+/// a second entry so #131's question — whether one `ldmatrix.m8n8.x4` per block
+/// beats two `.x2`s on a kernel whose every pass is a `load_tile` — could be
+/// asked with both arms in one bundle. The body is shared so that the arm
+/// differs from the shipped entry in the load width and in nothing else.
+#[inline(always)]
+pub(crate) unsafe fn rows<const X4: bool>(
+    source: *const TmaDescriptor,
+    destination: *const TmaDescriptor,
+    mut plane: i32,
+) {
+    unsafe {
+        let Shared { tile, loaded, .. } = shared(SharedPlan::attach());
+
+        let lane = lane();
+        let row_base = 32 * warp_id();
+        plane += thread::blockIdx_y() as i32;
+
+        if thread::threadIdx_x() == 0 {
+            loaded.init(1);
+            publish_to_async_proxy();
+        }
+        thread::sync_threads();
+        if thread::threadIdx_x() == 0 {
+            loaded.expect_tx(tile.tma_load(
+                source,
+                (ROWS as u32 * thread::blockIdx_x()) as i32,
+                plane,
+                loaded,
+            ));
+        }
+        loaded.wait(0);
+        thread::sync_threads();
+
+        let chunks = tile.chunk_writer();
+
+        let mut peak = Rows::splat(f32::NEG_INFINITY);
+        let mut chunk = 0usize;
+        while chunk < CHUNKS {
+            let x = band::<X4>(chunks, row_base, (CHUNK * chunk) as u32, lane);
+            peak.max_assign(x.row_max());
+            chunk += 1;
+        }
+
+        let mut total = Rows::splat(0.0);
+        chunk = 0;
+        while chunk < CHUNKS {
+            let x = band::<X4>(chunks, row_base, (CHUNK * chunk) as u32, lane);
+            total.add_assign(x.sub_row(peak).exp2_hw().row_sum());
+            chunk += 1;
+        }
+        let scale = total.recip();
+
+        chunk = 0;
+        while chunk < CHUNKS {
+            let column = (CHUNK * chunk) as u32;
+            let x = band::<X4>(chunks, row_base, column, lane);
+            let x = x.sub_row(peak).exp2_hw().mul_row(scale);
+            store_tile(chunks, row_base, column, lane, x);
+            chunk += 1;
+        }
+        // `stmatrix` writes through the generic proxy; the TMA engine reads
+        // through the async one.
+        publish_to_async_proxy();
+        thread::sync_threads();
+
+        if thread::threadIdx_x() == 0 {
+            tile.tma_store(
+                destination,
+                (ROWS as u32 * thread::blockIdx_x()) as i32,
+                plane,
+            );
+            tma_store_commit();
+            tma_store_wait::<0>();
+            loaded.inval();
+        }
+    }
+}
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
@@ -75,74 +186,9 @@ pub mod kernels {
     pub unsafe fn softmax_rows(
         source: *const TmaDescriptor,
         destination: *const TmaDescriptor,
-        mut plane: i32,
+        plane: i32,
     ) {
-        unsafe {
-            let Shared { tile, loaded, .. } = shared(SharedPlan::attach());
-
-            let lane = lane();
-            let row_base = 32 * warp_id();
-            plane += thread::blockIdx_y() as i32;
-
-            if thread::threadIdx_x() == 0 {
-                loaded.init(1);
-                publish_to_async_proxy();
-            }
-            thread::sync_threads();
-            if thread::threadIdx_x() == 0 {
-                loaded.expect_tx(tile.tma_load(
-                    source,
-                    (ROWS as u32 * thread::blockIdx_x()) as i32,
-                    plane,
-                    loaded,
-                ));
-            }
-            loaded.wait(0);
-            thread::sync_threads();
-
-            let chunks = tile.chunk_writer();
-
-            let mut peak = Rows::splat(f32::NEG_INFINITY);
-            let mut chunk = 0usize;
-            while chunk < CHUNKS {
-                let x: Band = load_tile(chunks, row_base, (CHUNK * chunk) as u32, lane);
-                peak.max_assign(x.row_max());
-                chunk += 1;
-            }
-
-            let mut total = Rows::splat(0.0);
-            chunk = 0;
-            while chunk < CHUNKS {
-                let x: Band = load_tile(chunks, row_base, (CHUNK * chunk) as u32, lane);
-                total.add_assign(x.sub_row(peak).exp2_hw().row_sum());
-                chunk += 1;
-            }
-            let scale = total.recip();
-
-            chunk = 0;
-            while chunk < CHUNKS {
-                let column = (CHUNK * chunk) as u32;
-                let x: Band = load_tile(chunks, row_base, column, lane);
-                let x = x.sub_row(peak).exp2_hw().mul_row(scale);
-                store_tile(chunks, row_base, column, lane, x);
-                chunk += 1;
-            }
-            // `stmatrix` writes through the generic proxy; the TMA engine reads
-            // through the async one.
-            publish_to_async_proxy();
-            thread::sync_threads();
-
-            if thread::threadIdx_x() == 0 {
-                tile.tma_store(
-                    destination,
-                    (ROWS as u32 * thread::blockIdx_x()) as i32,
-                    plane,
-                );
-                tma_store_commit();
-                tma_store_wait::<0>();
-                loaded.inval();
-            }
-        }
+        unsafe { rows::<false>(source, destination, plane) }
     }
 }
 
@@ -191,12 +237,27 @@ fn nothing_after(
     Ok(())
 }
 
+/// One launch of an entry with this kernel's signature, at the grid and shared
+/// plan [`run`] fixes.
+///
+/// A parameter rather than [`kernels::load`]'s own entry, so that the arm
+/// `experiments/` compiles beside the shipped one (#131) is checked by the
+/// same CPU reference and timed on the same clock. Nothing else about a run
+/// varies with it.
+pub(crate) type Launch<'a> = &'a dyn Fn(
+    &cuda_core::CudaStream,
+    cuda_core::LaunchConfig,
+    *const TmaDescriptor,
+    *const TmaDescriptor,
+) -> Result<(), Box<dyn Error>>;
+
 /// Launch over `planes * rows` rows, compare every output against a CPU
 /// reference, and only then hand the launch to `then`.
-fn run<T>(
+pub(crate) fn run<T>(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     rows: usize,
     planes: usize,
+    launch: Launch,
     then: impl FnOnce(
         &cuda_core::CudaStream,
         &mut dyn FnMut() -> Result<(), Box<dyn Error>>,
@@ -217,7 +278,6 @@ fn run<T>(
     }
 
     let stream = context.default_stream();
-    let module = kernels::load(context)?;
 
     let staged = staged(rows, planes);
     let source = DeviceBuffer::from_host(&stream, &staged)?;
@@ -235,19 +295,15 @@ fn run<T>(
         block_dim: (THREADS, 1, 1),
         shared_mem_bytes: SHARED_BYTES as u32,
     };
-    let mut launch_once = || -> Result<(), Box<dyn Error>> {
-        // SAFETY: the grid covers exactly the rows and planes both maps
-        // describe, and the block and shared plan are the kernel's own.
-        unsafe {
-            module.softmax_rows(
-                &stream,
-                config,
-                source_map.as_ptr(),
-                destination_map.as_ptr(),
-                0,
-            )?
-        };
-        Ok(())
+    // The grid covers exactly the rows and planes both maps describe, and the
+    // block and shared plan are the kernel's own.
+    let mut launch_once = || {
+        launch(
+            &stream,
+            config,
+            source_map.as_ptr(),
+            destination_map.as_ptr(),
+        )
     };
     launch_once()?;
 
@@ -291,8 +347,30 @@ fn run<T>(
     ))
 }
 
+/// [`run`] with the shipped entry supplied as its launch.
+fn shipped<T>(
+    context: &std::sync::Arc<cuda_core::CudaContext>,
+    rows: usize,
+    planes: usize,
+    then: impl FnOnce(
+        &cuda_core::CudaStream,
+        &mut dyn FnMut() -> Result<(), Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>>,
+) -> Result<(String, T), Box<dyn Error>> {
+    let module = kernels::load(context)?;
+    let launch = |stream: &cuda_core::CudaStream,
+                  config: cuda_core::LaunchConfig,
+                  source: *const TmaDescriptor,
+                  destination: *const TmaDescriptor|
+     -> Result<(), Box<dyn Error>> {
+        unsafe { module.softmax_rows(stream, config, source, destination, 0) }?;
+        Ok(())
+    };
+    run(context, rows, planes, &launch, then)
+}
+
 pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String, Box<dyn Error>> {
-    run(context, CHECK_ROWS, CHECK_PLANES, nothing_after).map(|(note, ())| note)
+    shipped(context, CHECK_ROWS, CHECK_PLANES, nothing_after).map(|(note, ())| note)
 }
 
 /// The benchmark's entry point. A softmax [`Shape`] is `rows x COLUMNS x
@@ -301,5 +379,5 @@ pub fn bench(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     shape: Shape,
 ) -> Result<Timings, Box<dyn Error>> {
-    run(context, shape.m, shape.k, time).map(|(_, timings)| timings)
+    shipped(context, shape.m, shape.k, time).map(|(_, timings)| timings)
 }

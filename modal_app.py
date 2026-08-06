@@ -58,6 +58,10 @@ Local usage:
                                       # gemm's epilogue INSTRUCTION WIDTHS:
                                       # .x8 LDTM and stmatrix .x4 on the staged
                                       # epilogue, ablated and composed (#117)
+    modal run modal_app.py::bench --case ldmatrix
+                                      # the OTHER direction's width: softmax's
+                                      # loads at ldmatrix .x2 against .x4,
+                                      # paired and interleaved (#131)
     modal run modal_app.py::bench --case residual
                                       # where the gap to cuBLASLt lives, with
                                       # every control re-run in one container

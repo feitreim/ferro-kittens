@@ -10,6 +10,12 @@
 //! compose those blocks into an `[M, N]` band — the same composition
 //! [`crate::tmem::TmemTile::tile`] does over the drain.
 //!
+//! Both directions also have a `.x4` form — [`store_tile_x4`], [`load_tile_x4`]
+//! — that moves a block in one instruction rather than two, and they ship at
+//! different widths on purpose: the store side's removed a wait and won (#116),
+//! the load side's has no wait to remove and measured a wash (#131). See
+//! [`load_fragment_x4`] for the numbers.
+//!
 //! [`scatter_tile`] is the store direction for the elements `stmatrix` cannot
 //! move: one `st.shared` per owned value instead of one instruction per block,
 //! generic in the element and the layout. An fp32 band reaches a staging tile
@@ -27,7 +33,7 @@
 
 use cuda_device::ptx_asm;
 use cuda_device::thread::__unroll_config;
-use cuda_device::wmma::ldmatrix_x2;
+use cuda_device::wmma::{ldmatrix_x2, ldmatrix_x4};
 
 use crate::reg::{
     BaseLdtm, ColLayout, ColVec, Fragment, FragmentLayout, RegTile, RegVec, RowLayout,
@@ -265,6 +271,76 @@ pub unsafe fn load_fragment<E: Element<Unpacked = [f32; 2]>>(
     }
 }
 
+/// [`load_fragment`]'s four matrices in one instruction, rather than two `.x2`s
+/// a slot apart — the load twin of [`store_fragment_x4`], and **the measured
+/// alternative rather than the shipped spelling**.
+///
+/// The addressing is [`store_fragment_x4`]'s and needs no derivation of its own:
+/// `ldmatrix.m8n8.x4` takes 32 addresses from all lanes where `.x2` takes 16
+/// from the first half, so lane `l` supplies here what lane `l % 16` supplied
+/// for slot `l / 16` (`x4_addresses_are_the_x2_addresses_restacked`). The four
+/// destination registers are the four matrices in that same order — the two
+/// slots' two 8-column halves — so they land in the fragment exactly where
+/// [`store_fragment_x4`] takes them from.
+///
+/// # What it is worth, and why [`load_fragment`] is still what ships
+///
+/// `.x4` on the store side (#116) and `.x8` on the TMEM drain (#117) both paid
+/// by removing *waits*. An `ldmatrix` has no wait to remove — it is a plain
+/// shared read — so all this can buy is issue slots, and what it costs is
+/// liveness: four matrices arrive at once where two let the compiler fuse a
+/// slot through to its consumer. Measured on `softmax`, whose three passes are
+/// all `load_tile`, both entries in one bundle and taken round-robin (#131):
+///
+/// | rows × 128 × 2 | blocks | `.x2` GB/s | `.x4` GB/s | `.x4`/`.x2` ms, of four paired |
+/// | --- | ---: | ---: | ---: | ---: |
+/// | 4096 | 64 | 397.2 | 398.4 | 1.0124, straddling (0.976–1.025) |
+/// | 32768 | 512 | 2020.4 | 1993.5 | 1.0176, straddling (0.990–1.021) |
+/// | 524288 | 8192 | **4281.0** | **4235.6** | **1.0110** (1.0097–1.0148) |
+///
+/// The liveness cost is the one that showed: 32 registers a thread against 40,
+/// on a kernel whose residency is shared memory's either way. The two smaller
+/// rows have not ordered the spellings — a paired ratio below 1.000 is in each
+/// of them — and the bandwidth-bound row has, 1.1% the *narrow* load's way.
+///
+/// Full table and the argument: `docs/library/ldst.md`.
+///
+/// # Safety
+///
+/// As [`load_fragment`], except that all 32 lanes supply addresses here rather
+/// than only the first 16:
+///
+/// - All 32 lanes of the warp must call this together.
+/// - `chunks` must belong to a tile at least `row + 16` rows tall into which
+///   `column + 16` fits.
+/// - Its bytes must already be visible to the generic proxy.
+#[inline(always)]
+pub unsafe fn load_fragment_x4<E: Element<Unpacked = [f32; 2]>>(
+    chunks: SwizzledChunks<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+) -> Fragment {
+    unsafe {
+        let (address_row, chunk) = fragment_address(row, column, lane % 16, (lane / 16) as usize);
+        let [low, high, next_low, next_high] =
+            ldmatrix_x4(chunks.at(address_row, chunk) as *const u32);
+        let (low, high) = (E::unpack(low), E::unpack(high));
+        let (next_low, next_high) = (E::unpack(next_low), E::unpack(next_high));
+
+        let mut fragment = Fragment::zero();
+        fragment.set(0, 0, low[0]);
+        fragment.set(0, 1, low[1]);
+        fragment.set(0, 2, high[0]);
+        fragment.set(0, 3, high[1]);
+        fragment.set(1, 0, next_low[0]);
+        fragment.set(1, 1, next_low[1]);
+        fragment.set(1, 2, next_high[0]);
+        fragment.set(1, 3, next_high[1]);
+        fragment
+    }
+}
+
 /// A whole `[M, N]` band of a swizzled tile at `(row, column)`, composed out of
 /// the `M/16 × N/16` blocks [`load_fragment`] returns — the shared-side twin of
 /// [`crate::tmem::TmemTile::tile`].
@@ -316,6 +392,59 @@ where
                     row_block,
                     column_block,
                     load_fragment(
+                        chunks,
+                        row + 16 * row_block as u32,
+                        column + 16 * column_block as u32,
+                        lane,
+                    ),
+                );
+                column_block += 1;
+            }
+            row_block += 1;
+        }
+        tile
+    }
+}
+
+/// [`load_tile`] over [`load_fragment_x4`] — the same band, at one `ldmatrix`
+/// per `[16, 16]` block instead of two.
+///
+/// The mirror of [`store_tile_x4`], and what [`load_fragment_x4`]'s measurement
+/// was taken through: `softmax` reads its band this way in all three passes
+/// under the `.x4` arm and nothing else about the kernel moves.
+///
+/// # Safety
+///
+/// As [`load_fragment_x4`], for every block of the band:
+///
+/// - All 32 lanes of the warp must call this together.
+/// - `chunks` must belong to a tile at least `row + M` rows tall into which
+///   `column + N` fits.
+/// - Its bytes must already be visible to the generic proxy.
+#[inline(always)]
+pub unsafe fn load_tile_x4<E: Element<Unpacked = [f32; 2]>, const M: usize, const N: usize>(
+    chunks: SwizzledChunks<E>,
+    row: u32,
+    column: u32,
+    lane: u32,
+) -> RegTile<M, N, BaseLdtm>
+where
+    BaseLdtm: FragmentLayout<M, N>,
+{
+    unsafe {
+        let mut tile = RegTile::<M, N, BaseLdtm>::zero();
+        // Fully unrolled for `tile`'s sake — see `store_tile_x4` (#166).
+        let mut row_block = 0usize;
+        while row_block < const { M / 16 } {
+            __unroll_config::<0>();
+            let mut column_block = 0usize;
+            while column_block < const { N / 16 } {
+                __unroll_config::<0>();
+                place_block(
+                    &mut tile,
+                    row_block,
+                    column_block,
+                    load_fragment_x4(
                         chunks,
                         row + 16 * row_block as u32,
                         column + 16 * column_block as u32,
@@ -640,9 +769,10 @@ pub unsafe fn load_row_vec<E: Element, const M: usize, L: RowLayout<M>>(
 /// written as inline PTX because cuda-oxide's stmatrix declaration does not
 /// resolve for `sm_100a`.
 ///
-/// The load direction needs no such workaround:
-/// [`cuda_device::wmma::ldmatrix_x2`] lowers cleanly, so [`load_fragment`]
-/// calls it directly.
+/// The load direction needs no such workaround at either width:
+/// [`cuda_device::wmma::ldmatrix_x2`] and [`cuda_device::wmma::ldmatrix_x4`]
+/// both lower cleanly, so [`load_fragment`] and [`load_fragment_x4`] call them
+/// directly.
 ///
 /// # Safety
 ///
@@ -857,8 +987,12 @@ mod tests {
 
     /// The `.x4`'s 32 addresses are the `.x2`'s two sets of 16, stacked in slot
     /// order — why [`store_fragment_x4`] needs no derivation of its own.
+    ///
+    /// `ldmatrix.m8n8.x4` takes its addresses the same way `stmatrix` does, so
+    /// this is [`load_fragment_x4`]'s derivation as well and the two wide forms
+    /// can no more drift apart than the two narrow ones can.
     #[test]
-    fn stmatrix_x4_addresses_are_the_x2_addresses_restacked() {
+    fn x4_addresses_are_the_x2_addresses_restacked() {
         for row in [0u32, 16, 48] {
             for column in [0u32, 16, 32, 48] {
                 for lane in 0..32u32 {
@@ -883,8 +1017,8 @@ mod tests {
     }
 
     /// The four matrices of one `.x4` are exactly the four the two `.x2`s
-    /// wrote, one lane group each: nothing is dropped and nothing is written
-    /// twice.
+    /// moved, one lane group each: nothing is dropped, nothing is written
+    /// twice, and nothing is read from a block the pair of `.x2`s did not.
     #[test]
     fn the_x4_covers_both_slots_of_both_halves() {
         for row in [0u32, 32] {
