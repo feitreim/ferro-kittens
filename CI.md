@@ -85,11 +85,18 @@ register count rather than a compile — and that is worth seeing on the check
 list rather than in a log. It builds all three kernel crates in its own
 container, so tier 2 now costs roughly twice what it did; still CPU-minutes.
 
-`examples/` and `experiments/` both emit `gemm_cg2_staged_x8x4` — it is the same
-kernel, shipped by one and kept as every A/B's control arm by the other — and
-`_measure` keys on `(ptx file, kernel)`, so the table carries both rows. Two
-identical rows is the claim that the teaching copy moved no instruction; a
-difference between them is a finding.
+`examples/` and `experiments/` both emit `gemm_cg2_staged_x8x4` and the three
+`gemm_sol` entries — the same kernels, shipped by one and kept as every A/B's
+control arm by the other — and `_measure` keys on `(ptx file, kernel)`, so the
+table carries both rows. Two identical rows is the claim that the teaching copy
+moved no instruction; a difference between them is a finding.
+
+For `gemm_sol` that pair is now the *only* thing holding the two copies
+together. The teaching copy ships one configuration with the consts baked in and
+the arms deleted; the notebook copy keeps `ABLATE`, `DRAIN`, `WATCH`, `FOLD` and
+the warpgroup count as parameters, because an arm nobody can build is a verdict
+nobody can re-run. They were one file behind a `#[path]` until then, and a
+`#[path]` cannot serve a teaching copy that is supposed to have no dials in it.
 
 Both jobs go through **`scripts/modal-run`**, so the wedge watchdog and the
 completion sentinel cover this tier — see the wrapper's own section below.

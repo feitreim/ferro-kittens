@@ -1,8 +1,22 @@
 # `gemm_sol`
 
-The design record for `examples/src/gemm_sol.rs`: why the kernel has the shape
-it has, every measurement behind a decision, and the alternatives that were
-tried and lost.
+The design record for `gemm_sol`: why the kernel has the shape it has, every
+measurement behind a decision, and the alternatives that were tried and lost.
+
+**The code is in two files, and which one a section is about matters.**
+`examples/src/gemm_sol.rs` is the kernel as it ships — one configuration, every
+const below baked to the value it won at, no dials and no arms — and it is the
+one to read to see what a launch does. `experiments/src/gemm_sol.rs` is the same
+device body with `ABLATE`, `DRAIN`, `WATCH`, `FOLD` and the warpgroup count
+still const parameters, and every arm named here is an instantiation of it. Both
+crates emit `gemm_sol_m256`, `gemm_sol_m256_n128` and `gemm_sol_m512`, and
+`regcount`'s opcode census carries a row per copy: two identical rows are the
+claim that baking the dials in moved no instruction.
+
+The arms stay buildable rather than being deleted with their verdicts, because
+this tree re-runs verdicts — #197's warpgroup split reversed sign when the
+`.local` depot underneath it went away, and it could only be re-run because the
+arm was still there.
 
 The kernel is a kittens port of cuda-oxide's canonical Blackwell
 `gemm_sol_final`, expressed through this library's typed tiles and pipeline
@@ -270,8 +284,10 @@ next band owes itself.
   same `stmatrix`, same staging tile, same `store_shared_rows`, same two
   `warp::sync_mask` a staged pass, same shared plan. The difference against the
   per-issue drain is the wait structure and the band's register liveness and
-  nothing besides. `SHIPPED_DRAIN` names the winner in one place, so a rung that
-  wins its A/B ships by moving that line — which is what `paired` did.
+  nothing besides. `SHIPPED_DRAIN` names the winner in one place in
+  `experiments/`, and the teaching copy writes that winner out as its only
+  drain, so a rung that wins its A/B ships by moving both — which is what
+  `paired` did.
 - **`wide`** — a 128-column band, all four issues in flight before one wait: a
   quarter of `per issue`'s waits per byte of `C`, at 128 f32 a thread live. It
   first measured −1.1 to −1.3% at 4096³ and +0.2 to +0.3% at 8192³, and the note
@@ -401,10 +417,16 @@ able to watch any arm.
   publish separately. Eight slots a CTA covers its six warps.
 - A stall also sets a one-word `stop` flag that every role polls at its loop
   head, so a warp that gave up takes the other five out with it and the launch
-  reaches `cluster_sync` instead of hanging on it. The flag is reserved in every
-  arm, including the shipped ones, because the alternative is two shared plans
-  for one kernel — and everything from the barriers to the staging buffer sits
-  inside padding that was already there.
+  reaches `cluster_sync` instead of hanging on it. It is reserved in every arm in
+  `experiments/`, including that crate's copies of the shipped entries, because
+  the alternative is two shared plans for one kernel.
+
+  The teaching copy has no watchdog and so does not reserve it, **and its plan is
+  byte for byte the same one**: the word sits in the padding before `ClcQueue`'s
+  16-byte alignment, so dropping it moves no offset after it. That is checked
+  rather than asserted here — both files carry
+  `196_864 / 131_328 / 229_632` as compile-time asserts on their own plans, and
+  the two `#[launch_contract]`s state the same three numbers.
 - A stalled `wait_load` reports rather than returning: the K loop's shape is
   somebody else's argument and the instrument must not change it, so the loop
   runs its remaining turns against operands nobody promised and the item loop
@@ -452,10 +474,12 @@ partial sum is exact in fp32 and `check_output` compares with `==` against a
 reference rounded the same way, rather than against a tolerance. The worst
 relative error it returns is bf16's own.
 
-The four staging and checking functions are `pub` because `experiments/`' copy
-of the *unported* upstream kernel is staged and checked by them rather than by
-re-derivations of them: two kernels compared on one clock have to read
-byte-identical operands, and the way to guarantee that is to call the same code.
+The four staging and checking functions are `pub` in `experiments/`' copy
+because the *unported* upstream kernel beside it is staged and checked by them
+rather than by re-derivations of them: two kernels compared on one clock have to
+read byte-identical operands, and the way to guarantee that is to call the same
+code. In the teaching copy they are private — nothing outside its own `check`
+calls them.
 
 `check` runs all three entries at `1024x1024x512` and then the three
 `SHALLOW_K_GATE` shapes, each exact over every output. `bench_plan` checks at

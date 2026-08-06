@@ -470,35 +470,6 @@ pub fn grid(m: usize, n: usize) -> u32 {
     RANKS * (rows * columns).min(MAX_CLUSTERS)
 }
 
-/// Bytes of shared memory an SM divides between its resident CTAs, queried
-/// rather than written down: a residency is a floor division by it.
-fn shared_per_sm(
-    context: &std::sync::Arc<cuda_core::CudaContext>,
-) -> Result<usize, Box<dyn Error>> {
-    let mut bytes = 0i32;
-    // SAFETY: the attribute is an `int` and `context` names a live device.
-    let status = unsafe {
-        cuda_core::sys::cuDeviceGetAttribute(
-            &mut bytes,
-            cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
-            context.cu_device(),
-        )
-    };
-    if status != cuda_core::sys::cudaError_enum_CUDA_SUCCESS {
-        return Err(format!(
-            "cuDeviceGetAttribute(MAX_SHARED_MEMORY_PER_MULTIPROCESSOR) = {status}"
-        )
-        .into());
-    }
-    Ok(bytes as usize)
-}
-
-/// [`CTAS_PER_SM`] said as arithmetic instead of as a measurement, and printed
-/// by [`check`] so the two can disagree out loud.
-fn ctas_per_sm(shared_per_sm: usize) -> u32 {
-    (512 / BLOCK_N).min(shared_per_sm / STAGED_SHARED_BYTES) as u32
-}
-
 fn run(
     context: &std::sync::Arc<cuda_core::CudaContext>,
     m: usize,
@@ -608,8 +579,12 @@ fn check_c(observed: &[u16], m: usize, n: usize, k: usize) -> Result<f64, Box<dy
 const CHECK_GROUPS: [u32; 4] = [GROUP, 1, 3, 6];
 
 /// The correctness run: two sizes, four traversals, checked, nothing timed.
+///
+/// It reports the launch envelope it ran at and nothing derived from a clock or
+/// from the driver. [`CTAS_PER_SM`] against what the device actually admits is
+/// `experiments/`' sweep, which prints predicted and counted side by side at
+/// every tile rung, and `device-tests`' `tmem residency census`.
 pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String, Box<dyn Error>> {
-    let per_sm = shared_per_sm(context)?;
     let mut notes = Vec::new();
     for (m, n, k) in [(M, N, K), (ITEMS_M, ITEMS_N, ITEMS_K)] {
         let (rows, columns) = tile_grid(m, n);
@@ -620,11 +595,10 @@ pub fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<String,
         }
         notes.push(format!(
             "{m}x{n}x{k} exact at groups {CHECK_GROUPS:?} of {rows} tile-rows \
-             ({} tiles over {} clusters, {STAGED_SHARED_BYTES} B, {} CTAs/SM, \
+             ({} tiles over {} clusters, {STAGED_SHARED_BYTES} B, \
              worst |rel| {:.2e} against the fp32 reference)",
             rows * columns,
             grid(m, n) / RANKS,
-            ctas_per_sm(per_sm),
             rounding.expect("CHECK_GROUPS is not empty"),
         ));
     }

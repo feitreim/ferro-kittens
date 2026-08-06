@@ -942,12 +942,13 @@ def _parse_ptxas(log: str) -> dict[str, dict[str, int]]:
 # configures, and their register and shared-memory counts are what an occupancy
 # argument about a real kernel has to be made of (#47).
 #
-# `examples` and `experiments` both emit `gemm_cg2_staged_x8x4`, because it is
-# the same kernel: the teaching crate ships it and the notebook keeps it as the
-# arm every A/B is measured against. `_measure` keys on `(ptx file, kernel)` so
-# both rows are printed, and the pair is a free check that the extraction moved
-# no instruction -- two identical rows are the claim, and a difference between
-# them is the finding.
+# `examples` and `experiments` both emit `gemm_cg2_staged_x8x4` and the three
+# `gemm_sol` entries, because they are the same kernels: the teaching crate
+# ships them with every const baked to what it ships at, and the notebook keeps
+# the dialed body every arm is an instantiation of. `_measure` keys on
+# `(ptx file, kernel)` so both rows are printed, and the pair is a free check
+# that baking the dials in moved no instruction -- two identical rows are the
+# claim, and a difference between them is the finding.
 PTX_CRATES = (
     ("device-tests", HARNESS_DIR),
     ("kittens-examples", EXAMPLES_DIR),
@@ -1672,6 +1673,16 @@ GATED_KERNELS = (
     ("gemm_sol_m256", "examples", "examples/src/gemm_sol.rs"),
     ("gemm_sol_m256_n128", "examples", "examples/src/gemm_sol.rs"),
     ("gemm_sol_m512", "examples", "examples/src/gemm_sol.rs"),
+    # And `experiments/`' copies, which stopped being the same *file* when the
+    # teaching copy lost its dials: `examples/src/gemm_sol.rs` is the shipped
+    # configuration written out, `experiments/src/gemm_sol.rs` is the body every
+    # ablation arm instantiates, and both emit these three entries. Two files
+    # can drift where one `#[path]` could not, and `gemm_cg2_staged_x8x4`'s pair
+    # is the precedent for what that costs: 80 registers against 96 on the same
+    # source, from crate composition alone.
+    ("gemm_sol_m256", "experiments", "experiments/src/gemm_sol.rs"),
+    ("gemm_sol_m256_n128", "experiments", "experiments/src/gemm_sol.rs"),
+    ("gemm_sol_m512", "experiments", "experiments/src/gemm_sol.rs"),
 )
 
 _CONTRACT_BLOCK = re.compile(r"block\s*=\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)")
