@@ -23,11 +23,12 @@
 //! best-scored ones a broken mask could admit; the check runs four key blocks,
 //! one past [`STAGES`], so the ring wraps.
 //!
-//!     modal run modal_app.py::examples
+//!     scripts/modal-run examples          # the check
+//!     scripts/modal-run bench --case flash # the same launch, timed
 //!
-//! The shared plan by component, the 1 block/SM ceiling and why it is tcgen05
-//! rather than this plan, the register-side measurements, the seed argument
-//! and the tolerance: `docs/kernels/flash_forward.md`.
+//! The shared plan by component, the 1 CTA/SM ceiling and why it is this plan
+//! rather than tcgen05 (#84), the register-side measurements, the seed
+//! argument and the tolerance: `docs/kernels/flash_forward.md`.
 
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
@@ -49,7 +50,8 @@ const QUERIES: usize = 128;
 const KEYS: usize = 64;
 const HEAD: usize = 128;
 const STAGES: usize = 3;
-/// Folded into the score scale so the exponential is `exp2`.
+/// Folded into the score scale so the exponential is base two, which is what
+/// the library's `exp2` family — both spellings of it — is written in.
 const LOG2E: f32 = core::f32::consts::LOG2_E;
 
 type QTile = SharedTile<Bf16, QUERIES, HEAD, Swizzle128B>;
@@ -69,8 +71,15 @@ type Rows = RegVec<32, BaseLdtm>;
 
 /// Columns of tensor memory the CTA allocates for the scores and the output
 /// beside them. `KEYS + HEAD` is 192 and `tcgen05.alloc` takes a power of two
-/// in `[32, 512]`; rounding up is free, since the driver charges a CTA the SM's
-/// whole tensor memory at 32 columns exactly as at 512.
+/// in `[32, 512]`, so 256 is the smallest legal count that covers both
+/// segments.
+///
+/// Rounding up is free here, and **not** for the reason #77 gave. A CTA is not
+/// charged the SM's whole tensor memory the moment it allocates: #84's census
+/// counts 512/columns CTAs holding at once at every legal count, so these 256
+/// columns admit **two** CTAs an SM. They cost nothing because this kernel's
+/// own shared plan admits **one** before the columns are consulted — see
+/// [`SHARED_BYTES`] and `docs/kernels/flash_forward.md`.
 ///
 /// The power-of-two half of that used to be asserted here, because the count
 /// was an argument to an instruction and no type could see it. `alloc_block`
@@ -124,7 +133,10 @@ const fn shared(at: SharedPlan) -> Shared {
 }
 
 /// Dynamic shared memory the launch declares — 144 KiB and change, which is why
-/// this kernel needs [`kittens::launch::admit_shared_plan`].
+/// this kernel needs [`kittens::launch::admit_shared_plan`] and why it runs one
+/// CTA to an SM: two of these do not fit in the 233472 B an SM has (#84). Where
+/// the second CTA starts fitting is counted rather than divided —
+/// `device-tests`' census carries the `shared half` rungs (#85).
 pub const SHARED_BYTES: usize = shared(SharedPlan::sizing()).plan.bytes();
 pub const THREADS: u32 = (QUERIES / 32) as u32 * 32;
 
@@ -228,6 +240,15 @@ pub mod kernels {
                 let s = s.scale(scale * LOG2E);
                 let row_max = s.row_max();
                 online_rescale(&mut running_max, row_max, &mut running_sum, &mut out_acc);
+                // `exp2` — the FMA polynomial — and it is here on a clock
+                // rather than by default. The SFU `exp2_hw` is 2.7x on
+                // `softmax` (#76), and swapping it in here is exact against
+                // the reference above and **not faster**: 0.6756 ms against
+                // 0.6492 at 2048 queries x 16 heads, where that shape's own
+                // two runs repeat to 0.3% (#81). This kernel spends its time
+                // in the MMA and TMA pipeline at 4 warps and one CTA an SM,
+                // and it is where the exponential costs the *least*, not the
+                // most.
                 let s = s.sub_row(running_max).exp2();
                 running_sum.add_assign(s.row_sum());
 
@@ -417,6 +438,12 @@ fn reference_row(panels: &Panels, row: usize) -> Vec<f64> {
         .collect()
 }
 
+/// CTAs a launch over `sequence` queries by `heads` heads asks for: one per
+/// query block per head, which is the grid [`run`] builds.
+pub fn grid(sequence: usize, heads: usize) -> u32 {
+    (sequence / QUERIES * heads) as u32
+}
+
 fn nothing_after(
     _: &cuda_core::CudaStream,
     _: &mut dyn FnMut() -> Result<(), Box<dyn Error>>,
@@ -440,7 +467,10 @@ fn run<T>(
 
     /// One doubling above the 1.66e-3 a correct kernel measures, which is
     /// `P`'s trip to bf16 on its way to being the second MMA's `A` operand;
-    /// the argument is in `docs/kernels/flash_forward.md`.
+    /// the argument is in `docs/kernels/flash_forward.md`. The exponential is
+    /// not what sets it: the SFU `exp2_hw` measures 1.73e-3 through the same
+    /// check, a hair worse and a factor of two inside this bound either way
+    /// (#81).
     const TOLERANCE: f32 = 1.0 / 256.0;
 
     if !sequence.is_multiple_of(QUERIES) || heads == 0 {

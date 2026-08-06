@@ -42,10 +42,17 @@ struct Example {
     status: &'static str,
     threads: u32,
     shared_bytes: usize,
-    /// The PTX entry name. `None` where the occupancy query is the wrong
-    /// question — it takes a block shape and no cluster, so a
+    /// The PTX entry name. `None` where the *block* occupancy query is the
+    /// wrong question — it takes a block shape and no cluster, so a
     /// `#[cluster_launch]` kernel would be answered about a launch it never
     /// performs.
+    ///
+    /// Which is not the same as unanswerable, and this table used to imply it
+    /// was. `cuOccupancyMaxActiveClusters` takes the cluster shape and the
+    /// grid, and `device-tests`' residency census asks it beside its counted
+    /// number (#84). Wiring it in here needs a grid this table does not have,
+    /// so the column still says `cluster` — and the reason is now the missing
+    /// argument rather than a missing query (#85).
     entry: Option<&'static str>,
 }
 

@@ -52,8 +52,7 @@ kernels shipped with; `exp2_hw` is one `ex2.approx.f32` SFU instruction
 (`cuda_device::float::ex2_approx_f32`, a generated intrinsic at the pinned
 revision, so no libdevice call).
 
-**On a clock the SFU wins by 2.7×.** Timed on `softmax` at `CHUNK = 16` over
-8192 blocks:
+**On `softmax` the SFU wins by 2.7×.** Timed at `CHUNK = 16` over 8192 blocks:
 
 | | registers | stack frame | throughput |
 | --- | --- | --- | --- |
@@ -68,13 +67,48 @@ An earlier claim that the measurement did not favour the SFU was taken from a
 *register count* on a probe shape no kernel has; the throughput numbers above
 are the correction.
 
-**The default has not moved anyway.** `exp2` — the method name, on every
-register family — still resolves to `Exp2Approx`, and
-`exp2_stays_the_polynomial_everywhere` asserts it. Which implementation a *name*
-means is a numerics change, and `flash_forward`, the other caller (twice per
-element in its inner loop), has no CPU reference to check one against. `softmax`
-calls `exp2_hw` explicitly; ports that must hold "same SASS" keep the
-polynomial.
+### And on `flash_forward` it wins nothing (#81)
+
+The other caller exponentiates every element of every key block, which is where
+the polynomial should cost the most. It does not. Timed through
+`bench --case flash` on a B200, min of 30 launches after 5 warm-ups, each arm
+checked against the f64 reference before it was timed — and the polynomial run
+twice, because a difference between two containers is worth its arms' own
+repeatability (#122):
+
+| sequence × heads | CTAs | `exp2` | `exp2` again | `exp2_hw` |
+| --- | ---: | ---: | ---: | ---: |
+| 1024 × 2 | 16 | 0.1789 ms | 0.1741 ms | 0.1820 ms |
+| 2048 × 4 | 64 | 0.3336 ms | 0.3254 ms | 0.3343 ms |
+| **2048 × 16** | 256 | **0.6513 ms** | **0.6492 ms** | **0.6756 ms** |
+
+The last row is the one to read: it is the first shape past a full wave, it
+repeats to 0.3% across two runs of the same arm, and the SFU is **3.9% slower**
+there. The two smaller shapes put 16 and 64 CTAs on 148 SMs and repeat to 2.7%,
+so they say only that nothing large happened. Registers say nothing at all — 168
+in `examples`, 255 in `experiments`, a 1568 B frame and 702/395 `.local`
+stores/loads, *identical* for both spellings. The check moves from 1.66e-3 to
+1.73e-3 against a 3.91e-3 tolerance.
+
+Why: `softmax` is a bandwidth loop whose entire arithmetic is two exponentials
+an element, and `flash_forward` is an MMA and TMA pipeline at four warps and one
+CTA an SM, where 40-odd FMAs an element hide in the shadow of the tensor core
+and one SFU instruction per element does not have three other warps to
+interleave with. That is a reading of the two numbers, not a measurement — the
+probe that would settle it is a warp-count sweep of one exponentiating loop, and
+`ex2.approx` serialization (which this header used to assert, and no longer
+does) needs exactly that probe rather than either of these kernels.
+
+**So the default does not move, and neither does either kernel.** `exp2` — the
+method name, on every register family — resolves to `Exp2Approx`, and
+`exp2_stays_the_polynomial_everywhere` asserts it. That is structural rather
+than a verdict: `ex2.approx.f32` is a device-only intrinsic that panics on the
+host, so the polynomial is the only spelling a CPU reference, a host test or a
+doctest can evaluate, and `Exp` and `online_rescale` are on it for the same
+reason. `softmax` names `exp2_hw` because it measured 2.7× for it;
+`flash_forward` names `exp2` because it measured nothing; ports that must hold
+"same SASS" keep the polynomial. Which one a kernel wants is a question about
+that kernel, and #81's answer is that it has to be asked once per kernel.
 
 ## By-value against in-place maps
 

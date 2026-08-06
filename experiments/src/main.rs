@@ -87,6 +87,8 @@ pub mod sol_watch;
 /// written against `examples/src/bench.rs`'s clock, which this crate's [`bench`]
 /// re-exports, so both crates compile one set of source files and the rows in
 /// the sweep are the rows the example ships.
+#[path = "../../examples/src/flash_forward.rs"]
+pub mod flash_forward;
 #[path = "../../examples/src/layernorm.rs"]
 pub mod layernorm;
 #[path = "../../examples/src/softmax.rs"]

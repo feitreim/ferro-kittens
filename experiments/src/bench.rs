@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use cuda_core::CudaContext;
 
-use crate::{gemm, gemm_sol, layernorm, softmax};
+use crate::{flash_forward, gemm, gemm_sol, layernorm, softmax};
 
 #[path = "../../examples/src/bench.rs"]
 mod harness;
@@ -481,6 +481,37 @@ const LAYERNORM_SIZES: &[Shape] = &[
     },
 ];
 
+/// Sizes for `flash_forward`, as `sequence x HEAD x heads`. The head dimension
+/// is the kernel's own 128 and cannot sweep; the sequence and the head count
+/// are what do.
+///
+/// The first two are the operating points #184 published this kernel's
+/// register change against, kept so those numbers and these are the same rows.
+/// Both are under a wave — one CTA per query block per head is 16 and 64 CTAs
+/// against 148 SMs — so they measure a kernel that has the device to itself,
+/// which is the right place to read a change to its inner loop and the wrong
+/// place to read a throughput. The third is the first size past a full wave,
+/// and it is bounded by the *host*: the f64 reference every timed run is
+/// checked against is `heads · sequence² · HEAD` multiply-adds, so a sweep that
+/// kept quadrupling would spend its minutes on the CPU.
+const FLASH_SIZES: &[Shape] = &[
+    Shape {
+        m: 1024,
+        n: 128,
+        k: 2,
+    },
+    Shape {
+        m: 2048,
+        n: 128,
+        k: 4,
+    },
+    Shape {
+        m: 2048,
+        n: 128,
+        k: 16,
+    },
+];
+
 fn cases() -> Vec<Case> {
     #[allow(unused_mut)]
     let mut cases = vec![
@@ -567,6 +598,23 @@ fn cases() -> Vec<Case> {
             bench: layernorm::bench_group,
             baseline: None,
         },
+        Case {
+            name: "flash",
+            bound: Bound::Compute,
+            // The flops the kernel *issues*, which is the denominator it owed
+            // (#85): both MMAs run over every key block of every query block,
+            // so a `[QUERIES, KEYS]` score tile and a `[QUERIES, HEAD]` output
+            // update cost `4 · sequence² · HEAD` a head with the tile
+            // constants cancelled out. The causal half of that is the work
+            // that survives the mask — this kernel does not skip a key block
+            // it will mask away, so the two differ by a shade under 2× and the
+            // table quotes the one that is on the clock.
+            work: |shape| 4.0 * shape.m as f64 * shape.m as f64 * shape.n as f64 * shape.k as f64,
+            sizes: FLASH_SIZES,
+            blocks: |shape| flash_forward::grid(shape.m, shape.k),
+            bench: flash_forward::bench,
+            baseline: None,
+        },
     ];
 
     // `gemm-sol`'s denominator was cuBLASLt and its *numerator* had no control
@@ -614,10 +662,11 @@ fn cases() -> Vec<Case> {
 /// Examples with no row above, and why. There is no path through this file
 /// that times a launch it did not first check — so a missing reference is what
 /// keeps one out, not its speed.
-const SKIPPED: &[(&str, &str)] = &[(
-    "flash_forward",
-    "checked in `examples` but not included in this crate; a timed case owes a causal-FLOP denominator first",
-)];
+///
+/// Empty since `flash_forward` earned a row: it was the last entry here, kept
+/// out first for having no reference and then for owing a denominator, and
+/// #81's exp2 question is what needed it on a clock.
+const SKIPPED: &[(&str, &str)] = &[];
 
 /// The ratio table, and the caveats that make it readable.
 ///
