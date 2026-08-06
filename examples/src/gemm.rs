@@ -33,7 +33,7 @@ use cuda_device::{DisjointSlice, cluster_launch, cuda_module, kernel, launch_con
 
 use std::error::Error;
 
-use kittens::epilogue;
+use kittens::epilogue::{Drain, X4, X8};
 use kittens::global::GlobalRows;
 use kittens::mma::{commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, Job};
@@ -61,11 +61,6 @@ const STAGE_N: usize = 64;
 /// [`STAGE_N`] columns, 4096 B, and nobody else's — which is what keeps the
 /// epilogue's barrier count at zero.
 type StageTile = SharedTile<Bf16, { BaseLdtm::WARP_ROWS }, STAGE_N, Swizzle128B>;
-/// #117's two instruction widths on the drain, both on: `tcgen05.ld.16x256b.x8`
-/// for the TMEM half and `stmatrix.m8n8.x4` for the shared half. The four
-/// combinations are `experiments/`' rungs; this is the one that ships.
-const LDTM_X8: bool = true;
-const STMATRIX_X4: bool = true;
 const RANKS: u32 = 2;
 const PAIR: u16 = ((1u32 << RANKS) - 1) as u16;
 const LEADER: u32 = 0;
@@ -233,9 +228,14 @@ impl Tile {
         }
     }
 
-    /// [`kittens::epilogue::Drain::staged`] over this CTA's tile: the band walk,
-    /// the two instruction widths and the `bar.warp.sync` between passes are
-    /// the library's, and what stays here is where in `C` the tile goes.
+    /// [`Drain::staged`] over this CTA's tile: the band walk and the
+    /// `bar.warp.sync` between passes are the library's, and what stays here is
+    /// where in `C` the tile goes.
+    ///
+    /// `X8` and `X4` are #117's two instruction widths, one per half of the
+    /// drain — `tcgen05.ld.16x256b.x8` reading the band and `stmatrix.m8n8.x4`
+    /// writing it. Both at their wide end is what ships; the four combinations
+    /// are `experiments/`' rungs.
     ///
     /// # Safety
     /// Every thread of the CTA, with the accumulator complete and fenced, and
@@ -244,7 +244,7 @@ impl Tile {
     unsafe fn drain(&self, item: u32) {
         unsafe {
             let (row_base, column_base) = self.origin(item);
-            epilogue::Drain::<LDTM_X8, STMATRIX_X4>::staged(
+            Drain::<X8, X4>::staged(
                 self.accumulator,
                 self.warp_id,
                 self.stage,

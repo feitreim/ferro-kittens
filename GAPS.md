@@ -1015,10 +1015,20 @@ ordered by size. All three have since closed.
   once and has nothing to overlap it with. `StoreRing` stays: #123's
   measurement is `gemm`-shaped and the engine is still the right answer for a
   kernel that stores a whole `[R, C]` box per item.
-  **What did not close**: `gemm_sol`'s drain, which walks sub-bands narrower
-  than its staging tile through `tile_x8_batched` and converges twice a pass.
-  Migrating it is a codegen change on the kernel with the tightest register
-  count in the repo, so it is a measurement rather than a refactor.
+  The two widths started as `bool` const parameters and are now the `TmemRead`
+  and `FragmentStore` rungs — `X1`/`X8`/`X8Batched<ISSUES>` and `X2`/`X4`, unit
+  structs in `Swizzle`'s and `Scope`'s idiom — because neither axis has two
+  rungs and the batched read carries an `ISSUES` count no `bool` can hold. A
+  rung the ISA has and the crate does not is now an impl rather than an arm in
+  the walk and a position in every dial that reaches it.
+  **What did not close**: `gemm_sol`'s drain. `X8Batched` is the rung it reads
+  with and the axes are no longer what separates them; the walk is. It fills a
+  128-wide staging tile out of two 64-wide bands on purpose (four `.x8` issues
+  behind one wait is 176 registers against 96), it drains a column *span* of a
+  wider accumulator because two warpgroups split the tile (#197), and it
+  converges twice a pass. Those are three parameters on the walk, and moving
+  the codegen of the kernel with the tightest register count in the repo is a
+  measurement rather than a refactor.
 - **The band origin — landed (#126).** `32 * warp_id` appeared in every kernel
   in the repo, five times inline in `flash_forward.rs`. The `32` is
   `BaseLdtm::WARP_ROWS` now, and `DRAIN_N = 128` — the widest band a thread can

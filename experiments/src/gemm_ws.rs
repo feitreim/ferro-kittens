@@ -388,7 +388,7 @@ use crate::bench::{Baseline, Shape, Timings, time};
 use crate::gemm::{Scheduler, a_value, b_value, check_c, stage};
 use std::error::Error;
 
-use kittens::epilogue;
+use kittens::epilogue::{Drain, FragmentStore, TmemRead, X1, X2, X4, X8};
 use kittens::global::{GlobalRows, store_rows};
 use kittens::mma::{commit_multicast_cg2, mma_walk_cg2};
 use kittens::pipeline::{self, ClcQueue, Job};
@@ -820,14 +820,14 @@ impl<const STAGES: usize> Tile<STAGES> {
     /// [`STAGED_SHARED_BYTES`] — which is what makes [`Self::stage_tile`]'s
     /// address one this launch owns.
     #[inline(always)]
-    unsafe fn drain_staged<const WIDE: bool, const X4: bool>(&self, item: u32, stage: u32) {
+    unsafe fn drain_staged<R: TmemRead, W: FragmentStore>(&self, item: u32, stage: u32) {
         unsafe {
             let tile = self.stage_tile();
             let accumulator = self.accumulator(stage);
             let (tile_m, tile_n) = pipeline::grouped(item, self.tiles_m, self.tiles_n, self.group);
             let row_base = 2 * BLOCK_M as u32 * tile_m + BLOCK_M as u32 * self.rank;
             let column_base = BLOCK_N as u32 * tile_n;
-            epilogue::Drain::<WIDE, X4>::staged(
+            Drain::<R, W>::staged(
                 accumulator,
                 self.warp_id,
                 tile,
@@ -952,10 +952,10 @@ impl<const STAGES: usize, const DRAIN: u8> Ws<STAGES, DRAIN> {
         unsafe {
             match DRAIN {
                 drain::REGISTER => self.tile.drain(item, stage),
-                drain::STAGED => self.tile.drain_staged::<false, false>(item, stage),
-                drain::STAGED_X8 => self.tile.drain_staged::<true, false>(item, stage),
-                drain::STAGED_X4 => self.tile.drain_staged::<false, true>(item, stage),
-                drain::STAGED_X8_X4 => self.tile.drain_staged::<true, true>(item, stage),
+                drain::STAGED => self.tile.drain_staged::<X1, X2>(item, stage),
+                drain::STAGED_X8 => self.tile.drain_staged::<X8, X2>(item, stage),
+                drain::STAGED_X4 => self.tile.drain_staged::<X1, X4>(item, stage),
+                drain::STAGED_X8_X4 => self.tile.drain_staged::<X8, X4>(item, stage),
                 _ => {}
             }
         }
