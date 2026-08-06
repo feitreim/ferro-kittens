@@ -166,16 +166,21 @@ across the boundary intact, and drain it at the top of the next item — after t
 item's first stages are issued and while they are in flight. The pending item is
 job state, `work` is where the phases are ordered, and `lcsf` is therefore a
 reordering inside a `Job` rather than a stage this scaffold sequences.
-`examples/src/gemm.rs`'s `Lcsf` is one, built against this module unmodified.
+`experiments/src/gemm.rs`'s `Lcsf` is one, built against this module unmodified.
 
-Two obligations move to the job with it, and both are silent when missed:
+Two obligations come with it, and both are silent when missed:
 
 - The drain reads tensor memory the *next* item's MMA will overwrite, so whatever
   rendezvous separates them must cover every CTA that MMA writes — for a
   `cta_group::2` accumulator that is the cluster, not the block, and the item
-  boundary's scope has to appear inside `work` and not only around it.
-- A job that defers its last item's store owes one drain after `run` returns,
-  which is a whole output tile computed by nobody if it is forgotten.
+  boundary's scope has to appear inside `work` and not only around it. That one
+  is the job's, and it lives inside `work`.
+- A job that defers its last item's store owes one drain once the item loop runs
+  out of items, which is a whole output tile computed by nobody if it is
+  forgotten. That one is `Job::finish`'s — empty by default, called by both
+  loops after the last item and before the caller gives its tensor memory back,
+  so no entry point can forget it (#132). It was thirteen hand-written calls
+  before there was a hook to put it on.
 
 What that buys is a separate question from whether it can be expressed, and for
 the GEMM the answer is nothing — `experiments/README.md` §7 has the two sessions
