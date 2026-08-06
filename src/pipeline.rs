@@ -142,8 +142,9 @@ pub trait Job {
     /// Whatever the job's last item still owes, once there is no next item to
     /// overlap it with. Called by [`run`] and [`run_stealing`] after their item
     /// loops, by every thread that called them, exactly once — including in a
-    /// cluster that got no items at all, which owes nothing and is why the
-    /// default is empty.
+    /// cluster the schedule gave no items to, which a job that defers has to
+    /// answer for itself and both of this repo's do with a sentinel. The default
+    /// is empty, so a job that defers nothing pays nothing for the hook.
     ///
     /// A job that defers its last item's store — see this trait's own doc, and
     /// `Lcsf` in `experiments/` — owes one drain here, and it is a whole output
