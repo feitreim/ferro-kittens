@@ -714,16 +714,22 @@ pub unsafe fn store_shared_rows<
     };
     unsafe {
         match access_width(dest, column) {
-            CHUNK_BYTES => drain_in_accesses::<CHUNK_BYTES, E, R, C, S, THREADS>(
+            AccessWidth::Bytes16 => drain_in_accesses::<CHUNK_BYTES, E, R, C, S, THREADS>(
                 dest, row, column, thread, tile,
             ),
-            8 => drain_in_accesses::<8, E, R, C, S, THREADS>(dest, row, column, thread, tile),
+            AccessWidth::Bytes8 => {
+                drain_in_accesses::<8, E, R, C, S, THREADS>(dest, row, column, thread, tile)
+            }
+            AccessWidth::Bytes4 => {
+                drain_in_accesses::<4, E, R, C, S, THREADS>(dest, row, column, thread, tile)
+            }
             // Const-false at a 4-byte element, which is what keeps this arm
             // from being emitted for one: `access_width` cannot return 2 there.
-            2 if E::BYTES == 2 => {
-                drain_in_accesses::<2, E, R, C, S, THREADS>(dest, row, column, thread, tile)
+            AccessWidth::Bytes2 => {
+                if E::BYTES == 2 {
+                    drain_in_accesses::<2, E, R, C, S, THREADS>(dest, row, column, thread, tile)
+                }
             }
-            _ => drain_in_accesses::<4, E, R, C, S, THREADS>(dest, row, column, thread, tile),
         }
     }
 }
@@ -789,48 +795,84 @@ pub unsafe fn accumulate_shared_rows<
     };
     unsafe {
         match access_width(dest, column) {
-            CHUNK_BYTES => fold_in_accesses::<CHUNK_BYTES, E, R, C, S, THREADS>(
+            AccessWidth::Bytes16 => fold_in_accesses::<CHUNK_BYTES, E, R, C, S, THREADS>(
                 dest, row, column, thread, tile,
             ),
-            8 => fold_in_accesses::<8, E, R, C, S, THREADS>(dest, row, column, thread, tile),
-            2 if E::BYTES == 2 => {
-                fold_in_accesses::<2, E, R, C, S, THREADS>(dest, row, column, thread, tile)
+            AccessWidth::Bytes8 => {
+                fold_in_accesses::<8, E, R, C, S, THREADS>(dest, row, column, thread, tile)
             }
-            _ => fold_in_accesses::<4, E, R, C, S, THREADS>(dest, row, column, thread, tile),
+            AccessWidth::Bytes4 => {
+                fold_in_accesses::<4, E, R, C, S, THREADS>(dest, row, column, thread, tile)
+            }
+            AccessWidth::Bytes2 => {
+                if E::BYTES == 2 {
+                    fold_in_accesses::<2, E, R, C, S, THREADS>(dest, row, column, thread, tile)
+                }
+            }
         }
     }
 }
 
-/// Bytes per access the ladder settles on for this cursor and column origin —
+/// A rung of the staged drain's access ladder: the bytes one shared-to-global
+/// access moves.
+///
+/// The set is closed and it is a type rather than a `usize` because the two
+/// drains dispatch on it and nothing else may: [`store_shared_rows`] and
+/// [`accumulate_shared_rows`] match every rung by name, so a rung added here is
+/// a compile error at both of them instead of silently arriving at whichever
+/// arm a wildcard left standing. The discriminants are the byte counts, which
+/// is what [`AccessWidth::bytes`] reads back for a caller doing arithmetic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(usize)]
+pub enum AccessWidth {
+    /// `st.global.v4.b32` — one whole 16-byte chunk per access.
+    Bytes16 = CHUNK_BYTES,
+    /// `st.global.v2.b32`.
+    Bytes8 = 8,
+    /// One word, and the bottom rung of a 4-byte element.
+    Bytes4 = 4,
+    /// One 2-byte element, reachable only when `E` is one.
+    Bytes2 = 2,
+}
+
+impl AccessWidth {
+    /// The rung as a byte count.
+    pub const fn bytes(self) -> usize {
+        self as usize
+    }
+}
+
+/// The access width the ladder settles on for this cursor and column origin —
 /// the whole of [`store_shared_rows`]' width decision, as a pure function.
 ///
 /// Descends 16, 8, 4, `E::BYTES`, each rung a [`GlobalRows::runs_aligned`] at
 /// the run of elements that width is worth. The bottom rung is the element and
 /// not a fixed 2 bytes, so the ladder always terminates: a cursor is aligned for
 /// its own element by [`GlobalRows::from_raw`]'s contract. At fp32 that rung
-/// *is* the 4-byte one and 2 is never returned.
+/// *is* the 4-byte one and [`AccessWidth::Bytes2`] is never returned.
 ///
 /// ```
-/// use kittens::global::{GlobalRows, access_width};
+/// use kittens::global::{AccessWidth, GlobalRows, access_width};
 /// use kittens::shared::Bf16;
 ///
 /// // A bf16 `C` at a leading dimension of 208, one column origin per rung.
 /// let ldc = |column| unsafe {
 ///     access_width(GlobalRows::<Bf16>::from_raw(0x7f00_0000usize as *mut u8, 208), column)
 /// };
-/// assert_eq!(ldc(64), 16);
-/// assert_eq!(ldc(68), 8);
-/// assert_eq!(ldc(65), 2);
+/// assert_eq!(ldc(64), AccessWidth::Bytes16);
+/// assert_eq!(ldc(68), AccessWidth::Bytes8);
+/// assert_eq!(ldc(65), AccessWidth::Bytes2);
+/// assert_eq!(ldc(64).bytes(), 16);
 /// ```
-pub fn access_width<E: Element>(dest: GlobalRows<E>, column: u32) -> usize {
+pub fn access_width<E: Element>(dest: GlobalRows<E>, column: u32) -> AccessWidth {
     if dest.runs_aligned(column, CHUNK_BYTES / E::BYTES) {
-        CHUNK_BYTES
+        AccessWidth::Bytes16
     } else if dest.runs_aligned(column, 8 / E::BYTES) {
-        8
+        AccessWidth::Bytes8
     } else if E::BYTES == 2 && !dest.runs_aligned(column, 2) {
-        2
+        AccessWidth::Bytes2
     } else {
-        4
+        AccessWidth::Bytes4
     }
 }
 
@@ -1435,36 +1477,37 @@ mod drain_tests {
     /// carry a 16-byte store gets an 8-byte one, and so down to the element.
     #[test]
     fn the_ladder_takes_the_widest_access_the_cursor_admits() {
-        assert_eq!(access_width(bf16(PITCH), 64), 16);
-        assert_eq!(access_width(bf16(PITCH), 68), 8);
-        assert_eq!(access_width(bf16(PITCH), 66), 4);
-        assert_eq!(access_width(bf16(PITCH), 65), 2);
+        assert_eq!(access_width(bf16(PITCH), 64), AccessWidth::Bytes16);
+        assert_eq!(access_width(bf16(PITCH), 68), AccessWidth::Bytes8);
+        assert_eq!(access_width(bf16(PITCH), 66), AccessWidth::Bytes4);
+        assert_eq!(access_width(bf16(PITCH), 65), AccessWidth::Bytes2);
         // The stride is the other term that shifts every row at once: an odd
         // leading dimension flips the parity per row and costs everything.
-        assert_eq!(access_width(bf16(PITCH + 1), 64), 2);
+        assert_eq!(access_width(bf16(PITCH + 1), 64), AccessWidth::Bytes2);
         // And an even stride stops the ladder wherever the row it lands on
         // stops it: 212 bf16 is 424 bytes, which carries an 8-byte access to
         // every row and a 16-byte one only to the first.
-        assert_eq!(access_width(bf16(212), 64), 8);
-        assert_eq!(access_width(bf16(210), 64), 4);
+        assert_eq!(access_width(bf16(212), 64), AccessWidth::Bytes8);
+        assert_eq!(access_width(bf16(210), 64), AccessWidth::Bytes4);
     }
 
     /// **fp32 has no bottom rung to reach**, which is not the obvious result:
     /// a cursor is aligned for its own element by contract, so a 4-byte access
     /// is legal at every column a 4-byte element names and the 2-byte rung is
-    /// unreachable. That is what the `E::BYTES == 2` guard in
-    /// [`store_shared_rows`] spends — the arm is not emitted at fp32 at all.
+    /// unreachable. That is what the `E::BYTES == 2` test inside
+    /// [`store_shared_rows`]' [`AccessWidth::Bytes2`] arm spends — const-false
+    /// at a 4-byte element, so the arm is not emitted at fp32 at all.
     #[test]
     fn a_four_byte_element_never_descends_below_its_own_width() {
         let f32s = |stride, column| {
             access_width(unsafe { GlobalRows::<F32>::from_raw(BASE, stride) }, column)
         };
-        assert_eq!(f32s(PITCH, 64), 16);
+        assert_eq!(f32s(PITCH, 64), AccessWidth::Bytes16);
         for column in [65u32, 66, 67, 68] {
-            assert!(f32s(PITCH, column) >= 4, "column {column}");
+            assert_ne!(f32s(PITCH, column), AccessWidth::Bytes2, "column {column}");
         }
         for stride in [PITCH + 1, PITCH + 2, PITCH + 3] {
-            assert!(f32s(stride, 64) >= 4, "stride {stride}");
+            assert_ne!(f32s(stride, 64), AccessWidth::Bytes2, "stride {stride}");
         }
     }
 

@@ -129,8 +129,10 @@ pub const fn pair_shape(m: usize, n: usize) -> MmaShape {
 ///
 /// The accumulator stays fp32 because [`TmemTile`] is an fp32 segment and
 /// carries no element to read one off; fp16 accumulation is a `.kind::f16`-only
-/// mode no kernel here uses, and threading a typed accumulator through belongs
-/// with whatever gives [`TmemTile`] an element (#128 deliberately did not).
+/// mode no kernel here uses. #203 closed #128 by typing the walks' accumulator
+/// *address* and stopping there, on purpose, so an accumulator element type is
+/// something nothing in the tree owns and no issue asks for — this field is a
+/// constant, not a parameter someone forgot to thread.
 #[inline(always)]
 fn descriptor<E: MmaElement>(shape: MmaShape, transpose_a: bool, transpose_b: bool) -> u32 {
     Tcgen05InstructionDescriptor::builder()
