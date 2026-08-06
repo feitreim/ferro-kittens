@@ -19,13 +19,19 @@
 //! accesses rather than a matrix instruction: a [`ColVec`]'s values are one
 //! element each at columns no `ldmatrix` shape describes.
 //!
+//! [`load_row_vec`] and [`store_row_vec`] are the same pair on the other axis,
+//! and are not that one transposed — see [`store_row_vec`] for why a column is
+//! a broadcast and a row is a scatter.
+//!
 //! Design notes and measurements: `docs/library/ldst.md`.
 
 use cuda_device::ptx_asm;
 use cuda_device::thread::__unroll_config;
 use cuda_device::wmma::ldmatrix_x2;
 
-use crate::reg::{BaseLdtm, ColLayout, ColVec, Fragment, FragmentLayout, RegTile};
+use crate::reg::{
+    BaseLdtm, ColLayout, ColVec, Fragment, FragmentLayout, RegTile, RegVec, RowLayout,
+};
 use crate::shared::{Element, SharedVec, SwizzledChunks};
 use crate::tmem::{place_block, take_block};
 
@@ -547,6 +553,89 @@ pub unsafe fn store_vec<E: Element, const N: usize, L: ColLayout<N>>(
     }
 }
 
+/// Stage a [`RegVec`] in shared memory: one element per logical row, at the
+/// index [`RowLayout::row_of`] names it.
+///
+/// The way a per-row statistic leaves the warp that computed it — an attention
+/// block's running max or log-sum-exp, a normalization's mean and inverse
+/// deviation. Without it a statistic that has to cross a warp goes through
+/// [`crate::sync::block_reduce`], which folds it to a scalar, or is recomputed.
+///
+/// **Not [`store_vec`] transposed.** Under [`BaseLdtm`] a column depends only
+/// on `lane % 4`, so a [`ColVec`]'s store is eight lanes issuing one address; a
+/// row depends on `lane / 4`, so this is a scatter of `L::SLOTS` elements per
+/// lane, 8 rows apart, with no run to widen. Only the lanes
+/// [`RowLayout::owns_row`] names write — the other three of each quad hold the
+/// same value, and every replica storing would be several threads writing one
+/// address, which is idempotent and still not a single writer.
+///
+/// The global twin is [`crate::global::store_row_vec`], the same scatter down
+/// one column of a `[rows, heads]` buffer.
+///
+/// ```no_run
+/// # use kittens::ldst::store_row_vec;
+/// # use kittens::shared::{F32, SharedVec};
+/// # use kittens::{BaseLdtm, RegVec, lane};
+/// # unsafe fn demo(lse: SharedVec<F32, 32>, running_sum: RegVec<32, BaseLdtm>) {
+/// unsafe { store_row_vec(lse, lane(), running_sum.log2()) };
+/// # }
+/// ```
+///
+/// # Safety
+///
+/// Every lane passing the layout's [`RowLayout::owns_row`] test must call this,
+/// or the rows only that lane writes stay unwritten, and the caller owes a
+/// [`crate::shared::publish_to_async_proxy`] before the TMA engine reads the
+/// vector.
+#[inline(always)]
+pub unsafe fn store_row_vec<E: Element, const M: usize, L: RowLayout<M>>(
+    vec: SharedVec<E, M>,
+    lane: u32,
+    rows: RegVec<M, L>,
+) {
+    unsafe {
+        if !L::owns_row(lane) {
+            return;
+        }
+        let mut slot = 0usize;
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
+            vec.set(L::row_of(lane, slot) as usize, rows.get(slot));
+            slot += 1;
+        }
+    }
+}
+
+/// The inverse of [`store_row_vec`]: a per-row bias, or another warp's
+/// statistic, read back over the addresses that wrote it.
+///
+/// Every lane loads, including the replicas [`RowLayout::owns_row`] rejects for
+/// the store: a [`RegVec`] is *defined* as one copy per lane holding the row, so
+/// the reads that look redundant are what makes the vector well-formed. The
+/// four lanes of a quad issue the same address and shared memory answers them
+/// from one bank read, exactly as [`load_vec`]'s eight do.
+///
+/// # Safety
+///
+/// The vector's bytes must already be visible to the generic proxy (a TMA load
+/// needs its barrier waited on, another warp's [`store_row_vec`] a barrier).
+#[inline(always)]
+pub unsafe fn load_row_vec<E: Element, const M: usize, L: RowLayout<M>>(
+    vec: SharedVec<E, M>,
+    lane: u32,
+) -> RegVec<M, L> {
+    unsafe {
+        let mut rows = RegVec::<M, L>::splat(0.0);
+        let mut slot = 0usize;
+        while slot < const { L::SLOTS } {
+            __unroll_config::<0>();
+            rows.set(slot, vec.get(L::row_of(lane, slot) as usize));
+            slot += 1;
+        }
+        rows
+    }
+}
+
 /// Store two packed b16 matrix fragments (`stmatrix.sync.aligned.m8n8.x2`),
 /// written as inline PTX because cuda-oxide's stmatrix declaration does not
 /// resolve for `sm_100a`.
@@ -600,6 +689,59 @@ mod tests {
     use super::*;
     use crate::reg::{BaseLdtm, ColLayout, RowLayout};
     use crate::shared::{Bf16, F32, SharedTile, Swizzle128B};
+
+    /// `F32`'s reads and writes are plain pointer accesses, so the scatter runs
+    /// on the host: the owning lanes between them fill the vector, each row
+    /// carries the `(lane, slot)` that wrote it, and every lane of a quad —
+    /// owner and replicas alike — reads its own rows back.
+    ///
+    /// The device case `shared row statistic` is the same claim where the
+    /// addresses are shared memory's.
+    #[test]
+    fn a_row_statistic_scatters_to_the_rows_the_map_names() {
+        fn round_trip<const M: usize>()
+        where
+            BaseLdtm: RowLayout<M>,
+        {
+            let slots = <BaseLdtm as RowLayout<M>>::SLOTS;
+            // Nothing an owner writes, so a row no lane claimed stays visible.
+            let mut staging = vec![-1.0f32; M];
+            let vec = unsafe { SharedVec::<F32, M>::from_raw(staging.as_mut_ptr().cast()) };
+
+            for lane in 0..32u32 {
+                let mut rows = RegVec::<M, BaseLdtm>::splat(0.0);
+                for slot in 0..slots {
+                    rows.set(slot, (32 * slot + lane as usize) as f32);
+                }
+                unsafe { store_row_vec(vec, lane, rows) };
+            }
+
+            for (row, &value) in staging.iter().enumerate() {
+                // The one lane of the quad that owns this row, and the slot it
+                // holds it in.
+                let (lane, slot) = (0..32u32)
+                    .filter(|&lane| <BaseLdtm as RowLayout<M>>::owns_row(lane))
+                    .flat_map(|lane| (0..slots).map(move |slot| (lane, slot)))
+                    .find(|&(lane, slot)| {
+                        <BaseLdtm as RowLayout<M>>::row_of(lane, slot) as usize == row
+                    })
+                    .expect("every row of the band has an owner");
+                assert_eq!(value, (32 * slot + lane as usize) as f32, "row {row}");
+            }
+
+            // Every lane reads, replicas included: the four lanes of a quad
+            // come back with the value their owner wrote.
+            for lane in 0..32u32 {
+                let read: RegVec<M, BaseLdtm> = unsafe { load_row_vec(vec, lane) };
+                for slot in 0..slots {
+                    assert_eq!(read.get(slot), (32 * slot + (lane & !3) as usize) as f32);
+                }
+            }
+        }
+        round_trip::<16>();
+        round_trip::<32>();
+        round_trip::<128>();
+    }
 
     /// The accesses a warp's [`scatter_tile`] forms are exactly the tile's
     /// `[M, N]` band, each byte written once — which is the whole of its

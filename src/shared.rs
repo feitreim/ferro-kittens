@@ -1478,6 +1478,40 @@ impl<E: Element, const N: usize> SharedVec<E, N> {
         unsafe { self.base.add(index * E::BYTES) }
     }
 
+    /// The `LEN` elements from `start`, as a vector in its own right — a base
+    /// address and nothing else, because a vector is flat and unswizzled and
+    /// has no phase for an offset to disturb.
+    ///
+    /// What a chunked walk over a parameter vector takes: [`crate::ldst::load_vec`]
+    /// reads a whole [`SharedVec`], so a band `LEN` columns wide asks for the
+    /// `LEN` elements its columns index rather than for the vector the kernel
+    /// staged.
+    ///
+    /// `LEN <= N` is a post-monomorphization assert, so a slice wider than the
+    /// vector fails at codegen. Where it *starts* is a runtime cursor and stays
+    /// the caller's, exactly as [`Self::at`]'s index is.
+    ///
+    /// ```no_run
+    /// # use kittens::shared::{Bf16, SharedVec};
+    /// # unsafe fn demo(gamma: SharedVec<Bf16, 128>, column: usize) {
+    /// let chunk: SharedVec<Bf16, 16> = unsafe { gamma.slice(column) };
+    /// # }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// - `start + LEN <= N`.
+    #[inline(always)]
+    pub const unsafe fn slice<const LEN: usize>(self, start: usize) -> SharedVec<E, LEN> {
+        const {
+            assert!(
+                LEN <= N,
+                "a slice is no longer than the vector it comes from"
+            )
+        };
+        unsafe { SharedVec::from_raw(self.at(start)) }
+    }
+
     /// Element `index` widened to the fp32 a register holds.
     ///
     /// # Safety
@@ -1896,6 +1930,26 @@ mod tests {
         assert_eq!(SharedVec::<Bf16, 4>::BYTES, 8);
         let narrow = [0u16; 4];
         let _ = unsafe { SharedVec::<Bf16, 4>::from_raw(narrow.as_ptr() as *mut u8) };
+    }
+
+    #[test]
+    fn a_slice_is_the_base_address_and_nothing_else() {
+        // A chunked walk over a parameter vector: every window addresses the
+        // elements the whole vector does, at the offset it was cut from, and
+        // the type it arrives in is the one `load_vec` reads.
+        const CHUNK: usize = 4;
+        let parameters: Vec<f32> = (0..16).map(|value| value as f32).collect();
+        let whole = unsafe { SharedVec::<F32, 16>::from_raw(parameters.as_ptr() as *mut u8) };
+        for start in (0..16).step_by(CHUNK) {
+            let chunk: SharedVec<F32, CHUNK> = unsafe { whole.slice(start) };
+            assert_eq!(chunk.base(), unsafe { whole.at(start) });
+            for index in 0..CHUNK {
+                assert_eq!(unsafe { chunk.get(index) }, (start + index) as f32);
+            }
+        }
+        // A narrowing slice keeps the element type's stride, so the length is
+        // the only thing that changed.
+        assert_eq!(SharedVec::<F32, CHUNK>::BYTES, CHUNK * 4);
     }
 
     #[test]

@@ -62,7 +62,6 @@ type Chunk = RegTile<32, CHUNK, BaseLdtm>;
 type Rows = RegVec<32, BaseLdtm>;
 type Columns = ColVec<CHUNK, BaseLdtm>;
 type Parameters = SharedVec<Bf16, COLUMNS>;
-type ParameterChunk = SharedVec<Bf16, CHUNK>;
 /// fp32 and not bf16: a partial rounded on its way through shared memory would
 /// cost the sum eight bits, and the variance pass would inherit the error.
 type Partials = SharedVec<F32, WARPS>;
@@ -202,9 +201,8 @@ pub mod kernels {
             while chunk < CHUNKS {
                 let column = (CHUNK * chunk) as u32;
                 let x: Chunk = load_tile(chunks, row_base, column, lane);
-                let g: Columns =
-                    load_vec(ParameterChunk::from_raw(gamma.at(column as usize)), lane);
-                let b: Columns = load_vec(ParameterChunk::from_raw(beta.at(column as usize)), lane);
+                let g: Columns = load_vec(gamma.slice::<CHUNK>(column as usize), lane);
+                let b: Columns = load_vec(beta.slice::<CHUNK>(column as usize), lane);
                 let x = x.sub_row(mean).mul_row(deviation).mul_col(g).add_col(b);
                 store_tile(chunks, row_base, column, lane, x);
                 chunk += 1;

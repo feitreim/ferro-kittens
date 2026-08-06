@@ -348,6 +348,23 @@ the width of a TMA box, and an unswizzled vector wants neither:
 subtile), and `SharedTile<Bf16, 1, 64, Swizzle128B>` spends 128 bytes on its
 single row where `SharedVec<Bf16, 32>` spends 64.
 
+### A slice of one is a base address
+
+`SharedVec::slice::<LEN>(start)` adds `start * E::BYTES` and narrows the length
+in the type. That is the whole of it, and it is this section's own fact read
+forwards: with no swizzle phase and no subtile stride there is nothing for an
+offset to disturb, so a window into a vector is a vector.
+
+`LEN <= N` is a post-monomorphization assert and so fires at codegen, not on a
+device. Where the window *starts* is a runtime cursor and stays the caller's,
+exactly as `at`'s index is — a chunked walk's start is a loop variable, and
+making it a const parameter would decide the shape of every caller's loop to
+buy an assertion the length already carries.
+
+`layernorm_rows` is the caller: it walks `gamma` and `beta` a `CHUNK` at a time
+because `load_vec` reads a whole vector, and it used to say so with a type alias
+and an `at()` → `from_raw()` pair that existed for nothing else.
+
 Adding a `SwizzleNone` mode is a *different* job, left open. It owns **tiles**
 under narrower and absent swizzles: an unswizzled `[R, C]` staging tile does
 need a `Swizzle` impl, and it needs `ATOM_BYTES` to stop meaning "box width"
