@@ -110,6 +110,18 @@
 //!   memory was not the lever. Every one of those four answers was the allocator
 //!   pinning the query. It is the only lever that kernel has.
 //!
+//! # And four rungs that locate the shared-memory step itself (#85)
+//!
+//! Every rung above declares an envelope some kernel has. [`THRESHOLD_PLANS`]
+//! declares four nobody has, 1 KiB apart around half of the SM's 233472 B,
+//! because the number #85 has to design `flash_forward`'s ring against is the
+//! plan at which a second CTA stops being admitted — and what this census had
+//! established about it was only that it lies between 73768 B (counts 2) and
+//! 147536 B (counts 1). [`located_step`] narrows that to an interval and
+//! prints it. Those rungs are the one place here where a count is reported
+//! rather than asserted, since a step that is not where the arithmetic puts it
+//! is the finding.
+//!
 //! # And three rungs that exist to be a control for something else (#98)
 //!
 //! `gemm`'s plan and the same plan with 8192 and 49152 dead bytes on the end
@@ -248,6 +260,36 @@ const WS_SHARED: u32 = 131_176;
 /// this file counts rather than a `min` this file computes.
 const WS_SHARED_STAGED: u32 = 147_584;
 
+/// Shared plans that bracket the **two-CTAs-an-SM step** (#85), 1 KiB apart
+/// around half of the SM's 233472 B.
+///
+/// #85 needs a plan under 116736 B for `flash_forward` to reach two CTAs an SM,
+/// and 116736 is arithmetic: half the SM, from a census that only ever
+/// bracketed the step between 73768 B (counts 2) and 147536 B (counts 1). Two
+/// things could move it and neither is visible from the host — the driver
+/// reserves a slice of an SM's shared memory per CTA, and it rounds a plan up
+/// to an allocation granularity — and both push the step *down*. So the ladder
+/// is three rungs at and under the arithmetic value and one above it, which is
+/// the positive control: the step has to be somewhere, and a ladder that counts
+/// 2 at every rung has located nothing.
+///
+/// They carry no allocator. Tensor memory would admit 2 at 256 columns and 4 at
+/// 128, so an allocating rung here would be counting the `min` of two terms at
+/// the exact point where one of them is what is being located.
+const THRESHOLD_PLANS: [(&str, u32); 4] = [
+    ("shared half - 2 KiB", HALF_SHARED_PER_SM - 2048),
+    ("shared half - 1 KiB", HALF_SHARED_PER_SM - 1024),
+    ("shared half (#85)", HALF_SHARED_PER_SM),
+    ("shared half + 1 KiB", HALF_SHARED_PER_SM + 1024),
+];
+
+/// Half of a B200's 233472 B of shared memory an SM, which is where #85 puts
+/// the two-CTA threshold by arithmetic. Written down rather than derived from
+/// the device's own attribute because [`THRESHOLD_PLANS`] has to be a *fixed*
+/// ladder — a rung that moved with the device would not be the number #85
+/// designs against — and [`located_step`] says so when the device disagrees.
+const HALF_SHARED_PER_SM: u32 = 116_736;
+
 /// How far the achieved hold may sit under [`HOLD_NS`] before the harness
 /// calls the spin broken rather than the residency low. A CTA that exited on
 /// [`CENSUS_SPIN_GUARD`](crate::CENSUS_SPIN_GUARD) instead of on the clock
@@ -276,6 +318,11 @@ struct Rung {
     /// is the *other* per-CTA resource an SM divides, and a rung can be used to
     /// ask which of the two binds first.
     shared: u32,
+    /// Whether this rung is here to *locate* the shared-memory step
+    /// ([`THRESHOLD_PLANS`]) rather than to confirm the model at an envelope
+    /// some kernel declares. What it counts is the finding, so it is reported
+    /// and not asserted against: [`Measured::budget`] is `None` for these.
+    bisects: bool,
 }
 
 /// What one rung's census came to.
@@ -285,6 +332,7 @@ struct Measured {
     ranks: u32,
     holds: bool,
     shared: u32,
+    bisects: bool,
     /// CTAs an SM the driver predicts for this same loaded function.
     predicted: f64,
     /// SMs that ran at least one CTA of this rung.
@@ -308,8 +356,12 @@ impl Measured {
     /// `None` where neither resource is doing anything — a rung holding no
     /// columns and declaring a token shared plan is bounded only by warp slots
     /// and by the grid, which are not what this file is about and not stable
-    /// enough to assert.
+    /// enough to assert — and `None` for a rung that bisects the step, whose
+    /// whole job is to say where this arithmetic stops holding.
     fn budget(&self, shared_per_sm: u32) -> Option<usize> {
+        if self.bisects {
+            return None;
+        }
         let tmem = match (self.holds, self.columns) {
             (true, Some(columns)) => Some(512 / columns as usize),
             _ => None,
@@ -338,6 +390,7 @@ fn rungs() -> Vec<Rung> {
                 ranks: $ranks,
                 holds: $holds,
                 shared: $shared,
+                bisects: false,
             }
         };
     }
@@ -531,6 +584,17 @@ fn rungs() -> Vec<Rung> {
             WS_SHARED_STAGED
         ),
     ]
+    .into_iter()
+    .chain(THRESHOLD_PLANS.map(|(name, shared)| Rung {
+        name,
+        entry: <kernels::__residency_census_none_CudaKernel as CudaKernel>::PTX_NAME,
+        columns: None,
+        ranks: 1,
+        holds: false,
+        shared,
+        bisects: true,
+    }))
+    .collect()
 }
 
 /// What the *driver* predicts for this rung, in CTAs per SM, so the table can
@@ -709,6 +773,7 @@ fn tally(rung: &Rung, predicted: f64, rows: &[u64]) -> Result<Measured, Box<dyn 
         ranks: rung.ranks,
         holds: rung.holds,
         shared: rung.shared,
+        bisects: rung.bisects,
         predicted,
         sms,
         resident,
@@ -841,7 +906,47 @@ fn verdict(measured: &[Measured], shared_per_sm: u32) -> Result<String, Box<dyn 
             plan_only.shared, plan_only.holding, envelope.holding
         )
     };
-    Ok(format!("{tcgen05} {flash}"))
+    Ok(format!("{tcgen05} {flash} {}", located_step(measured)))
+}
+
+/// Where the two-CTAs-an-SM shared-memory step landed, from the
+/// [`THRESHOLD_PLANS`] rungs — #85 step 2.
+///
+/// Reported and not asserted, and that is the point of the rungs: the number
+/// #85 has to design against is the one this locates, so a rung of the ladder
+/// counting something other than the arithmetic is the finding rather than a
+/// failure. What it *cannot* do is say nothing — a ladder whose every rung
+/// counts 2, or whose every rung counts 1, has located no step and says so.
+fn located_step(measured: &[Measured]) -> String {
+    let plans = |wanted: bool| {
+        measured
+            .iter()
+            .filter(move |row| row.bisects && (row.resident >= 2) == wanted)
+            .map(|row| row.shared)
+    };
+    let (fits, capped) = (plans(true).max(), plans(false).min());
+    let arithmetic = HALF_SHARED_PER_SM;
+    match (fits, capped) {
+        (Some(fits), Some(capped)) => format!(
+            "The two-CTA shared step (#85) is in [{fits}, {capped}): {fits} B counts 2 and \
+             {capped} B counts 1, so a plan reaching two CTAs an SM has to come in at or under \
+             {fits} B — {} the {arithmetic} B half of the SM #85 does the arithmetic at. \
+             flash_forward's 147536 B is {} B over it.",
+            if fits >= arithmetic {
+                "which is"
+            } else {
+                "under"
+            },
+            FLASH_SHARED - fits
+        ),
+        _ => format!(
+            "The step-bisecting rungs located nothing: every one of them counted {}. They are \
+             spaced around {arithmetic} B, half of a B200's 233472 B an SM, so on a device with \
+             another amount of shared memory they bracket the wrong number and #85's threshold \
+             is unmeasured here.",
+            if fits.is_some() { "2 or more" } else { "1" }
+        ),
+    }
 }
 
 fn table(measured: &[Measured], blocks: u32, sms: u32, shared_per_sm: u32) -> String {

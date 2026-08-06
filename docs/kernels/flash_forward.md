@@ -9,10 +9,12 @@ three panel maps.
 ## Status
 
 **Runs**, checked against an f64 causal reference by `flash_forward::check` —
-worst relative error **1.66e-3** over two heads and four key blocks. Earning
-that word cost this kernel its second real bug: the epilogue's output cursor
-dropped the head term, so every head wrote query block *x*'s rows of the same
-panel, and the first checked run failed 50,885 of 65,536 outputs (see below).
+worst relative error **1.66e-3** over two heads and four key blocks — and
+**timed**, since #81, by `bench --case flash` in `experiments/`, which checks
+every size it times. Earning the first word cost this kernel its second real
+bug: the epilogue's output cursor dropped the head term, so every head wrote
+query block *x*'s rows of the same panel, and the first checked run failed
+50,885 of 65,536 outputs (see below).
 The first bug was #175's band overwrite, found by inspection; both lived here
 exactly as long as nothing compared `O` to a known-good answer.
 
@@ -51,8 +53,14 @@ The measurements below were taken at 147 536, before the plan reserved the
 144 KiB decides nothing here, and the numbers are left as they were taken.
 
 Two thirds of the plan is the pipeline — `STAGES` deep over both `K` and `V` at
-16 384 B a stage a side. Dropping to two stages would save 32 768 B, **and it
-buys nothing.**
+16 384 B a stage a side. Dropping to two stages would save 32 768 B, and **that
+is the one lever this kernel has**: it is the only change on the table large
+enough to put the plan under the step where a second CTA is admitted. It used
+to say here that it buys nothing, on #70's reading that shared memory was not
+what capped this kernel — see the two sections below, which is where that went
+wrong and what replaced it. Nobody has priced the shorter ring yet, and the
+harness that would price it (a launcher, a CPU reference, and a row on the
+clock) exists only since #182 and this file's `flash` bench case.
 
 ## The `0` blocks/SM this used to report was the query, not the plan
 
@@ -66,46 +74,81 @@ On a B200 the same function at the same 147 536 B goes **0 → 1** across a sing
 `kittens::launch::admit_shared_plan` call, with the device's own ceiling at
 232 448 B — **84 912 B of headroom under a plan that was never too large**.
 
-## The `1` is tcgen05, and it is not this kernel's fault
+## The `1` is the shared plan, and every query that said otherwise was pinned
 
-Swept on a freshly loaded function per probe, this kernel answers **1 block/SM
+Swept on a freshly loaded function per probe, this kernel *answers* **1 block/SM
 at 147 536 B, at 73 792, at 32 800, and at 0** — flat, and flat across block
 widths of 32, 64, 128 and 256, where `softmax` goes 28/14/7/3 and `layernorm`
-8/4/2/1. A ceiling that ignores both shared memory and warp count is a *per-CTA*
-resource, and the one this kernel holds that neither control does is tensor
-memory.
+8/4/2/1. That was read as a per-CTA resource ignoring both shared memory and
+warp count, and the only such resource this kernel holds is tensor memory. A
+control agreed: `device-tests`' `tmem occupancy ladder`, a nine-register kernel
+whose entire content is `tcgen05.alloc`, answers 1 at every column count and
+every block width against 32/32/16/8 for the byte-identical kernel with the
+allocator deleted.
 
-That was a correlation over a sample of one until the control was built:
-`device-tests`' `tmem occupancy ladder`, a nine-register kernel whose entire
-content is `tcgen05.alloc`, against the byte-identical kernel with the allocator
-deleted. On a B200, blocks/SM at zero dynamic shared:
+**All of that is a fact about `cuOccupancyMaxActiveBlocksPerMultiprocessor`,
+and #84 measured the hardware instead.** `device-tests`' `tmem residency census`
+counts CTAs an SM directly — every CTA writes down its `%smid` and timestamps
+both ends of its allocation off `%globaltimer` — and what it counts is
+`min(512 / columns, shared per SM / plan)`, exactly, at every rung. A CTA is
+charged the columns it asks for and not the SM's whole tensor memory:
 
-| rung | 32 | 64 | 128 | 256 threads |
-| --- | --- | --- | --- | --- |
-| no tcgen05 | 32 | 32 | 16 | 8 |
-| `alloc` 32 columns | 1 | 1 | 1 | 1 |
-| `alloc` 64 / 128 / 192 / 256 / 512 | 1 | 1 | 1 | 1 |
+| resource | this kernel's value | CTAs an SM it admits |
+| --- | ---: | ---: |
+| TMEM columns | 256 | 2 |
+| dynamic shared | 147 536 B | **1** |
+| both together | | **1** (counted) |
 
-**The guess was right and its obvious remedy is wrong.** A CTA that touches the
-allocator is charged the SM's *whole* tensor memory — the smallest allocation
-the ISA defines costs exactly what the largest does. The 192 rung takes its
-column count as a *kernel argument*, so the driver is not reading a number
-`ptxas` recorded; it is pricing the allocator itself. And this kernel confirms it
-directly: cut to 32 columns and re-queried, it still answers 1.
+So the 1 CTA/SM is **real**, and shared memory alone causes it — the rung
+carrying this plan with *no allocator in the kernel at all* counts 1 too, which
+is what isolates it. #70 queried this kernel's occupancy at 147 536, 73 792,
+32 800 and 0 bytes, got 1 at all four, and concluded the plan was not the lever;
+every one of those four answers was the allocator pinning the query.
 
-So none of the three levers anyone had in hand is one. Shrinking the rings buys
-nothing, shrinking the tensor-memory allocation buys nothing, and there is no
-cluster shape to blame — `required_cluster_dimensions` is `None` on every rung of
-the ladder, and tcgen05 implies no `cta_group::2`.
+**So the lever is the shared plan**, which is the one thing that was ruled out,
+and the two remedies that were on the table are not. Shrinking the tensor-memory
+allocation buys nothing — 256 columns already admit two CTAs and shared memory
+caps the kernel below that. Warps per CTA is not a constant to raise: 4 warps is
+`QUERIES / 32`, one warp per 32 accumulator rows, so more warps means a
+different decomposition — a producer/consumer split with warps dedicated to the
+TMA and the MMA issue — and that is a design to price rather than a change to
+make blind.
 
-**What is left is warps per CTA.** At 1 block/SM the CTA's own width is the
-entire occupancy of the SM, and this kernel is 128 threads — 4 warps where its
-own `max_threads_per_block` is 512 and where the control above holds 32. That is
-not a tuning constant to raise: 4 warps is `QUERIES / 32`, one warp per 32
-accumulator rows, so more warps means a different decomposition — a
-producer/consumer split with warps dedicated to the TMA and the MMA issue, which
-is what the shape of a tcgen05 kernel is *for*. With no launcher and no CPU
-reference, that is a design to price rather than a change to make blind.
+### Where the step actually is
+
+Two CTAs an SM need a plan under half of the SM's 233 472 B, which is 116 736 —
+*arithmetic*, and #85 says so. The census bracketed it between 73 768 B (counts
+2) and 147 536 B (counts 1) and did not locate it, and shared-memory allocation
+granularity or a per-CTA reservation could move it. Four rungs 1 KiB apart
+around the arithmetic value now locate it; `THRESHOLD_PLANS` in
+`device-tests/src/tmem_residency.rs` is the ladder and the census prints the
+interval it lands in.
+
+On a B200, counted (#81's run of the census):
+
+| declared plan | CTAs an SM |
+| ---: | ---: |
+| 114 688 B (half − 2 KiB) | 2 |
+| **115 712 B (half − 1 KiB)** | **2** |
+| 116 736 B (half, #85's arithmetic) | **1** |
+| 117 760 B (half + 1 KiB) | 1 |
+
+**The step is in [115 712, 116 736), so #85's arithmetic is a kilobyte too
+generous** — at exactly half the SM a second CTA is *not* admitted. The
+arithmetic ignores what the driver keeps per CTA, and 2 × (115 712 + 1024) is
+233 472 exactly, which is the reading the rungs support and do not prove: a
+1 KiB per-CTA reservation, which is what
+`CU_DEVICE_ATTRIBUTE_RESERVED_SHARED_MEMORY_PER_BLOCK` reports on every
+architecture that publishes it. Locating it inside that
+kilobyte would take another ladder and would not change what this kernel has to
+do.
+
+So the ring has to give up **31 824 B**, not the 30 800 B the halving says —
+`STAGES` from 3 to 2 is 32 768 B and still clears it, with 944 B to spare.
+
+Nothing here shrinks the ring. That is the follow-up #85 asks for, and what it
+was waiting on — a launcher, a CPU reference and a row on the clock — exists
+now.
 
 ## Tensor memory: 192 is not a legal allocation
 
@@ -123,9 +166,15 @@ only the half that is its own: that 256 covers `KEYS + HEAD`. The hand-written
 legality assert it grew after the audit is gone, because the entry point it was
 standing in front of now refuses the argument.
 
-Rounding up to 256 costs **nothing**, which is not obvious: the driver charges a
-CTA the SM's entire tensor memory the moment it touches the allocator, at 32
-columns exactly as at 512, so the 64 columns past `KEYS + HEAD` are free.
+Rounding up to 256 costs **nothing here**, and the reason this file used to give
+was wrong. It is not that the driver charges a CTA the SM's entire tensor memory
+the moment it touches the allocator: #84 counts `512 / columns` CTAs holding at
+once at every legal count, so these 256 columns admit two. They are free because
+the shared plan above admits one before the columns are consulted. Bring the
+plan under the step and the two terms meet: 256 columns admit exactly the two
+CTAs the smaller plan would, so the allocation is the right size either way and
+a *third* CTA would need both to move — and 128 columns do not cover
+`KEYS + HEAD`.
 
 The `dealloc_block` at the end is not optional. tcgen05 allocations are not
 scoped to the CTA the way shared memory is — a kernel that exits holding them is
@@ -210,6 +259,17 @@ kernel that *would* read this differently is one with room to spare in shared
 memory, where the third CTA is real — which is why #184 is recorded here and
 not only in `docs/library/reg.md`.
 
+**The 255 is `experiments`' copy now, and `examples`' reads 168** — same source
+file, two crates, one compiled through `#[path]` since #81 put this kernel on
+the clock, and the frame (1568 B), the `.local` traffic (702 stores, 395 loads)
+and the spill columns (zero) are identical between them. Crate composition alone
+moving a register count is not new — `groupnorm_tile` went 168 → 236 across the
+same split and crossed an occupancy step for it, which is why it is gated
+(`modal_app.py`'s `GATED_KERNELS`). It costs nothing here for the reason above —
+one CTA an SM either way — and it is recorded because the two rows sit side by
+side in `regcount` and an unexplained gap between them is exactly what that
+table is for.
+
 ### The epilogue
 
 fp32 straight out of registers through `kittens::global::store_rows`, with no
@@ -229,6 +289,45 @@ rows of panel zero — head 1's panel stayed zeroed and head 0's held whichever
 CTA wrote last. The failure was 50,885 of 65,536 outputs at two heads, and it
 is why [the check](#the-check) runs two: at one head the collision has nobody
 to collide with and the kernel scores a pass it has not earned.
+
+### The exponential is the polynomial, and that is measured (#81)
+
+The inner loop calls `exp2` — `kittens::reg::exp2_approx`, a clamp, a
+shift-trick split and a degree-3 minimax — once per element of every key block.
+`softmax` calls the SFU `exp2_hw` instead and is **2.7×** faster for it (#76),
+which made this kernel the obvious next place to spend the same change: it
+exponentiates more elements per byte of traffic than anything else here.
+
+It buys nothing. Timed through `bench --case flash`, each arm checked before it
+was timed, and the polynomial run twice so the difference carries its arms' own
+repeatability (#122):
+
+| sequence × heads | CTAs | `exp2` | `exp2` again | `exp2_hw` |
+| --- | ---: | ---: | ---: | ---: |
+| 1024 × 2 | 16 | 0.1789 ms | 0.1741 ms | 0.1820 ms |
+| 2048 × 4 | 64 | 0.3336 ms | 0.3254 ms | 0.3343 ms |
+| **2048 × 16** | 256 | **0.6513 ms** | **0.6492 ms** | **0.6756 ms** |
+
+The last row is the one with a denominator: 256 CTAs is the first size past a
+full wave, it repeats to **0.3%** across two runs of the same arm, and the SFU
+is **3.9% slower** there. The other two rows put 16 and 64 CTAs on 148 SMs,
+repeat to 2.7%, and say only that nothing large happened either way. The
+register table does not distinguish the arms at all — 168 registers in
+`examples`, 255 in `experiments`, 1568 B of frame and 702/395 `.local`
+stores/loads, identical for both spellings — so a swap made on the register
+column would have been made blind in either direction.
+
+So this kernel keeps the polynomial, and the swap is recorded rather than
+shipped. The reading is that a change to the exponential is invisible behind the
+MMA and TMA pipeline at four warps and one CTA an SM: `softmax` is a bandwidth
+loop whose whole arithmetic is the exponential, and this is not. That is a
+reading and not a measurement — what would settle it is a warp-count sweep of
+one exponentiating loop, which nothing here has, and it is also what the
+`ex2.approx` serialization claim would need.
+
+The numerics half is settled: the check measures **1.66e-3** with the polynomial
+and **1.73e-3** with the SFU, against a 3.91e-3 tolerance. Neither spelling is
+what sets the error, and neither would have been caught by the register column.
 
 ### Causal masking
 
@@ -278,4 +377,24 @@ over both heads is **1.66e-3 = 0.85 × 2⁻⁹**, under half a bf16 ulp at the
 outputs' `[2, 4)` end and the same neighbourhood `softmax`'s floor lives in
 (its `ex2` polynomial is in play here too, folded into the same number). 2⁻⁸
 is one doubling above the floor, the repository's usual headroom, arrived at
-from this kernel's own measurement.
+from this kernel's own measurement. The SFU `exp2_hw` moves it to 1.73e-3 and
+nothing else (#81), which is the same statement from the other side: the
+exponential is not what the tolerance is made of.
+
+## The clock
+
+`experiments/src/bench.rs` carries the `flash` case, at `sequence × HEAD ×
+heads`. It was the last entry in that file's `SKIPPED` list — first for having
+no reference, then for owing a denominator — and the denominator is the flops
+the kernel *issues*: both MMAs run over every key block of every query block, so
+one head of `sequence` queries costs `4 · sequence² · HEAD`. The kernel does not
+skip a key block it will mask away, so a causal-optimal kernel would do a little
+under half of that, and the table quotes what is on the clock rather than what
+is useful.
+
+Three sizes, and the ceiling on them is the *host*: the f64 reference every
+timed run is checked against is `heads · sequence² · HEAD` multiply-adds, so a
+sweep that kept quadrupling would spend its minutes on the CPU. 1024 × 2 and
+2048 × 4 are #184's operating points, kept so those numbers and these are the
+same rows; 2048 × 16 is 256 CTAs, the first size past a full wave and the only
+one of the three whose throughput column means anything.

@@ -196,15 +196,17 @@ slots and pays for them in liveness, and on this kernel that trade is very
 slightly negative. The full table and what it says about the store side's `.x4`
 are in `docs/library/ldst.md`.
 
-### A register claim upstream is not a speed claim
+### A register claim upstream was not a speed claim
 
-`src/reg.rs`'s module header says of the two `exp2`s that "the measurement does
-not favour" the SFU, on the evidence that pointing `exp2` at it takes
-`softmax_probe_128` from 168 registers to 255 with 112 bytes of spill. That is
-true, and it is a statement about *registers*. At this kernel's shape it is 32
-registers and a zero frame either way, and the SFU is **2.7× faster**. That is
+`src/reg.rs`'s module header used to say of the two `exp2`s that "the
+measurement does not favour" the SFU, on the evidence that pointing `exp2` at it
+takes `softmax_probe_128` from 168 registers to 255 with 112 bytes of spill.
+That is true, and it is a statement about *registers*. At this kernel's shape it
+is 32 registers and a zero frame either way, and the SFU is **2.7× faster** —
 the fourth time in this repository that the register column has ordered time
-backwards, and the note upstream should be read as the register claim it is.
+backwards. #81 is where the header was corrected, and where the 2.7× was found
+not to travel: on `flash_forward` the same swap is 3.9% *slower*, so this
+kernel's number is this kernel's. `docs/library/reg.md` carries both.
 
 ## What the check can prove
 

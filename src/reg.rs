@@ -16,6 +16,27 @@
 //! `docs/library/reg.md` carries the measurements: by-value against in-place,
 //! the two `exp2`s, and the ThunderKittens naming inversion.
 //!
+//! **Which `exp2` a kernel should call is a measurement that kernel has to
+//! take** (#81). The SFU spelling [`exp2_hw`] is one `ex2.approx.f32` against
+//! [`exp2_approx`]'s clamp, shift-trick split and degree-3 minimax, and it is
+//! worth **2.7× on `softmax`** (#76) and **nothing on `flash_forward`** — 3.9%
+//! slower there, at the shape that fills the device, against 0.3% run-to-run.
+//! Neither is the general answer: `softmax` is a bandwidth loop whose arithmetic
+//! is the exponential, and flash spends its time in the MMA and TMA pipeline at
+//! four warps a CTA. Accuracy does not decide it either — both kernels' checks
+//! move by less than a bf16 ulp between the two spellings, because what
+//! dominates is the round trip and not the transcendental.
+//!
+//! So the *name* `exp2` is the polynomial, on every register family, and the
+//! reason is structural rather than a verdict: `ex2.approx.f32` exists only
+//! under device compilation and panics anywhere else, so the polynomial is the
+//! only one of the two a host test, a doctest or a CPU reference can evaluate,
+//! and [`Exp`] and [`online_rescale`] are on it for that reason too. An earlier
+//! version of this header said the measurement did not favour the SFU on the
+//! evidence of a *register count* on a probe shape no kernel has; the register
+//! column does not separate the two spellings in either shipped kernel, and
+//! #76's and #81's clocks are what the sentence above is made of.
+//!
 //! ```no_run
 //! # use kittens::lane;
 //! # use kittens::reg::{BaseLdtm, RegTile};
@@ -42,8 +63,10 @@ pub fn fmin(a: f32, b: f32) -> f32 {
 }
 
 /// `2^x` on FMA units — max relative error 7.5e-5, and what every `exp2` in
-/// the crate resolves to. [`exp2_hw`] is the SFU alternative and rounds
-/// differently.
+/// the crate resolves to, because it is the one of the two that has a value on
+/// the host. [`exp2_hw`] is the SFU alternative: 2.7× on `softmax` (#76), 3.9%
+/// slower on `flash_forward` (#81), a different rounding, and a panic if a host
+/// build evaluates it.
 ///
 /// The input is clamped to ±125, so a masked-score sentinel flushes to a
 /// harmless ~2^-125 instead of overflowing: a fully masked row sums to zero
@@ -69,9 +92,16 @@ pub fn exp2_approx(x: f32) -> f32 {
     f32::from_bits((poly.to_bits() as i32).wrapping_add(integer << 23) as u32)
 }
 
-/// `2^x` as one `ex2.approx.f32` SFU instruction — 2.7× the throughput of
-/// [`exp2_approx`] on `softmax`, and a different rounding. Adopting it in a
-/// gated kernel is a numerics change, not a refactor.
+/// `2^x` as one `ex2.approx.f32` SFU instruction, and a different rounding —
+/// 2.7× the throughput of [`exp2_approx`] on `softmax` (#76) and 3.9% *slower*
+/// on `flash_forward` (#81). Worth trying in a kernel whose arithmetic is the
+/// exponential; not a swap to make on a ladder someone else measured.
+///
+/// A spelling a kernel asks for rather than the default, because the intrinsic
+/// exists only under device compilation and panics anywhere else. Adopting it
+/// is a numerics change and not a refactor, so it wants a check in front of it:
+/// both kernels' worst relative errors move by less than a bf16 ulp, since what
+/// dominates them is the round trip and not the transcendental.
 #[inline(always)]
 pub fn exp2_hw(x: f32) -> f32 {
     cuda_device::float::ex2_approx_f32(x)
@@ -212,10 +242,11 @@ macro_rules! scalar_ops {
 }
 
 scalar_ops! { UnaryOp:
-    /// The FMA polynomial ([`exp2_approx`]) — what the validated kernels ship.
+    /// The FMA polynomial ([`exp2_approx`]) — what `exp2` means everywhere,
+    /// and the only spelling a host build can evaluate.
     Exp2Approx(x) = exp2_approx(x);
-    /// The SFU instruction ([`exp2_hw`]). Rounds differently from
-    /// [`Exp2Approx`]; the choice between them is a numerics decision.
+    /// The SFU instruction ([`exp2_hw`]) — a different rounding, and a
+    /// per-kernel measurement rather than a faster twin (#81).
     Exp2Hw(x) = exp2_hw(x);
     /// `e^x` on [`Exp2Approx`], inheriting its error bound and its ±125
     /// exponent clamp — so this saturates at `x = ±86.6`, just inside where
@@ -635,10 +666,12 @@ macro_rules! op_methods {
 macro_rules! unary_op_methods {
     () => {
         op_methods! { unary
-            /// Software `2^x` ([`exp2_approx`]) — the shipped kernels'
-            /// rounding, and what every `exp2` in the crate resolves to.
+            /// Software `2^x` ([`exp2_approx`]) — what every `exp2` in the
+            /// crate resolves to, and the spelling that also has a value off a
+            /// device.
             exp2 = Exp2Approx;
-            /// SFU `2^x` ([`exp2_hw`]); a different result from `exp2`.
+            /// SFU `2^x` ([`exp2_hw`]) — a different result from `exp2`, and
+            /// faster in a loop whose arithmetic is the exponential (#81).
             exp2_hw = Exp2Hw;
             exp = Exp;
             log = Log;
