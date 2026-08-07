@@ -451,7 +451,57 @@ def _cached_target(cwd: str) -> dict[str, str]:
     return {"CARGO_TARGET_DIR": f"{CACHE_DIR}/target/{Path(cwd).name}"}
 
 
+# Whether this container has already been made safe for the cache volume. Once
+# per container, not once per command: `_freshen` forces a rebuild of the
+# project's own crates, and doing it between `clippy` and `test` would make the
+# second step redo what the first had just done.
+_FRESHENED = False
+
+
+def _freshen() -> None:
+    """Give the mounted sources a **new mtime**, so cargo can see that they
+    changed.
+
+    Without this the cache volume serves a stale build, silently, and the gate
+    that is supposed to reject a bad diff passes a tree it never compiled. It was
+    caught on the PR that added this: `cargo clippy --features host
+    --all-targets` finished in **1.05 s having compiled nothing**, and the run's
+    `cargo test` then reported **127** unit tests -- from a `libkittens.rlib`
+    built before the two new ones existed. The tell was `rustdoc`, which is the
+    one step that reads the sources unconditionally: it found the new module's
+    doctest and failed it against the stale rlib. With the volume emptied, the
+    same tree built and ran **129**.
+
+    The mechanism is cargo's freshness check, which for a path crate is *mtime
+    against the fingerprint*. Modal's mounts do not hand the container mtimes
+    newer than artifacts already on the volume, so an edited file can look older
+    than the object built from its predecessor, and cargo is right to believe
+    what it was told. Nothing here is cargo's fault or the volume's; it is the
+    pairing.
+
+    So the fix is to make the tree honest rather than to distrust cargo: touch
+    every file it fingerprints, once, before the first command runs. The
+    project's crates are then rebuilt on every invocation -- which is the
+    behaviour anyone reading a gate assumes -- and the dependency tree, which is
+    what the volume is actually worth (#226: the four `clippy` steps went 67.6 s
+    -> 17.3 s), is untouched because none of it lives under `PROJECT_DIR`.
+
+    A no-op without the volume: an entry point that does not mount it builds into
+    a `target/` that died with its container, so there is nothing stale to be."""
+    global _FRESHENED
+    if _FRESHENED or not Path(CACHE_DIR).is_dir():
+        return
+    _FRESHENED = True
+    print(f"$ touch every source under {PROJECT_DIR}  (the cache volume is mounted)", flush=True)
+    subprocess.run(
+        ["find", PROJECT_DIR, "(", "-name", "*.rs", "-o", "-name", "*.toml",
+         "-o", "-name", "*.lock", ")", "-exec", "touch", "{}", "+"],
+        check=True,
+    )
+
+
 def _run(cmd: list[str], cwd: str, env: dict[str, str] | None = None) -> None:
+    _freshen()
     if env:
         print(f"$ {' '.join(f'{name}={value}' for name, value in env.items())}", flush=True)
     print(f"$ {' '.join(cmd)}  (cwd={cwd})", flush=True)

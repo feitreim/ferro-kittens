@@ -448,7 +448,7 @@ fn round(
     for _ in 0..WARMUP {
         launch()?;
     }
-    watchdog::wait(&stream)?;
+    watchdog::wait(stream)?;
 
     let mut best = f64::INFINITY;
     for _ in 0..ITERATIONS {
