@@ -43,10 +43,11 @@
 //!
 //! An unbounded `while true {}` would demonstrate the same thing and would leave
 //! a B200 running a kernel nobody is waiting for if the host somehow failed to
-//! die. [`WEDGE_SECONDS`] is two minutes in `wedge_demo`, against a budget of
-//! five seconds: indistinguishable from a true wedge for twenty-four times as
-//! long as the demonstration needs, and self-terminating if everything else about
-//! the demonstration goes wrong.
+//! die. [`WEDGE_SECONDS`] is two minutes in `wedge_demo` against a budget of five
+//! seconds: indistinguishable from a true wedge for far longer than the
+//! demonstration needs, and self-terminating if everything else about it goes
+//! wrong. Getting a spin that is *both* bounded and real took four attempts and
+//! the watchdog's own trace to diagnose — see [`kernels::wedge`].
 
 use std::error::Error;
 use std::sync::OnceLock;
@@ -68,25 +69,35 @@ static INJECTED: OnceLock<()> = OnceLock::new();
 pub mod kernels {
     use super::*;
 
-    /// Occupy the device for `nanoseconds`, computing nothing.
+    /// Occupy the device for `ticks` of the SM clock, computing nothing.
     ///
-    /// `globaltimer` is a wall clock in nanoseconds, read through an intrinsic
-    /// the backend does not fold — the same property `Semaphore::wait_before`
-    /// relies on for `clock64`. One warp of one block is enough: what the host
-    /// waits on is the stream, and the stream is not drained until this returns
-    /// however small the launch is.
+    /// **`clock64` and not `globaltimer`, and that is a measurement.** The first
+    /// three spellings of this kernel read `globaltimer` — a wall clock in
+    /// nanoseconds, which is the number a caller would rather state — and all
+    /// three launched and returned immediately, wedging nothing. The launch
+    /// watchdog is what said so, once it was asked to trace: the guarded wait
+    /// straight after this launch reported **0.000 s** with a sixty-second spin
+    /// supposedly in front of it.
     ///
-    /// **A second parameter was tried and is not here.** Writing each reading to
-    /// a `*mut u64` looked like cheap insurance against the loop being optimized
-    /// away; the measured effect was the opposite one — with the store, the
-    /// launch returned immediately and wedged nothing, where this spelling had
-    /// held a container for as long as it was left to. Whatever the argument
-    /// marshalling does with the pair, the version that demonstrably spins is
-    /// the one with nothing to marshal.
+    /// A loop with no side effect is a loop LLVM may assume terminates, and one
+    /// whose only content is a foldable register read has no side effect. So the
+    /// spin uses the primitive this tree has already watched terminate:
+    /// `clock64`, which is what [`kittens::sync::Semaphore::wait_before`] bounds
+    /// every spin in `sol_watch` with, per-SM and monotonic within a launch.
+    ///
+    /// The price is that `ticks` are SM clocks and not nanoseconds, so the
+    /// duration is approximate — a B200 boosts to about 1.9 GHz, so a caller
+    /// asking for `n * 1e9` ticks gets roughly `n / 2` seconds. Approximate is
+    /// all this needs: the demonstration only requires "much longer than the
+    /// budget", and being *shorter* than nominal is the safe direction for a
+    /// kernel whose other job is to give the device back.
+    ///
+    /// One warp of one block is enough: what the host waits on is the stream, and
+    /// the stream is not drained until this returns however small the launch is.
     #[kernel]
-    pub unsafe fn wedge(nanoseconds: u64) {
-        let start = cuda_device::debug::globaltimer();
-        while cuda_device::debug::globaltimer().wrapping_sub(start) < nanoseconds {}
+    pub unsafe fn wedge(ticks: u64) {
+        let start = cuda_device::debug::clock64();
+        while cuda_device::debug::clock64().wrapping_sub(start) < ticks {}
     }
 }
 
@@ -119,6 +130,8 @@ pub fn inject(stream: &CudaStream) -> Result<(), Box<dyn Error>> {
         shared_mem_bytes: 0,
     };
     eprintln!("  wedge: launching");
+    // SM clocks, not nanoseconds -- see the kernel. A B200 runs this at about
+    // half the nominal seconds, which is far more than any budget needs.
     unsafe { module.wedge(stream, config, seconds * 1_000_000_000)? };
     eprintln!("  wedge: queued; the next wait on this stream is a wait on it");
     Ok(())
