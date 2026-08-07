@@ -1190,18 +1190,6 @@ pub fn main() -> ExitCode {
         _ => println!("device 0 (attributes unavailable)"),
     }
 
-    // Nothing in a default build, and a launch that does not return in a
-    // `--features wedge` one — see [`crate::wedge`]. It sits here rather than in
-    // any one sweep so that *which* case gets wedged is an environment variable
-    // and not a code path: every `bench <case>` reaches this line, including
-    // `sol-k`, which is the case the watchdog was written for, and `profile`,
-    // which runs one of these under `ncu`.
-    #[cfg(feature = "wedge")]
-    if let Err(error) = crate::wedge::inject(&context) {
-        println!("FAIL  could not inject the wedge: {error}");
-        return ExitCode::FAILURE;
-    }
-
     // `bench swizzle` is not a [`Case`] and does not pretend to be one: a
     // `Case` sweeps *sizes* with the kernel held fixed, and this sweeps the
     // kernel's item traversal with the size held fixed (#89). It rides this

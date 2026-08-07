@@ -4,37 +4,65 @@
 //! `scripts/modal-run` has `modal_app.py::stall` for exactly this reason: *a
 //! check nobody has watched fail is not a check*. [`kittens::watchdog`] is the
 //! same kind of guard one level in, and this is its stall — a kernel that spins
-//! for far longer than any budget, launched ahead of a sweep's own work on the
-//! same stream, so the wait the sweep does next is a wait on a launch that is
-//! still running. That is a hang in the shape the real ones had (#146,
-//! `bench --case sol-k` at `4096x4096x1024`), reproducible on demand and at a
-//! cost of one row.
+//! for far longer than any budget, queued **immediately in front of a row's own
+//! launch, on the row's own stream**, so the wait that row takes next is a wait
+//! on a launch that is still running. That is #146's failure exactly
+//! (`bench --case sol-k` at `4096x4096x1024`, twenty minutes of a B200 saying
+//! nothing), reproducible on demand and at a cost of one row.
 //!
 //! It is behind the off-by-default `wedge` feature, so no shipping build carries
 //! it: `regcount`'s register table, the occupancy-step gate and the local-memory
 //! census all read the crate's default feature set and none of them ever sees
 //! this kernel. `modal_app.py::wedge_demo` is the only thing that turns it on.
 //!
+//! # Where it is injected, and why it moved
+//!
+//! [`inject`] is called from [`crate::gemm_sol::run`], between that row's
+//! staging and its checked launch. It was first called at the top of
+//! [`crate::bench::main`] instead — before anything else the process did — on the
+//! theory that wedging earlier can only be a stronger test. Two runs said
+//! otherwise, and both are worth keeping written down:
+//!
+//! 1. The first sat in `DeviceBuffer::from_host` staging the gate size's
+//!    operands, because the constructors synchronize inside themselves too and
+//!    only the readbacks had been routed through the deadline.
+//!    [`kittens::watchdog::stage`] and [`kittens::watchdog::cleared`] exist
+//!    because of that run.
+//! 2. The second, with those guarded, stopped even earlier — before the sweep's
+//!    own header reached the log — with the only candidate ahead of the first
+//!    guarded wait being `kernels::load`, the driver's JIT and module load. That
+//!    is a wait this crate does not own and cannot put an event behind.
+//!
+//! Neither is the failure the watchdog is for, and wedging a process before it
+//! has loaded its kernels is not a stronger test of "a launch that does not
+//! return", it is a different one. So the injection sits where the real thing
+//! happened: everything a row needs is already loaded and staged, and the next
+//! thing that happens is a launch that will not finish.
+//!
 //! # The spin is bounded, and that is deliberate
 //!
 //! An unbounded `while true {}` would demonstrate the same thing and would leave
 //! a B200 running a kernel nobody is waiting for if the host somehow failed to
-//! die. [`WEDGE_SECONDS`] defaults to ten minutes: two orders of magnitude past
-//! [`kittens::watchdog::DEFAULT_BUDGET_MS`], indistinguishable from a true wedge
-//! for as long as the demonstration takes, and self-terminating if everything
-//! else about the demonstration goes wrong.
+//! die. [`WEDGE_SECONDS`] is ten minutes in `wedge_demo`: two orders of magnitude
+//! past the budget that demonstration sets, indistinguishable from a true wedge
+//! for as long as it takes, and self-terminating if everything else about the
+//! demonstration goes wrong.
 
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::OnceLock;
 
-use cuda_core::{CudaContext, LaunchConfig};
+use cuda_core::{CudaStream, LaunchConfig};
 use cuda_device::{cuda_module, kernel};
 
-/// Set to a number of seconds to wedge the run's first wait; unset to do
-/// nothing. Read at the top of [`crate::bench::main`], so any `bench <case>`
-/// can be wedged and the arm that gets it is chosen by the environment rather
+/// Set to a number of seconds to wedge the first row that launches; unset to do
+/// nothing at all. The arm that gets wedged is chosen by the environment rather
 /// than by which case has an injection point.
 pub const WEDGE_SECONDS: &str = "KITTENS_WEDGE_SECONDS";
+
+/// One wedge a process. A sweep is a ladder of rows and every one of them would
+/// otherwise queue another spin, which would make the second row's failure a
+/// test of the first row's leftovers.
+static INJECTED: OnceLock<()> = OnceLock::new();
 
 #[cuda_module]
 pub mod kernels {
@@ -46,7 +74,7 @@ pub mod kernels {
     /// intrinsic with side effects, so the loop survives optimization — the same
     /// property `Semaphore::wait_before` relies on for `clock64`. One warp of one
     /// block is enough: what the host waits on is the stream, and the stream is
-    /// not drained until this returns however small it is.
+    /// not drained until this returns however small the launch is.
     #[kernel]
     pub unsafe fn wedge(nanoseconds: u64) {
         let start = cuda_device::debug::globaltimer();
@@ -54,17 +82,8 @@ pub mod kernels {
     }
 }
 
-/// Queue the wedge on the default stream if [`WEDGE_SECONDS`] asks for one.
-///
-/// Ahead of everything the sweep then does, and on the stream the sweep uses, so
-/// nothing about the sweep has to know this exists. The first wait it takes is a
-/// wait on this — and *which* wait that is has already been a finding. The first
-/// run of the demonstration sat in `DeviceBuffer::from_host`, staging the gate
-/// size's operands, because the constructors synchronize inside themselves too
-/// and only the readbacks had been routed through the deadline.
-/// [`kittens::watchdog::stage`] and [`kittens::watchdog::cleared`] exist because
-/// of that run: a control earns its keep the first time it fires.
-pub fn inject(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
+/// Queue the wedge on `stream` if [`WEDGE_SECONDS`] asks for one, once.
+pub fn inject(stream: &CudaStream) -> Result<(), Box<dyn Error>> {
     let Some(seconds) = std::env::var(WEDGE_SECONDS)
         .ok()
         .and_then(|text| text.trim().parse::<u64>().ok())
@@ -72,18 +91,20 @@ pub fn inject(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
     else {
         return Ok(());
     };
+    if INJECTED.set(()).is_err() {
+        return Ok(());
+    }
     println!(
-        "\n{WEDGE_SECONDS}={seconds}: queueing a {seconds} s spin on the default stream ahead\n\
-         of this run's own work. every wait after this one is a wait on a launch that is\n\
-         still going, which is what `kittens::watchdog` is for."
+        "\n{WEDGE_SECONDS}={seconds}: queueing a {seconds} s spin in front of this row's own\n\
+         launch, on this row's own stream. the wait that follows it is a wait on a launch\n\
+         that is still running, which is what `kittens::watchdog` is for."
     );
-    let stream = context.default_stream();
-    let module = kernels::load(context)?;
+    let module = kernels::load(stream.context())?;
     let config = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
-    unsafe { module.wedge(&stream, config, seconds * 1_000_000_000)? };
+    unsafe { module.wedge(stream, config, seconds * 1_000_000_000)? };
     Ok(())
 }

@@ -2273,6 +2273,14 @@ fn run<T>(
             }
         };
 
+    // Nothing at all in a default build. With `--features wedge` and
+    // `KITTENS_WEDGE_SECONDS` set, a launch that does not return, queued
+    // immediately in front of this row's own on this row's own stream -- which
+    // is the shape #146 had, and is the whole of what `kittens::watchdog` is a
+    // guard against. See `crate::wedge` for why the injection is here and not
+    // at the top of the process.
+    #[cfg(feature = "wedge")]
+    crate::wedge::inject(&stream)?;
     launch_once(&mut c)?;
     watchdog::wait(&stream)?;
     let label = if initialize {

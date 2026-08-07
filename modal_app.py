@@ -1202,10 +1202,11 @@ def wedge_demo(seconds: int = 600, budget_ms: int = 5000) -> None:
 
       1. `bench:softmax` -- a green arm before the failure.
       2. `bench:sol-k` with `KITTENS_WEDGE_SECONDS` set, so `crate::wedge`
-         queues a `seconds`-long spin on the default stream ahead of the sweep's
-         own work. The first wait the sweep takes is therefore a wait on a launch
-         that is still running, which is #146's failure exactly. It must fail,
-         with `SIGABRT` from the watchdog, in about `budget_ms`.
+         queues a `seconds`-long spin *immediately in front of the first row's
+         own launch*, on that row's own stream -- everything loaded, everything
+         staged, and then a launch that will not finish. That is #146's failure
+         exactly. It must fail, with `SIGABRT` from the watchdog, in about
+         `budget_ms`.
       3. `device-tests` -- a green arm *after* the failure, which is the claim.
          57 cases, on the device the wedged arm was just using.
 
