@@ -977,9 +977,10 @@ WRITE_OPT_WRAPPER = (
 #
 #   1. **A launch that does not return costs one row, not a container.** Every
 #      host wait in the three kernel crates goes through `kittens::watchdog`,
-#      which polls the event behind the work instead of blocking on it and ends
-#      the process past 30 s naming the row the sweep last announced. A wedged
-#      arm exits -6 in half a minute.
+#      and a sentinel thread carries a second deadline on the row, because a
+#      launch that has not returned has no event behind it to poll. Measured:
+#      `wedge_demo` ends the wedged arm **5.0 s** after its row was announced,
+#      naming that row, and the arms after it run.
 #   2. **An arm's failure is contained by a process boundary.** It always was --
 #      `_run` is a `subprocess` -- and `_session` below no longer throws the rest
 #      of the run away when one of them fails. The arms after a failure run, and
@@ -1049,11 +1050,6 @@ SMI = ["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total
        "--format=csv"]
 
 OK = "ok"
-# What a process ended by `kittens::watchdog` exits with: the module calls
-# `abort()`, so the shell sees SIGABRT and `subprocess` reports -6. Named
-# because the summary line is where somebody first meets it, and "-6" on its own
-# reads like a mystery rather than like the deadline doing its job.
-WEDGED = -6
 
 
 def _steps(name: str) -> list[tuple[list[str], str]]:
@@ -1088,9 +1084,13 @@ def _session(arms) -> list[tuple[str, str, float]]:
                 _run(cmd, cwd, env)
             outcome = OK
         except subprocess.CalledProcessError as failure:
+            # The code is whatever this arm's *command* exited with, and for a
+            # `cargo oxide run` arm that is cargo's and not the kernel binary's:
+            # a process ended by `kittens::watchdog` aborts, cargo reports
+            # `Failed with exit code: None` for the signal, and this sees 1. So
+            # the summary says a row failed and the banner above it says why --
+            # measured, on the run that first fired the deadline.
             outcome = f"FAILED (exit {failure.returncode})"
-            if failure.returncode == WEDGED:
-                outcome += " -- the launch watchdog"
             print(f"=== session arm: {name}: {outcome} ===", flush=True)
         outcomes.append((name, outcome, time.monotonic() - start))
     print("\n=== session summary ===", flush=True)

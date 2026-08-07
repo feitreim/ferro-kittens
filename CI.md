@@ -376,9 +376,11 @@ container). Two things had to become true first, and both now are:
 
 1. **A launch that does not return costs one row, not a container.** Every host
    wait in the three kernel crates goes through `kittens::watchdog`, which polls
-   the event behind the work rather than blocking on it and ends the process
-   past 30 s naming the row the sweep last announced. See
-   `docs/library/watchdog.md`.
+   the event behind the work rather than blocking on it; and a sentinel thread
+   carries a second deadline on the *row*, because a launch that has not
+   returned has no event behind it to poll — measured on a B200, the row's own
+   `cuLaunchKernelEx` blocks. `wedge_demo` ends the wedged arm **5.0 s** after
+   its row was announced, naming that row. See `docs/library/watchdog.md`.
 2. **A failed arm no longer throws the rest of the session away.** Each arm was
    always its own process — `_run` is a `subprocess` — and `session` now runs
    the arms after a failure and prints a summary saying which of them failed.
@@ -550,18 +552,20 @@ each one covers what the level below cannot see. They are listed inside-out.
 
 | bound | who owns it | budget | what it catches |
 | --- | --- | ---: | --- |
-| one launch | `kittens::watchdog`, in the process | 30 s | a kernel that stops making progress |
+| one launch | `kittens::watchdog`, in the process | 30 s | a wait on a kernel that stops making progress |
+| one row | `kittens::watchdog`'s sentinel thread | 600 s | anything else the row blocks in, including the launch call itself |
 | a container's silence | `scripts/modal-run`, on your laptop or the runner | 300 s to first output, 1200 s between lines | a container that never reaches Python, and a run stopped out from under the client |
 | the function | Modal's `timeout=` | per entry point, below | everything else, including a wedge in `cargo` |
 
 **The launch deadline is new and is the one that changed what can be batched.**
 Every host wait in `src/`, `examples/`, `experiments/` and `device-tests/` goes
 through `kittens::watchdog::wait` or `ReadBack::read_back`, which poll the event
-behind the work instead of blocking on it. Past 30 s the process prints the row
-the sweep last announced and calls `abort()`, so a wedged arm exits `-6` in half
-a minute where it used to hold a B200 until `timeout=`.
-`modal_app.py::wedge_demo` is the control that shows it firing, and
-`docs/library/watchdog.md` has the design.
+behind the work instead of blocking on it, and every announced row arms a
+sentinel thread. Past its budget the process prints the row the sweep last
+announced and calls `abort()`, where it used to hold a B200 until `timeout=`.
+`modal_app.py::wedge_demo` is the control that shows it firing — 5.0 s, with the
+arms after it green — and `docs/library/watchdog.md` has the design, including
+why one deadline was not enough.
 
 ### `timeout=`, and the measurement each one is three times
 
