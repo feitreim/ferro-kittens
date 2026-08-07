@@ -168,6 +168,7 @@ use cuda_host::CudaKernel;
 use kittens::reg::{BaseLdtm, FragmentLayout, RegTile};
 
 use crate::kernels;
+use kittens::watchdog::{self, ReadBack};
 
 /// Iterations of the probe's accumulate loop per launch, as the runtime
 /// argument the kernel takes. Large enough that a launch is tens of
@@ -447,7 +448,7 @@ fn round(
     for _ in 0..WARMUP {
         launch()?;
     }
-    stream.synchronize()?;
+    watchdog::wait(stream)?;
 
     let mut best = f64::INFINITY;
     for _ in 0..ITERATIONS {
@@ -472,7 +473,7 @@ fn checked(
     expected: &[f64],
 ) -> Result<f64, Box<dyn Error>> {
     launch(&rung.function, stream, blocks, scores, steps, out)?;
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
     verify(&observed, expected).map_err(|error| {
         format!(
             "{} at {blocks} block(s), {steps} steps: {error}",
@@ -494,9 +495,9 @@ where
     let staged: Vec<f32> = (0..2 * STEPS as usize)
         .flat_map(|step| (0..elements).map(move |index| score(step, index)))
         .collect();
-    let scores = DeviceBuffer::from_host(stream, &staged)?;
-    let mut one = DeviceBuffer::<f32>::zeroed(stream, elements)?;
-    let mut many = DeviceBuffer::<f32>::zeroed(stream, blocks as usize * elements)?;
+    let scores = watchdog::stage(stream, &staged)?;
+    let mut one = watchdog::cleared::<f32>(stream, elements)?;
+    let mut many = watchdog::cleared::<f32>(stream, blocks as usize * elements)?;
     let short_reference = reference::<M, N>(STEPS);
     let long_reference = reference::<M, N>(2 * STEPS);
 

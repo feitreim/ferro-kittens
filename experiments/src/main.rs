@@ -82,6 +82,11 @@ pub mod softmax_x4;
 pub mod sol;
 pub mod sol_ablate;
 pub mod sol_watch;
+/// A launch that does not return, so `kittens::watchdog`'s deadline can be
+/// watched firing rather than read and believed. Behind the off-by-default
+/// `wedge` feature — no shipping build, and no census, carries this kernel.
+#[cfg(feature = "wedge")]
+pub mod wedge;
 
 /// The teaching crate's kernels, compiled here so [`bench`] can time them
 /// against their own CPU references.

@@ -113,6 +113,7 @@ use kittens::sync::{Semaphore, block_reduce, block_reduce_sum};
 use kittens::tmem::{
     TmemTile, alloc_block, alloc_cluster, dealloc_block, dealloc_cluster, store_wait, warp_lanes,
 };
+use kittens::watchdog::{self, ReadBack};
 
 mod ladder_bench;
 mod ldst_fence;
@@ -1353,7 +1354,7 @@ pub mod kernels {
     /// a `.local` depot. That depot is the *fill's* and would sit in every one
     /// of these probes' `regcount` rows, which is exactly what stops the drains
     /// below being comparable to each other.
-    #[inline(always)]
+
     fn drain_identities<const C: usize>(row_base: u32, lane: u32) -> DrainBand<C>
     where
         BaseLdtm: FragmentLayout<DRAIN_WARP_ROWS, C>,
@@ -5746,17 +5747,17 @@ fn check_tma_2d<const R: usize, const C: usize>(
         let (source, destination) = (row * C / 2, row * pitch(C) / 2);
         pitched[destination..destination + C / 2].copy_from_slice(&staged[source..source + C / 2]);
     }
-    let source = DeviceBuffer::from_host(stream, &pitched)?;
+    let source = watchdog::stage(stream, &pitched)?;
     let layout =
         unsafe { GlobalLayout::<Bf16, 2>::strided(source.cu_deviceptr(), [C, R], [1, pitch(C)]) };
     let map = layout.tensor_map::<Tile<R, C>>(stream)?;
-    let mut out = DeviceBuffer::<u32>::zeroed(stream, staged.len())?;
+    let mut out = watchdog::cleared::<u32>(stream, staged.len())?;
     launch(
         launch_config(R as u32, tile_shared::<R, C>()),
         map.as_ptr(),
         &mut out,
     )?;
-    compare_tile(&out.to_host_vec(stream)?, &staged, C / 2)
+    compare_tile(&out.read_back(stream)?, &staged, C / 2)
 }
 
 /// Does the TMA store put each box where its map says?
@@ -5787,14 +5788,14 @@ fn check_tma_store<const R: usize, const C: usize>(
         2 * columns
     }
     let staged = identity_tile(R, C);
-    let source = DeviceBuffer::from_host(stream, &staged)?;
+    let source = watchdog::stage(stream, &staged)?;
     let source_map = unsafe { encode_bf16_panels::<R, C>(stream, source.cu_deviceptr(), R, 1)? };
 
-    let packed = DeviceBuffer::from_host(stream, &vec![POISON; staged.len()])?;
+    let packed = watchdog::stage(stream, &vec![POISON; staged.len()])?;
     let packed_map = unsafe { encode_bf16_panels::<R, C>(stream, packed.cu_deviceptr(), R, 1)? };
 
     let mut expected = vec![POISON; R * pitch(C) / 2];
-    let pitched = DeviceBuffer::from_host(stream, &expected)?;
+    let pitched = watchdog::stage(stream, &expected)?;
     let layout =
         unsafe { GlobalLayout::<Bf16, 2>::strided(pitched.cu_deviceptr(), [C, R], [1, pitch(C)]) };
     let pitched_map = layout.tensor_map::<Tile<R, C>>(stream)?;
@@ -5810,9 +5811,9 @@ fn check_tma_store<const R: usize, const C: usize>(
         let (source, destination) = (row * C / 2, row * pitch(C) / 2);
         expected[destination..destination + C / 2].copy_from_slice(&staged[source..source + C / 2]);
     }
-    compare_tile(&packed.to_host_vec(stream)?, &staged, C / 2)
+    compare_tile(&packed.read_back(stream)?, &staged, C / 2)
         .map_err(|error| format!("packed destination: {error}"))?;
-    compare_tile(&pitched.to_host_vec(stream)?, &expected, pitch(C) / 2)
+    compare_tile(&pitched.read_back(stream)?, &expected, pitch(C) / 2)
         .map_err(|error| format!("pitched destination: {error}").into())
 }
 
@@ -5838,7 +5839,7 @@ fn check_tma_store_add(
     const POISON_F32: f32 = -7.0;
 
     let tile: Vec<f32> = (0..ADD_ROWS * ADD_COLS).map(|i| (i + 1) as f32).collect();
-    let source = DeviceBuffer::from_host(stream, &tile)?;
+    let source = watchdog::stage(stream, &tile)?;
     let source_map = unsafe {
         GlobalLayout::<F32, 2>::packed(source.cu_deviceptr(), [ADD_COLS, ADD_ROWS])
             .tensor_map::<AddTile>(stream)?
@@ -5848,7 +5849,7 @@ fn check_tma_store_add(
     for row in 0..ADD_ROWS {
         seeded[row * PITCH..row * PITCH + ADD_COLS].fill(SEED);
     }
-    let dest = DeviceBuffer::from_host(stream, &seeded)?;
+    let dest = watchdog::stage(stream, &seeded)?;
     let dest_map = unsafe {
         GlobalLayout::<F32, 2>::strided(dest.cu_deviceptr(), [ADD_COLS, ADD_ROWS], [1, PITCH])
             .tensor_map::<AddTile>(stream)?
@@ -5866,7 +5867,7 @@ fn check_tma_store_add(
             expected[row * PITCH + column] = SEED + 2.0 * tile[row * ADD_COLS + column];
         }
     }
-    let observed = dest.to_host_vec(stream)?;
+    let observed = dest.read_back(stream)?;
     let mut report = String::new();
     let mut mismatches = 0usize;
     for (index, (&got, &want)) in observed.iter().zip(&expected).enumerate() {
@@ -5927,7 +5928,7 @@ fn check_store_ring<const BOX_ROWS: usize, const C: usize>(
     launch: impl Fn(LaunchConfig, *const TmaDescriptor) -> Result<(), cuda_core::DriverError>,
 ) -> Result<String, Box<dyn Error>> {
     let rows = RING_BANDS * RING_ROWS;
-    let destination = DeviceBuffer::from_host(stream, &vec![POISON; rows * C / 2])?;
+    let destination = watchdog::stage(stream, &vec![POISON; rows * C / 2])?;
     let map =
         unsafe { encode_bf16_panels::<BOX_ROWS, C>(stream, destination.cu_deviceptr(), rows, 1)? };
 
@@ -5944,7 +5945,7 @@ fn check_store_ring<const BOX_ROWS: usize, const C: usize>(
             }
         }
     }
-    let note = compare_tile(&destination.to_host_vec(stream)?, &expected, C / 2)?;
+    let note = compare_tile(&destination.read_back(stream)?, &expected, C / 2)?;
     let (box_rows, columns) = (BOX_ROWS, C);
     Ok(format!(
         "{RING_BANDS} bands of [{RING_ROWS}, {columns}] in [{box_rows}, {columns}] boxes \
@@ -5984,7 +5985,7 @@ fn check_shared_drain<const C: usize>(
 ) -> Result<String, Box<dyn Error>> {
     let seed = vec![POISON_HALF; DRAIN_MATRIX_ROWS * DRAIN_PITCH];
     for column in DRAIN_COLUMNS {
-        let mut destination = DeviceBuffer::from_host(stream, &seed)?;
+        let mut destination = watchdog::stage(stream, &seed)?;
         launch(
             launch_config(DRAIN_THREADS, Tile::<DRAIN_ROWS, C>::BYTES as u32),
             column,
@@ -5998,7 +5999,7 @@ fn check_shared_drain<const C: usize>(
                 expected[at] = cell_bits(row, tile_column);
             }
         }
-        compare_matrix(&destination.to_host_vec(stream)?, &expected, column)?;
+        compare_matrix(&destination.read_back(stream)?, &expected, column)?;
     }
     let columns = C;
     Ok(format!(
@@ -6036,13 +6037,13 @@ fn check_shared_accumulate<const C: usize>(
                 expected[at] = to_bf16(2.0 * cell(row, tile_column));
             }
         }
-        let mut destination = DeviceBuffer::from_host(stream, &seed)?;
+        let mut destination = watchdog::stage(stream, &seed)?;
         launch(
             launch_config(DRAIN_THREADS, Tile::<DRAIN_ROWS, C>::BYTES as u32),
             column,
             &mut destination,
         )?;
-        compare_matrix(&destination.to_host_vec(stream)?, &expected, column)?;
+        compare_matrix(&destination.read_back(stream)?, &expected, column)?;
     }
     let columns = C;
     Ok(format!(
@@ -6076,7 +6077,7 @@ fn check_scatter_drain<const C: usize>(
 ) -> Result<String, Box<dyn Error>> {
     let seed = vec![f32::from_bits(POISON); DRAIN_MATRIX_ROWS * DRAIN_PITCH];
     for column in DRAIN_COLUMNS {
-        let mut destination = DeviceBuffer::from_host(stream, &seed)?;
+        let mut destination = watchdog::stage(stream, &seed)?;
         launch(
             launch_config(DRAIN_THREADS, F32Tile::<DRAIN_ROWS, C>::BYTES as u32),
             column,
@@ -6090,7 +6091,7 @@ fn check_scatter_drain<const C: usize>(
                 expected[at] = cell(row, tile_column);
             }
         }
-        let observed = destination.to_host_vec(stream)?;
+        let observed = destination.read_back(stream)?;
         compare_f32_matrix(&observed, &expected, column)?;
     }
     let columns = C;
@@ -6198,15 +6199,15 @@ fn check_swizzle<const R: usize, const C: usize>(
     ) -> Result<(), cuda_core::DriverError>,
 ) -> Result<String, Box<dyn Error>> {
     let staged = identity_tile(R, C);
-    let source = DeviceBuffer::from_host(stream, &staged)?;
+    let source = watchdog::stage(stream, &staged)?;
     let map = unsafe { encode_bf16_panels::<R, C>(stream, source.cu_deviceptr(), R, 1)? };
-    let mut out = DeviceBuffer::<u32>::zeroed(stream, staged.len())?;
+    let mut out = watchdog::cleared::<u32>(stream, staged.len())?;
     launch(
         launch_config(R as u32, tile_shared::<R, C>()),
         map.as_ptr(),
         &mut out,
     )?;
-    compare_tile(&out.to_host_vec(stream)?, &staged, C / 2)
+    compare_tile(&out.read_back(stream)?, &staged, C / 2)
 }
 
 /// Does `stmatrix` put a fragment where the cursor says, at every block of the
@@ -6218,9 +6219,9 @@ fn check_stmatrix<const R: usize, const C: usize>(
     launch: impl Fn(LaunchConfig, &mut DeviceBuffer<u32>) -> Result<(), cuda_core::DriverError>,
 ) -> Result<String, Box<dyn Error>> {
     let expected = identity_tile(R, C);
-    let mut out = DeviceBuffer::<u32>::zeroed(stream, expected.len())?;
+    let mut out = watchdog::cleared::<u32>(stream, expected.len())?;
     launch(launch_config(32, tile_shared::<R, C>()), &mut out)?;
-    compare_tile(&out.to_host_vec(stream)?, &expected, C / 2)
+    compare_tile(&out.read_back(stream)?, &expected, C / 2)
 }
 
 /// Do the composed shared movers place a whole `[32, WIDE]` band where the
@@ -6239,13 +6240,13 @@ fn check_band_roundtrip(
     module: &kernels::LoadedModule,
 ) -> Result<String, Box<dyn Error>> {
     let staged = identity_tile(TILE, WIDE);
-    let source = DeviceBuffer::from_host(stream, &staged)?;
+    let source = watchdog::stage(stream, &staged)?;
     let map = unsafe { encode_bf16_panels::<TILE, WIDE>(stream, source.cu_deviceptr(), TILE, 1)? };
     let (band_rows, words) = (TILE / 2, WIDE / 2);
     let mut expected = staged.clone();
     expected.copy_within(0..band_rows * words, band_rows * words);
 
-    let mut out = DeviceBuffer::<u32>::zeroed(stream, staged.len())?;
+    let mut out = watchdog::cleared::<u32>(stream, staged.len())?;
     unsafe {
         module.band_roundtrip(
             stream,
@@ -6254,7 +6255,7 @@ fn check_band_roundtrip(
             &mut out,
         )?
     };
-    compare_tile(&out.to_host_vec(stream)?, &expected, words)
+    compare_tile(&out.read_back(stream)?, &expected, words)
 }
 
 /// Does [`load_rows`] read the elements the fragment layout says it does?
@@ -6276,13 +6277,13 @@ fn check_global_rows(
     let staged: Vec<f32> = (0..GLOBAL_ROWS)
         .flat_map(|row| (0..GLOBAL_PITCH).map(move |column| global_cell(row, column)))
         .collect();
-    let source = DeviceBuffer::from_host(stream, &staged)?;
+    let source = watchdog::stage(stream, &staged)?;
 
     type Band = RegTile<32, WIDE, BaseLdtm>;
     let (slots, values) = (Band::SLOTS, Band::VALUES);
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, 32 * slots * values)?;
+    let mut out = watchdog::cleared::<f32>(stream, 32 * slots * values)?;
     unsafe { module.global_rows_map(stream, launch_config(32, 0), &source, &mut out)? };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let mut report = String::new();
     let mut mismatches = 0usize;
@@ -6342,13 +6343,13 @@ fn check_global_cols(
     let staged: Vec<f32> = (0..GLOBAL_ROWS)
         .flat_map(|row| (0..GLOBAL_PITCH).map(move |column| global_cell(row, column)))
         .collect();
-    let source = DeviceBuffer::from_host(stream, &staged)?;
+    let source = watchdog::stage(stream, &staged)?;
 
     type Columns = ColVec<WIDE, BaseLdtm>;
     let values = Columns::VALUES;
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, 32 * values)?;
+    let mut out = watchdog::cleared::<f32>(stream, 32 * values)?;
     unsafe { module.global_cols_map(stream, launch_config(32, 0), &source, &mut out)? };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let mut report = String::new();
     let mut mismatches = 0usize;
@@ -6400,12 +6401,12 @@ fn check_global_col_vec(
     let staged: Vec<f32> = (0..GLOBAL_ROWS)
         .flat_map(|row| (0..GLOBAL_PITCH).map(move |column| global_cell(row, column)))
         .collect();
-    let source = DeviceBuffer::from_host(stream, &staged)?;
+    let source = watchdog::stage(stream, &staged)?;
 
     let values = <BaseLdtm as ColLayout<COLUMN_BAND>>::VALUES;
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, 32 * values)?;
+    let mut out = watchdog::cleared::<f32>(stream, 32 * values)?;
     unsafe { module.global_col_vec_map(stream, launch_config(32, 0), &source, &mut out)? };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let mut report = String::new();
     let mut mismatches = 0usize;
@@ -6469,16 +6470,16 @@ fn check_shared_vec(
     module: &kernels::LoadedModule,
 ) -> Result<String, Box<dyn Error>> {
     let staged = identity_tile(1, VECTOR);
-    let source = DeviceBuffer::from_host(stream, &staged)?;
+    let source = watchdog::stage(stream, &staged)?;
     let source_map = unsafe { GlobalLayout::<Bf16, 1>::packed(source.cu_deviceptr(), [VECTOR]) }
         .tensor_map::<Params>(stream)?;
 
-    let destination = DeviceBuffer::from_host(stream, &vec![POISON; staged.len()])?;
+    let destination = watchdog::stage(stream, &vec![POISON; staged.len()])?;
     let destination_map =
         unsafe { GlobalLayout::<Bf16, 1>::packed(destination.cu_deviceptr(), [VECTOR]) }
             .tensor_map::<Params>(stream)?;
 
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, 32 * VECTOR_VALUES)?;
+    let mut out = watchdog::cleared::<f32>(stream, 32 * VECTOR_VALUES)?;
     unsafe {
         module.shared_vec_roundtrip(
             stream,
@@ -6489,7 +6490,7 @@ fn check_shared_vec(
         )?
     };
 
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
     let mut report = String::new();
     let mut mismatches = 0usize;
     for lane in 0..32u32 {
@@ -6532,7 +6533,7 @@ fn check_shared_vec(
             cell_bits(0, VECTOR - 2 - 2 * pair),
         ));
     }
-    compare_tile(&destination.to_host_vec(stream)?, &reversed, VECTOR / 2)
+    compare_tile(&destination.read_back(stream)?, &reversed, VECTOR / 2)
 }
 
 /// Does a vector's rank-2 box really select one row?
@@ -6546,12 +6547,12 @@ fn check_shared_vec_row(
     module: &kernels::LoadedModule,
 ) -> Result<String, Box<dyn Error>> {
     let staged = identity_tile(VECTOR_ROWS, VECTOR);
-    let source = DeviceBuffer::from_host(stream, &staged)?;
+    let source = watchdog::stage(stream, &staged)?;
     let map =
         unsafe { GlobalLayout::<Bf16, 2>::packed(source.cu_deviceptr(), [VECTOR, VECTOR_ROWS]) }
             .tensor_map::<Params>(stream)?;
 
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, VECTOR)?;
+    let mut out = watchdog::cleared::<f32>(stream, VECTOR)?;
     unsafe {
         module.shared_vec_row(
             stream,
@@ -6561,7 +6562,7 @@ fn check_shared_vec_row(
         )?
     };
 
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
     let mut report = String::new();
     let mut mismatches = 0usize;
     for (column, &got) in observed.iter().enumerate() {
@@ -6608,7 +6609,7 @@ fn check_shared_row_vec(
     stream: &CudaStream,
     module: &kernels::LoadedModule,
 ) -> Result<String, Box<dyn Error>> {
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, ROW_VECTOR + 32 * ROW_SLOTS)?;
+    let mut out = watchdog::cleared::<f32>(stream, ROW_VECTOR + 32 * ROW_SLOTS)?;
     unsafe {
         module.shared_row_vec_roundtrip(
             stream,
@@ -6616,7 +6617,7 @@ fn check_shared_row_vec(
             &mut out,
         )?
     };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     // The one lane of each quad that owns a row, and the slot it holds it in.
     let owner = |row: usize| {
@@ -6735,9 +6736,9 @@ fn check_block_reduce(
         .map(|warp| block_partial(warp) / BLOCK_BAND_VALUES)
         .collect();
     let threads = BLOCK_WARPS * 32;
-    let device_seeds = DeviceBuffer::from_host(stream, &seeds)?;
+    let device_seeds = watchdog::stage(stream, &seeds)?;
 
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, threads * BLOCK_REDUCE_STRIDE)?;
+    let mut out = watchdog::cleared::<f32>(stream, threads * BLOCK_REDUCE_STRIDE)?;
     unsafe {
         module.block_reduce_probe(
             stream,
@@ -6746,7 +6747,7 @@ fn check_block_reduce(
             &mut out,
         )?
     };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let sum: f32 = (0..BLOCK_WARPS).map(block_partial).sum();
     let largest = block_partial(BLOCK_WARPS - 1);
@@ -6815,18 +6816,18 @@ fn check_ldmatrix<const R: usize, const C: usize>(
     ) -> Result<(), cuda_core::DriverError>,
 ) -> Result<String, Box<dyn Error>> {
     let staged = identity_tile(R, C);
-    let source = DeviceBuffer::from_host(stream, &staged)?;
+    let source = watchdog::stage(stream, &staged)?;
     let map = unsafe { encode_bf16_panels::<R, C>(stream, source.cu_deviceptr(), R, 1)? };
     let (row_blocks, column_blocks) = (R / 16, C / 16);
     let (slots, values) = (Fragment::SLOTS, Fragment::VALUES);
     let mut out =
-        DeviceBuffer::<f32>::zeroed(stream, row_blocks * column_blocks * 32 * slots * values)?;
+        watchdog::cleared::<f32>(stream, row_blocks * column_blocks * 32 * slots * values)?;
     launch(
         launch_config(32, tile_shared::<R, C>()),
         map.as_ptr(),
         &mut out,
     )?;
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let mut report = String::new();
     let mut mismatches = 0usize;
@@ -6905,9 +6906,9 @@ fn check_sttm_roundtrip(
     drain: impl Fn(LaunchConfig, &mut DeviceBuffer<f32>) -> Result<(), cuda_core::DriverError>,
 ) -> Result<String, Box<dyn Error>> {
     let (slots, values) = (RegTile::<32, COLUMNS, BaseLdtm>::SLOTS, COLUMNS / 4);
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, ROWS * slots * values)?;
+    let mut out = watchdog::cleared::<f32>(stream, ROWS * slots * values)?;
     drain(launch_config(ROWS as u32, STTM_SHARED as u32), &mut out)?;
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let coordinate = |index: usize| {
         let (thread, register) = (index / (slots * values), index % (slots * values));
@@ -6993,7 +6994,7 @@ fn check_clc(
     module: &kernels::LoadedModule,
 ) -> Result<String, Box<dyn Error>> {
     let blocks = CLC_CLUSTERS * 2;
-    let mut out = DeviceBuffer::<u64>::zeroed(stream, blocks as usize * CLC_FIELDS)?;
+    let mut out = watchdog::cleared::<u64>(stream, blocks as usize * CLC_FIELDS)?;
     let config = LaunchConfig {
         grid_dim: (blocks, 1, 1),
         block_dim: (32, 1, 1),
@@ -7004,7 +7005,7 @@ fn check_clc(
     // which the `#[cluster_launch(2, 1, 1)]` launcher requires.
     unsafe { module.clc_probe(stream, config, CLC_DEADLINE_NS, &mut out)? };
     finish_or_abort(context, stream, "clc probe")?;
-    let rows = out.to_host_vec(stream)?;
+    let rows = out.read_back(stream)?;
     let row = |cta: usize| {
         let base = cta * CLC_FIELDS;
         (rows[base], rows[base + 1], rows[base + 2], rows[base + 3])
@@ -7127,7 +7128,7 @@ fn check_relaunch(
 ) -> Result<String, Box<dyn Error>> {
     let registers = Fragment::SLOTS * Fragment::VALUES;
     let width = ROWS * registers;
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, RELAUNCH_BLOCKS as usize * width)?;
+    let mut out = watchdog::cleared::<f32>(stream, RELAUNCH_BLOCKS as usize * width)?;
     let config = LaunchConfig {
         grid_dim: (RELAUNCH_BLOCKS, 1, 1),
         block_dim: (ROWS as u32, 1, 1),
@@ -7145,7 +7146,7 @@ fn check_relaunch(
             &format!("repeated launch {launch}/{RELAUNCHES}"),
         )?;
 
-        let observed = out.to_host_vec(stream)?;
+        let observed = out.read_back(stream)?;
         let mut report = String::new();
         let mut mismatches = 0usize;
         for (index, &got) in observed.iter().enumerate() {
@@ -7220,17 +7221,17 @@ fn check_fragment_map(
     module: &kernels::LoadedModule,
     shape: Shape,
 ) -> Result<String, Box<dyn Error>> {
-    let a = DeviceBuffer::from_host(stream, &probe_a())?;
-    let b = DeviceBuffer::from_host(stream, &probe_b())?;
+    let a = watchdog::stage(stream, &probe_a())?;
+    let b = watchdog::stage(stream, &probe_b())?;
     let a_map = unsafe { encode_bf16_panels::<ROWS, DEPTH>(stream, a.cu_deviceptr(), ROWS, 1)? };
     let b_map = unsafe { encode_bf16_panels::<TILE, DEPTH>(stream, b.cu_deviceptr(), TILE, 2)? };
 
     let (m, n) = shape.dimensions();
     let warps = ROWS / 32;
     let per_lane = m * n / 32;
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, warps * 32 * per_lane)?;
+    let mut out = watchdog::cleared::<f32>(stream, warps * 32 * per_lane)?;
     unsafe { shape.launch(module, stream, a_map.as_ptr(), b_map.as_ptr(), &mut out)? };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let slots = per_lane / (n / 4);
     let values = n / 4;
@@ -7530,16 +7531,16 @@ fn check_walk(
     module: &kernels::LoadedModule,
     order: Order,
 ) -> Result<String, Box<dyn Error>> {
-    let a_k = DeviceBuffer::from_host(stream, &stage_walk_operand(ROWS, DEPTH, walk_a))?;
-    let a_mn = DeviceBuffer::from_host(
+    let a_k = watchdog::stage(stream, &stage_walk_operand(ROWS, DEPTH, walk_a))?;
+    let a_mn = watchdog::stage(
         stream,
         &stage_walk_operand(DEPTH, ROWS, |k, m| walk_a(m, k)),
     )?;
-    let b_k = DeviceBuffer::from_host(
+    let b_k = watchdog::stage(
         stream,
         &stage_walk_operand(COLUMNS, DEPTH, |n, k| walk_b(k, n)),
     )?;
-    let b_mn = DeviceBuffer::from_host(stream, &stage_walk_operand(DEPTH, COLUMNS, walk_b))?;
+    let b_mn = watchdog::stage(stream, &stage_walk_operand(DEPTH, COLUMNS, walk_b))?;
 
     let a_k_map =
         unsafe { encode_bf16_panels::<ROWS, DEPTH>(stream, a_k.cu_deviceptr(), ROWS, 1)? };
@@ -7554,9 +7555,9 @@ fn check_walk(
     let a_map = if a_transposed { &a_mn_map } else { &a_k_map };
     let b_map = if b_transposed { &b_mn_map } else { &b_k_map };
 
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, ROWS * COLUMNS)?;
+    let mut out = watchdog::cleared::<f32>(stream, ROWS * COLUMNS)?;
     unsafe { order.launch(module, stream, a_map.as_ptr(), b_map.as_ptr(), &mut out)? };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let reference = walk_reference();
     let (region_rows, region_columns) = order.region();
@@ -7674,12 +7675,12 @@ fn check_reductions(
     stream: &CudaStream,
     module: &kernels::LoadedModule,
 ) -> Result<String, Box<dyn Error>> {
-    let a = DeviceBuffer::from_host(stream, &probe_a())?;
-    let b = DeviceBuffer::from_host(stream, &probe_b())?;
+    let a = watchdog::stage(stream, &probe_a())?;
+    let b = watchdog::stage(stream, &probe_b())?;
     let a_map = unsafe { encode_bf16_panels::<ROWS, DEPTH>(stream, a.cu_deviceptr(), ROWS, 1)? };
     let b_map = unsafe { encode_bf16_panels::<TILE, DEPTH>(stream, b.cu_deviceptr(), TILE, 2)? };
 
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, ROWS * REDUCTION_STRIDE)?;
+    let mut out = watchdog::cleared::<f32>(stream, ROWS * REDUCTION_STRIDE)?;
     unsafe {
         module.reduction_probe(
             stream,
@@ -7689,7 +7690,7 @@ fn check_reductions(
             &mut out,
         )?
     };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let wanted = reduction_expectations();
     let mut report = String::new();
@@ -8200,6 +8201,10 @@ fn run() -> Result<usize, Box<dyn Error>> {
 
     let mut failures = 0usize;
     for (name, case) in &cases {
+        // What the launch watchdog names if one of this case's launches does
+        // not come back. Every case here reads a buffer back, and a readback is
+        // a wait — see `kittens::watchdog`.
+        kittens::watchdog::watching(format!("device-tests case `{name}`"));
         match case() {
             Ok(note) => println!("pass  {name:<26}  {note}"),
             Err(error) => {

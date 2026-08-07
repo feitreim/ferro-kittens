@@ -50,6 +50,8 @@ pub mod reg;
 pub mod shared;
 pub mod sync;
 pub mod tmem;
+#[cfg(feature = "host")]
+pub mod watchdog;
 
 pub use epilogue::{Cta, Scope, StoreRing, Warp};
 pub use plan::SharedPlan;

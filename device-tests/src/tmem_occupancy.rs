@@ -81,10 +81,11 @@
 use std::error::Error;
 use std::fmt::Write as _;
 
-use cuda_core::{CudaFunction, CudaStream, DeviceBuffer};
+use cuda_core::{CudaFunction, CudaStream};
 use cuda_host::CudaKernel;
 
 use crate::{kernels, launch_config};
+use kittens::watchdog::{self, ReadBack};
 
 /// Block widths the ladder is queried at, matching #74's table.
 const WIDTHS: [u32; 4] = [32, 64, 128, 256];
@@ -195,7 +196,7 @@ fn launched_address(
     module: &kernels::LoadedModule,
     rung: &Rung,
 ) -> Result<u32, Box<dyn Error>> {
-    let mut out = DeviceBuffer::<u32>::zeroed(stream, 1)?;
+    let mut out = watchdog::cleared::<u32>(stream, 1)?;
     let config = launch_config(LAUNCH_THREADS, LADDER_SHARED);
     unsafe {
         match rung.columns {
@@ -210,7 +211,7 @@ fn launched_address(
             }
         }
     }
-    Ok(out.to_host_vec(stream)?[0])
+    Ok(out.read_back(stream)?[0])
 }
 
 /// The shape #74 measured, asserted rather than merely printed.

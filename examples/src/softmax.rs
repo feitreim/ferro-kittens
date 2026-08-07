@@ -37,6 +37,7 @@ use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, RegTile, RegVec};
 use kittens::shared::{Bf16, SharedTile, Swizzle128B, SwizzledChunks, publish_to_async_proxy};
 use kittens::sync::Semaphore;
+use kittens::watchdog::{self, ReadBack};
 use kittens::{lane, warp_id};
 
 const ROWS: usize = 128;
@@ -258,7 +259,7 @@ pub(crate) fn run<T>(
         &mut dyn FnMut() -> Result<(), Box<dyn Error>>,
     ) -> Result<T, Box<dyn Error>>,
 ) -> Result<(String, T), Box<dyn Error>> {
-    use cuda_core::{DeviceBuffer, LaunchConfig};
+    use cuda_core::LaunchConfig;
     use kittens::global::encode_bf16_panels;
     use kittens::shared::Element;
 
@@ -275,8 +276,8 @@ pub(crate) fn run<T>(
     let stream = context.default_stream();
 
     let staged = staged(rows, planes);
-    let source = DeviceBuffer::from_host(&stream, &staged)?;
-    let destination = DeviceBuffer::<u32>::zeroed(&stream, staged.len())?;
+    let source = watchdog::stage(&stream, &staged)?;
+    let destination = watchdog::cleared::<u32>(&stream, staged.len())?;
     // SAFETY: both buffers outlive every launch consuming their maps below.
     let (source_map, destination_map) = unsafe {
         (
@@ -306,7 +307,7 @@ pub(crate) fn run<T>(
         .map(|value| (value as f64 / 8.0 - 127.0 / 8.0).exp2())
         .collect();
     let total: f64 = weight.iter().sum();
-    let observed = destination.to_host_vec(&stream)?;
+    let observed = destination.read_back(&stream)?;
     let (mut wrong, mut sample, mut worst) = (0usize, Vec::new(), 0.0f32);
     for plane in 0..planes {
         for row in 0..rows {

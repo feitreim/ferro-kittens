@@ -105,10 +105,11 @@ use std::error::Error;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::Arc;
 
-use cuda_core::{CudaContext, DeviceBuffer};
+use cuda_core::CudaContext;
 
 use crate::bench::{Shape, Timings, time};
 use crate::gemm;
+use kittens::watchdog::{self, ReadBack};
 
 /// Scratch cuBLASLt may use, and the cap the heuristic is chosen under.
 ///
@@ -433,11 +434,11 @@ pub fn bench(
 
     // Byte-identical to what `gemm::run` stages, from the same generators. Not
     // a re-implementation of the operands: the same function.
-    let a = DeviceBuffer::from_host(&stream, &gemm::stage(m, k, gemm::a_value))?;
-    let b = DeviceBuffer::from_host(&stream, &gemm::stage(n, k, gemm::b_value))?;
-    let c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
+    let a = watchdog::stage(&stream, &gemm::stage(m, k, gemm::a_value))?;
+    let b = watchdog::stage(&stream, &gemm::stage(n, k, gemm::b_value))?;
+    let c = watchdog::cleared::<u16>(&stream, m * n)?;
     // Outside the timed region, as every allocation on both sides is.
-    let workspace = DeviceBuffer::<u8>::zeroed(&stream, WORKSPACE_BYTES)?;
+    let workspace = watchdog::cleared::<u8>(&stream, WORKSPACE_BYTES)?;
 
     let mut session = Session::new();
     // SAFETY (this block): each call fills or consumes a field of `session`,
@@ -548,13 +549,13 @@ pub fn bench(
     };
 
     launch()?;
-    stream.synchronize()?;
+    watchdog::wait(&stream)?;
     // `==` on the bf16 words, against a reference rounded the way
     // `cvt.rn.bf16x2.f32` rounds — so this asserts the library's epilogue
     // rounds once, from an fp32 accumulator, exactly as ours does. The worst
     // relative error it returns is the same property of bf16 both sides carry,
     // and `gemm::check` is where it is reported.
-    gemm::check_c(&c.to_host_vec(&stream)?, m, n, k)?;
+    gemm::check_c(&c.read_back(&stream)?, m, n, k)?;
 
     Ok((time(&stream, &mut launch)?, describe(&heuristic)))
 }
@@ -569,10 +570,10 @@ pub fn bench_f16(
 ) -> Result<(Timings, String), Box<dyn Error>> {
     let Shape { m, n, k } = shape;
     let stream = context.default_stream();
-    let a = DeviceBuffer::<u16>::zeroed(&stream, m * k)?;
-    let b = DeviceBuffer::<u16>::zeroed(&stream, n * k)?;
-    let c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
-    let workspace = DeviceBuffer::<u8>::zeroed(&stream, WORKSPACE_BYTES)?;
+    let a = watchdog::cleared::<u16>(&stream, m * k)?;
+    let b = watchdog::cleared::<u16>(&stream, n * k)?;
+    let c = watchdog::cleared::<u16>(&stream, m * n)?;
+    let workspace = watchdog::cleared::<u8>(&stream, WORKSPACE_BYTES)?;
 
     let mut session = Session::new();
     checked(

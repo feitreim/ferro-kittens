@@ -37,7 +37,7 @@ use cuda_core::CudaContext;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{cuda_module, kernel};
 
-use crate::bench::{ITERATIONS, Shape, Timings, WARMUP, extremes, middle, time};
+use crate::bench::{ITERATIONS, Shape, Timings, WARMUP, announce, extremes, middle, time};
 use crate::softmax::{self, COLUMNS, run};
 
 #[cuda_module]
@@ -158,9 +158,9 @@ pub fn compare(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
     for &shape in SIZES {
         let (mut narrow, mut wide) = (Vec::new(), Vec::new());
         for pass in 1..=REPEATS {
-            eprintln!("{shape} x2 pass {pass}: staging and checking");
+            announce(format!("{shape} x2 pass {pass}"));
             narrow.push(softmax::bench(context, shape)?.min());
-            eprintln!("{shape} x4 pass {pass}: staging and checking");
+            announce(format!("{shape} x4 pass {pass}"));
             wide.push(bench(context, shape)?.min());
         }
         let paired: Vec<f64> = narrow

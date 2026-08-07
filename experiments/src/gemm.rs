@@ -317,7 +317,7 @@ use cuda_device::{
 };
 
 // Host side: the launcher's error type, and the benchmark's size and clock.
-use crate::bench::{Shape, Timings, time};
+use crate::bench::{Shape, Timings, announce, time};
 use core::marker::PhantomData;
 use std::error::Error;
 
@@ -331,6 +331,7 @@ use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
+use kittens::watchdog::{self, ReadBack};
 use kittens::{lane, warp_id};
 
 /// Rows of `C` one CTA owns. The pair covers `2 * BLOCK_M`, which is the `M`
@@ -5174,8 +5175,8 @@ fn run<T>(
     // entry point in it — the ABI the contract declares is the one compiled.
     let module = unsafe { kernels::load(context)? };
 
-    let a = DeviceBuffer::from_host(&stream, &stage(m, k, a_value))?;
-    let b = DeviceBuffer::from_host(&stream, &stage(n, k, b_value))?;
+    let a = watchdog::stage(&stream, &stage(m, k, a_value))?;
+    let b = watchdog::stage(&stream, &stage(n, k, b_value))?;
     // SAFETY: both buffers outlive every launch consuming their maps below.
     let (a_layout, b_layout) = unsafe {
         (
@@ -5196,7 +5197,7 @@ fn run<T>(
         columns => return Err(format!("no rung has {columns} pair columns").into()),
     };
 
-    let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
+    let mut c = watchdog::cleared::<u16>(&stream, m * n)?;
     // The TMA epilogues are the only ones that need a descriptor for the
     // *output* — every other rung writes `C` through a `GlobalRows` cursor
     // carrying `ldc` and nothing else — so one is built only where one is
@@ -5430,7 +5431,7 @@ fn run<T>(
             // rounding those words carry — the representation error of a bf16
             // `C`, which is a property of the output format and not of this
             // launch. See `check_c` for why the comparison is still `==`.
-            let worst = check_c(&c.to_host_vec(&stream)?, m, n, k)?;
+            let worst = check_c(&c.read_back(&stream)?, m, n, k)?;
             format!("{m}x{n}x{k} exact, worst |rel| {worst:.2e} against the fp32 reference")
         }
         (false, _) => format!(
@@ -5943,7 +5944,7 @@ pub fn compare(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<(), B
         let (waves, efficiency) = wave_efficiency(m, n);
         let mut milliseconds = Vec::new();
         for scheduler in SCHEDULERS {
-            eprintln!("{shape} on {}: staging and checking", scheduler.name());
+            announce(format!("{shape} on {}", scheduler.name()));
             let (_, timings) = run(context, m, n, k, Plan::new(scheduler), time)?;
             milliseconds.push(timings.min());
         }
@@ -6124,11 +6125,11 @@ fn timed(
     shape: Shape,
     plan: Plan,
 ) -> Result<f64, Box<dyn Error>> {
-    eprintln!(
-        "{shape} on {} at group {}: staging and checking",
+    announce(format!(
+        "{shape} on {} at group {}",
         plan.scheduler.name(),
         plan.group
-    );
+    ));
     let (_, timings) = run(context, shape.m, shape.n, shape.k, plan, time)?;
     Ok(timings.min())
 }
@@ -6327,7 +6328,7 @@ pub fn tile_sweep(
                 epilogue: Epilogue::Fused,
                 ablation: Ablation::Whole,
             };
-            eprintln!("{shape} on {}: staging and checking", rung.name());
+            announce(format!("{shape} on {}", rung.name()));
             let (_, timings) = run(context, shape.m, shape.n, shape.k, plan, time)?;
             let milliseconds = timings.min();
             measured.push((rung, shape, milliseconds));
@@ -6375,10 +6376,7 @@ pub fn tile_sweep(
                 epilogue: Epilogue::Fused,
                 ablation: Ablation::Whole,
             };
-            eprintln!(
-                "{SWEEP} on {} at group {group}: staging and checking",
-                rung.name()
-            );
+            announce(format!("{SWEEP} on {} at group {group}", rung.name()));
             let (_, timings) = run(context, SWEEP.m, SWEEP.n, SWEEP.k, plan, time)?;
             let milliseconds = timings.min();
             let (rows, columns, _, reuse) = wave_reuse(SWEEP.m, SWEEP.n, group, rung.block_n, cap);
@@ -6411,7 +6409,7 @@ pub fn tile_sweep(
             );
             break;
         };
-        eprintln!("{shape}: staging and checking {}", baseline.name);
+        announce(format!("{shape} on {}", baseline.name));
         let theirs = (baseline.bench)(context, shape)?.0.min();
         let at = |rung: Rung| {
             measured
@@ -6537,7 +6535,7 @@ pub fn crossover(
                 epilogue,
                 ablation: Ablation::Whole,
             };
-            eprintln!("{shape} on {label}: staging and checking");
+            announce(format!("{shape} on {label}"));
             let (_, timings) = run(context, shape.m, shape.n, shape.k, plan, time)?;
             let milliseconds = timings.min();
             measured.push((rung, epilogue, shape, milliseconds));
@@ -6624,7 +6622,7 @@ pub fn crossover(
             );
             break;
         };
-        eprintln!("{shape}: staging and checking {}", baseline.name);
+        announce(format!("{shape} on {}", baseline.name));
         let theirs = (baseline.bench)(context, shape)?.0.min();
         let chosen = plan_for(shape.m, shape.n);
         let at = |rung: Rung, epilogue: Epilogue| {
@@ -7078,7 +7076,7 @@ pub fn ablation_ladder(
         if shape.k != 8192 {
             continue;
         }
-        eprintln!("{shape}: staging and checking {}", baseline.name);
+        announce(format!("{shape} on {}", baseline.name));
         let theirs = (baseline.bench)(context, shape)?.0.min();
         println!(
             "{:<18}{:>14.4}{:>14.1}{:>16.3}",
@@ -7362,7 +7360,7 @@ pub fn epilogue_sweep(
             );
             break;
         };
-        eprintln!("{shape}: staging and checking {}", baseline.name);
+        announce(format!("{shape} on {}", baseline.name));
         let theirs = (baseline.bench)(context, shape)?.0.min();
         println!(
             "{:<18}{:>14.4}{:>14.1}{:>14.3}{:>16.3}",
@@ -7551,7 +7549,7 @@ pub fn staged_sweep(
             );
             break;
         };
-        eprintln!("{shape}: staging and checking {}", baseline.name);
+        announce(format!("{shape} on {}", baseline.name));
         let theirs = (baseline.bench)(context, shape)?.0.min();
         println!(
             "{:<18}{:>14.4}{:>14.1}{:>14.3}{:>16.3}",
@@ -7766,7 +7764,7 @@ pub fn widths_sweep(
     }
     println!();
     for (shape, arms, _) in &measured {
-        eprintln!("{shape}: staging and checking {}", baseline.name);
+        announce(format!("{shape} on {}", baseline.name));
         let theirs = (baseline.bench)(context, *shape)?.0.min();
         print!(
             "{:<18}{:>14.4}{:>14.1}",
@@ -7922,7 +7920,7 @@ pub fn residual_sweep(
             plan.with(Epilogue::Staged).ablated(Ablation::NoDrain),
         )?;
         let fused_bare = timed(context, shape, plan.ablated(Ablation::NoDrain))?;
-        eprintln!("{shape}: staging and checking {}", baseline.name);
+        announce(format!("{shape} on {}", baseline.name));
         let theirs = (baseline.bench)(context, shape)?.0;
         let (waves, efficiency) = wave_efficiency(shape.m, shape.n);
         println!(
@@ -7969,7 +7967,7 @@ pub fn residual_sweep(
         "shape", "min ms", "median", "max", "max/min", "again ms", "call/call"
     );
     for (shape, _, _, _, theirs) in &ceiling {
-        eprintln!("{shape}: staging and checking {} again", baseline.name);
+        announce(format!("{shape} on {} again", baseline.name));
         let again = (baseline.bench)(context, *shape)?.0.min();
         println!(
             "{:<18}{:>12.4}{:>12.4}{:>12.4}{:>10.2}{:>12.4}{:>10.3}",
@@ -8326,7 +8324,7 @@ fn tma_ordering(context: &std::sync::Arc<cuda_core::CudaContext>) -> Result<(), 
         let mut taken: Vec<Vec<Timings>> = TMA_ARMS.iter().map(|_| Vec::new()).collect();
         for pass in 1..=TMA_REPEATS {
             for (arm, into) in TMA_ARMS.iter().zip(taken.iter_mut()) {
-                eprintln!("{shape} {} pass {pass}: staging and checking", arm.name());
+                announce(format!("{shape} {} pass {pass}", arm.name()));
                 into.push(bench_with(context, shape, *arm)?);
             }
         }
@@ -8630,7 +8628,7 @@ pub fn swizzle(
     for shape in HEADLINE {
         let against = match baseline {
             Some(baseline) => {
-                eprintln!("{shape}: staging and checking {}", baseline.name);
+                announce(format!("{shape} on {}", baseline.name));
                 Some((baseline.bench)(context, shape)?.0.min())
             }
             None => None,

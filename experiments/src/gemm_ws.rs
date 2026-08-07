@@ -384,7 +384,7 @@ use cuda_device::tcgen05::tcgen05_fence_before_thread_sync;
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{DisjointSlice, cluster_launch, cuda_module, kernel, launch_contract};
 
-use crate::bench::{Baseline, Shape, Timings, time};
+use crate::bench::{Baseline, Shape, Timings, announce, time};
 use crate::gemm::{Scheduler, a_value, b_value, check_c, stage};
 use std::error::Error;
 
@@ -397,6 +397,7 @@ use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
+use kittens::watchdog::{self, ReadBack};
 use kittens::{lane, warp_id};
 
 /// Rows of `C` one CTA owns; the pair covers `2 * BLOCK_M`, which is the `M`
@@ -1766,8 +1767,8 @@ fn run<T>(
     // ABI compiled.
     let module = unsafe { kernels::load(context)? };
 
-    let a = DeviceBuffer::from_host(&stream, &stage(m, k, a_value))?;
-    let b = DeviceBuffer::from_host(&stream, &stage(n, k, b_value))?;
+    let a = watchdog::stage(&stream, &stage(m, k, a_value))?;
+    let b = watchdog::stage(&stream, &stage(n, k, b_value))?;
     // SAFETY: both buffers outlive every launch consuming their maps below.
     let (a_layout, b_layout) = unsafe {
         (
@@ -1778,7 +1779,7 @@ fn run<T>(
     let a_map = a_layout.tensor_map::<ATile>(&stream)?;
     let b_map = b_layout.tensor_map::<BTile>(&stream)?;
 
-    let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
+    let mut c = watchdog::cleared::<u16>(&stream, m * n)?;
     let blocks = grid_for(plan.scheduler, m, n);
     let (tiles_m, tiles_n) = tile_grid(m, n);
     let k_blocks = (k / BLOCK_K) as u32;
@@ -1843,7 +1844,7 @@ fn run<T>(
     // be a GEMM — every schedule, both depths, and all four epilogue widths —
     // goes through the element-by-element `==` before a clock can reach it.
     let label = if plan.entry.exact() {
-        let worst = check_c(&c.to_host_vec(&stream)?, m, n, k)?;
+        let worst = check_c(&c.read_back(&stream)?, m, n, k)?;
         format!("{m}x{n}x{k} exact, worst |rel| {worst:.2e} against the fp32 reference")
     } else {
         format!(
@@ -2017,11 +2018,11 @@ fn timed(
     shape: Shape,
     plan: Plan,
 ) -> Result<Timings, Box<dyn Error>> {
-    eprintln!(
-        "{shape} on {} / {}: staging and checking",
+    announce(format!(
+        "{shape} on {} / {}",
         plan.entry.name(),
         plan.scheduler.name()
-    );
+    ));
     run(context, shape.m, shape.n, shape.k, plan, time).map(|(_, timings)| timings)
 }
 
@@ -2089,7 +2090,7 @@ pub fn compare(
     );
     let mut measured = Vec::new();
     for shape in SIZES {
-        eprintln!("{shape} on gemm lcf (the control): staging and checking");
+        announce(format!("{shape} on gemm lcf (the control)"));
         // Named rather than taken from `gemm::bench`, and #119 is why: that
         // function launches `gemm`'s shipped epilogue, which is now `staged84`.
         // Table 1's whole claim is that the epilogue is identical on both
@@ -2298,7 +2299,7 @@ pub fn compare(
     for ((&(shape, control, _), (_, _, arms)), &(bare, _)) in
         measured.iter().zip(&ladder).zip(&floors)
     {
-        eprintln!("{shape} on gemm staged84 (the control): staging and checking");
+        announce(format!("{shape} on gemm staged84 (the control)"));
         let theirs =
             crate::gemm::bench_with(context, shape, crate::gemm::Epilogue::StagedWideX4)?.min();
         println!(
@@ -2342,7 +2343,7 @@ pub fn compare(
             );
             break;
         };
-        eprintln!("{shape}: staging and checking {}", baseline.name);
+        announce(format!("{shape} on {}", baseline.name));
         let theirs = (baseline.bench)(context, shape)?.0.min();
         println!(
             "{:<18}{:>13.4}{:>13.1}{:>9.3}{:>9.3}{:>9.3}{:>11.3}{:>12.3}{:>10.3}",
@@ -2421,7 +2422,7 @@ pub fn shallow(
     );
     let mut rows = Vec::new();
     for shape in SHALLOW {
-        eprintln!("{shape} on gemm staged84 (the control): staging and checking");
+        announce(format!("{shape} on gemm staged84 (the control)"));
         let control =
             crate::gemm::bench_with(context, shape, crate::gemm::Epilogue::StagedWideX4)?.min();
         let ours = rung(context, shape, SHIPPED_ENTRY)?;
@@ -2452,7 +2453,7 @@ pub fn shallow(
             );
             break;
         };
-        eprintln!("{shape}: staging and checking {}", baseline.name);
+        announce(format!("{shape} on {}", baseline.name));
         let theirs = (baseline.bench)(context, shape)?.0.min();
         println!(
             "{:<18}{:>13.4}{:>13.1}{:>9.3}{:>9.3}{:>9.3}{:>10.3}",

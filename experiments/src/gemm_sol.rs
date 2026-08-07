@@ -68,6 +68,7 @@ use kittens::shared::{
 };
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
+use kittens::watchdog::{self, ReadBack};
 
 /// The whole kernel: the arm every shipped entry passes.
 pub const WHOLE: u8 = 0;
@@ -2202,14 +2203,14 @@ fn run<T>(
     let stream = context.default_stream();
     let module = unsafe { kernels::load(context)? };
     let a = if initialize {
-        DeviceBuffer::from_host(&stream, &stage_f16(m, k, a_value))?
+        watchdog::stage(&stream, &stage_f16(m, k, a_value))?
     } else {
-        DeviceBuffer::<u16>::zeroed(&stream, m * k)?
+        watchdog::cleared::<u16>(&stream, m * k)?
     };
     let b = if initialize {
-        DeviceBuffer::from_host(&stream, &stage_f16(n, k, b_value))?
+        watchdog::stage(&stream, &stage_f16(n, k, b_value))?
     } else {
-        DeviceBuffer::<u16>::zeroed(&stream, n * k)?
+        watchdog::cleared::<u16>(&stream, n * k)?
     };
     let (a_layout, b_layout) = unsafe {
         (
@@ -2220,7 +2221,7 @@ fn run<T>(
     let a_map = a_layout.tensor_map::<ATile>(&stream)?;
     let b_map = b_layout.tensor_map::<BPanel>(&stream)?;
 
-    let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
+    let mut c = watchdog::cleared::<u16>(&stream, m * n)?;
     let tiles_m = (m / 256) as u32;
     let tiles_n = (n / variant.n_tile()) as u32;
     let config = LaunchConfig1D::new(
@@ -2272,10 +2273,18 @@ fn run<T>(
             }
         };
 
+    // Nothing at all in a default build. With `--features wedge` and
+    // `KITTENS_WEDGE_SECONDS` set, a launch that does not return, queued
+    // immediately in front of this row's own on this row's own stream -- which
+    // is the shape #146 had, and is the whole of what `kittens::watchdog` is a
+    // guard against. See `crate::wedge` for why the injection is here and not
+    // at the top of the process.
+    #[cfg(feature = "wedge")]
+    crate::wedge::inject(&stream)?;
     launch_once(&mut c)?;
-    stream.synchronize()?;
+    watchdog::wait(&stream)?;
     let label = if initialize {
-        let worst = check_output(&c.to_host_vec(&stream)?, m, n, k)?;
+        let worst = check_output(&c.read_back(&stream)?, m, n, k)?;
         format!(
             "{} {m}x{n}x{k} exact over {} BF16 outputs, worst |rel| {worst:.2e}",
             variant.name(),

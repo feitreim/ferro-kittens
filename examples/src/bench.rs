@@ -1,6 +1,6 @@
 //! The clock, and the shape a timed run is taken at — nothing else.
 //!
-//! Three rules this file exists to enforce, in the order they matter:
+//! Four rules this file exists to enforce, in the order they matter:
 //!
 //! 1. **A number only ever comes out of a checked run.** [`time`] takes the
 //!    launch as a closure, and every kernel here hands it one only from inside
@@ -9,7 +9,13 @@
 //! 2. **The clock is the device's.** CUDA events either side of the launch,
 //!    not wall clock around the driver call — at the small end of a sweep the
 //!    driver's launch path is the same order as the kernel.
-//! 3. **A single number is not a measurement.** [`Timings`] keeps the launches
+//! 3. **A wait on a device has a deadline.** Every wait here goes through
+//!    [`kittens::watchdog`], which polls the event the clock already records
+//!    instead of blocking on it, so a launch that stops making progress ends
+//!    this process in seconds naming the row — where a bare
+//!    `cuEventSynchronize` rides the container's whole `timeout=` (#146,
+//!    `bench --case sol-k`, twenty minutes of a B200 saying nothing).
+//! 4. **A single number is not a measurement.** [`Timings`] keeps the launches
 //!    both sorted and in the order they were issued. The headline is the
 //!    minimum, since every source of error on a quiet device adds time and
 //!    none subtracts it; [`Timings::spread`] and [`Timings::drift`] are the two
@@ -26,6 +32,8 @@
 use std::error::Error;
 
 use cuda_core::CudaStream;
+
+use kittens::watchdog;
 
 /// Launches discarded before timing begins. `pub` because a table quoting a
 /// minimum has to say how many launches it is the minimum *of*.
@@ -115,13 +123,19 @@ pub fn time(
     for _ in 0..WARMUP {
         launch()?;
     }
-    stream.synchronize()?;
+    watchdog::wait(stream)?;
 
     let mut milliseconds = Vec::with_capacity(ITERATIONS);
     for _ in 0..ITERATIONS {
         start.record(stream)?;
         launch()?;
         stop.record(stream)?;
+        // The wait `elapsed_ms` would do anyway, with a deadline on it, and on
+        // the event it already has: nothing is recorded, allocated or launched
+        // that was not before, and the pair bracketing the launch is untouched.
+        // `elapsed_ms` then synchronizes two events that have already been seen
+        // complete. See `kittens::watchdog` for why the poll is the same wait.
+        watchdog::wait_event(&stop)?;
         milliseconds.push(start.elapsed_ms(&stop)? as f64);
     }
     Ok(Timings::new(milliseconds))

@@ -37,6 +37,14 @@ cublas = []
 # takes the port's row both with and without that wrapper so the flag's own
 # effect is measured rather than assumed.
 gemm-sol-upstream = []
+# A kernel that spins for ten minutes, launched ahead of a sweep's own work when
+# `KITTENS_WEDGE_SECONDS` asks for one — the control for `kittens::watchdog`'s
+# launch deadline, in the way `modal_app.py::stall` is the control for
+# `scripts/modal-run`'s. Off by default so no shipping build carries it: with it
+# off, `regcount`'s register table, the occupancy-step gate and the local-memory
+# census never see the kernel, and the only thing that turns it on is
+# `modal_app.py::wedge_demo`. See `src/wedge.rs`.
+wedge = []
 
 [dependencies]
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "20a56163f258e09f2c51e4c27ae4e4ff17582443" }

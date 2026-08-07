@@ -135,12 +135,13 @@
 use std::error::Error;
 use std::fmt::Write as _;
 
-use cuda_core::{CudaFunction, CudaStream, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaFunction, CudaStream, LaunchConfig};
 use cuda_host::CudaKernel;
 
 use kittens::launch::admit_shared_plan;
 
 use crate::{CENSUS_FIELDS, kernels};
+use kittens::watchdog::{self, ReadBack};
 
 /// Threads a census CTA launches with. One warp is all the allocator needs and
 /// all the probe does, so blocks per SM *is* warps per SM and no register or
@@ -633,7 +634,7 @@ fn census(
     rung: &Rung,
     blocks: u32,
 ) -> Result<Vec<u64>, Box<dyn Error>> {
-    let mut out = DeviceBuffer::<u64>::zeroed(stream, blocks as usize * CENSUS_FIELDS)?;
+    let mut out = watchdog::cleared::<u64>(stream, blocks as usize * CENSUS_FIELDS)?;
     let config = LaunchConfig {
         grid_dim: (blocks, 1, 1),
         block_dim: (CENSUS_THREADS, 1, 1),
@@ -684,7 +685,7 @@ fn census(
             }
         }
     }
-    Ok(out.to_host_vec(stream)?)
+    Ok(out.read_back(stream)?)
 }
 
 /// One device attribute, by the same raw-`sys` route `ladder_bench` uses.

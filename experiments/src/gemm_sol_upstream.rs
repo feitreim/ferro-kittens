@@ -112,6 +112,7 @@ use kittens::ldst::stmatrix_m8n8_x2;
 
 use crate::bench::{Shape, Timings, time};
 use crate::gemm_sol::{check_output, stage_f16};
+use kittens::watchdog::{self, ReadBack};
 
 /// Upstream's shared-memory matrix descriptor encoder, copied out of its
 /// `main.rs`. The device code below calls it and nothing else of the host's.
@@ -301,14 +302,14 @@ fn run<T>(
     let module = kernels::load(context)?;
 
     let a = if initialize {
-        DeviceBuffer::from_host(&stream, &stage_f16(m, k, crate::gemm_sol::a_value))?
+        watchdog::stage(&stream, &stage_f16(m, k, crate::gemm_sol::a_value))?
     } else {
-        DeviceBuffer::<u16>::zeroed(&stream, m * k)?
+        watchdog::cleared::<u16>(&stream, m * k)?
     };
     let b = if initialize {
-        DeviceBuffer::from_host(&stream, &stage_f16(n, k, crate::gemm_sol::b_value))?
+        watchdog::stage(&stream, &stage_f16(n, k, crate::gemm_sol::b_value))?
     } else {
-        DeviceBuffer::<u16>::zeroed(&stream, n * k)?
+        watchdog::cleared::<u16>(&stream, n * k)?
     };
 
     let a_map = create_tma_descriptor_f16_swizzled(
@@ -326,14 +327,14 @@ fn run<T>(
     // Named, not shadowed: the maps live in device memory for as long as any
     // launch can read them, and binding the pointer over the buffer would free
     // what the pointer points at.
-    let a_map_buffer = DeviceBuffer::from_host(&stream, &a_map.opaque)?;
-    let b_map_buffer = DeviceBuffer::from_host(&stream, &b_map.opaque)?;
+    let a_map_buffer = watchdog::stage(&stream, &a_map.opaque)?;
+    let b_map_buffer = watchdog::stage(&stream, &b_map.opaque)?;
     let a_map = a_map_buffer.cu_deviceptr() as *const TmaDescriptor;
     let b_map = b_map_buffer.cu_deviceptr() as *const TmaDescriptor;
 
     // Two BF16 outputs per word, which is the shape of upstream's epilogue
     // store and therefore of its output parameter.
-    let mut c = DeviceBuffer::<u32>::zeroed(&stream, m * n / 2)?;
+    let mut c = watchdog::cleared::<u32>(&stream, m * n / 2)?;
 
     let tiles_m = (m / 256) as u32;
     let tiles_n = (n / 128) as u32;
@@ -370,12 +371,12 @@ fn run<T>(
         };
 
     launch_once(&mut c)?;
-    stream.synchronize()?;
+    watchdog::wait(&stream)?;
     let label = if initialize {
         // Upstream packs column `2i` in the low half of word `i`, so the words
         // read back little-endian *are* `C` row-major in BF16 — the same slice
         // the port's own check takes.
-        let words = c.to_host_vec(&stream)?;
+        let words = c.read_back(&stream)?;
         let observed: Vec<u16> = words
             .iter()
             .flat_map(|&word| [word as u16, (word >> 16) as u16])

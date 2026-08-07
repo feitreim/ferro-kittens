@@ -124,6 +124,18 @@ Progress from `time` goes to stderr and not into the table: a sweep is minutes
 long, and a reader watching it should be able to tell a slow size from a stuck
 one. Reaching that line at all is the check having passed.
 
+### Every wait in it has a deadline
+
+The two waits `time` takes — the one after the warm-up launches, and the one
+`elapsed_ms` would take on each timed pair — go through `kittens::watchdog`, so
+a launch that stops making progress ends the process in 30 s naming the row
+instead of holding the container until Modal's `timeout=`. The timed loop uses
+`wait_event` on the `stop` event it already records: no event is created, no
+allocation is made, and the pair bracketing the launch is untouched, so this is
+not a change to what the clock measures. `docs/library/watchdog.md` has the
+argument for why a poll is the same wait a blocking synchronize would have
+done.
+
 ## The occupancy census — `main.rs`
 
 A register count off `ptxas` is half an occupancy argument; the blocks-per-SM
@@ -182,3 +194,4 @@ nothing can reach.
 - `docs/kernels/softmax.md`, `docs/kernels/layernorm.md` — the two kernels whose
   `bench` entry points are written against this clock.
 - `experiments/README.md` — the sweeps that include this file through `#[path]`.
+- `docs/library/watchdog.md` — the deadline every wait here carries.

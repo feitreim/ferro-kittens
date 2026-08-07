@@ -58,7 +58,6 @@ use std::error::Error;
 use std::fmt::Write as _;
 
 use cuda_core::CudaStream;
-use cuda_core::DeviceBuffer;
 
 use kittens::reg::Fragment;
 
@@ -66,6 +65,7 @@ use crate::{
     HANDOFF_BARRIER, HANDOFF_FENCE, HANDOFF_ROTATE, HANDOFF_THREADS, HANDOFF_WRITER, TILE,
     decode_cell, dump_index, handoff_cell, kernels, launch_config, tile_shared,
 };
+use kittens::watchdog::{self, ReadBack};
 
 /// `[16, 16]` blocks the reader reads back, and the `warp` slot of
 /// [`dump_index`] — one band a block, as `ldmatrix map` dumps.
@@ -199,7 +199,7 @@ fn measure(
     module: &kernels::LoadedModule,
     row: &Row,
 ) -> Result<Vec<f32>, Box<dyn Error>> {
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, DUMP)?;
+    let mut out = watchdog::cleared::<f32>(stream, DUMP)?;
     let config = launch_config(HANDOFF_THREADS, tile_shared::<TILE, TILE>());
     unsafe {
         if row.early {
@@ -208,7 +208,7 @@ fn measure(
             module.stmatrix_handoff(stream, config, row.sync, row.reader, &mut out)
         }
     }?;
-    Ok(out.to_host_vec(stream)?)
+    Ok(out.read_back(stream)?)
 }
 
 /// Which generation the value at one position belongs to.
