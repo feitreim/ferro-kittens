@@ -85,6 +85,7 @@ use cuda_core::{CudaFunction, CudaStream, DeviceBuffer};
 use cuda_host::CudaKernel;
 
 use crate::{kernels, launch_config};
+use kittens::watchdog::ReadBack;
 
 /// Block widths the ladder is queried at, matching #74's table.
 const WIDTHS: [u32; 4] = [32, 64, 128, 256];
@@ -210,7 +211,7 @@ fn launched_address(
             }
         }
     }
-    Ok(out.to_host_vec(stream)?[0])
+    Ok(out.read_back(stream)?[0])
 }
 
 /// The shape #74 measured, asserted rather than merely printed.

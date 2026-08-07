@@ -58,6 +58,26 @@ use crate::{flash_forward, gemm, gemm_sol, layernorm, softmax};
 mod harness;
 pub use harness::{ITERATIONS, Shape, Timings, WARMUP, time};
 
+/// Say which row is about to be launched, and name it for the launch watchdog.
+///
+/// One fact that used to be written twice. The announcement is the instrument —
+/// `sol::sweep_k`'s doc has said since #149 that *the last announced row is the
+/// one that did not return*, and this is what stops that being something a
+/// reader has to do afterwards: [`kittens::watchdog`] prints the same row when
+/// its deadline expires, so the sweep says where it stopped even when nobody
+/// was watching the stream it said it on.
+///
+/// Every sweep in this crate should call it in front of a row. One that does
+/// not is named by its own command line, which still says which case is in
+/// flight and not which row of it.
+pub fn announce(row: impl Into<String>) {
+    let row = row.into();
+    // To stderr and not into the table: a sweep is minutes long and a reader
+    // watching it should be able to tell a slow size from a stuck one.
+    eprintln!("{row}: staging and checking");
+    kittens::watchdog::watching(row);
+}
+
 /// Dense bf16 tensor-core peak for one B200. NVIDIA's HGX B200 page lists
 /// 36 PFLOPS FP16/BF16 for the 8-GPU board, footnoted "Sparse. Dense is ½
 /// sparse spec shown" — 36/8/2 = 2.25 PFLOP/s dense per GPU.
@@ -782,7 +802,7 @@ fn report(context: &Arc<CudaContext>, case: &Case, sizes: &[Shape]) -> usize {
     let mut failures = 0;
     let mut compared = Vec::new();
     for &shape in sizes {
-        eprintln!("{shape}: staging and checking");
+        announce(format!("{} at {shape}", case.name));
         let timings = match (case.bench)(context, shape) {
             Ok(timings) => timings,
             Err(error) => {
@@ -813,7 +833,7 @@ fn report(context: &Arc<CudaContext>, case: &Case, sizes: &[Shape]) -> usize {
         let Some(baseline) = case.baseline else {
             continue;
         };
-        eprintln!("{shape}: staging and checking {}", baseline.name);
+        announce(format!("{} at {shape}", baseline.name));
         match (baseline.bench)(context, shape) {
             Ok((against, algorithm)) => compared.push((shape, timings, against, algorithm)),
             Err(error) => {
@@ -971,7 +991,7 @@ pub fn repro(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
         let mut taken: Vec<Vec<Timings>> = REPRO_ARMS.iter().map(|_| Vec::new()).collect();
         for pass in 1..=REPEATS {
             for (arm, into) in REPRO_ARMS.iter().zip(taken.iter_mut()) {
-                eprintln!("{shape} {} pass {pass}: staging and checking", arm.name());
+                announce(format!("{shape} {} pass {pass}", arm.name()));
                 into.push(gemm::bench_with(context, shape, *arm)?);
             }
         }
@@ -1168,6 +1188,18 @@ pub fn main() -> ExitCode {
             println!("{name}, sm_{major}{minor}, {sms} SMs")
         }
         _ => println!("device 0 (attributes unavailable)"),
+    }
+
+    // Nothing in a default build, and a launch that does not return in a
+    // `--features wedge` one — see [`crate::wedge`]. It sits here rather than in
+    // any one sweep so that *which* case gets wedged is an environment variable
+    // and not a code path: every `bench <case>` reaches this line, including
+    // `sol-k`, which is the case the watchdog was written for, and `profile`,
+    // which runs one of these under `ncu`.
+    #[cfg(feature = "wedge")]
+    if let Err(error) = crate::wedge::inject(&context) {
+        println!("FAIL  could not inject the wedge: {error}");
+        return ExitCode::FAILURE;
     }
 
     // `bench swizzle` is not a [`Case`] and does not pretend to be one: a

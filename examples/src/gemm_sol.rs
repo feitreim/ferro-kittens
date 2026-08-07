@@ -59,6 +59,7 @@ use kittens::shared::{
 };
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
+use kittens::watchdog::{self, ReadBack};
 
 const BLOCK_M: usize = 128;
 pub const BLOCK_N: usize = 256;
@@ -1358,9 +1359,9 @@ fn run(
             };
         }
     }
-    stream.synchronize()?;
+    watchdog::wait(&stream)?;
 
-    let worst = check_output(&c.to_host_vec(&stream)?, m, n, k)?;
+    let worst = check_output(&c.read_back(&stream)?, m, n, k)?;
     Ok(format!(
         "{} {m}x{n}x{k} exact over {} BF16 outputs, worst |rel| {worst:.2e}",
         variant.name(),

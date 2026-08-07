@@ -328,12 +328,32 @@ Two mechanisms, one per level:
   between two sessions. Arms taken in one container share a device, a driver, a
   clock and a cuBLASLt.
 
-**Do not batch an arm whose failure would cost the others.** `bench --case
-sol-k` exists precisely because a launch that hangs takes every row after it,
-and `profile` serializes and replays launches; both keep their own process and
-neither has an arm in the table. `session` has no retry and no isolation on
-purpose — the first arm that raises ends the run, because the arms after it
-would otherwise be reported against a container that had already failed.
+**Every sweep has an arm now, including the two that used to be barred.**
+`bench --case sol-k` and `profile` were kept out of the table because a launch
+that hangs takes every row after it — which is how `sol-k` was found (#146:
+`4096x4096x1024` printing nothing for 1200 s until the wrapper stopped the
+container). Two things had to become true first, and both now are:
+
+1. **A launch that does not return costs one row, not a container.** Every host
+   wait in the three kernel crates goes through `kittens::watchdog`, which polls
+   the event behind the work rather than blocking on it and ends the process
+   past 30 s naming the row the sweep last announced. See
+   `docs/library/watchdog.md`.
+2. **A failed arm no longer throws the rest of the session away.** Each arm was
+   always its own process — `_run` is a `subprocess` — and `session` now runs
+   the arms after a failure and prints a summary saying which of them failed.
+   The session is still red; the rows that ran are still there.
+
+The rule that replaces the old one is narrower and worth keeping: **an arm may
+fail, and may not take the container with it.** What it does not license is
+reading a table from an arm that ran *after* a failure without asking what
+failed — a build error fails every arm identically, and an unhealthy device
+fails them for a reason none of them prints. The summary is there to be read.
+
+`modal run modal_app.py::wedge_demo` is what makes that a demonstration rather
+than an argument, the way `stall` does for the wrapper below: it launches a
+kernel that spins for ten minutes and takes a three-arm session through it,
+requiring exactly the middle arm to fail.
 
 ### 3. Measure at the cheapest tier that can see the thing
 
@@ -469,17 +489,69 @@ is a twentieth of the silence budget.
 
 The startup budget is the one doing the work in CI, and that is by construction
 rather than by luck: `SILENCE_GRACE` is 1200 s while these three entry points
-carry `timeout=900`, 900 and 1200 (#99), so a run that starts and *then* hangs
-dies on Modal's clock at the same moment or sooner. What `timeout=` cannot see
-is a container that never reaches Python — that is the whole reason the wrapper
-exists — and 300 s of startup silence against a worst observed 4.4 s is what
-covers it.
+carry `timeout=` of 900, 900 and **300** (the third was 1200 until the launch
+watchdog PR right-sized it against `device_tests`' measured 83.5 s), so a run
+that starts and *then* hangs dies on Modal's clock at the same moment or sooner.
+What `timeout=` cannot see is a container that never reaches Python — that is
+the whole reason the wrapper exists — and 300 s of startup silence against a
+worst observed 4.4 s is what covers it.
 
-So a *lower* silence budget in CI is the one change these numbers would
-support: it would stop a post-start hang at a fraction of the function timeout
-instead of dead-heating with it, which on tier 3 is GPU-minutes. Not done here,
-on one warm sample per entry point. It wants a handful of cold ones first, and
-`bench` — the quiet one #99 sized 1200 against — is not run by any workflow.
+A *lower* silence budget would still be the change these numbers support: it
+would stop a post-start hang at a fraction of the function timeout instead of
+dead-heating with it. Not done here, on one warm sample per entry point — and
+less urgent than it was, because the hang it was aimed at is now caught two
+levels in. A launch that stops making progress is `kittens::watchdog`'s 30 s,
+and the silence budget only ever sees the ones with no launch in them.
+
+## Deadlines: three of them, one per level
+
+Nothing here is allowed to run forever, and the three bounds are nested so that
+each one covers what the level below cannot see. They are listed inside-out.
+
+| bound | who owns it | budget | what it catches |
+| --- | --- | ---: | --- |
+| one launch | `kittens::watchdog`, in the process | 30 s | a kernel that stops making progress |
+| a container's silence | `scripts/modal-run`, on your laptop or the runner | 300 s to first output, 1200 s between lines | a container that never reaches Python, and a run stopped out from under the client |
+| the function | Modal's `timeout=` | per entry point, below | everything else, including a wedge in `cargo` |
+
+**The launch deadline is new and is the one that changed what can be batched.**
+Every host wait in `src/`, `examples/`, `experiments/` and `device-tests/` goes
+through `kittens::watchdog::wait` or `ReadBack::read_back`, which poll the event
+behind the work instead of blocking on it. Past 30 s the process prints the row
+the sweep last announced and calls `abort()`, so a wedged arm exits `-6` in half
+a minute where it used to hold a B200 until `timeout=`.
+`modal_app.py::wedge_demo` is the control that shows it firing, and
+`docs/library/watchdog.md` has the design.
+
+### `timeout=`, and the measurement each one is three times
+
+The rule, borrowed from the twin repo (oxide-train#131): **a timeout is about
+three times a measured baseline, with the baseline in a comment beside it.** An
+entry point whose work is chosen by its arguments has no baseline to state, and
+stays open-ended — and *says so*, rather than merely being large. What the file
+carries:
+
+| entry point | measured | `timeout=` | |
+| --- | ---: | ---: | --- |
+| `build` | 291.8 s warm, 470.8 s worst (#226) | 900 | 3.1× warm |
+| `regcount` | 183–184 s (the per-line timestamps above) | 900 | 4.9× |
+| `upstream_ptx` | a clean clone plus `ptxas`; unmeasured | 900 | rides `CHECKING` |
+| `device_tests` | 83.5 s (#226) | **300** | 3.6×, down from 1200 |
+| `examples` | two binaries, both correctness gates; unmeasured | 1200 | open-ended |
+| `bench`, `session`, the named sweeps | the argument chooses the work | 3600 | open-ended |
+| `wedge_demo` | three arms, one killed at 5 s | 1200 | open-ended |
+| `doctor` | one driver query | 300 | open-ended |
+| `stall` | a nap of a length its caller picks | 300 | a bound on its argument |
+
+`device_tests` is the one that moved: it shared `RUNNING` (1200 s) with
+`examples` and is 83.5 s, which made its ceiling fourteen times its own
+measurement. The two do different amounts of work and now carry different
+constants.
+
+A ceiling is not a bill — the container is billed for what it runs — so the only
+thing a loose one costs is a wedge riding longer. That is why these are worth
+tightening at all, and it is also why they are no longer the first line of
+defence: the 30 s row above is.
 
 ## Pull requests from forks
 

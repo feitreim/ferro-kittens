@@ -112,6 +112,7 @@ use kittens::plan::SharedPlan;
 use kittens::reg::{Add, BaseLdtm, FragmentLayout, RegTile, RegVec, rsqrt, warp_reduce};
 use kittens::shared::{Bf16, Element, F32, SharedVec};
 use kittens::sync::block_reduce_sum;
+use kittens::watchdog::ReadBack;
 use kittens::{lane, warp_id};
 
 /// Rows one warp's band covers, and the thing the walk cannot go under:
@@ -618,7 +619,7 @@ impl Staged {
                 destination,
             )?
         };
-        let observed = self.destination.to_host_vec(&self.stream)?;
+        let observed = self.destination.read_back(&self.stream)?;
         verify(&observed, self.rows, self.columns)
     }
 

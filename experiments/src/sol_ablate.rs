@@ -228,6 +228,7 @@ use cuda_device::{DisjointSlice, cluster_launch, cuda_module, kernel, launch_con
 
 use kittens::global::GlobalLayout;
 use kittens::shared::F16;
+use kittens::watchdog::{self, ReadBack};
 
 use crate::bench::{Shape, Timings, time};
 use crate::gemm_sol::{
@@ -2675,7 +2676,7 @@ pub fn measure(
     };
 
     launch_once(&mut c)?;
-    stream.synchronize()?;
+    watchdog::wait(&stream)?;
     let mut launch = || launch_once(&mut c);
     time(&stream, &mut launch)
 }
@@ -3294,8 +3295,8 @@ pub fn check(context: &Arc<CudaContext>) -> Result<String, Box<dyn Error>> {
                     return Err("the narrow entry has no drain rungs of its own".into());
                 }
             }
-            stream.synchronize()?;
-            let worst = crate::gemm_sol::check_output(&c.to_host_vec(&stream)?, m, n, k)
+            watchdog::wait(&stream)?;
+            let worst = crate::gemm_sol::check_output(&c.read_back(&stream)?, m, n, k)
                 .map_err(|error| format!("{} {}: {error}", variant.name(), arm.name()))?;
             notes.push(format!(
                 "{} {} exact over {} outputs, worst |rel| {worst:.2e}",

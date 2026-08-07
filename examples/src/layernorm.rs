@@ -42,6 +42,7 @@ use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, ColVec, RegTile, RegVec, rsqrt};
 use kittens::shared::{Bf16, F32, SharedTile, SharedVec, Swizzle128B, publish_to_async_proxy};
 use kittens::sync::{Semaphore, block_reduce_sum};
+use kittens::watchdog::ReadBack;
 use kittens::{lane, warp_id};
 
 const ROWS: usize = 128;
@@ -454,7 +455,7 @@ fn run<T>(
     launch_once()?;
 
     let classes: Vec<(f64, f64)> = (0..BOOSTS).map(statistics).collect();
-    let observed = destination.to_host_vec(&stream)?;
+    let observed = destination.read_back(&stream)?;
     let (mut wrong, mut sample, mut worst) = (0usize, Vec::new(), 0.0f32);
     for row in 0..rows {
         let (mean, deviation) = classes[row % BOOSTS];
@@ -579,7 +580,7 @@ fn run_group<T>(
     launch_once()?;
 
     let classes: Vec<(f64, f64)> = (0..BOOSTS).map(tile_statistics).collect();
-    let observed = destination.to_host_vec(&stream)?;
+    let observed = destination.read_back(&stream)?;
     let (mut wrong, mut sample, mut worst) = (0usize, Vec::new(), 0.0f32);
     for row in 0..rows {
         let tile_first_row = row / ROWS * ROWS;

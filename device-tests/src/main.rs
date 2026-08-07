@@ -113,6 +113,7 @@ use kittens::sync::{Semaphore, block_reduce, block_reduce_sum};
 use kittens::tmem::{
     TmemTile, alloc_block, alloc_cluster, dealloc_block, dealloc_cluster, store_wait, warp_lanes,
 };
+use kittens::watchdog::ReadBack;
 
 mod ladder_bench;
 mod ldst_fence;
@@ -5756,7 +5757,7 @@ fn check_tma_2d<const R: usize, const C: usize>(
         map.as_ptr(),
         &mut out,
     )?;
-    compare_tile(&out.to_host_vec(stream)?, &staged, C / 2)
+    compare_tile(&out.read_back(stream)?, &staged, C / 2)
 }
 
 /// Does the TMA store put each box where its map says?
@@ -5810,9 +5811,9 @@ fn check_tma_store<const R: usize, const C: usize>(
         let (source, destination) = (row * C / 2, row * pitch(C) / 2);
         expected[destination..destination + C / 2].copy_from_slice(&staged[source..source + C / 2]);
     }
-    compare_tile(&packed.to_host_vec(stream)?, &staged, C / 2)
+    compare_tile(&packed.read_back(stream)?, &staged, C / 2)
         .map_err(|error| format!("packed destination: {error}"))?;
-    compare_tile(&pitched.to_host_vec(stream)?, &expected, pitch(C) / 2)
+    compare_tile(&pitched.read_back(stream)?, &expected, pitch(C) / 2)
         .map_err(|error| format!("pitched destination: {error}").into())
 }
 
@@ -5866,7 +5867,7 @@ fn check_tma_store_add(
             expected[row * PITCH + column] = SEED + 2.0 * tile[row * ADD_COLS + column];
         }
     }
-    let observed = dest.to_host_vec(stream)?;
+    let observed = dest.read_back(stream)?;
     let mut report = String::new();
     let mut mismatches = 0usize;
     for (index, (&got, &want)) in observed.iter().zip(&expected).enumerate() {
@@ -5944,7 +5945,7 @@ fn check_store_ring<const BOX_ROWS: usize, const C: usize>(
             }
         }
     }
-    let note = compare_tile(&destination.to_host_vec(stream)?, &expected, C / 2)?;
+    let note = compare_tile(&destination.read_back(stream)?, &expected, C / 2)?;
     let (box_rows, columns) = (BOX_ROWS, C);
     Ok(format!(
         "{RING_BANDS} bands of [{RING_ROWS}, {columns}] in [{box_rows}, {columns}] boxes \
@@ -5998,7 +5999,7 @@ fn check_shared_drain<const C: usize>(
                 expected[at] = cell_bits(row, tile_column);
             }
         }
-        compare_matrix(&destination.to_host_vec(stream)?, &expected, column)?;
+        compare_matrix(&destination.read_back(stream)?, &expected, column)?;
     }
     let columns = C;
     Ok(format!(
@@ -6042,7 +6043,7 @@ fn check_shared_accumulate<const C: usize>(
             column,
             &mut destination,
         )?;
-        compare_matrix(&destination.to_host_vec(stream)?, &expected, column)?;
+        compare_matrix(&destination.read_back(stream)?, &expected, column)?;
     }
     let columns = C;
     Ok(format!(
@@ -6090,7 +6091,7 @@ fn check_scatter_drain<const C: usize>(
                 expected[at] = cell(row, tile_column);
             }
         }
-        let observed = destination.to_host_vec(stream)?;
+        let observed = destination.read_back(stream)?;
         compare_f32_matrix(&observed, &expected, column)?;
     }
     let columns = C;
@@ -6206,7 +6207,7 @@ fn check_swizzle<const R: usize, const C: usize>(
         map.as_ptr(),
         &mut out,
     )?;
-    compare_tile(&out.to_host_vec(stream)?, &staged, C / 2)
+    compare_tile(&out.read_back(stream)?, &staged, C / 2)
 }
 
 /// Does `stmatrix` put a fragment where the cursor says, at every block of the
@@ -6220,7 +6221,7 @@ fn check_stmatrix<const R: usize, const C: usize>(
     let expected = identity_tile(R, C);
     let mut out = DeviceBuffer::<u32>::zeroed(stream, expected.len())?;
     launch(launch_config(32, tile_shared::<R, C>()), &mut out)?;
-    compare_tile(&out.to_host_vec(stream)?, &expected, C / 2)
+    compare_tile(&out.read_back(stream)?, &expected, C / 2)
 }
 
 /// Do the composed shared movers place a whole `[32, WIDE]` band where the
@@ -6254,7 +6255,7 @@ fn check_band_roundtrip(
             &mut out,
         )?
     };
-    compare_tile(&out.to_host_vec(stream)?, &expected, words)
+    compare_tile(&out.read_back(stream)?, &expected, words)
 }
 
 /// Does [`load_rows`] read the elements the fragment layout says it does?
@@ -6282,7 +6283,7 @@ fn check_global_rows(
     let (slots, values) = (Band::SLOTS, Band::VALUES);
     let mut out = DeviceBuffer::<f32>::zeroed(stream, 32 * slots * values)?;
     unsafe { module.global_rows_map(stream, launch_config(32, 0), &source, &mut out)? };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let mut report = String::new();
     let mut mismatches = 0usize;
@@ -6348,7 +6349,7 @@ fn check_global_cols(
     let values = Columns::VALUES;
     let mut out = DeviceBuffer::<f32>::zeroed(stream, 32 * values)?;
     unsafe { module.global_cols_map(stream, launch_config(32, 0), &source, &mut out)? };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let mut report = String::new();
     let mut mismatches = 0usize;
@@ -6405,7 +6406,7 @@ fn check_global_col_vec(
     let values = <BaseLdtm as ColLayout<COLUMN_BAND>>::VALUES;
     let mut out = DeviceBuffer::<f32>::zeroed(stream, 32 * values)?;
     unsafe { module.global_col_vec_map(stream, launch_config(32, 0), &source, &mut out)? };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let mut report = String::new();
     let mut mismatches = 0usize;
@@ -6489,7 +6490,7 @@ fn check_shared_vec(
         )?
     };
 
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
     let mut report = String::new();
     let mut mismatches = 0usize;
     for lane in 0..32u32 {
@@ -6532,7 +6533,7 @@ fn check_shared_vec(
             cell_bits(0, VECTOR - 2 - 2 * pair),
         ));
     }
-    compare_tile(&destination.to_host_vec(stream)?, &reversed, VECTOR / 2)
+    compare_tile(&destination.read_back(stream)?, &reversed, VECTOR / 2)
 }
 
 /// Does a vector's rank-2 box really select one row?
@@ -6561,7 +6562,7 @@ fn check_shared_vec_row(
         )?
     };
 
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
     let mut report = String::new();
     let mut mismatches = 0usize;
     for (column, &got) in observed.iter().enumerate() {
@@ -6616,7 +6617,7 @@ fn check_shared_row_vec(
             &mut out,
         )?
     };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     // The one lane of each quad that owns a row, and the slot it holds it in.
     let owner = |row: usize| {
@@ -6746,7 +6747,7 @@ fn check_block_reduce(
             &mut out,
         )?
     };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let sum: f32 = (0..BLOCK_WARPS).map(block_partial).sum();
     let largest = block_partial(BLOCK_WARPS - 1);
@@ -6826,7 +6827,7 @@ fn check_ldmatrix<const R: usize, const C: usize>(
         map.as_ptr(),
         &mut out,
     )?;
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let mut report = String::new();
     let mut mismatches = 0usize;
@@ -6907,7 +6908,7 @@ fn check_sttm_roundtrip(
     let (slots, values) = (RegTile::<32, COLUMNS, BaseLdtm>::SLOTS, COLUMNS / 4);
     let mut out = DeviceBuffer::<f32>::zeroed(stream, ROWS * slots * values)?;
     drain(launch_config(ROWS as u32, STTM_SHARED as u32), &mut out)?;
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let coordinate = |index: usize| {
         let (thread, register) = (index / (slots * values), index % (slots * values));
@@ -7004,7 +7005,7 @@ fn check_clc(
     // which the `#[cluster_launch(2, 1, 1)]` launcher requires.
     unsafe { module.clc_probe(stream, config, CLC_DEADLINE_NS, &mut out)? };
     finish_or_abort(context, stream, "clc probe")?;
-    let rows = out.to_host_vec(stream)?;
+    let rows = out.read_back(stream)?;
     let row = |cta: usize| {
         let base = cta * CLC_FIELDS;
         (rows[base], rows[base + 1], rows[base + 2], rows[base + 3])
@@ -7145,7 +7146,7 @@ fn check_relaunch(
             &format!("repeated launch {launch}/{RELAUNCHES}"),
         )?;
 
-        let observed = out.to_host_vec(stream)?;
+        let observed = out.read_back(stream)?;
         let mut report = String::new();
         let mut mismatches = 0usize;
         for (index, &got) in observed.iter().enumerate() {
@@ -7230,7 +7231,7 @@ fn check_fragment_map(
     let per_lane = m * n / 32;
     let mut out = DeviceBuffer::<f32>::zeroed(stream, warps * 32 * per_lane)?;
     unsafe { shape.launch(module, stream, a_map.as_ptr(), b_map.as_ptr(), &mut out)? };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let slots = per_lane / (n / 4);
     let values = n / 4;
@@ -7556,7 +7557,7 @@ fn check_walk(
 
     let mut out = DeviceBuffer::<f32>::zeroed(stream, ROWS * COLUMNS)?;
     unsafe { order.launch(module, stream, a_map.as_ptr(), b_map.as_ptr(), &mut out)? };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let reference = walk_reference();
     let (region_rows, region_columns) = order.region();
@@ -7689,7 +7690,7 @@ fn check_reductions(
             &mut out,
         )?
     };
-    let observed = out.to_host_vec(stream)?;
+    let observed = out.read_back(stream)?;
 
     let wanted = reduction_expectations();
     let mut report = String::new();
@@ -8200,6 +8201,10 @@ fn run() -> Result<usize, Box<dyn Error>> {
 
     let mut failures = 0usize;
     for (name, case) in &cases {
+        // What the launch watchdog names if one of this case's launches does
+        // not come back. Every case here reads a buffer back, and a readback is
+        // a wait — see `kittens::watchdog`.
+        kittens::watchdog::watching(format!("device-tests case `{name}`"));
         match case() {
             Ok(note) => println!("pass  {name:<26}  {note}"),
             Err(error) => {

@@ -141,6 +141,7 @@ use cuda_host::CudaKernel;
 use kittens::launch::admit_shared_plan;
 
 use crate::{CENSUS_FIELDS, kernels};
+use kittens::watchdog::ReadBack;
 
 /// Threads a census CTA launches with. One warp is all the allocator needs and
 /// all the probe does, so blocks per SM *is* warps per SM and no register or
@@ -684,7 +685,7 @@ fn census(
             }
         }
     }
-    Ok(out.to_host_vec(stream)?)
+    Ok(out.read_back(stream)?)
 }
 
 /// One device attribute, by the same raw-`sys` route `ladder_bench` uses.

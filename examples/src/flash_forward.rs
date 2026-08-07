@@ -44,6 +44,7 @@ use kittens::reg::{BaseLdtm, RegTile, RegVec, online_rescale};
 use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, Swizzle128B, publish_to_async_proxy};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
+use kittens::watchdog::ReadBack;
 use kittens::{lane, warp_id};
 
 const QUERIES: usize = 128;
@@ -530,7 +531,7 @@ fn run<T>(
     };
     launch(&mut out)?;
 
-    let observed = out.to_host_vec(&stream)?;
+    let observed = out.read_back(&stream)?;
     let (mut wrong, mut sample, mut worst) = (0usize, Vec::new(), 0.0f32);
     for head in 0..heads {
         let panels = panels(head, sequence);

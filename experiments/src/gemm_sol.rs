@@ -68,6 +68,7 @@ use kittens::shared::{
 };
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
+use kittens::watchdog::{self, ReadBack};
 
 /// The whole kernel: the arm every shipped entry passes.
 pub const WHOLE: u8 = 0;
@@ -2273,9 +2274,9 @@ fn run<T>(
         };
 
     launch_once(&mut c)?;
-    stream.synchronize()?;
+    watchdog::wait(&stream)?;
     let label = if initialize {
-        let worst = check_output(&c.to_host_vec(&stream)?, m, n, k)?;
+        let worst = check_output(&c.read_back(&stream)?, m, n, k)?;
         format!(
             "{} {m}x{n}x{k} exact over {} BF16 outputs, worst |rel| {worst:.2e}",
             variant.name(),

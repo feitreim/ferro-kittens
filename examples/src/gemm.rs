@@ -42,6 +42,7 @@ use kittens::reg::BaseLdtm;
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
+use kittens::watchdog::ReadBack;
 use kittens::{lane, warp_id};
 
 const BLOCK_M: usize = 128;
@@ -533,7 +534,7 @@ fn run(
             &mut c,
         )?
     };
-    check_c(&c.to_host_vec(&stream)?, m, n, k)
+    check_c(&c.read_back(&stream)?, m, n, k)
 }
 
 /// Compare an observed bf16 `C` element by element with `==`: the reference

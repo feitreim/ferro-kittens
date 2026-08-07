@@ -112,6 +112,7 @@ use kittens::ldst::stmatrix_m8n8_x2;
 
 use crate::bench::{Shape, Timings, time};
 use crate::gemm_sol::{check_output, stage_f16};
+use kittens::watchdog::{self, ReadBack};
 
 /// Upstream's shared-memory matrix descriptor encoder, copied out of its
 /// `main.rs`. The device code below calls it and nothing else of the host's.
@@ -370,12 +371,12 @@ fn run<T>(
         };
 
     launch_once(&mut c)?;
-    stream.synchronize()?;
+    watchdog::wait(&stream)?;
     let label = if initialize {
         // Upstream packs column `2i` in the low half of word `i`, so the words
         // read back little-endian *are* `C` row-major in BF16 — the same slice
         // the port's own check takes.
-        let words = c.to_host_vec(&stream)?;
+        let words = c.read_back(&stream)?;
         let observed: Vec<u16> = words
             .iter()
             .flat_map(|&word| [word as u16, (word >> 16) as u16])

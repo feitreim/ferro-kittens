@@ -66,7 +66,7 @@ use std::sync::Arc;
 
 use cuda_core::CudaContext;
 
-use crate::bench::{Baseline, ITERATIONS, Shape, WARMUP};
+use crate::bench::{Baseline, ITERATIONS, Shape, WARMUP, announce};
 use crate::gemm_sol::{self, Plan, Variant};
 
 /// The shipped entry first, so every `vs row 1` column has the control as its
@@ -157,7 +157,7 @@ impl Denominators<'_> {
         {
             return Some(row.1);
         }
-        eprintln!("{shape} on {}: staging and checking", baseline.name);
+        announce(format!("{shape} on {}", baseline.name));
         match (baseline.bench)(self.context, shape) {
             Ok((timings, algorithm)) => {
                 self.taken.push((shape, timings.min(), algorithm));
@@ -197,7 +197,7 @@ fn row(
     denominators: &mut Denominators<'_>,
     reference: Option<f64>,
 ) -> Option<f64> {
-    eprintln!("{shape} on {label}: staging and checking");
+    announce(format!("{shape} on {label}"));
     let timings = match gemm_sol::bench_plan(context, shape, plan) {
         Ok(timings) => timings,
         Err(error) => {
@@ -288,16 +288,19 @@ pub fn sweep_small(
 /// runs. A `k` shorter than `m` is otherwise unexercised by this kernel, so the
 /// question is where the boundary is and what is on the far side of it.
 ///
-/// It is its own entry point, and it announces each row on `stderr` *before*
-/// launching it, because the instrument has to survive the thing it measures: a
-/// launch that does not return takes the process with it, and the last line
-/// printed is then the whole of the answer. Every row is a complete
-/// stage-check-time cycle at the shipped plan, so a row that prints is a row that
-/// computed the right `C`.
+/// It is its own entry point, and it announces each row *before* launching it,
+/// because the instrument has to survive the thing it measures: a launch that
+/// does not return takes the process with it, and the last line printed is then
+/// the whole of the answer. Every row is a complete stage-check-time cycle at the
+/// shipped plan, so a row that prints is a row that computed the right `C`.
 ///
-/// Pipe the run through `tee` and read the file as it grows rather than waiting on
-/// the exit status: the announcements are the instrument, and a capture that
-/// buffers them until the process ends throws away the one line that matters.
+/// **The announcement is now also the watchdog's**. [`crate::bench::announce`]
+/// hands each row to [`kittens::watchdog`], which polls the event behind the
+/// launch rather than blocking on it and, past 30 s, prints that row and ends
+/// the process. So the last announced row arrives on `stdout` from the run
+/// itself instead of having to be recovered from a capture — which is what let
+/// this case into `modal_app.py`'s `ARMS` table, having been the reason the
+/// table had an exclusion list at all.
 ///
 /// # Since #149 every rung returns
 ///

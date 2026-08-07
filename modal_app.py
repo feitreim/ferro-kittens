@@ -88,6 +88,11 @@ Local usage:
     modal run modal_app.py::doctor    # env / GPU sanity check
     modal run modal_app.py::stall     # does nothing, out loud -- the control
                                       # for scripts/modal-run (#103)
+    modal run modal_app.py::wedge_demo
+                                      # launches a kernel that does not return,
+                                      # and shows a session surviving it -- the
+                                      # control for kittens::watchdog, the way
+                                      # stall is the control for modal-run
 """
 
 import functools
@@ -334,26 +339,63 @@ EXPERIMENTS_DIR = f"{PROJECT_DIR}/experiments"
 STUB_ENV = ["env", "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs"]
 
 
-# Every GPU entry point carried `timeout=5400` -- ninety minutes, uniform
-# across six functions doing very different amounts of work, and derived from
-# nothing. That ceiling is what a wedged container rides to the end, and a
-# wedged container is indistinguishable from a slow one from the outside: one
-# died after twenty-six minutes having printed fifteen lines of NVIDIA banner
-# and never reached Python, billed at B200 rates the whole way.
+# --- the timeouts, and the measurement each one is three times ----------------
 #
-# These are sized from what the runs take, and the elapsed line `_run` prints
-# is the evidence for tightening them further. `build` is 155-221 s over ten
-# CI runs warm, ~7.5 min cold since #93 gave it a whole CPU.
-CHECKING = 900  # compile and lint, no launches: `build`, `regcount`
-RUNNING = 1200  # compile and a short harness: `device_tests`, `examples`
-# 3600 rather than 2700 since #122 added a seventh table to `bench --case
-# residual`: three more rungs at each of 4096^3, 8192^3 and 16384^3, and the
-# host cost of that sweep is re-staging and re-checking the operands rather
-# than the launches. A ceiling is not a bill -- the container is billed for
-# what it runs -- so the only thing raising it costs is a wedge riding longer,
-# which is what `scripts/modal-run`'s silence budget is for.
-SWEEPING = 3600  # 16384^3 launched dozens of times: `bench` and the profiles
-ASKING = 300  # one driver query, nothing built: `doctor`
+# Every GPU entry point carried `timeout=5400` -- ninety minutes, uniform across
+# six functions doing very different amounts of work, and derived from nothing.
+# That ceiling is what a wedged container rides to the end, and a wedged
+# container is indistinguishable from a slow one from the outside: one died after
+# twenty-six minutes having printed fifteen lines of NVIDIA banner and never
+# reached Python, billed at B200 rates the whole way.
+#
+# The rule since is the one oxide-train#131 wrote down for the twin repo: **a
+# timeout is three times a measured baseline, and the baseline is in the comment
+# beside it.** An entry point whose work is chosen by its arguments has no
+# baseline to state and stays open-ended -- and says so, rather than merely
+# being large. Sized:
+#
+#   entry point       measured                                    timeout
+#   build             291.8 s warm, 470.8 s worst (#226)           900   3.1x warm
+#   regcount          183-184 s (CI.md's per-line timestamps)      900   4.9x
+#   upstream_ptx      a clean clone plus ptxas; unmeasured         900   see below
+#   device_tests      83.5 s (#226 corrected tier 3's cost line)   300   3.6x
+#   examples          two binaries, both correctness gates;        1200  open-ended
+#                     no published measurement
+#   the sweeps        `--case`/`--arms` chooses the work           3600  open-ended
+#   wedge_demo        three arms, one of them killed at 5 s        1200  see below
+#   doctor            one driver query, nothing built              300   open-ended
+#   stall             a nap of a length its caller picks           300   open-ended
+#
+# A ceiling is not a bill: the container is billed for what it runs, so the only
+# thing a loose ceiling costs is a wedge riding longer. That is why the numbers
+# above are worth tightening at all, and it is also why tightening them is not
+# the *first* line of defence any more -- a launch that does not return is now
+# `kittens::watchdog`'s 30 s, one process, one row (see `ARMS`).
+CHECKING = 900  # compile and lint, no launches: `build`, `regcount`, `upstream_ptx`
+# 83.5 s measured on tier 3 at 41f9e57: 57 cases in ~20 s of B200 behind a
+# compile costing two and a half times as much. It was on `RUNNING` (1200) with
+# `examples`, which is 14x its own measurement -- the two do different amounts
+# of work and now carry different ceilings.
+HARNESS = 300  # the device-test binary, every case: `device_tests`
+# Open-ended, and the reason is that nobody has measured it: `examples` runs
+# *two* binaries -- `kittens-examples`' four teaching kernels and
+# `kittens-experiments -- check`'s every rung and probe that computes a GEMM, at
+# both check sizes and all three traversal widths. That is strictly more work
+# than `device_tests` and no run of it has been timed on the record. Put it in a
+# session beside a measured arm and this becomes a number.
+RUNNING = 1200  # compile and a correctness gate: `examples`
+# Open-ended for a reason that will not go away: what a sweep does is chosen by
+# its argument. `bench` with no `--case` runs every table including 16384^3;
+# `bench --case softmax` is 79.7 s (#226). `session --arms` is however many arms
+# were asked for. `profile` replays launches under a profiler. There is no
+# single measurement for any of them, so there is no 3x to take -- 3600 rather
+# than 2700 since #122 added a seventh table to `bench --case residual`.
+SWEEPING = 3600  # work chosen by argument: `bench`, `session`, the named sweeps
+# `doctor` is one driver query and a `cargo oxide doctor` against the warmup
+# crate. `stall` sleeps for as long as its caller asks, so this is a bound on its
+# argument rather than a baseline: `stall --seconds 400` dies at the ceiling,
+# which is correct -- the control for a wedge should not be able to become one.
+ASKING = 300  # a driver query, or a nap of a stated length: `doctor`, `stall`
 
 
 # Positive evidence that an entry point reached its last line. `scripts/modal-run`
@@ -409,11 +451,15 @@ def _cached_target(cwd: str) -> dict[str, str]:
     return {"CARGO_TARGET_DIR": f"{CACHE_DIR}/target/{Path(cwd).name}"}
 
 
-def _run(cmd: list[str], cwd: str) -> None:
+def _run(cmd: list[str], cwd: str, env: dict[str, str] | None = None) -> None:
+    if env:
+        print(f"$ {' '.join(f'{name}={value}' for name, value in env.items())}", flush=True)
     print(f"$ {' '.join(cmd)}  (cwd={cwd})", flush=True)
     start = time.monotonic()
     try:
-        subprocess.run(cmd, cwd=cwd, check=True, env={**os.environ, **_cached_target(cwd)})
+        subprocess.run(
+            cmd, cwd=cwd, check=True, env={**os.environ, **_cached_target(cwd), **(env or {})}
+        )
     finally:
         # Printed on the failure path too -- a step that ran for nineteen of a
         # twenty-minute budget and a step that died on contact are different
@@ -530,7 +576,7 @@ def build() -> None:
 # compiler** -- the worst ratio in this file, and paid on the two gates every
 # change runs. `bench`, `ladder_bench` and `profile` already say it; these two
 # were simply missed.
-@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=RUNNING)
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=HARNESS)
 @completes
 def device_tests() -> None:
     """The harness itself. One binary, every case, non-zero exit on failure."""
@@ -732,6 +778,41 @@ NCU_SECTIONS = (
 # alone leaves the other thirty-five running at full speed.
 NCU_SKIP, NCU_COUNT = "6", "1"
 
+# Whether the performance-counter library is here at all, printed before the
+# profiler is asked for a counter. It is `|| echo` rather than a failure because
+# its absence is the *expected* state on this image and the message is the whole
+# diagnosis -- see `profile` below.
+PCC_PRESENT = (
+    "ls /usr/lib/x86_64-linux-gnu/libnvidia-pcc* 2>/dev/null"
+    " || echo 'libnvidia-pcc.so absent: the profiler will report LibraryNotLoaded'"
+)
+
+
+def _profile_arm(
+    kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192
+) -> list[tuple[list[str], str]]:
+    """`profile`'s own commands, so a session and the entry point issue the same
+    ones -- `ARMS`' rule, and this arm is new to that table since the launch
+    watchdog made a serializing profiler safe to batch."""
+    return [
+        (["sh", "-c", PCC_PRESENT], "/"),
+        # Build first: `--target-processes all` would otherwise follow the
+        # compiler around for ten minutes looking for a context it never creates.
+        (["cargo", "oxide", "build", "kittens-experiments", "--arch", "sm_100a"],
+         EXPERIMENTS_DIR),
+        (
+            [
+                NCU, "--target-processes", "all", "--clock-control", "none",
+                "--kernel-name", f"regex:{kernel}", "--launch-skip", NCU_SKIP,
+                "--launch-count", NCU_COUNT, "--print-details", "all",
+                *[argument for section in NCU_SECTIONS for argument in ("--section", section)],
+                "cargo", "oxide", "run", "kittens-experiments", "--",
+                "bench", kernel, str(m), str(n), str(k),
+            ],
+            EXPERIMENTS_DIR,
+        ),
+    ]
+
 
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
 @completes
@@ -780,25 +861,9 @@ def profile(kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192) -
     duration that belongs to the same table.
     """
     _run(SMI, cwd="/")
-    subprocess.run(
-        ["bash", "-lc", "ls /usr/lib/x86_64-linux-gnu/libnvidia-pcc* 2>/dev/null "
-         "|| echo 'libnvidia-pcc.so absent: the profiler will report LibraryNotLoaded'"],
-        check=False,
-    )
-    # Build first: `--target-processes all` would otherwise follow the compiler
-    # around for ten minutes looking for a context it never creates.
-    _run(["cargo", "oxide", "build", "kittens-experiments", "--arch", "sm_100a"], cwd=EXPERIMENTS_DIR)
-    _run(
-        [
-            NCU, "--target-processes", "all", "--clock-control", "none",
-            "--kernel-name", f"regex:{kernel}", "--launch-skip", NCU_SKIP,
-            "--launch-count", NCU_COUNT, "--print-details", "all",
-            *[argument for section in NCU_SECTIONS for argument in ("--section", section)],
-            "cargo", "oxide", "run", "kittens-experiments", "--",
-            "bench", kernel, str(m), str(n), str(k),
-        ],
-        cwd=EXPERIMENTS_DIR,
-    )
+    # In `_profile_arm`, which `session` runs as the `profile` arm.
+    for cmd, cwd in _profile_arm(kernel, m, n, k):
+        _run(cmd, cwd)
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=ASKING)
@@ -853,11 +918,27 @@ WRITE_OPT_WRAPPER = (
 # commands and differ only in how many containers pay for them. That is the
 # property that makes batching safe to reach for: it cannot change a number.
 #
-# What deliberately has no arm: `bench --case sol-k`, which exists because a
-# launch that hangs takes every row after it (that is how it was found), and
-# `profile`, which serializes and replays launches. An arm that can wedge the
-# container belongs in its own process, and this table is not the place to
-# quietly give it company.
+# **Every sweep has an arm now, including the two that used to be barred.**
+# `bench --case sol-k` and `profile` were kept out of this table because a launch
+# that hangs takes every row after it -- which is how `sol-k` was found (#146:
+# `4096x4096x1024` printing nothing for 1200 s until `scripts/modal-run` stopped
+# the container). Two things had to be true before they could come in, and both
+# now are:
+#
+#   1. **A launch that does not return costs one row, not a container.** Every
+#      host wait in the three kernel crates goes through `kittens::watchdog`,
+#      which polls the event behind the work instead of blocking on it and ends
+#      the process past 30 s naming the row the sweep last announced. A wedged
+#      arm exits -6 in half a minute.
+#   2. **An arm's failure is contained by a process boundary.** It always was --
+#      `_run` is a `subprocess` -- and `_session` below no longer throws the rest
+#      of the run away when one of them fails. The arms after a failure run, and
+#      the summary says which failed.
+#
+# `modal_app.py::wedge_demo` is what says this is true rather than reasoned:
+# it launches a kernel that spins for ten minutes and takes a three-arm session
+# through it. The rule that replaces the old one is narrower and worth keeping:
+# **an arm may fail, and may not take the container with it.**
 RUN = ["cargo", "oxide", "run"]
 CUBLAS = ["--features", "cublas"]
 UPSTREAM = ["--features", "cublas,gemm-sol-upstream"]
@@ -888,6 +969,11 @@ ARMS: dict[str, list[tuple[list[str], str]]] = {
         ([*WITH_OPT, *RUN, "kittens-experiments", *UPSTREAM, "--", "bench",
           "gemm-sol,gemm-sol-upstream,gemm-sol-upstream-m512"], EXPERIMENTS_DIR),
     ],
+    # The default `gemm` at 8192^3, which is what `profile` with no arguments
+    # asks for. A session cannot pass the other three, and that is the right
+    # trade: a profile of another kernel or another size is a one-argument
+    # `modal run` and does not want company.
+    "profile": _profile_arm(),
 }
 
 
@@ -911,6 +997,56 @@ def _bench_arm(case: str, m: int = 0, n: int = 0, k: int = 0) -> list[tuple[list
 # neither reports a rate and neither reads a clock.
 SMI = ["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
        "--format=csv"]
+
+OK = "ok"
+# What a process ended by `kittens::watchdog` exits with: the module calls
+# `abort()`, so the shell sees SIGABRT and `subprocess` reports -6. Named
+# because the summary line is where somebody first meets it, and "-6" on its own
+# reads like a mystery rather than like the deadline doing its job.
+WEDGED = -6
+
+
+def _steps(name: str) -> list[tuple[list[str], str]]:
+    """The commands one arm name runs -- `ARMS`, plus `bench:<case>`."""
+    if name.startswith("bench:"):
+        return _bench_arm(name.removeprefix("bench:"))
+    return ARMS[name]
+
+
+def _session(arms) -> list[tuple[str, str, float]]:
+    """Run named arms in this container, one process each, and say how each went.
+
+    **A failing arm does not end the session.** It used to, and the argument was
+    that the arms after it would be reported against a container that had already
+    failed. What made that argument bite was the case it could not survive -- a
+    launch that hangs, holding the container until Modal's `timeout=` -- and that
+    case is now bounded by `kittens::watchdog` at 30 s inside the arm's own
+    process. What is left is an ordinary non-zero exit, which is contained by the
+    process boundary `_run` has always had. So the session runs on and prints a
+    summary; the caller decides what a failed arm means, which is how
+    `wedge_demo` can require exactly one.
+
+    Yields nothing and returns everything: a session is minutes long and the
+    summary is the thing worth having in one place at the end of it, after the
+    thousands of lines the arms themselves printed."""
+    outcomes: list[tuple[str, str, float]] = []
+    for name, steps, env in arms:
+        print(f"\n=== session arm: {name} ===", flush=True)
+        start = time.monotonic()
+        try:
+            for cmd, cwd in steps:
+                _run(cmd, cwd, env)
+            outcome = OK
+        except subprocess.CalledProcessError as failure:
+            outcome = f"FAILED (exit {failure.returncode})"
+            if failure.returncode == WEDGED:
+                outcome += " -- the launch watchdog"
+            print(f"=== session arm: {name}: {outcome} ===", flush=True)
+        outcomes.append((name, outcome, time.monotonic() - start))
+    print("\n=== session summary ===", flush=True)
+    for name, outcome, elapsed in outcomes:
+        print(f"  {name:<28}{outcome:<40}{elapsed:>8.1f}s", flush=True)
+    return outcomes
 
 
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
@@ -953,10 +1089,16 @@ def session(arms: str = "") -> None:
     between two sessions. Arms taken in one container share a device, a driver,
     a clock and a cuBLASLt, so a difference between two of them is theirs.
 
-    Keep an arm out of a session when a wedge in it would cost the others: see
-    the note on the table above. This function has no retry and no isolation --
-    the first arm that raises ends the run, deliberately, because the arms after
-    it would be reported against a container that had already failed."""
+    **An arm may fail without taking the rest of the session with it**, which is
+    the change that let `bench:sol-k` and `profile` into the table at all. Each
+    arm is its own process -- `_run` is a `subprocess`, and always was -- and a
+    launch that does not return is `kittens::watchdog`'s 30 s rather than the
+    container's `timeout=`. So a failed arm is one row of the summary below, the
+    arms after it run, and the session as a whole is red. What that does *not*
+    license is reading a table from an arm that ran after a failure without
+    asking what failed: a build error fails every arm identically, and a device
+    that has gone unhealthy fails them for a reason none of them will print.
+    The summary is there to be read."""
     _run(SMI, cwd="/")
     requested = [name for name in arms.split(",") if name]
     if not requested:
@@ -977,11 +1119,88 @@ def session(arms: str = "") -> None:
             f"no arm named {', '.join(unknown)}; the arms are "
             f"{', '.join(sorted(ARMS))}, plus bench:<case>"
         )
-    for name in requested:
-        print(f"\n=== session arm: {name} ===", flush=True)
-        for cmd, cwd in (_bench_arm(name.removeprefix("bench:")) if name.startswith("bench:")
-                         else ARMS[name]):
-            _run(cmd, cwd)
+    failed = [
+        name
+        for name, outcome, _ in _session(
+            (name, _steps(name), {}) for name in requested
+        )
+        if outcome != OK
+    ]
+    if failed:
+        raise RuntimeError(f"{len(failed)} arm(s) failed: {', '.join(failed)}")
+
+
+# `--features cublas,wedge`: the crate's usual feature for a session plus the
+# spin kernel. It is a separate build of `experiments/` and therefore a separate
+# device codegen, which is why this is its own entry point and not a flag on
+# `session` -- a session's commands are supposed to be byte-identical to the ones
+# its arms' entry points issue, and these deliberately are not.
+WEDGE_FEATURES = ["--features", "cublas,wedge"]
+
+
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=RUNNING)
+@completes
+def wedge_demo(seconds: int = 600, budget_ms: int = 5000) -> None:
+    """Watch the launch watchdog fire, and watch the session survive it.
+
+    This is to `kittens::watchdog` what `stall` is to `scripts/modal-run`: the
+    control that makes the guard something seen rather than something read. A
+    deadline nobody has watched fire is not a deadline, and this one is the whole
+    reason `bench:sol-k` and `profile` are allowed in `ARMS`.
+
+    Three arms in one container, in this order:
+
+      1. `bench:softmax` -- a green arm before the failure.
+      2. `bench:sol-k` with `KITTENS_WEDGE_SECONDS` set, so `crate::wedge`
+         queues a `seconds`-long spin on the default stream ahead of the sweep's
+         own work. The first wait the sweep takes is therefore a wait on a launch
+         that is still running, which is #146's failure exactly. It must fail,
+         with `SIGABRT` from the watchdog, in about `budget_ms`.
+      3. `device-tests` -- a green arm *after* the failure, which is the claim.
+         57 cases, on the device the wedged arm was just using.
+
+    The pass condition is the shape and not merely the exit code: arm 2 failed,
+    arms 1 and 3 did not. A run where the wedged arm *passed* is a watchdog that
+    did nothing; one where a green arm failed is a wedge that took a neighbour,
+    which is the thing this whole change claims cannot happen. Both raise here.
+
+    `budget_ms` is `KITTENS_LAUNCH_BUDGET_MS`, five seconds rather than the
+    30 s default so the demonstration costs seconds of B200 rather than a minute
+    -- and so the override itself is exercised. `seconds` is two orders of
+    magnitude past it; the spin is bounded rather than infinite so that a
+    demonstration that goes wrong still gives the device back."""
+    _run(SMI, cwd="/")
+    green = "bench:softmax"
+    wedged = "bench:sol-k"
+    after = "device-tests"
+    bench = [*RUN, "kittens-experiments", *WEDGE_FEATURES, "--", "bench"]
+    outcomes = _session(
+        [
+            (green, [([*bench, "softmax"], EXPERIMENTS_DIR)], {}),
+            (
+                wedged,
+                [([*bench, "sol-k"], EXPERIMENTS_DIR)],
+                {
+                    "KITTENS_WEDGE_SECONDS": str(seconds),
+                    "KITTENS_LAUNCH_BUDGET_MS": str(budget_ms),
+                },
+            ),
+            (after, ARMS[after], {}),
+        ]
+    )
+    by_name = {name: outcome for name, outcome, _ in outcomes}
+    wrong = [
+        f"{name} was {by_name[name]}, wanted {want}"
+        for name, want in ((green, OK), (wedged, "a failure"), (after, OK))
+        if (by_name[name] == OK) != (want == OK)
+    ]
+    if wrong:
+        raise RuntimeError("; ".join(wrong))
+    print(
+        f"\nthe wedged arm failed in {[e for n, _, e in outcomes if n == wedged][0]:.1f} s and "
+        f"`{after}` ran after it. that is the whole claim.",
+        flush=True,
+    )
 
 
 # No cache mount: this one builds a throwaway clone under `/tmp`, which is a

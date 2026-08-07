@@ -68,6 +68,7 @@ use crate::{
     COLUMNS, DEPTH, PROBE_SHARED, RESCALE, ROWS, TILE, accumulator_value, dump_index, kernels,
     launch_config, probe_a, probe_b,
 };
+use kittens::watchdog::ReadBack;
 
 /// The band each warp drains, stores back and is dumped from.
 type Band = RegTile<32, COLUMNS, BaseLdtm>;
@@ -207,7 +208,7 @@ fn measure(
             )
         }
     }?;
-    Ok(out.to_host_vec(stream)?)
+    Ok(out.read_back(stream)?)
 }
 
 /// What the dump says, against the multiple the row names.

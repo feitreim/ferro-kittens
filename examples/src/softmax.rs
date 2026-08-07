@@ -37,6 +37,7 @@ use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, RegTile, RegVec};
 use kittens::shared::{Bf16, SharedTile, Swizzle128B, SwizzledChunks, publish_to_async_proxy};
 use kittens::sync::Semaphore;
+use kittens::watchdog::ReadBack;
 use kittens::{lane, warp_id};
 
 const ROWS: usize = 128;
@@ -306,7 +307,7 @@ pub(crate) fn run<T>(
         .map(|value| (value as f64 / 8.0 - 127.0 / 8.0).exp2())
         .collect();
     let total: f64 = weight.iter().sum();
-    let observed = destination.to_host_vec(&stream)?;
+    let observed = destination.read_back(&stream)?;
     let (mut wrong, mut sample, mut worst) = (0usize, Vec::new(), 0.0f32);
     for plane in 0..planes {
         for row in 0..rows {

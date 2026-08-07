@@ -91,6 +91,7 @@ use crate::{
     STTM_SHARED, WG_CHUNK, WG_CHUNKS, WG_COLUMNS, WG_DUMP, WG_MARK, WG_MMA_SHARED, WG_THREADS,
     WG_WARPS, kernels, launch_config, wg_cell, wg_decode, wg_index,
 };
+use kittens::watchdog::ReadBack;
 
 /// Warps a launch has, over both warpgroups.
 const WARPS: u32 = WG_THREADS / 32;
@@ -424,7 +425,7 @@ fn measure(
             Shape::PastQuadrant => module.warpgroup_past_quadrant(stream, config, &mut out)?,
         }
     }
-    Ok(out.to_host_vec(stream)?)
+    Ok(out.read_back(stream)?)
 }
 
 /// What the dump says, against what the shape names.

@@ -109,6 +109,7 @@ use cuda_core::{CudaContext, DeviceBuffer};
 
 use crate::bench::{Shape, Timings, time};
 use crate::gemm;
+use kittens::watchdog::{self, ReadBack};
 
 /// Scratch cuBLASLt may use, and the cap the heuristic is chosen under.
 ///
@@ -548,13 +549,13 @@ pub fn bench(
     };
 
     launch()?;
-    stream.synchronize()?;
+    watchdog::wait(&stream)?;
     // `==` on the bf16 words, against a reference rounded the way
     // `cvt.rn.bf16x2.f32` rounds — so this asserts the library's epilogue
     // rounds once, from an fp32 accumulator, exactly as ours does. The worst
     // relative error it returns is the same property of bf16 both sides carry,
     // and `gemm::check` is where it is reported.
-    gemm::check_c(&c.to_host_vec(&stream)?, m, n, k)?;
+    gemm::check_c(&c.read_back(&stream)?, m, n, k)?;
 
     Ok((time(&stream, &mut launch)?, describe(&heuristic)))
 }

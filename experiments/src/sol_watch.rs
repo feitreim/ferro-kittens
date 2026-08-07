@@ -74,8 +74,9 @@ use cuda_device::{DisjointSlice, cluster_launch, cuda_module, kernel, launch_con
 
 use kittens::global::GlobalLayout;
 use kittens::shared::F16;
+use kittens::watchdog::{self, ReadBack};
 
-use crate::bench::Shape;
+use crate::bench::{Shape, announce};
 use crate::gemm_sol::{
     ACCUM_COLUMNS, ALL_LANES, ATile, B_BOX, BLOCK_N, BPanel, HALF_N, ONE_WARPGROUP, REPORT_FIELDS,
     REPORT_ROWS, REPORT_SLOTS, SHIPPED_DRAIN, SMALL_RINGS_END, SMALL_SHARED_BYTES, WATCH_DEEP,
@@ -244,7 +245,7 @@ pub fn watch(context: &Arc<CudaContext>, shape: Shape, depth: Depth) -> Result<(
         );
     }
 
-    eprintln!("  {shape} {}: staging and launching", depth.name());
+    announce(format!("{shape} {}", depth.name()));
     let stream = context.default_stream();
     let module = unsafe { kernels::load(context)? };
     let a = DeviceBuffer::from_host(&stream, &stage_f16(m, k, a_value))?;
@@ -284,9 +285,9 @@ pub fn watch(context: &Arc<CudaContext>, shape: Shape, depth: Depth) -> Result<(
             };
         }
     }
-    stream.synchronize()?;
+    watchdog::wait(&stream)?;
 
-    let host = c.to_host_vec(&stream)?;
+    let host = c.read_back(&stream)?;
     let report = &host[m * n..];
     let marks: Vec<Vec<Mark>> = (0..ctas)
         .map(|cta| {
