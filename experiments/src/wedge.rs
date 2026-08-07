@@ -46,15 +46,13 @@
 //! die. [`WEDGE_SECONDS`] is two minutes in `wedge_demo`, against a budget of
 //! five seconds: indistinguishable from a true wedge for twenty-four times as
 //! long as the demonstration needs, and self-terminating if everything else about
-//! the demonstration goes wrong. The store in the loop is what makes that second
-//! half true rather than hoped for.
+//! the demonstration goes wrong.
 
 use std::error::Error;
 use std::sync::OnceLock;
 
 use cuda_core::{CudaStream, LaunchConfig};
 use cuda_device::{cuda_module, kernel};
-use kittens::watchdog;
 
 /// Set to a number of seconds to wedge the first row that launches; unset to do
 /// nothing at all. The arm that gets wedged is chosen by the environment rather
@@ -70,29 +68,25 @@ static INJECTED: OnceLock<()> = OnceLock::new();
 pub mod kernels {
     use super::*;
 
-    /// Occupy the device for `nanoseconds`, computing nothing anyone reads.
+    /// Occupy the device for `nanoseconds`, computing nothing.
     ///
-    /// `globaltimer` is a wall clock in nanoseconds. The loop writes the reading
-    /// it just took to `now`, and that store is what keeps the loop honest: a
-    /// spin whose only content is a register read is a spin an optimizer is free
-    /// to hoist the read out of, and this kernel's whole contract is that it ends
-    /// when it says it will. `Semaphore::wait_before` gets the same property for
-    /// free, from the barrier poll in its condition.
+    /// `globaltimer` is a wall clock in nanoseconds, read through an intrinsic
+    /// the backend does not fold — the same property `Semaphore::wait_before`
+    /// relies on for `clock64`. One warp of one block is enough: what the host
+    /// waits on is the stream, and the stream is not drained until this returns
+    /// however small the launch is.
     ///
-    /// One warp of one block is enough: what the host waits on is the stream, and
-    /// the stream is not drained until this returns however small the launch is.
-    ///
-    /// # Safety
-    ///
-    /// `now` must be a writable device address.
+    /// **A second parameter was tried and is not here.** Writing each reading to
+    /// a `*mut u64` looked like cheap insurance against the loop being optimized
+    /// away; the measured effect was the opposite one — with the store, the
+    /// launch returned immediately and wedged nothing, where this spelling had
+    /// held a container for as long as it was left to. Whatever the argument
+    /// marshalling does with the pair, the version that demonstrably spins is
+    /// the one with nothing to marshal.
     #[kernel]
-    pub unsafe fn wedge(nanoseconds: u64, now: *mut u64) {
+    pub unsafe fn wedge(nanoseconds: u64) {
         let start = cuda_device::debug::globaltimer();
-        let mut reading = start;
-        while reading.wrapping_sub(start) < nanoseconds {
-            reading = cuda_device::debug::globaltimer();
-            unsafe { now.write_volatile(reading) };
-        }
+        while cuda_device::debug::globaltimer().wrapping_sub(start) < nanoseconds {}
     }
 }
 
@@ -119,27 +113,13 @@ pub fn inject(stream: &CudaStream) -> Result<(), Box<dyn Error>> {
     // control that reports and a control that has to be re-run to be read.
     eprintln!("  wedge: loading the module");
     let module = kernels::load(stream.context())?;
-    eprintln!("  wedge: allocating the timer cell");
-    let now = watchdog::cleared::<u64>(stream, 1)?;
     let config = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
     eprintln!("  wedge: launching");
-    unsafe {
-        module.wedge(
-            stream,
-            config,
-            seconds * 1_000_000_000,
-            now.cu_deviceptr() as *mut u64,
-        )?
-    };
-    // The buffer must outlive the launch, and the launch outlives this function
-    // by design -- so it is leaked rather than dropped. `Drop` would free the
-    // cell the kernel is still storing into, and the process is going to be
-    // ended by the watchdog anyway.
-    std::mem::forget(now);
+    unsafe { module.wedge(stream, config, seconds * 1_000_000_000)? };
     eprintln!("  wedge: queued; the next wait on this stream is a wait on it");
     Ok(())
 }

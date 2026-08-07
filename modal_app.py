@@ -1235,6 +1235,13 @@ def wedge_demo(seconds: int = 120, budget_ms: int = 5000) -> None:
                 {
                     "KITTENS_WEDGE_SECONDS": str(seconds),
                     "KITTENS_LAUNCH_BUDGET_MS": str(budget_ms),
+                    # Every wait says how long it took, so a run where the
+                    # deadline does *not* fire still says whether this wait
+                    # returned promptly (something else is blocking) or never
+                    # returned at all. Four attempts at this demonstration could
+                    # not tell those apart; see `kittens::watchdog`'s
+                    # `TRACE_VARIABLE`.
+                    "KITTENS_WATCHDOG_TRACE": "1",
                 },
             ),
             (after, ARMS[after], {}),

@@ -169,6 +169,20 @@ fn expired(waited: Duration) -> ! {
     std::process::abort()
 }
 
+/// Set to anything to have every wait say how long it took, on `stderr`.
+///
+/// Two uses, and the second is why it is checked in rather than deleted. It says
+/// how much of a sweep is the host waiting on the device rather than staging or
+/// checking — and it is the only thing that can distinguish *this* wait
+/// returning promptly from *some other* driver call blocking, which is a
+/// distinction a run that does not come back has no other way to make.
+pub const TRACE_VARIABLE: &str = "KITTENS_WATCHDOG_TRACE";
+
+fn traced() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os(TRACE_VARIABLE).is_some())
+}
+
 /// Wait for `event`, or end the process past [`budget`].
 ///
 /// The one to reach for when the caller already has an event recorded behind the
@@ -179,6 +193,9 @@ pub fn wait_event(event: &CudaEvent) -> Result<(), DriverError> {
     let budget = budget();
     loop {
         if event.query()? {
+            if traced() {
+                eprintln!("  watchdog: waited {:.3} s", start.elapsed().as_secs_f64());
+            }
             return Ok(());
         }
         let waited = start.elapsed();
