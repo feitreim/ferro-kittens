@@ -2534,9 +2534,30 @@ def _print_local_depot() -> None:
 # page was green.
 #
 # **This is a report and not a gate, and the day-one census is why.** Measured
-# at bda3329: 55 of 318 entry functions carry one, and at 3ae07a8 — the commit
-# before #219 — 51 of 309 carry one, *the same set*, plus the four kernels that
-# did not exist yet. Every count is identical. So the tables are not #219's in
+# at bda3329: 55 of 318 entry functions carry one, and at 3ae07a8 -- the commit
+# before #219 -- 51 of 309 carry one, *the same set*, plus the four kernels that
+# did not exist yet. Every count is identical.
+#
+# **At b589b8a the census reads zero, and that is not what #227 recorded.**
+# From a build verified fresh by `_freshen` -- all four crates recompiled in the
+# container, see the `find`/`touch` line at the top of the run -- this tree has
+# **0 of 319** entry functions carrying a `brx`, where #227's own codegen table
+# says "jump-table census: identical set, identical counts (+ the new probe)"
+# across the change that merged as b589b8a. 319 is 318 plus `shared_drain_quad`,
+# so the entry set is the one that comparison was about; only the counts differ,
+# and they differ by all of them.
+#
+# The direction is the intended one -- #227 made both drains dispatch on
+# `access_width_bytes` with a wildcard, which is three cases, and LLVM branches
+# at three -- so what the fresh build says is that the fix removed every table in
+# the tree rather than none. #227 concluded the opposite, and its comparison was
+# taken across the warm cache volume this file's `_freshen` was written for: a
+# "main vs this branch" diff over that window could be two readings of the same
+# artifacts. That is the finding, not a defect in the fix.
+#
+# **So the arming condition below is now met** and deliberately not acted on
+# here: one fresh measurement of a report is not the same as a gate, and arming
+# one belongs to whoever re-takes the before/after on two verified-fresh builds. So the tables are not #219's in
 # this tree; they are what the four-rung access ladder has always lowered to
 # here, and they load: `device_tests` (57/57), `examples`, `kittens-experiments
 # -- check` and `bench --case gemm-sol` all run on a B200 on driver 580.95.05,
