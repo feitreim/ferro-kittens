@@ -83,7 +83,6 @@ use std::error::Error;
 use std::fmt::Write as _;
 
 use cuda_core::CudaStream;
-use cuda_core::DeviceBuffer;
 
 use kittens::reg::BaseLdtm;
 
@@ -91,7 +90,7 @@ use crate::{
     STTM_SHARED, WG_CHUNK, WG_CHUNKS, WG_COLUMNS, WG_DUMP, WG_MARK, WG_MMA_SHARED, WG_THREADS,
     WG_WARPS, kernels, launch_config, wg_cell, wg_decode, wg_index,
 };
-use kittens::watchdog::ReadBack;
+use kittens::watchdog::{self, ReadBack};
 
 /// Warps a launch has, over both warpgroups.
 const WARPS: u32 = WG_THREADS / 32;
@@ -395,7 +394,7 @@ fn measure(
     module: &kernels::LoadedModule,
     row: &Row,
 ) -> Result<Vec<f32>, Box<dyn Error>> {
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, DUMP)?;
+    let mut out = watchdog::cleared::<f32>(stream, DUMP)?;
     let config = launch_config(WG_THREADS, row.shape.shared());
     unsafe {
         match row.shape {

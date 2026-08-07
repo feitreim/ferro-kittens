@@ -495,9 +495,9 @@ where
     let staged: Vec<f32> = (0..2 * STEPS as usize)
         .flat_map(|step| (0..elements).map(move |index| score(step, index)))
         .collect();
-    let scores = DeviceBuffer::from_host(stream, &staged)?;
-    let mut one = DeviceBuffer::<f32>::zeroed(stream, elements)?;
-    let mut many = DeviceBuffer::<f32>::zeroed(stream, blocks as usize * elements)?;
+    let scores = watchdog::stage(stream, &staged)?;
+    let mut one = watchdog::cleared::<f32>(stream, elements)?;
+    let mut many = watchdog::cleared::<f32>(stream, blocks as usize * elements)?;
     let short_reference = reference::<M, N>(STEPS);
     let long_reference = reference::<M, N>(2 * STEPS);
 

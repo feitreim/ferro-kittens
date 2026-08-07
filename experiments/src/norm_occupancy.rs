@@ -112,7 +112,7 @@ use kittens::plan::SharedPlan;
 use kittens::reg::{Add, BaseLdtm, FragmentLayout, RegTile, RegVec, rsqrt, warp_reduce};
 use kittens::shared::{Bf16, Element, F32, SharedVec};
 use kittens::sync::block_reduce_sum;
-use kittens::watchdog::ReadBack;
+use kittens::watchdog::{self, ReadBack};
 use kittens::{lane, warp_id};
 
 /// Rows one warp's band covers, and the thing the walk cannot go under:
@@ -566,8 +566,8 @@ impl Staged {
         let stream = context.default_stream();
         let multiprocessors = context.multiprocessor_count()? as u32;
         let module = kernels::load(context)?;
-        let source = DeviceBuffer::from_host(&stream, &staged(rows, columns))?;
-        let destination = DeviceBuffer::<u16>::zeroed(&stream, rows * columns)?;
+        let source = watchdog::stage(&stream, &staged(rows, columns))?;
+        let destination = watchdog::cleared::<u16>(&stream, rows * columns)?;
         Ok(Staged {
             stream,
             multiprocessors,

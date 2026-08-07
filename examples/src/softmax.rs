@@ -37,7 +37,7 @@ use kittens::plan::SharedPlan;
 use kittens::reg::{BaseLdtm, RegTile, RegVec};
 use kittens::shared::{Bf16, SharedTile, Swizzle128B, SwizzledChunks, publish_to_async_proxy};
 use kittens::sync::Semaphore;
-use kittens::watchdog::ReadBack;
+use kittens::watchdog::{self, ReadBack};
 use kittens::{lane, warp_id};
 
 const ROWS: usize = 128;
@@ -259,7 +259,7 @@ pub(crate) fn run<T>(
         &mut dyn FnMut() -> Result<(), Box<dyn Error>>,
     ) -> Result<T, Box<dyn Error>>,
 ) -> Result<(String, T), Box<dyn Error>> {
-    use cuda_core::{DeviceBuffer, LaunchConfig};
+    use cuda_core::LaunchConfig;
     use kittens::global::encode_bf16_panels;
     use kittens::shared::Element;
 
@@ -276,8 +276,8 @@ pub(crate) fn run<T>(
     let stream = context.default_stream();
 
     let staged = staged(rows, planes);
-    let source = DeviceBuffer::from_host(&stream, &staged)?;
-    let destination = DeviceBuffer::<u32>::zeroed(&stream, staged.len())?;
+    let source = watchdog::stage(&stream, &staged)?;
+    let destination = watchdog::cleared::<u32>(&stream, staged.len())?;
     // SAFETY: both buffers outlive every launch consuming their maps below.
     let (source_map, destination_map) = unsafe {
         (

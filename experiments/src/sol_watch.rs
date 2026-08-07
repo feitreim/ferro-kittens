@@ -68,7 +68,7 @@
 use std::error::Error;
 use std::sync::Arc;
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig1D};
+use cuda_core::{CudaContext, LaunchConfig1D};
 use cuda_device::tma::TmaDescriptor;
 use cuda_device::{DisjointSlice, cluster_launch, cuda_module, kernel, launch_contract};
 
@@ -248,8 +248,8 @@ pub fn watch(context: &Arc<CudaContext>, shape: Shape, depth: Depth) -> Result<(
     announce(format!("{shape} {}", depth.name()));
     let stream = context.default_stream();
     let module = unsafe { kernels::load(context)? };
-    let a = DeviceBuffer::from_host(&stream, &stage_f16(m, k, a_value))?;
-    let b = DeviceBuffer::from_host(&stream, &stage_f16(n, k, b_value))?;
+    let a = watchdog::stage(&stream, &stage_f16(m, k, a_value))?;
+    let b = watchdog::stage(&stream, &stage_f16(n, k, b_value))?;
     let (a_layout, b_layout) = unsafe {
         (
             GlobalLayout::<F16, 2>::packed(a.cu_deviceptr(), [k, m]),
@@ -259,7 +259,7 @@ pub fn watch(context: &Arc<CudaContext>, shape: Shape, depth: Depth) -> Result<(
     let a_map = a_layout.tensor_map::<ATile>(&stream)?;
     let b_map = b_layout.tensor_map::<BPanel>(&stream)?;
     // The report rows are why this allocation is not `m * n`.
-    let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n + REPORT_ROWS * n)?;
+    let mut c = watchdog::cleared::<u16>(&stream, m * n + REPORT_ROWS * n)?;
 
     let config = LaunchConfig1D::new(ctas, threads(ONE_WARPGROUP), SMALL_SHARED_BYTES as u32);
     let (tiles_m, tiles_n) = ((m / 256) as u32, (n / tile_n) as u32);

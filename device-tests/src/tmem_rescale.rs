@@ -58,7 +58,6 @@ use std::error::Error;
 use std::fmt::Write as _;
 
 use cuda_core::CudaStream;
-use cuda_core::DeviceBuffer;
 use cuda_device::tma::TmaDescriptor;
 
 use kittens::global::encode_bf16_panels;
@@ -68,7 +67,7 @@ use crate::{
     COLUMNS, DEPTH, PROBE_SHARED, RESCALE, ROWS, TILE, accumulator_value, dump_index, kernels,
     launch_config, probe_a, probe_b,
 };
-use kittens::watchdog::ReadBack;
+use kittens::watchdog::{self, ReadBack};
 
 /// The band each warp drains, stores back and is dumped from.
 type Band = RegTile<32, COLUMNS, BaseLdtm>;
@@ -195,7 +194,7 @@ fn measure(
     a_map: *const TmaDescriptor,
     b_map: *const TmaDescriptor,
 ) -> Result<Vec<f32>, Box<dyn Error>> {
-    let mut out = DeviceBuffer::<f32>::zeroed(stream, DUMP)?;
+    let mut out = watchdog::cleared::<f32>(stream, DUMP)?;
     let config = launch_config(ROWS as u32, PROBE_SHARED as u32);
     unsafe {
         if row.store {
@@ -348,8 +347,8 @@ pub fn check(
     stream: &CudaStream,
     module: &kernels::LoadedModule,
 ) -> Result<String, Box<dyn Error>> {
-    let a = DeviceBuffer::from_host(stream, &probe_a())?;
-    let b = DeviceBuffer::from_host(stream, &probe_b())?;
+    let a = watchdog::stage(stream, &probe_a())?;
+    let b = watchdog::stage(stream, &probe_b())?;
     let a_map = unsafe { encode_bf16_panels::<ROWS, DEPTH>(stream, a.cu_deviceptr(), ROWS, 1)? };
     let b_map = unsafe { encode_bf16_panels::<TILE, DEPTH>(stream, b.cu_deviceptr(), TILE, 2)? };
 

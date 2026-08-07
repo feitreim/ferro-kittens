@@ -57,8 +57,13 @@ pub mod kernels {
 /// Queue the wedge on the default stream if [`WEDGE_SECONDS`] asks for one.
 ///
 /// Ahead of everything the sweep then does, and on the stream the sweep uses, so
-/// nothing about the sweep has to know this exists. The first wait it takes —
-/// the checked launch's, or the clock's warm-up — is a wait on this.
+/// nothing about the sweep has to know this exists. The first wait it takes is a
+/// wait on this — and *which* wait that is has already been a finding. The first
+/// run of the demonstration sat in `DeviceBuffer::from_host`, staging the gate
+/// size's operands, because the constructors synchronize inside themselves too
+/// and only the readbacks had been routed through the deadline.
+/// [`kittens::watchdog::stage`] and [`kittens::watchdog::cleared`] exist because
+/// of that run: a control earns its keep the first time it fires.
 pub fn inject(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
     let Some(seconds) = std::env::var(WEDGE_SECONDS)
         .ok()
@@ -73,7 +78,7 @@ pub fn inject(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
          still going, which is what `kittens::watchdog` is for."
     );
     let stream = context.default_stream();
-    let module = unsafe { kernels::load(context)? };
+    let module = kernels::load(context)?;
     let config = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (32, 1, 1),

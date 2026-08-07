@@ -397,7 +397,7 @@ use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
-use kittens::watchdog::ReadBack;
+use kittens::watchdog::{self, ReadBack};
 use kittens::{lane, warp_id};
 
 /// Rows of `C` one CTA owns; the pair covers `2 * BLOCK_M`, which is the `M`
@@ -1767,8 +1767,8 @@ fn run<T>(
     // ABI compiled.
     let module = unsafe { kernels::load(context)? };
 
-    let a = DeviceBuffer::from_host(&stream, &stage(m, k, a_value))?;
-    let b = DeviceBuffer::from_host(&stream, &stage(n, k, b_value))?;
+    let a = watchdog::stage(&stream, &stage(m, k, a_value))?;
+    let b = watchdog::stage(&stream, &stage(n, k, b_value))?;
     // SAFETY: both buffers outlive every launch consuming their maps below.
     let (a_layout, b_layout) = unsafe {
         (
@@ -1779,7 +1779,7 @@ fn run<T>(
     let a_map = a_layout.tensor_map::<ATile>(&stream)?;
     let b_map = b_layout.tensor_map::<BTile>(&stream)?;
 
-    let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
+    let mut c = watchdog::cleared::<u16>(&stream, m * n)?;
     let blocks = grid_for(plan.scheduler, m, n);
     let (tiles_m, tiles_n) = tile_grid(m, n);
     let k_blocks = (k / BLOCK_K) as u32;

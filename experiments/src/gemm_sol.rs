@@ -2203,14 +2203,14 @@ fn run<T>(
     let stream = context.default_stream();
     let module = unsafe { kernels::load(context)? };
     let a = if initialize {
-        DeviceBuffer::from_host(&stream, &stage_f16(m, k, a_value))?
+        watchdog::stage(&stream, &stage_f16(m, k, a_value))?
     } else {
-        DeviceBuffer::<u16>::zeroed(&stream, m * k)?
+        watchdog::cleared::<u16>(&stream, m * k)?
     };
     let b = if initialize {
-        DeviceBuffer::from_host(&stream, &stage_f16(n, k, b_value))?
+        watchdog::stage(&stream, &stage_f16(n, k, b_value))?
     } else {
-        DeviceBuffer::<u16>::zeroed(&stream, n * k)?
+        watchdog::cleared::<u16>(&stream, n * k)?
     };
     let (a_layout, b_layout) = unsafe {
         (
@@ -2221,7 +2221,7 @@ fn run<T>(
     let a_map = a_layout.tensor_map::<ATile>(&stream)?;
     let b_map = b_layout.tensor_map::<BPanel>(&stream)?;
 
-    let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
+    let mut c = watchdog::cleared::<u16>(&stream, m * n)?;
     let tiles_m = (m / 256) as u32;
     let tiles_n = (n / variant.n_tile()) as u32;
     let config = LaunchConfig1D::new(

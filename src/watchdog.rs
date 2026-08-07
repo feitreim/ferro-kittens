@@ -34,12 +34,19 @@
 //!
 //! # What it does and does not cover
 //!
-//! It covers the host waits this tree owns: [`wait`] wherever a sweep
-//! synchronized, and [`ReadBack::read_back`] wherever one read a buffer back
-//! (`to_host_vec` synchronizes inside itself, so an unguarded readback is an
-//! unguarded wait). It does not cover a wedge with no launch in it — a container
-//! that never reaches Python, a `cargo` that hangs — which is
-//! `scripts/modal-run`'s startup and silence budgets, one level out.
+//! It covers every call in this tree that waits on a stream, and the list is
+//! longer than it looks because three of `cuda-core`'s conveniences synchronize
+//! inside themselves: `DeviceBuffer::from_host`, `DeviceBuffer::zeroed` and
+//! `DeviceBuffer::to_host_vec`. An unguarded readback taken after a launch *is*
+//! an unguarded wait for that launch, and so is an unguarded staging call. So
+//! [`wait`] replaces every `stream.synchronize()`, [`stage`] and [`cleared`]
+//! replace the two constructors, and [`ReadBack::read_back`] replaces the
+//! readback. Nothing in `src/`, `examples/`, `experiments/` or `device-tests/`
+//! waits on a device any other way.
+//!
+//! It does not cover a wedge with no launch in it — a container that never
+//! reaches Python, a `cargo` that hangs — which is `scripts/modal-run`'s startup
+//! and silence budgets, one level out.
 //!
 //! # Why the process ends rather than the call failing
 //!
@@ -196,6 +203,37 @@ pub fn wait(stream: &CudaStream) -> Result<(), DriverError> {
     let event = stream.context().new_event(None)?;
     event.record(stream)?;
     wait_event(&event)
+}
+
+/// `DeviceBuffer::from_host`, behind the same deadline.
+///
+/// The constructors synchronize too — `from_host` enqueues a host-to-device copy
+/// and then waits for the stream, as [`cleared`]'s `memset` does — so a staging
+/// call taken while a launch is in flight is a wait on that launch, with no
+/// deadline on it. That is not a theoretical hole: it is what the first run of
+/// `modal_app.py::wedge_demo` found, sitting in `DeviceBuffer::from_host` behind
+/// a kernel that had ten minutes left to run.
+///
+/// So the rule is the one [`ReadBack::read_back`] follows and there are no
+/// exceptions to it: **every call in this tree that waits on a stream drains it
+/// under the deadline first.** What is left after that is arithmetic — an event
+/// created, recorded and queried on a stream that is almost always already
+/// empty, which is microseconds against a copy measured in milliseconds.
+pub fn stage<T: DeviceCopy>(
+    stream: &CudaStream,
+    data: &[T],
+) -> Result<DeviceBuffer<T>, DriverError> {
+    wait(stream)?;
+    DeviceBuffer::from_host(stream, data)
+}
+
+/// `DeviceBuffer::zeroed`, behind the same deadline. See [`stage`].
+pub fn cleared<T: DeviceCopy>(
+    stream: &CudaStream,
+    len: usize,
+) -> Result<DeviceBuffer<T>, DriverError> {
+    wait(stream)?;
+    DeviceBuffer::zeroed(stream, len)
 }
 
 /// Reading a device buffer back, behind the same deadline.

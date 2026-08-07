@@ -2391,9 +2391,9 @@ pub fn measure(
     let stream = context.default_stream();
     let ablated = unsafe { kernels::load(context)? };
 
-    let a = DeviceBuffer::<u16>::zeroed(&stream, m * k)?;
-    let b = DeviceBuffer::<u16>::zeroed(&stream, n * k)?;
-    let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
+    let a = watchdog::cleared::<u16>(&stream, m * k)?;
+    let b = watchdog::cleared::<u16>(&stream, n * k)?;
+    let mut c = watchdog::cleared::<u16>(&stream, m * n)?;
     let (a_layout, b_layout) = unsafe {
         (
             GlobalLayout::<F16, 2>::packed(a.cu_deviceptr(), [k, m]),
@@ -3191,11 +3191,11 @@ pub fn check(context: &Arc<CudaContext>) -> Result<String, Box<dyn Error>> {
     let stream = context.default_stream();
     let ablated = unsafe { kernels::load(context)? };
 
-    let a = DeviceBuffer::from_host(
+    let a = watchdog::stage(
         &stream,
         &crate::gemm_sol::stage_f16(m, k, crate::gemm_sol::a_value),
     )?;
-    let b = DeviceBuffer::from_host(
+    let b = watchdog::stage(
         &stream,
         &crate::gemm_sol::stage_f16(n, k, crate::gemm_sol::b_value),
     )?;
@@ -3219,7 +3219,7 @@ pub fn check(context: &Arc<CudaContext>) -> Result<String, Box<dyn Error>> {
                 arm.threads(),
                 variant.shared_bytes() as u32,
             );
-            let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
+            let mut c = watchdog::cleared::<u16>(&stream, m * n)?;
             macro_rules! launch {
                 ($prepare:ident, $call:ident) => {{
                     let prepared = ablated.$prepare(config)?;

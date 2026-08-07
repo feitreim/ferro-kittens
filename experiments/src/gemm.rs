@@ -331,7 +331,7 @@ use kittens::reg::{BaseLdtm, RegTile};
 use kittens::shared::{Bf16, SharedTile, SharedTileRing, Swizzle128B};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_cluster, dealloc_cluster};
-use kittens::watchdog::ReadBack;
+use kittens::watchdog::{self, ReadBack};
 use kittens::{lane, warp_id};
 
 /// Rows of `C` one CTA owns. The pair covers `2 * BLOCK_M`, which is the `M`
@@ -5175,8 +5175,8 @@ fn run<T>(
     // entry point in it — the ABI the contract declares is the one compiled.
     let module = unsafe { kernels::load(context)? };
 
-    let a = DeviceBuffer::from_host(&stream, &stage(m, k, a_value))?;
-    let b = DeviceBuffer::from_host(&stream, &stage(n, k, b_value))?;
+    let a = watchdog::stage(&stream, &stage(m, k, a_value))?;
+    let b = watchdog::stage(&stream, &stage(n, k, b_value))?;
     // SAFETY: both buffers outlive every launch consuming their maps below.
     let (a_layout, b_layout) = unsafe {
         (
@@ -5197,7 +5197,7 @@ fn run<T>(
         columns => return Err(format!("no rung has {columns} pair columns").into()),
     };
 
-    let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
+    let mut c = watchdog::cleared::<u16>(&stream, m * n)?;
     // The TMA epilogues are the only ones that need a descriptor for the
     // *output* — every other rung writes `C` through a `GlobalRows` cursor
     // carrying `ldc` and nothing else — so one is built only where one is

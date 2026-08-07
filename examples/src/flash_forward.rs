@@ -44,7 +44,7 @@ use kittens::reg::{BaseLdtm, RegTile, RegVec, online_rescale};
 use kittens::shared::{Bf16, F32, SharedTile, SharedTileRing, Swizzle128B, publish_to_async_proxy};
 use kittens::sync::{Semaphore, SemaphoreRing};
 use kittens::tmem::{TmemTile, alloc_block, dealloc_block};
-use kittens::watchdog::ReadBack;
+use kittens::watchdog::{self, ReadBack};
 use kittens::{lane, warp_id};
 
 const QUERIES: usize = 128;
@@ -489,10 +489,10 @@ fn run<T>(
     let function = module.as_cuda_module().load_function("flash_forward")?;
     kittens::launch::admit_shared_plan(&function, SHARED_BYTES as u32)?;
 
-    let q = DeviceBuffer::from_host(&stream, &staged(sequence, heads, q_value))?;
-    let k = DeviceBuffer::from_host(&stream, &staged(sequence, heads, k_value))?;
-    let v = DeviceBuffer::from_host(&stream, &staged(sequence, heads, v_value))?;
-    let mut out = DeviceBuffer::<f32>::zeroed(&stream, heads * sequence * HEAD)?;
+    let q = watchdog::stage(&stream, &staged(sequence, heads, q_value))?;
+    let k = watchdog::stage(&stream, &staged(sequence, heads, k_value))?;
+    let v = watchdog::stage(&stream, &staged(sequence, heads, v_value))?;
+    let mut out = watchdog::cleared::<f32>(&stream, heads * sequence * HEAD)?;
     // SAFETY: all three buffers outlive every launch consuming their maps
     // below.
     let (q_map, k_map, v_map) = unsafe {

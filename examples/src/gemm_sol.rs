@@ -1302,13 +1302,13 @@ fn run(
     k: usize,
     variant: Variant,
 ) -> Result<String, Box<dyn Error>> {
-    use cuda_core::{DeviceBuffer, LaunchConfig1D};
+    use cuda_core::LaunchConfig1D;
 
     validate_shape(m, n, k, variant)?;
     let stream = context.default_stream();
     let module = unsafe { kernels::load(context)? };
-    let a = DeviceBuffer::from_host(&stream, &stage_f16(m, k, a_value))?;
-    let b = DeviceBuffer::from_host(&stream, &stage_f16(n, k, b_value))?;
+    let a = watchdog::stage(&stream, &stage_f16(m, k, a_value))?;
+    let b = watchdog::stage(&stream, &stage_f16(n, k, b_value))?;
     let (a_layout, b_layout) = unsafe {
         (
             GlobalLayout::<F16, 2>::packed(a.cu_deviceptr(), [k, m]),
@@ -1318,7 +1318,7 @@ fn run(
     let a_map = a_layout.tensor_map::<ATile>(&stream)?;
     let b_map = b_layout.tensor_map::<BPanel>(&stream)?;
 
-    let mut c = DeviceBuffer::<u16>::zeroed(&stream, m * n)?;
+    let mut c = watchdog::cleared::<u16>(&stream, m * n)?;
     let config = LaunchConfig1D::new(
         grid(m, n, variant),
         variant.threads(),
