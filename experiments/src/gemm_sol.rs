@@ -291,14 +291,34 @@ pub const NARROW_GROUPS: u32 = ONE_WARPGROUP;
 /// fact that is per *warp* — a warp is through its drain when its last
 /// `tcgen05.wait::ld` has retired, and `tcgen05.wait::ld` retires the warp's
 /// loads and not the lane's.
-pub const ALL_LANES: bool = false;
+///
+/// The dial is two independent bits, because the release has two questions and
+/// #218 answered only the first: bit 0 is the arrival **scope**, bit 1 is the
+/// arrival's **place in the drain**.
+pub const ALL_LANES: u8 = 0;
 /// [`ALL_LANES`]' twin: one arrival a warp, from its lane 0, which is 16 a slot
 /// at two warpgroups and 8 at one. oxide-train's `gemm_sol_final` releases this
 /// way.
-pub const ONE_LANE: bool = true;
-/// The scope the three entries ship, and it changed in #218: table 7 has the
-/// A/B.
-pub const SHIPPED_RELEASE: bool = ONE_LANE;
+pub const ONE_LANE: u8 = 1;
+/// [`ALL_LANES`] released at the last band's `tcgen05.wait::ld` rather than at
+/// the end of the drain — the timing arm, holding the scope.
+pub const ALL_LANES_EARLY: u8 = 2;
+/// Both: one arrival a warp, at the last band's load. What the entries ship.
+pub const ONE_LANE_EARLY: u8 = 3;
+/// Bit 0 of the release dial: one arrival a warp instead of 32.
+pub const fn one_lane(release: u8) -> bool {
+    release & 1 != 0
+}
+/// Bit 1 of the release dial: the arrival sits at the last band's
+/// `tcgen05.wait::ld` — the instant the accumulator stops being read — instead
+/// of at the end of the drain, so the `stmatrix` and `st.global` passes below
+/// that load leave the next item's critical path.
+pub const fn early(release: u8) -> bool {
+    release & 2 != 0
+}
+/// What the three entries ship. The scope bit landed in #218 (a null on its own)
+/// and the timing bit in #221; tables 6 and 7 have both A/Bs.
+pub const SHIPPED_RELEASE: u8 = ONE_LANE_EARLY;
 
 const fn epilogue_warps(groups: u32) -> u32 {
     EPILOGUE_ROWS * groups
@@ -306,8 +326,8 @@ const fn epilogue_warps(groups: u32) -> u32 {
 /// Arrivals `empty` is armed with, which is [`Common::release_accumulator`]'s
 /// signaller count and nothing else. Getting it out of step with the guard there
 /// is a launch that never reaches its second item.
-pub const fn empty_arrivals(groups: u32, one_lane: bool) -> u32 {
-    RANKS * epilogue_warps(groups) * if one_lane { 1 } else { 32 }
+pub const fn empty_arrivals(groups: u32, release: u8) -> u32 {
+    RANKS * epilogue_warps(groups) * if one_lane(release) { 1 } else { 32 }
 }
 const fn tma_warp(groups: u32) -> u32 {
     epilogue_warps(groups)
@@ -724,18 +744,19 @@ impl Common {
         }
     }
 
-    /// Hand an accumulator slot back to the MMA warp, at [`ALL_LANES`] or
-    /// [`ONE_LANE`] scope. [`empty_arrivals`] is the same dial read from the
+    /// Hand an accumulator slot back to the MMA warp, at the scope [`one_lane`]
+    /// reads out of `RELEASE`. [`empty_arrivals`] is the same bit read from the
     /// other end and the two have to agree.
     ///
-    /// What makes [`ONE_LANE`] legal is the closing `warp::sync_mask` of
-    /// [`Common::drain_dial`]: `tcgen05.wait::ld` retires every load the *warp*
-    /// has outstanding, so past that sync no lane of it still has the
-    /// accumulator in flight, and nothing else in the drain reads tensor memory.
+    /// What makes the guard legal is the `warp::sync_mask` that precedes every
+    /// call: `tcgen05.wait::ld` retires every load the *warp* has outstanding, so
+    /// past that sync no lane of it still has the accumulator in flight, and
+    /// nothing below the last band's load reads tensor memory at all — which is
+    /// also what makes [`early`] legal.
     #[inline(always)]
-    unsafe fn release_accumulator<const ONE_LANE: bool>(self, slot: u32) {
+    unsafe fn release_accumulator<const RELEASE: u8>(self, slot: u32) {
         unsafe {
-            if ONE_LANE && self.lane != 0 {
+            if one_lane(RELEASE) && self.lane != 0 {
                 return;
             }
             let empty = self.empty.sem(slot);
@@ -842,11 +863,13 @@ impl Common {
         const BAND: usize,
         const ISSUES: usize,
         const GROUPS: u32,
+        const RELEASE: u8,
     >(
         self,
         accumulator: TmemTile<BLOCK_M, N>,
         tile_row: u32,
         tile_column: u32,
+        slot: u32,
     ) where
         BaseLdtm: kittens::reg::FragmentLayout<32, BAND>,
     {
@@ -860,6 +883,7 @@ impl Common {
             let stage = self.staging::<STAGE_N>();
             let row = self.drain_row(tile_row);
             let (base, span) = self.drain_columns::<N, GROUPS>();
+            let last_band = span - BAND as u32;
             let mut column = 0u32;
             while column < span {
                 let mut band_column = 0u32;
@@ -869,6 +893,10 @@ impl Common {
                             32 * self.row_block(),
                             base + column + band_column,
                         );
+                    if early(RELEASE) && column + band_column == last_band {
+                        warp::sync_mask(u32::MAX);
+                        self.release_accumulator::<RELEASE>(slot);
+                    }
                     store_tile_x4(stage.chunk_writer(), 0, band_column, self.lane, band);
                     band_column += BAND as u32;
                 }
@@ -1000,12 +1028,18 @@ impl Common {
     /// literal 128-column band here would break the two-warpgroup build, whose
     /// 64-wide staging tile cannot divide it, even though it never takes that arm.
     #[inline(always)]
+    /// The drain rung `DRAIN` names, and **the accumulator's release with it**:
+    /// only the batched rungs can place the arrival at the last band's load, so
+    /// every other rung takes the late release here rather than carrying a dial
+    /// it cannot honour.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn drain_dial<
         const ABLATE: u8,
         const DRAIN: u8,
         const N: usize,
         const STAGE_N: usize,
         const GROUPS: u32,
+        const RELEASE: u8,
         const WIDE_BAND: usize,
         const WIDE_ISSUES: usize,
     >(
@@ -1014,21 +1048,26 @@ impl Common {
         tile_row: u32,
         tile_column: u32,
         again: (u32, u32),
+        slot: u32,
     ) where
         BaseLdtm: kittens::reg::FragmentLayout<32, WIDE_BAND>,
     {
         unsafe {
+            let batched = DRAIN == DRAIN_PAIRED || DRAIN == DRAIN_WIDE;
             match DRAIN {
-                DRAIN_PAIRED => self.drain_batched::<N, STAGE_N, BAND_N, 2, GROUPS>(
+                DRAIN_PAIRED => self.drain_batched::<N, STAGE_N, BAND_N, 2, GROUPS, RELEASE>(
                     accumulator,
                     tile_row,
                     tile_column,
+                    slot,
                 ),
-                DRAIN_WIDE => self.drain_batched::<N, STAGE_N, WIDE_BAND, WIDE_ISSUES, GROUPS>(
-                    accumulator,
-                    tile_row,
-                    tile_column,
-                ),
+                DRAIN_WIDE => self
+                    .drain_batched::<N, STAGE_N, WIDE_BAND, WIDE_ISSUES, GROUPS, RELEASE>(
+                        accumulator,
+                        tile_row,
+                        tile_column,
+                        slot,
+                    ),
                 DRAIN_PACK16 => {
                     self.drain_packed::<N, STAGE_N, GROUPS>(accumulator, tile_row, tile_column)
                 }
@@ -1041,6 +1080,9 @@ impl Common {
                     tile_column,
                     again,
                 ),
+            }
+            if !(batched && early(RELEASE)) {
+                self.release_accumulator::<RELEASE>(slot);
             }
         }
     }
@@ -1296,7 +1338,7 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
         const DRAIN: u8,
         const WATCH: u8,
         const GROUPS: u32,
-        const RELEASE: bool,
+        const RELEASE: u8,
         const WIDE_BAND: usize,
         const WIDE_ISSUES: usize,
     >(
@@ -1328,14 +1370,25 @@ impl<const N: usize, const HALF: usize, const BOX: usize, const STAGE: usize>
                     break;
                 }
                 if drains(ABLATE) || DRAIN >= DRAIN_PACK16 {
-                    common.drain_dial::<ABLATE, DRAIN, N, STAGE, GROUPS, WIDE_BAND, WIDE_ISSUES>(
+                    common.drain_dial::<
+                        ABLATE,
+                        DRAIN,
+                        N,
+                        STAGE,
+                        GROUPS,
+                        RELEASE,
+                        WIDE_BAND,
+                        WIDE_ISSUES,
+                    >(
                         Common::accumulator(self.accumulator, sequence),
                         row,
                         column,
                         again,
+                        sequence,
                     );
+                } else {
+                    common.release_accumulator::<RELEASE>(sequence);
                 }
-                common.release_accumulator::<RELEASE>(sequence);
                 sequence += 1;
             }
         }
@@ -1615,7 +1668,7 @@ impl<const BOX: usize> Large<BOX> {
         const DRAIN: u8,
         const WATCH: u8,
         const GROUPS: u32,
-        const RELEASE: bool,
+        const RELEASE: u8,
         const WARP_STAGE: usize,
         const WIDE_BAND: usize,
         const WIDE_ISSUES: usize,
@@ -1654,14 +1707,16 @@ impl<const BOX: usize> Large<BOX> {
                         common.full.sem(half).wait(sequence & 1);
                     }
                     if drains(ABLATE) || DRAIN >= DRAIN_PACK16 {
-                        common.drain_dial::<ABLATE, DRAIN, BLOCK_N, WARP_STAGE, GROUPS, WIDE_BAND, WIDE_ISSUES>(
+                        common.drain_dial::<ABLATE, DRAIN, BLOCK_N, WARP_STAGE, GROUPS, RELEASE, WIDE_BAND, WIDE_ISSUES>(
                             self.accumulator.columns_right(half * BLOCK_N as u32),
                             info.row * 512 + half * 256,
                             info.column * BLOCK_N as u32,
                             again,
+                            half,
                         );
+                    } else {
+                        common.release_accumulator::<RELEASE>(half);
                     }
-                    common.release_accumulator::<RELEASE>(half);
                     half += 1;
                 }
                 sequence += 1;
@@ -1693,7 +1748,7 @@ pub unsafe fn small_body<
     const DRAIN: u8,
     const WATCH: u8,
     const GROUPS: u32,
-    const RELEASE: bool,
+    const RELEASE: u8,
     const WIDE_BAND: usize,
     const WIDE_ISSUES: usize,
 >(
@@ -1751,7 +1806,7 @@ pub unsafe fn large_body<
     const DRAIN: u8,
     const WATCH: u8,
     const GROUPS: u32,
-    const RELEASE: bool,
+    const RELEASE: u8,
     const WARP_STAGE: usize,
     const WIDE_BAND: usize,
     const WIDE_ISSUES: usize,

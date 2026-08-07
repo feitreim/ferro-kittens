@@ -231,11 +231,11 @@ use kittens::shared::F16;
 
 use crate::bench::{Shape, Timings, time};
 use crate::gemm_sol::{
-    ACCUM_COLUMNS, ALL_LANES, ATile, B_BOX, BAND_N, BLOCK_N, BPanel, DRAIN_NOCVT, DRAIN_PACK16,
-    DRAIN_PAIRED, DRAIN_PER_ISSUE, DRAIN_WIDE, FEED_ONLY, HALF_N, ISSUE_ONLY, LARGE_STAGE_N,
-    MMA_ONLY, NO_DRAIN, ONE_LANE, ONE_WARPGROUP, SHIPPED_DRAIN, SMALL_RINGS_END, TWICE_ALL,
-    TWICE_GLOBAL, TWICE_SHARED, TWO_WARPGROUPS, Variant, WATCH_OFF, WHOLE, WIDE_B_BOX, WideBPanel,
-    clusters, default_group, empty_arrivals, large_body, small_body, threads,
+    ACCUM_COLUMNS, ALL_LANES, ALL_LANES_EARLY, ATile, B_BOX, BAND_N, BLOCK_N, BPanel, DRAIN_NOCVT,
+    DRAIN_PACK16, DRAIN_PAIRED, DRAIN_PER_ISSUE, DRAIN_WIDE, FEED_ONLY, HALF_N, ISSUE_ONLY,
+    LARGE_STAGE_N, MMA_ONLY, NO_DRAIN, ONE_LANE, ONE_WARPGROUP, SHIPPED_DRAIN, SMALL_RINGS_END,
+    TWICE_ALL, TWICE_GLOBAL, TWICE_SHARED, TWO_WARPGROUPS, Variant, WATCH_OFF, WHOLE, WIDE_B_BOX,
+    WideBPanel, clusters, default_group, empty_arrivals, large_body, small_body, threads,
 };
 
 /// SMs on the B200 this file's arithmetic is for, and CTAs one of them holds at
@@ -1872,6 +1872,173 @@ pub mod kernels {
         }
     }
 
+    /// [`gemm_sol_m256_paired`] releasing its accumulator at the last band's
+    /// `tcgen05.wait::ld` rather than at the end of the drain, at the same
+    /// [`ALL_LANES`] scope: one const between it and that arm.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m256`], at 192 threads.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 196_864,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m256_paired_early(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            small_body::<
+                BLOCK_N,
+                ACCUM_COLUMNS,
+                HALF_N,
+                B_BOX,
+                BLOCK_N,
+                SMALL_RINGS_END,
+                WHOLE,
+                true,
+                DRAIN_PAIRED,
+                WATCH_OFF,
+                ONE_WARPGROUP,
+                ALL_LANES_EARLY,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
+        }
+    }
+
+    /// [`gemm_sol_m256_paired_early`] at the `[512, 256]` entry.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m512`], at 192 threads.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        dynamic_shared = 229_632,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m512_paired_early(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            large_body::<
+                B_BOX,
+                WHOLE,
+                true,
+                DRAIN_PAIRED,
+                WATCH_OFF,
+                ONE_WARPGROUP,
+                ALL_LANES_EARLY,
+                LARGE_STAGE_N,
+                128,
+                4,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
+        }
+    }
+
+    /// [`gemm_sol_m256_wg2`] at the early release — the other corner of the
+    /// split × release-timing square.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m256`], **at 320 threads**.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (320, 1, 1),
+        dynamic_shared = 196_864,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m256_wg2_early(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            small_body::<
+                BLOCK_N,
+                ACCUM_COLUMNS,
+                HALF_N,
+                B_BOX,
+                { BLOCK_N / 2 },
+                SMALL_RINGS_END,
+                WHOLE,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                TWO_WARPGROUPS,
+                ALL_LANES_EARLY,
+                BAND_N,
+                2,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
+        }
+    }
+
+    /// [`gemm_sol_m256_wg2_early`] at the `[512, 256]` entry.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::gemm_sol::kernels::gemm_sol_m512`], **at 320 threads**.
+    #[kernel]
+    #[cluster_launch(2, 1, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (320, 1, 1),
+        dynamic_shared = 229_632,
+        dynamic_shared_alignment = 128
+    )]
+    pub unsafe fn gemm_sol_m512_wg2_early(
+        a_map: *const TmaDescriptor,
+        b_map: *const TmaDescriptor,
+        tiles_m: u32,
+        tiles_n: u32,
+        k_blocks: u32,
+        group: u32,
+        ldc: u32,
+        mut c: DisjointSlice<u16>,
+    ) {
+        unsafe {
+            large_body::<
+                B_BOX,
+                WHOLE,
+                true,
+                SHIPPED_DRAIN,
+                WATCH_OFF,
+                TWO_WARPGROUPS,
+                ALL_LANES_EARLY,
+                { LARGE_STAGE_N / 2 },
+                BAND_N,
+                2,
+            >(a_map, b_map, tiles_m, tiles_n, k_blocks, group, ldc, &mut c)
+        }
+    }
+
     /// The whole kernel at the geometry every ladder in this file is held at:
     /// one epilogue warpgroup, 192 threads, [`ALL_LANES`].
     ///
@@ -1992,6 +2159,13 @@ pub enum Arm {
     Wg2NoDrain,
     /// [`Arm::Wg2`] releasing from one lane a warp instead of 32.
     Wg2Lane,
+    /// [`Arm::Paired`] releasing its accumulator at the last band's
+    /// `tcgen05.wait::ld` instead of at the end of the drain, at the same
+    /// [`ALL_LANES`] scope: the timing half of the release, at one warpgroup.
+    PairedEarly,
+    /// [`Arm::PairedEarly`] at two warpgroups — the other corner of table 6's
+    /// split × release-timing square, and the shipped timing.
+    Wg2Early,
     /// **Never launched.** `.pack::16b` faults on the device against an fp32
     /// accumulator — `Xid 13, Out Of Range Address` on every SM — so this arm
     /// exists for its opcode census and has no timed row. See
@@ -2030,17 +2204,26 @@ impl Arm {
     const DRAINS: [Arm; 4] = [Arm::Paired, Arm::PerIssue, Arm::Wide, Arm::NoCvt];
     /// The drain rungs that compute a right `C` and are therefore on [`check`].
     /// `NoCvt` and `Pack16` are not among them and cannot be.
-    const EXACT_DRAINS: [Arm; 5] = [
+    const EXACT_DRAINS: [Arm; 7] = [
         Arm::Paired,
         Arm::PerIssue,
         Arm::Wide,
         Arm::Wg2,
         Arm::Wg2Lane,
+        Arm::PairedEarly,
+        Arm::Wg2Early,
     ];
     /// The warpgroup split and the pair of controls it is read against. Each arm
     /// subtracts the `no drain` at **its own** thread count, because the split
     /// changes the launch geometry and a shared control would carry that with it.
-    const WARPGROUPS: [Arm; 4] = [Arm::Paired, Arm::NoDrain, Arm::Wg2, Arm::Wg2NoDrain];
+    const WARPGROUPS: [Arm; 6] = [
+        Arm::Paired,
+        Arm::NoDrain,
+        Arm::Wg2,
+        Arm::Wg2NoDrain,
+        Arm::PairedEarly,
+        Arm::Wg2Early,
+    ];
     /// The accumulator release's arrival scope, both arms at the shipped
     /// geometry and reading against the one `no drain` control that geometry
     /// has. They differ in one const and compute the same `C`.
@@ -2082,6 +2265,8 @@ impl Arm {
             Arm::Wg2 => "two warpgroups",
             Arm::Wg2NoDrain => "two wg, no drain",
             Arm::Wg2Lane => "one lane a warp",
+            Arm::PairedEarly => "one wg, early",
+            Arm::Wg2Early => "two wg, early",
             Arm::Pack16 => "pack16",
         }
     }
@@ -2107,6 +2292,8 @@ impl Arm {
             Arm::Wg2 => "8 epilogue warps, columns split, 320 threads",
             Arm::Wg2NoDrain => "the same launch with the drain removed",
             Arm::Wg2Lane => "the same launch releasing from lane 0 only",
+            Arm::PairedEarly => "4 warps, released at the last band's LDTM",
+            Arm::Wg2Early => "8 warps, released at the last band's LDTM",
             Arm::Pack16 => ".pack::16b; FAULTS ON THE DEVICE, never launched",
         }
     }
@@ -2122,7 +2309,19 @@ impl Arm {
     /// its `release_accumulator` signals — the count table 7 is about, derived
     /// here so the table can be read without the source beside it.
     fn empty_arrivals(self) -> u32 {
-        empty_arrivals(self.warpgroups(), self == Arm::Wg2Lane)
+        empty_arrivals(self.warpgroups(), self.release())
+    }
+
+    /// The release dial this arm's kernel is compiled at: scope in bit 0, and
+    /// whether the arrival sits at the last band's load in bit 1. Everything the
+    /// port carried is [`ALL_LANES`]; the two timing arms hold that scope so the
+    /// only thing between them and their control is where the arrival sits.
+    fn release(self) -> u8 {
+        match self {
+            Arm::Wg2Lane => ONE_LANE,
+            Arm::PairedEarly | Arm::Wg2Early => ALL_LANES_EARLY,
+            _ => ALL_LANES,
+        }
     }
 
     /// Epilogue warpgroups this arm runs, which is what [`Arm::threads`] is a
@@ -2130,7 +2329,7 @@ impl Arm {
     /// warpgroups, not linear, because the TMA and MMA warps are in it too.
     fn warpgroups(self) -> u32 {
         match self {
-            Arm::Wg2 | Arm::Wg2NoDrain | Arm::Wg2Lane => TWO_WARPGROUPS,
+            Arm::Wg2 | Arm::Wg2NoDrain | Arm::Wg2Lane | Arm::Wg2Early => TWO_WARPGROUPS,
             _ => ONE_WARPGROUP,
         }
     }
@@ -2269,6 +2468,34 @@ pub fn measure(
                 &ablated,
                 prepare_gemm_sol_m512_wg2_lane,
                 gemm_sol_m512_wg2_lane
+            )
+        }
+        (Variant::M256xN256, Arm::PairedEarly) => {
+            launcher!(
+                &ablated,
+                prepare_gemm_sol_m256_paired_early,
+                gemm_sol_m256_paired_early
+            )
+        }
+        (Variant::M512xN256, Arm::PairedEarly) => {
+            launcher!(
+                &ablated,
+                prepare_gemm_sol_m512_paired_early,
+                gemm_sol_m512_paired_early
+            )
+        }
+        (Variant::M256xN256, Arm::Wg2Early) => {
+            launcher!(
+                &ablated,
+                prepare_gemm_sol_m256_wg2_early,
+                gemm_sol_m256_wg2_early
+            )
+        }
+        (Variant::M512xN256, Arm::Wg2Early) => {
+            launcher!(
+                &ablated,
+                prepare_gemm_sol_m512_wg2_early,
+                gemm_sol_m512_wg2_early
             )
         }
         (Variant::M512xN256, Arm::Wg2NoDrain) => {
@@ -2831,31 +3058,66 @@ fn drain_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
 /// same rows, so eight warps split the accumulator's **columns**. Two whole passes
 /// each, because the effect being looked for is a few percent and one pass of that
 /// is not a number.
+/// The square is `#221`'s question: if the drain leaves the critical path, does
+/// the split's win go with it? Both levers are one const each, all four corners
+/// are one binary, and the two `no drain` controls are per thread count.
 fn warpgroup_table(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
     println!(
-        "\n6. the epilogue's warpgroups — four warps against eight, splitting the\n\
-         accumulator's columns rather than its rows, at a byte-identical shared plan.\n\
+        "\n6. the epilogue's warpgroups × the accumulator release's timing — four warps\n\
+         against eight, splitting the accumulator's columns rather than its rows, at a\n\
+         byte-identical shared plan, each crossed with an accumulator released at the\n\
+         last band's `tcgen05.wait::ld` instead of at the end of the drain. all four\n\
+         corners hold `ALL_LANES` scope, so the only things moving are the two levers.\n\
          each arm subtracts the `no drain` at its own thread count, because the split\n\
          changes the launch geometry. `epilogue` is `whole - no drain` within a thread\n\
-         count, in µs per tile per cluster; `of one wg` above 1.00 is the split ahead."
+         count, in µs per tile per cluster; `of one wg` above 1.00 is the split ahead\n\
+         and `of late` above 1.00 is the early release ahead."
     );
     for (shape, variant) in HEADLINE {
         let (_, waves, _) = quantization(shape, variant);
         for pass in 1..=2 {
             println!("\n  {shape} — {}, pass {pass}", variant.name());
             let minima = arm_rows(context, shape, variant, &Arm::WARPGROUPS, Arm::Paired)?;
+            let (late_one, late_two) = (minima[0], minima[2]);
             println!(
-                "  {:<16}{:>9}{:>11}{:>13}{:>12}",
-                "warpgroups", "threads", "min ms", "epilogue", "of one wg"
+                "  {:<16}{:>9}{:>11}{:>13}{:>12}{:>11}",
+                "warpgroups", "threads", "min ms", "epilogue", "of one wg", "of late"
             );
-            for (name, whole, control, count) in [
-                ("one", minima[0], minima[1], threads(ONE_WARPGROUP)),
-                ("two", minima[2], minima[3], threads(TWO_WARPGROUPS)),
+            for (name, whole, control, count, late) in [
+                (
+                    "one, late",
+                    late_one,
+                    minima[1],
+                    threads(ONE_WARPGROUP),
+                    late_one,
+                ),
+                (
+                    "two, late",
+                    late_two,
+                    minima[3],
+                    threads(TWO_WARPGROUPS),
+                    late_one,
+                ),
+                (
+                    "one, early",
+                    minima[4],
+                    minima[1],
+                    threads(ONE_WARPGROUP),
+                    late_one,
+                ),
+                (
+                    "two, early",
+                    minima[5],
+                    minima[3],
+                    threads(TWO_WARPGROUPS),
+                    late_two,
+                ),
             ] {
                 println!(
-                    "  {name:<16}{count:>9}{whole:>11.4}{:>10.2} µs{:>12.3}",
+                    "  {name:<16}{count:>9}{whole:>11.4}{:>10.2} µs{:>12.3}{:>11.3}",
                     1e3 * (whole - control) / waves as f64,
-                    minima[0] / whole,
+                    late_one / whole,
+                    late / whole,
                 );
             }
         }
@@ -2989,6 +3251,15 @@ pub fn check(context: &Arc<CudaContext>) -> Result<String, Box<dyn Error>> {
                 (Variant::M256xN256, Arm::Wg2Lane) => {
                     launch!(prepare_gemm_sol_m256_wg2_lane, gemm_sol_m256_wg2_lane)
                 }
+                (Variant::M256xN256, Arm::PairedEarly) => {
+                    launch!(
+                        prepare_gemm_sol_m256_paired_early,
+                        gemm_sol_m256_paired_early
+                    )
+                }
+                (Variant::M256xN256, Arm::Wg2Early) => {
+                    launch!(prepare_gemm_sol_m256_wg2_early, gemm_sol_m256_wg2_early)
+                }
                 (Variant::M256xN256, _) => {
                     launch!(prepare_gemm_sol_m256_wide, gemm_sol_m256_wide)
                 }
@@ -3003,6 +3274,15 @@ pub fn check(context: &Arc<CudaContext>) -> Result<String, Box<dyn Error>> {
                 }
                 (Variant::M512xN256, Arm::Wg2Lane) => {
                     launch!(prepare_gemm_sol_m512_wg2_lane, gemm_sol_m512_wg2_lane)
+                }
+                (Variant::M512xN256, Arm::PairedEarly) => {
+                    launch!(
+                        prepare_gemm_sol_m512_paired_early,
+                        gemm_sol_m512_paired_early
+                    )
+                }
+                (Variant::M512xN256, Arm::Wg2Early) => {
+                    launch!(prepare_gemm_sol_m512_wg2_early, gemm_sol_m512_wg2_early)
                 }
                 (Variant::M512xN256, _) => {
                     launch!(prepare_gemm_sol_m512_wide, gemm_sol_m512_wide)

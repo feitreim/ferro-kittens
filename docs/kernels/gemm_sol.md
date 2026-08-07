@@ -315,6 +315,113 @@ whichever lane it came from. The count was never the term. It ships guarded
 anyway, because one arrival a warp is what the code means and 512 was an
 accident of where the guard was not.
 
+### The deferred release: one entry has it, the other cannot (#221)
+
+oxide-train #86's `gemm_sol_final` releases an accumulator so that the slot an
+item waits on drained a **full item's MMA ago** — `empty(i − SLOTS)` rather than
+`empty(i − 1)` — and reported the handoff collapsing from 4 815 to 100 SM ticks.
+Porting that here found the two entries in opposite states, and the difference is
+not a choice.
+
+**The `[256, N]` entries have had it all along.** `Small::multiply` waits
+
+```rust
+if common.rank == LEADER && sequence >= ACCUMULATORS as u32 {
+    common.empty.wait(sequence - ACCUMULATORS as u32);
+}
+```
+
+and `SemaphoreRing::<2>::wait(i − 2)` resolves to slot `(i − 2) % 2 == i % 2` at
+phase `((i − 2) / 2) & 1` — which is the arrival item `i − 2` made when *it*
+released that slot. It is `wait_recycled(sequence)` written out longhand: the
+accumulator item `i` takes was drained two items back, and item `i − 1`'s whole K
+walk has run since. The 512-column allocation ping-pongs **and** the wait skips a
+generation.
+
+**The `[512, 256]` entry does not, and no version of it can.** Its waits are
+`empty.sem(0).wait((sequence − 1) & 1)` at the top of `Large::multiply` and
+`empty.sem(1)` between the two MMA issues of the item's first stage: both are the
+*previous* item's drain. The reason is that its two slots are not a ping-pong
+across items at all — they are the item's own two 256-row halves of a 512-row
+macro-tile, both live for the whole K walk. Deferring by one item would need a
+third `[128, 256]` slot, and the entry's `alloc_cluster::<512>` is already the
+whole of an SM's tensor memory (`src/tmem.rs`: "an SM has 512"). There is no
+third slot to have.
+
+**Which is the reconciliation #197 was missing.** oxide-train's kernel is a
+one-accumulator geometry — this tree's `[256, 256]` — so the null oxide-train
+PR #119 measured for the warpgroup split was measured against an already-deferred
+release. #197's +2.1% was measured at `[512, 256]`, where the drain sits between
+an item and its successor entire, and the same table's `[256, 256]` arm read
++0.8%/+0.9%: the split's win tracks the deferral almost two and a half to one.
+The arithmetic agrees. At 8192³ the `[512, 256]` entry runs seven items a cluster
+in 0.5396 ms, so an item is 77 µs; the split cut the drain 4.72 µs → 3.05 µs, and
+1.67 / 77 is 2.2% against 2.1% measured. **The drain there is exposed
+essentially 1:1**, and the 3.05 µs that remain are 3.9% of the launch.
+
+### The release's other half: where in the drain it sits
+
+What `[512, 256]` cannot defer across items it can still stop paying for inside
+one. A warp is done with the accumulator the instant its **last** band's
+`tcgen05.wait::ld` retires — nothing below that load reads tensor memory — but
+the release used to sit at the end of `Common::drain`, past that band's
+`stmatrix` pass and past the `ld.shared`/`st.global` pass under it. Those are the
+two phases `bench sol-ablate`'s doubling ladder prices at most of the drain
+(`twice shared − twice global` alone is 69%), and every one of them was standing
+between an accumulator's last read and the next item's first MMA.
+
+So the arrival moved to the last band's load, behind one `warp::sync_mask` — the
+same sync that makes #218's lane guard legal, now placed where it also makes the
+timing legal. `drain` takes the slot it is draining rather than the epilogue
+releasing it afterwards, which is why the call has no site outside `drain` at
+all.
+
+`bench sol-ablate` table 6 is now the **square** of the two levers rather than
+one of them: the warpgroup split crossed with the release's timing, four corners
+in one binary, each subtracting the `no drain` at its own thread count, all four
+holding `ALL_LANES` scope so nothing else moves. Two passes:
+
+| 8192³ `[512, 256]` | epilogue, pass 1 | pass 2 | launch vs `one, late` |
+| --- | ---: | ---: | ---: |
+| one warpgroup, late | 4.69 µs | 4.83 µs | 1.000 |
+| one warpgroup, **early** | 4.32 | 4.50 | 1.005, 1.004 |
+| two warpgroups, late | 3.33 | 3.27 | 1.019, 1.019 |
+| two warpgroups, **early** | **2.86** | **2.79** | **1.025, 1.025** |
+
+**The split's win does not shrink, and #221's prediction that it would is
+wrong.** Two warpgroups over one is 1.019 and 1.019 with the late release and
+1.020 and 1.021 with the early one — the two levers are additive to within a
+tenth of a percent, in both passes, and the best corner is both of them, which is
+the corner that ships. The reason is visible in the same table: the early release takes 14% off
+the drain at two warpgroups and 7% at one, not the whole of it. What leaves the
+critical path is the last band's landing, and three quarters of an item's drain
+is still standing between the accumulator and the next MMA. The prediction would
+have needed a *deferred* release, which is the thing this entry cannot have.
+
+At `[256, 256]`, where the release is already deferred, both levers are nulls
+inside that shape's own spread: 1.001/0.988 for the split and 1.003/1.002 for the
+timing, against a fixed arm that itself moves 0.0949 to 0.0961 between passes.
+Which is the prediction being right about the entry it was right about.
+
+The shipped effect, `bench --case gemm-sol` against a cuBLASLt FP16 taken in the
+same process and stream, before and after — read the ratio column, because the
+denominator held to 0.12% across the two containers:
+
+| shape | entry | ours before | ours after | Δ | ratio before | ratio after |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 4096³ | `[256, 256]` | 0.0949 ms | **0.0943** | −0.63% | 0.859 | **0.865** |
+| 8192³ | `[512, 256]` | 0.5387 | **0.5356** | −0.58% | 0.944 | **0.950** |
+| 16384³ | `[512, 256]` | 4.1135 | **4.1111** | −0.06% | 0.987 | **0.989** |
+
+**What it costs is registers, and the cost is real.** `gemm_sol_m512` goes 83 →
+**112**, `gemm_sol_m256` 82 → 92, `gemm_sol_m256_n128` 80 → 93, all at zero spill
+and zero stack. The barrier between the last load and its landing gives `ptxas`
+a reason to keep more of the band alive across it. No entry crosses its step —
+residency here is fixed at one CTA an SM by the shared plan and no register count
+can raise it — but `gemm_sol_m512`'s `_ctas_by_registers` falls from 2 to 1
+against a `wants` of 1, so the headroom that used to be 85 registers is now 56.
+That is the number to watch before the next thing is added to this epilogue.
+
 ### The drain rungs
 
 The shipped drain is a band of 64 columns out of TMEM, `stmatrix` into the
