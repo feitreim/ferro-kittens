@@ -102,10 +102,14 @@ command line, which still names the case.
 
 ## Coverage, stated honestly
 
-Guarded: every `stream.synchronize()` in the three kernel crates, and every
-readback, through `ReadBack::read_back` — `DeviceBuffer::to_host_vec`
-synchronizes inside itself, so an unguarded readback after a launch is an
-unguarded wait, and every correctness check in this tree is one.
+Guarded: every call in the tree that waits on a stream. The list is longer than
+it looks, because three of `cuda-core`'s conveniences synchronize inside
+themselves — `DeviceBuffer::from_host`, `DeviceBuffer::zeroed` and
+`DeviceBuffer::to_host_vec`. An unguarded readback taken after a launch *is* an
+unguarded wait for that launch, and so is an unguarded staging call; every
+correctness check in this tree is the first and every row starts with the second.
+So `wait` replaces each `stream.synchronize()`, `stage` and `cleared` replace the
+two constructors, and `ReadBack::read_back` replaces the readback.
 
 Not guarded, by design: a wedge with no launch in it. A container that never
 reaches Python, a `cargo` that hangs, a Modal-side eviction — those are
