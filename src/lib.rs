@@ -31,6 +31,12 @@
 // *every* broken link off that feature, not just those — `cargo doc --features
 // host` is the only real gate on them (CI.md, tier 1).
 #![cfg_attr(not(feature = "host"), allow(rustdoc::broken_intra_doc_links))]
+// `AccessWidth::RUNGS`, which is what makes a rung added to the access ladder a
+// compile error at both drains now that they dispatch over the ladder's byte
+// count and a wildcard rather than over the enum (`global`, #225). The
+// toolchain is pinned to one nightly anyway — cuda-oxide's macros need it — so
+// this costs nothing a consumer was not already paying.
+#![feature(variant_count)]
 
 pub mod epilogue;
 pub mod global;
