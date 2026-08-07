@@ -1,10 +1,14 @@
 # Tier 3 — the device-test harness, on a real B200.
 #
-# COST. This job allocates an NVIDIA B200. `modal_app.py::device_tests` runs
-# its ~20 cases in about 1.5 minutes of GPU time, but the billed window is the
-# whole container: image pull, the harness build, and the run. Budget on the
-# order of ten GPU-minutes per invocation. That is dollars, not cents, and it
-# is why this workflow does NOT run on every push.
+# COST. This job allocates an NVIDIA B200. The billed window is the whole
+# container: image pull, the harness build, and the run. Measured at 41f9e57 —
+# 83.5 s wall, of which 53.3 s was `cargo` and about 20 s was the 57 cases. So
+# the compile costs more than twice what the gate does, and it cannot be cached
+# away: cargo-oxide redoes the crate's device codegen on every invocation, and a
+# warm cargo volume made this container *slower* rather than faster (CI.md,
+# spending policy). The lever on a GPU bill here is fewer containers, not
+# shorter ones. That is dollars, not cents, and it is why this workflow does NOT
+# run on every push.
 #
 # WHEN IT RUNS
 #
