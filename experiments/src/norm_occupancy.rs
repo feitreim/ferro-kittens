@@ -306,15 +306,20 @@ unsafe fn walk<const CHUNK: usize, const WARPS: usize>(
 }
 
 /// One arm as the host has to know it: what to call it, how wide its block is,
-/// what shared memory it declares, how many rows a CTA covers, and the fp32 a
-/// lane holds — the last two being the two levers the table is about.
+/// what shared memory it declares, how many rows a CTA covers, and how many
+/// fp32 a lane holds *live* — the last two being the two levers the table is
+/// about.
 struct Arm {
     name: &'static str,
     entry: &'static str,
     threads: u32,
     shared_bytes: u32,
     rows_per_block: usize,
-    values_per_lane: usize,
+    /// Values a lane holds at once, which is not the same as values it touches:
+    /// the reference streams the row a pair at a time in both passes and holds
+    /// two, however long the row is, where a walk arm holds a whole chunk of it.
+    /// This is the column the register counts are supposed to track.
+    live_per_lane: usize,
 }
 
 const ARMS: [Arm; 5] = [
@@ -324,9 +329,8 @@ const ARMS: [Arm; 5] = [
         threads: PER_ROW_THREADS,
         shared_bytes: PER_ROW_SHARED_BYTES as u32,
         rows_per_block: 1,
-        // `dim / PER_ROW_THREADS` and therefore shape-dependent; printed from
-        // the shape rather than from here, which is why this is zero.
-        values_per_lane: 0,
+        // One `read_pair`, whatever `dim` is — the arm's whole point.
+        live_per_lane: 2,
     },
     Arm {
         name: "walk c64 w4",
@@ -334,7 +338,7 @@ const ARMS: [Arm; 5] = [
         threads: 128,
         shared_bytes: 0,
         rows_per_block: 64,
-        values_per_lane: 32,
+        live_per_lane: 32,
     },
     Arm {
         name: "walk c64 w8",
@@ -342,7 +346,7 @@ const ARMS: [Arm; 5] = [
         threads: 256,
         shared_bytes: 0,
         rows_per_block: 128,
-        values_per_lane: 32,
+        live_per_lane: 32,
     },
     Arm {
         name: "walk c16 w4",
@@ -350,7 +354,7 @@ const ARMS: [Arm; 5] = [
         threads: 128,
         shared_bytes: 0,
         rows_per_block: 64,
-        values_per_lane: 8,
+        live_per_lane: 8,
     },
     Arm {
         name: "walk c16 w8",
@@ -358,7 +362,7 @@ const ARMS: [Arm; 5] = [
         threads: 256,
         shared_bytes: 0,
         rows_per_block: 128,
-        values_per_lane: 8,
+        live_per_lane: 8,
     },
 ];
 
@@ -498,6 +502,12 @@ unsafe fn launch(
 /// reason to want to slip.
 struct Staged {
     stream: Arc<cuda_core::CudaStream>,
+    /// The device's SM count, so the table can print waves beside blocks: a
+    /// walk arm's CTA owns `16 · WARPS` rows, so it launches that many times
+    /// fewer blocks than the reference and quantizes against the device far
+    /// more coarsely. That is a property of the idiom and not of the harness,
+    /// and it is the second thing the 16-row floor costs.
+    multiprocessors: u32,
     module: kernels::LoadedModule,
     source: DeviceBuffer<u16>,
     destination: DeviceBuffer<u16>,
@@ -519,11 +529,13 @@ impl Staged {
             return Err(format!("{columns} columns does not divide the widest chunk, 64").into());
         }
         let stream = context.default_stream();
+        let multiprocessors = context.multiprocessor_count()? as u32;
         let module = kernels::load(context)?;
         let source = DeviceBuffer::from_host(&stream, &staged(rows, columns))?;
         let destination = DeviceBuffer::<u16>::zeroed(&stream, rows * columns)?;
         Ok(Staged {
             stream,
+            multiprocessors,
             module,
             source,
             destination,
@@ -652,12 +664,15 @@ const REPEATS: usize = 3;
 ///
 /// The first is oxide-train's own: `B·T = 24576` rows of `dim = 3072`, which is
 /// where `rms_norm_forward_tile_bf16` measured +7–14% and is the row this file
-/// exists to reproduce. The second halves the row length with the row count
-/// held, so the walk's chunk count halves and its per-lane liveness does not —
-/// the arm that says whether the verdict is about `dim`. The third is a long
-/// row at a quarter of the rows: more columns a warp walks, fewer CTAs to hide
-/// anything behind, which is where a wide chunk should look best if it ever
-/// does.
+/// exists to reproduce. The second thirds the row length with the row count
+/// held, so the number of chunks a warp walks moves and nothing else does.
+///
+/// The third is deliberately the shape where the *granularity* bites rather
+/// than the access: a long row and few of them, so a walk CTA's `16 · WARPS`
+/// rows leave 48 CTAs for 148 SMs. The `waves` column is what says so, and a
+/// row where it is under 1.00 is measuring the launch shape and not the
+/// kernel — which is itself the second thing the 16-row floor costs, and worth
+/// one row of a table to make concrete.
 const SIZES: [Shape; 3] = [
     Shape {
         m: 24576,
@@ -718,11 +733,12 @@ pub fn compare(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
             bytes(rows, columns) / 1e6
         );
         println!(
-            "{:<14}{:>8}{:>8}{:>9}{:>7}{:>7}{:>11}{:>12}{:>10}{:>10}{:>8}",
+            "{:<14}{:>8}{:>10}{:>9}{:>8}{:>7}{:>7}{:>11}{:>12}{:>10}{:>10}{:>8}",
             "arm",
             "threads",
-            "f32/lane",
+            "live f32",
             "blocks",
+            "waves",
             "regs",
             "frame",
             "blocks/SM",
@@ -750,16 +766,13 @@ pub fn compare(context: &Arc<CudaContext>) -> Result<(), Box<dyn Error>> {
         for (index, arm) in ARMS.iter().enumerate() {
             let (registers, frame, blocks_per_sm) = staged.envelope(arm)?;
             let milliseconds = middle(&samples[index]);
-            let per_lane = match arm.values_per_lane {
-                0 => columns / arm.threads as usize,
-                values => values,
-            };
             println!(
-                "{:<14}{:>8}{:>8}{:>9}{:>7}{:>7}{:>11}{:>12}{:>10.4}{:>10.1}{:>8.3}",
+                "{:<14}{:>8}{:>10}{:>9}{:>8.2}{:>7}{:>7}{:>11}{:>12}{:>10.4}{:>10.1}{:>8.3}",
                 arm.name,
                 arm.threads,
-                per_lane,
+                arm.live_per_lane,
                 staged.grid(arm),
+                staged.grid(arm) as f64 / staged.multiprocessors as f64,
                 registers,
                 frame,
                 blocks_per_sm,
