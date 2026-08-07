@@ -2216,6 +2216,118 @@ def _print_local_depot() -> None:
     print(f"\n  {carrying} of {len(shipped)} shipped kernels carry local memory.")
 
 
+# --- the jump-table census ------------------------------------------------
+#
+# `brx.idx` is a computed branch through a `.branchtargets` label list — LLVM's
+# jump table, and the construct a downstream consumer's module died on: ferro
+# #219 put four of them into oxide-train's `gemm_tcgen05_bf16_optimized` and the
+# driver's PTX JIT refused the module at `cuModuleLoadData` with
+# `DriverError(218)`, before any kernel was looked up, while offline `ptxas`
+# assembled the same text and reported unchanged register counts (#225,
+# oxide-train #127). Every check on this page is `ptxas`, so every check on this
+# page was green.
+#
+# **This is a report and not a gate, and the day-one census is why.** Measured
+# at bda3329: 55 of 318 entry functions carry one, and at 3ae07a8 — the commit
+# before #219 — 51 of 309 carry one, *the same set*, plus the four kernels that
+# did not exist yet. Every count is identical. So the tables are not #219's in
+# this tree; they are what the four-rung access ladder has always lowered to
+# here, and they load: `device_tests` (57/57), `examples`, `kittens-experiments
+# -- check` and `bench --case gemm-sol` all run on a B200 on driver 580.95.05,
+# which is the driver in the report. `device-tests`' `shared_drain_quad` was
+# built to put the consumer's exact shape — four tables in one entry — in a
+# module the harness loads, and that loads too. So a `brx` is not sufficient to
+# fail a JIT load, and a gate here would fail every run of a tree that works.
+#
+# What the census is for is the thing nobody had: a **number to diff**. The
+# regression downstream was one instruction class appearing in one module, and
+# it took a consumer's bisect to find because ferro measured registers, opcodes
+# and `.local` and never this. The column that moves is the finding.
+#
+# Where it comes from, so a row that moves can be read: LLVM turns a switch into
+# a jump table at four cases and into branches at three
+# (`MinimumJumpTableEntries`, checked against `llc -mtriple=nvptx64` at
+# sm_100a). The bf16 drains have four live rungs — 16, 8, 4 and 2 bytes — and
+# table; the fp32 drains have three, because `access_width` cannot return 2 for
+# a 4-byte element, and they never appear here. That pair is the in-tree
+# control. An exhaustive `match` over `AccessWidth` also *names* every rung, so
+# it re-materialises one a caller had constant-folded away — which is how a
+# consumer whose rungs folded to three acquired four (#225, `global`).
+#
+# It arms into a gate when the shipped set reads zero.
+JUMP_TABLE_PATTERN = "brx"
+
+
+def _jump_table_census() -> dict[tuple[str, str], int]:
+    """`brx` per entry function, over every crate's PTX, keyed like the depot
+    census. Counted in the PTX *text*: nothing in the tree writes `brx` by hand,
+    so an occurrence is the compiler's jump table and nothing else. Three per
+    table — the list's label, the `brx.idx`, and its reference to the label."""
+    counted: dict[tuple[str, str], int] = {}
+    for _, directory in PTX_CRATES:
+        for ptx in sorted(Path(directory).rglob("*.ptx")):
+            crate = str(ptx.relative_to(PROJECT_DIR)).split("/", 1)[0]
+            text = ptx.read_text()
+            for chunk in text.split(".visible .entry ")[1:]:
+                name = chunk.split("(", 1)[0].strip()
+                counted[(crate, name)] = chunk.count(JUMP_TABLE_PATTERN)
+            # Whatever sits outside an entry function — a `.func` body an entry
+            # calls — is nobody's row above and would hide there.
+            outside = text.split(".visible .entry ")[0].count(JUMP_TABLE_PATTERN)
+            if outside:
+                counted[(crate, f"{ptx.name} (outside any entry)")] = outside
+    return counted
+
+
+def _jump_table_excerpt(lines_before: int = 22) -> str:
+    """The first table in the tree, with the code that reaches it.
+
+    A count says a module carries one; the excerpt says which dispatch built it.
+    The `.branchtargets` list is the arm count, and the `selp` chain above it is
+    the ladder LLVM speculated into a value so it could index on it."""
+    for _, directory in PTX_CRATES:
+        for ptx in sorted(Path(directory).rglob("*.ptx")):
+            lines = ptx.read_text().splitlines()
+            for index, line in enumerate(lines):
+                if "brx.idx" not in line:
+                    continue
+                start = max(0, index - lines_before)
+                body = "\n".join(f"      {text}" for text in lines[start : index + 1])
+                return f"\n    the first of them, in {ptx.name}:\n{body}\n"
+    return ""
+
+
+def _print_jump_tables() -> None:
+    """`brx` in the PTX text, per entry function — the substrate `ptxas` cannot
+    see and the one a runtime compiler can refuse.
+
+    A report, for the reason and with the numbers in the section comment above.
+    Diff it across a change the way the register table is diffed: a kernel that
+    gains a table has had a dispatch materialised, and a consumer that JIT-loads
+    it is the one who finds out."""
+    counted = _jump_table_census()
+    tabled = {key: count for key, count in counted.items() if count}
+    print(
+        f"\n  jump tables — `{JUMP_TABLE_PATTERN}` in the PTX text, per entry function.\n"
+        "  LLVM tables a switch at four cases and branches at three, so this column is\n"
+        "  the drain dispatch's arm count showing through. `ptxas` accepts a table and a\n"
+        "  driver's JIT may not (#225): diff it, do not read it."
+    )
+    if not tabled:
+        print(f"    zero everywhere: none of the {len(counted)} entry functions carry one.")
+        print("    That is the census this report arms into a gate on — see modal_app.py.")
+        return
+
+    shipped = {key for key in counted if key[0] == "examples"}
+    shipped |= {(package, kernel) for kernel, package, _ in GATED_KERNELS}
+    for (crate, name), count in sorted(tabled.items()):
+        mark = "shipped" if (crate, name) in shipped else ""
+        print(f"    {crate + '/' + name:<52}{count:>6}{mark:>9}")
+    carrying = sum(1 for key in tabled if key in shipped)
+    print(f"\n  {len(tabled)} of {len(counted)} entry functions carry one, {carrying} of them shipped.")
+    print(_jump_table_excerpt(), end="")
+
+
 @app.function(cpu=8, timeout=CHECKING, volumes=CACHE)
 @completes
 def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) -> None:
@@ -2262,6 +2374,13 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     — see `_print_local_depot`'s section comment for the day-one census, the
     idiom the check was built against, and the condition under which it arms.
 
+    The sixth reads that same substrate for the other thing a runtime compiler
+    can refuse and `ptxas` cannot see: `brx` jump tables, which is what a
+    four-case dispatch lowers to and what cost a consumer its module at
+    `cuModuleLoadData` (#225). Also a report, and its section comment carries
+    the day-one census, the driver it was measured on and the arming
+    condition.
+
     `--determinism` measures the same tree twice, with both crates' artifacts
     thrown away in between, and asserts the two tables are identical. It is not
     ceremony: a diff of this table is only evidence if the table is a function
@@ -2279,6 +2398,7 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     _print_timed_twins(measured)
     _check_occupancy_step(measured)
     _print_local_depot()
+    _print_jump_tables()
 
     if not determinism:
         return

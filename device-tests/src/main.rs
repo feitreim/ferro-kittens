@@ -1446,6 +1446,44 @@ pub mod kernels {
         unsafe { shared_drain_probe::<WIDE, true>(column, &mut out) }
     }
 
+    /// Every drain the library has, in **one entry function** — a kernel that
+    /// exists for what its module does at load rather than for what it computes.
+    ///
+    /// The four calls are four distinct instantiations, so each carries its own
+    /// copy of the access ladder, and this is the only entry in the tree that
+    /// carries four of anything the ladder lowers to. That is the shape a
+    /// consumer's GEMM epilogue has and the shape ferro had no module of:
+    /// oxide-train's `gemm_tcgen05_bf16_optimized` calls both drains from one
+    /// kernel, and at ferro #219 that kernel carried four `brx.idx` jump tables
+    /// and the driver's PTX JIT refused the whole module — `cuModuleLoadData`
+    /// failing with `DriverError(218)` before a kernel was looked up, while
+    /// offline `ptxas` accepted the same text (#225, oxide-train #127).
+    ///
+    /// **What this measured, which is a negative result worth keeping.** On a
+    /// B200 on driver 580.95.05 — the driver in that report — this module
+    /// loads and the harness runs. So four jump tables in one entry are not
+    /// what a JIT refuses, and neither is one: at ferro #218, *before* the
+    /// commit the consumer bisected to, ferro's own PTX already carried 51 of
+    /// them and every gate was green (`modal_app.py`'s jump-table census
+    /// carries that comparison). Whatever tipped that module over is not the
+    /// count, and it is not reproducible here.
+    ///
+    /// It stays because it costs nothing and it is the only module in the tree
+    /// with the consumer's shape: module load is whole-module, so the harness
+    /// exercises this by starting at all, and a toolchain or driver that stops
+    /// taking the shape goes red here rather than downstream. No case launches
+    /// it. Launching it is safe (`DRAIN_THREADS`, the widest tile's shared
+    /// memory) and says nothing the four separate cases do not.
+    #[kernel]
+    pub unsafe fn shared_drain_quad(column: u32, mut out: DisjointSlice<u16>) {
+        unsafe {
+            shared_drain_probe::<TILE, false>(column, &mut out);
+            shared_drain_probe::<WIDE, false>(column, &mut out);
+            shared_drain_probe::<TILE, true>(column, &mut out);
+            shared_drain_probe::<WIDE, true>(column, &mut out);
+        }
+    }
+
     /// [`shared_drain_probe`] at **fp32**, where `stmatrix` cannot go: the band
     /// reaches the staging tile through
     /// [`kittens::ldst::scatter_tile`] and leaves it through the same

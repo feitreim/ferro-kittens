@@ -98,6 +98,28 @@ the warpgroup count as parameters, because an arm nobody can build is a verdict
 nobody can re-run. They were one file behind a `#[path]` until then, and a
 `#[path]` cannot serve a teaching copy that is supposed to have no dials in it.
 
+### What tier 2 could not see, and the census that was added for it
+
+`ptxas` is a host assembler and the driver's PTX JIT is a different compiler.
+They disagree, and this tier is entirely the first one: every register count,
+every spill column and the occupancy gate come out of `ptxas -v`. A module it
+assembles cleanly can still be **refused at `cuModuleLoadData` with
+`DriverError(218)`**, and when that happened it happened downstream —
+oxide-train's pin bump (#225, oxide-train #127) died at the first module load
+with every ferro check green, and the opcode diff that found it was run in the
+consumer's repo because ferro had no number that moved.
+
+`regcount` counts `brx` per entry function now, beside the local-memory depot
+and for the same reason: a substrate `ptxas` never reports. It is a **report**,
+and its section comment in `modal_app.py` carries the census that made it one —
+the tables were already there at #218, the same set, and they load. What was
+missing was never a gate. It was a column to diff.
+
+The device tier's half of this is `device-tests`' `shared_drain_quad`, which
+puts the consumer's shape — four of the ladder's dispatches in one entry — in
+a module the harness JIT-loads on every run, at no extra container and no extra
+device time. Module load is whole-module, so tier 3 exercises it by starting.
+
 Both jobs go through **`scripts/modal-run`**, so the wedge watchdog and the
 completion sentinel cover this tier — see the wrapper's own section below.
 

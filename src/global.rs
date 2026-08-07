@@ -728,24 +728,24 @@ pub unsafe fn store_shared_rows<
             "the drain's threads must divide the tile's 16-byte chunks between them exactly"
         )
     };
+    const {
+        assert!(
+            AccessWidth::RUNGS == 4,
+            "the access ladder below spells four rungs and `AccessWidth` has more (see its note before adding an arm)"
+        )
+    };
     unsafe {
-        match access_width(dest, column) {
-            AccessWidth::Bytes16 => drain_in_accesses::<CHUNK_BYTES, E, R, C, S, THREADS>(
+        match access_width_bytes(dest, column) {
+            CHUNK_BYTES => drain_in_accesses::<CHUNK_BYTES, E, R, C, S, THREADS>(
                 dest, row, column, thread, tile,
             ),
-            AccessWidth::Bytes8 => {
-                drain_in_accesses::<8, E, R, C, S, THREADS>(dest, row, column, thread, tile)
-            }
-            AccessWidth::Bytes4 => {
-                drain_in_accesses::<4, E, R, C, S, THREADS>(dest, row, column, thread, tile)
-            }
+            8 => drain_in_accesses::<8, E, R, C, S, THREADS>(dest, row, column, thread, tile),
             // Const-false at a 4-byte element, which is what keeps this arm
             // from being emitted for one: `access_width` cannot return 2 there.
-            AccessWidth::Bytes2 => {
-                if E::BYTES == 2 {
-                    drain_in_accesses::<2, E, R, C, S, THREADS>(dest, row, column, thread, tile)
-                }
+            2 if E::BYTES == 2 => {
+                drain_in_accesses::<2, E, R, C, S, THREADS>(dest, row, column, thread, tile)
             }
+            _ => drain_in_accesses::<4, E, R, C, S, THREADS>(dest, row, column, thread, tile),
         }
     }
 }
@@ -809,22 +809,22 @@ pub unsafe fn accumulate_shared_rows<
             "the drain's threads must divide the tile's 16-byte chunks between them exactly"
         )
     };
+    const {
+        assert!(
+            AccessWidth::RUNGS == 4,
+            "the access ladder below spells four rungs and `AccessWidth` has more (see its note before adding an arm)"
+        )
+    };
     unsafe {
-        match access_width(dest, column) {
-            AccessWidth::Bytes16 => fold_in_accesses::<CHUNK_BYTES, E, R, C, S, THREADS>(
+        match access_width_bytes(dest, column) {
+            CHUNK_BYTES => fold_in_accesses::<CHUNK_BYTES, E, R, C, S, THREADS>(
                 dest, row, column, thread, tile,
             ),
-            AccessWidth::Bytes8 => {
-                fold_in_accesses::<8, E, R, C, S, THREADS>(dest, row, column, thread, tile)
+            8 => fold_in_accesses::<8, E, R, C, S, THREADS>(dest, row, column, thread, tile),
+            2 if E::BYTES == 2 => {
+                fold_in_accesses::<2, E, R, C, S, THREADS>(dest, row, column, thread, tile)
             }
-            AccessWidth::Bytes4 => {
-                fold_in_accesses::<4, E, R, C, S, THREADS>(dest, row, column, thread, tile)
-            }
-            AccessWidth::Bytes2 => {
-                if E::BYTES == 2 {
-                    fold_in_accesses::<2, E, R, C, S, THREADS>(dest, row, column, thread, tile)
-                }
-            }
+            _ => fold_in_accesses::<4, E, R, C, S, THREADS>(dest, row, column, thread, tile),
         }
     }
 }
@@ -832,12 +832,28 @@ pub unsafe fn accumulate_shared_rows<
 /// A rung of the staged drain's access ladder: the bytes one shared-to-global
 /// access moves.
 ///
-/// The set is closed and it is a type rather than a `usize` because the two
-/// drains dispatch on it and nothing else may: [`store_shared_rows`] and
-/// [`accumulate_shared_rows`] match every rung by name, so a rung added here is
-/// a compile error at both of them instead of silently arriving at whichever
-/// arm a wildcard left standing. The discriminants are the byte counts, which
-/// is what [`AccessWidth::bytes`] reads back for a caller doing arithmetic.
+/// The set is closed and it is a type rather than a `usize` because a caller
+/// reasoning about the width should not be handed an integer that means
+/// nothing: the discriminants are the byte counts, which is what
+/// [`AccessWidth::bytes`] reads back for arithmetic.
+///
+/// **The drains do not dispatch on it**, and that is deliberate rather than an
+/// oversight. They match the ladder's byte count, three cases and a wildcard,
+/// and hold their coverage obligation through [`AccessWidth::RUNGS`] instead —
+/// because an exhaustive `match` over this enum *names every rung whether or
+/// not the instantiation can reach it*. A four-arm match lowers to
+/// `switchInt(.., [16, 8, 4, 2, otherwise: unreachable])`, so a rung that
+/// constant-folds away at a caller — a compile-time leading dimension, a known
+/// column — is materialised back into a live switch case, and LLVM turns a
+/// switch into a `brx.idx` jump table at four cases where it branches at three.
+/// #219 made exactly that change and it cost a downstream consumer its module:
+/// four jump tables appeared in one GEMM and the driver's PTX JIT refused it at
+/// `cuModuleLoadData` with `DriverError(218)`, while offline `ptxas` assembled
+/// the same text without complaint (#225, oxide-train #127).
+///
+/// A wildcard lets the dead rung fold. Adding a rung therefore means spelling
+/// it in the byte ladder, in [`access_width`], in both drains, and
+/// moving `RUNGS` — which is the compile error that says so.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(usize)]
 pub enum AccessWidth {
@@ -852,6 +868,13 @@ pub enum AccessWidth {
 }
 
 impl AccessWidth {
+    /// How many rungs the ladder has, from the type itself.
+    ///
+    /// The drains assert on it, so a rung added to this enum is a compile error
+    /// at both of them. That is the guarantee #219 bought with an exhaustive
+    /// `match` and this type's own note says it cannot keep paying for that way.
+    pub const RUNGS: usize = core::mem::variant_count::<Self>();
+
     /// The rung as a byte count.
     pub const fn bytes(self) -> usize {
         self as usize
@@ -881,14 +904,31 @@ impl AccessWidth {
 /// assert_eq!(ldc(64).bytes(), 16);
 /// ```
 pub fn access_width<E: Element>(dest: GlobalRows<E>, column: u32) -> AccessWidth {
+    match access_width_bytes(dest, column) {
+        CHUNK_BYTES => AccessWidth::Bytes16,
+        8 => AccessWidth::Bytes8,
+        2 => AccessWidth::Bytes2,
+        _ => AccessWidth::Bytes4,
+    }
+}
+
+/// The ladder itself, in bytes, and the value both drains dispatch on.
+///
+/// Split out from [`access_width`] so the dispatch never runs over a
+/// discriminant: three `match` arms and a wildcard here, where four arms over
+/// [`AccessWidth`] spell a rung a caller may have folded away and lower to a
+/// jump table for it (that type's note, #225). The enum is the answer for a
+/// reader; this is the answer for a switch.
+#[inline(always)]
+fn access_width_bytes<E: Element>(dest: GlobalRows<E>, column: u32) -> usize {
     if dest.runs_aligned(column, CHUNK_BYTES / E::BYTES) {
-        AccessWidth::Bytes16
+        CHUNK_BYTES
     } else if dest.runs_aligned(column, 8 / E::BYTES) {
-        AccessWidth::Bytes8
+        8
     } else if E::BYTES == 2 && !dest.runs_aligned(column, 2) {
-        AccessWidth::Bytes2
+        2
     } else {
-        AccessWidth::Bytes4
+        4
     }
 }
 
