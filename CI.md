@@ -9,7 +9,7 @@ buys something the one below genuinely cannot see.
 | Needs | nothing | CUDA toolkit | B200 |
 | Runs on | GitHub runner | Modal, CPU | Modal, B200 |
 | Secrets | none | Modal token | Modal token |
-| Cost | free | Modal CPU-minutes | ~10 GPU-minutes a run |
+| Cost | free | Modal CPU-minutes | ~1.5 GPU-minutes a run |
 | Trigger | every push to main, every PR | push to main, same-repo PRs, manual | labelled PR, `src/`+`device-tests/` on main, manual |
 
 ## Tier 1 — the device surface
@@ -115,16 +115,20 @@ the toolchain, maintained beside `modal_app.py` and free to drift from it.
 So: one definition, in `modal_app.py`, invoked identically from a laptop and
 from CI. The price is a credential, and therefore no coverage on fork PRs.
 
-Known inefficiency: each run compiles the pinned dependencies from scratch,
-because the image's warm cargo caches were populated for `/opt/warmup` and the
-project builds into a fresh `target/`. A Modal Volume mounted at the project's
-target directory would cut most of that. Not done here.
+Each run used to compile the pinned dependencies from scratch, because the
+image's warm cargo caches were populated for `/opt/warmup` and the project built
+into a fresh `target/`. That is now the `ferro-kittens-cargo` volume — see
+[Spending policy](#spending-policy) below.
 
 ## Tier 3 — the harness on a B200
 
-`scripts/modal-run device_tests`. The ~20 cases take about 1.5 minutes of GPU
-time, but the billed window is the whole container — image pull, harness build,
-run — so budget on the order of ten GPU-minutes per invocation.
+`scripts/modal-run device_tests`. The billed window is the whole container —
+image pull, harness build, run — and at 41f9e57 that measured **83.5 s wall, of
+which 53.3 s was `cargo`**: 57 cases in about 20 s of B200, behind a compile
+that costs two and a half times as much. This page used to budget ten
+GPU-minutes for it; the number is an eighth of that, and the shape of it is the
+argument for rules 1 and 2 of the [spending policy](#spending-policy) — the
+harness is cheap and the container is not.
 
 `scripts/modal-run examples` is the other correctness gate here, and it runs
 **two** binaries since the crates split: `kittens-examples` for the four
@@ -157,6 +161,190 @@ gh workflow run gpu.yml -f ref=refs/pull/17/merge # a specific PR
 ```
 
 `cuda.yml` takes the same `ref` input.
+
+## Spending policy
+
+Three rules, in the order they save the most. All three come out of one
+observation: a Modal function is billed for its whole **container**, and on a
+GPU entry point most of that container is usually a Rust compiler.
+
+### 1. Build on CPU, run on GPU
+
+**No compilation belongs on a B200 that can happen anywhere else.** The kernels
+never needed a device to build in the first place: `cargo oxide build` emits
+**PTX**, the driver's JIT turns it into SASS at load, and the link step is
+satisfied by the CUDA toolkit's driver *stub* (`LD_LIBRARY_PATH=…/lib64/stubs`,
+which `modal_app.py` calls `STUB_ENV`). A device is needed to *run* a kernel and
+never to produce one. That is why tier 2 does a full `cargo oxide build --arch
+sm_100a` of all three kernel crates on `cpu=8` — and it always has, so there was
+no GPU-held build tier here to reclaim.
+
+What was left was the dependency tree, recompiled from scratch by every run
+because the image's warm caches were populated for `/opt/warmup` and the project
+built into a fresh `target/`. That is now the **`ferro-kittens-cargo` volume**,
+mounted at `/cache`, one directory per crate under `/cache/target/`;
+`_cached_target` picks the right one from the working directory `_run` was
+given, and mounting the volume is the only switch — an entry point that mounts
+it builds onto it, one that does not builds where it always did.
+
+Nothing else moves. cargo-oxide writes the emitted PTX to the *working*
+directory rather than under `target/`, so `regcount`'s `_measure`, the opcode
+census and the local-memory census all read the same files from the same places.
+`regcount` is the check on that, and it is the reason to believe this is a
+placement change: run against 41f9e57 and against this tree, its output is
+**identical over all 1650 lines** — every register count, the shape ladder, the
+timed twins, the occupancy-step gate, the opcode census and the local-memory
+depot census. A cache that moved a number would have moved one of those.
+
+The registry is deliberately **not** on the volume: every dependency is already
+baked into `/root/.cargo` by the image's warmup layer, which is
+content-addressed and therefore free, and a second copy on a network filesystem
+would be slower than the one in the image.
+
+#### The volume is mounted by the CPU entry points and not the GPU ones
+
+That is a measurement, not a preference, and it is worth keeping written down so
+the next person does not redo it. The plan was the obvious one: fill the cache
+on `build`'s eight CPUs, then let tier 3 skip the compile it was being billed
+for. Measured on `device_tests` at 41f9e57, cache warm from a preceding `build`:
+
+| | dependency crates compiled | `cargo` in the container |
+| --- | ---: | ---: |
+| no volume | 58 | 53.3 s |
+| volume, warm | **1** | 66.0 s |
+| volume, warm, run again | **1** | 60.0 s |
+
+The cache does exactly what it claims and the container still gets *slower*,
+because the 58 dependencies were never the cost. They compile in parallel on
+`cpu=8` and hide behind the long pole, which is the crate's own device codegen —
+and **cargo-oxide redoes that on every invocation**, cache or no cache: two
+consecutive `run`s of an unchanged tree both recompiled `device-tests` in full.
+So on a GPU function the volume trades work that was already free for artifact
+I/O over a network filesystem, and loses. (`regcount --determinism` has been
+saying the same thing from the other side for a long time: a second pass "costs
+a second build of those two crates — their dependencies stay compiled".)
+
+The consequence is the whole of the GPU spending story here: **a GPU
+container's build cannot be cached away, so the only lever on it is fewer
+containers.** That is rule 2.
+
+#### What it bought
+
+`build`, at 41f9e57, wall clock from `scripts/modal-run` and step time from
+`_run`'s own elapsed lines:
+
+| tier 2 `build` (CPU, `cpu=8`) | wall | steps | of which `clippy`×4 |
+| --- | ---: | ---: | ---: |
+| before, no volume | 470.8 s | 457.1 s | 67.6 s |
+| after, volume cold (first fill) | 364.8 s | 352.8 s | 53.8 s |
+| after, volume warm | **291.8 s** | **281.1 s** | **17.3 s** |
+
+**Warm saves 176 s of step time per run, 38%**, and cold costs nothing over the
+baseline (the two are inside the Modal CPU pool's own run-to-run spread). The
+saving is concentrated exactly where the theory says: the four `clippy` steps
+collapse from 67.6 s to 17.3 s, while the five `cargo oxide build` steps barely
+move — they are codegen, and codegen is redone every time.
+
+Tier 2 runs two of these jobs (`build` and `regcount`) on every push to main and
+every same-repo PR, so the volume is worth roughly **350 CPU-seconds per push**,
+and **zero GPU-seconds**, which is the honest headline.
+
+The rule that falls out: **if a step can go red without a GPU, it must run
+without one.** Compile errors, lints, `ptxas` register counts, the occupancy
+gate, the cuBLASLt ABI assertion, upstream's PTX — all of that is tier 2 and
+none of it may migrate onto tier 3 for convenience.
+
+### 2. Batch arms into one container
+
+An arm's *device* time is usually a small part of what it costs. `ws_bench`'s
+own docstring prices its sweep at about 90 s of B200 inside a container that
+also pulls an image and builds a crate; `device_tests` runs its 57 cases in
+about 20 s of the 83.5 s above. So the question to ask of two tables is not
+"what do they cost" but "how many containers do they need".
+
+Measured at 41f9e57, three arms — `bench:softmax`, `bench:layernorm`,
+`device-tests` — as three runs and then as one `session`:
+
+| | wall | note |
+| --- | ---: | --- |
+| `bench --case softmax` | 79.7 s | 60 s of it cargo |
+| `bench --case layernorm` | 97.5 s | 72 s of it cargo |
+| `device_tests` | 81.0 s | 52 s of it cargo |
+| three separate runs | **258.2 s** | three image pulls, three builds |
+| `session --arms …` (same three) | **161.2 s** | one image pull, one dependency compile |
+
+**97 GPU-seconds saved on three arms, 38%.** What a session saves is the image
+pull and container start, once instead of three times, plus the *dependency*
+compile for any arm that follows one in the same crate — `bench:layernorm` built
+in 28.6 s behind `bench:softmax`'s 40.6 s against 72 s from cold. What it does
+**not** save is the crate's own device codegen, which cargo-oxide redoes for
+every invocation even inside one container. Same finding as rule 1's, from the
+other direction.
+
+Two mechanisms, one per level:
+
+* **Inside a sweep**, `bench --case` already takes a comma-separated list, and
+  `bench.rs`'s `selection` doc says why: a kernel, the kernel it is a port of
+  and their shared baseline are three tables that must be read against each
+  other, so they should be taken on one device on one day. Use it — `--case
+  gemm,gemm-depth,softmax` is one container.
+* **Across sweeps**, `session --arms` runs any comma-separated set of the named
+  arms (`clc`, `ws`, `ws-shallow`, `sol-ablate`, `upstream`, `examples`,
+  `device-tests`, `ladder`, and `bench:<case>` for anything `bench` narrows to):
+
+  ```
+  scripts/modal-run session --arms clc,ws,bench:gemm-sol
+  ```
+
+  The arms are one table in `modal_app.py`, and the individual entry points are
+  thin wrappers over the same table, so a session and N separate `modal run`s
+  issue **byte-identical** commands. Batching cannot change a number — it can
+  only change how many containers paid for it.
+
+  It also buys the control that #98 and #118 keep paying for by hand: 2.9% of
+  drift between two runs of the same tree, and a 16384³ row that moved 3%
+  between two sessions. Arms taken in one container share a device, a driver, a
+  clock and a cuBLASLt.
+
+**Do not batch an arm whose failure would cost the others.** `bench --case
+sol-k` exists precisely because a launch that hangs takes every row after it,
+and `profile` serializes and replays launches; both keep their own process and
+neither has an arm in the table. `session` has no retry and no isolation on
+purpose — the first arm that raises ends the run, because the arms after it
+would otherwise be reported against a container that had already failed.
+
+### 3. Measure at the cheapest tier that can see the thing
+
+In order. Do not skip a rung because the one above is more convincing; a rung
+that can see your change is a rung that can *reject* it before you pay for the
+next one.
+
+1. **Locally, no Modal.** The library's default feature set is device-only
+   ordinary Rust, so `cargo clippy --all-targets` and `cargo test` need no
+   toolkit and no GPU — that is tier 1, and it runs on a laptop. Run
+   `scripts/fmt` before you push: tier 1 checks four manifests and goes red in
+   twenty seconds.
+
+   The three kernel crates need one more thing and only one: `cuda.h`, for
+   `cuda-core` → `cuda-bindings`' build script. That script reads
+   `CUDA_TOOLKIT_PATH`, which is why the image sets it, so on a Linux box the
+   `cuda_cudart` redistributable unpacked anywhere plus `CUDA_TOOLKIT_PATH`
+   pointed at it is enough to `cargo check` and `clippy` all four crates —
+   including `--features host`, which nothing else local can reach.
+
+   That gets you the *typecheck* and not the codegen: a device build also wants
+   LLVM 21 and the cuda-oxide backend, which is the half the image exists for.
+   So a post-monomorphization `const { assert!(..) }` still belongs to tier 2.
+   Every ordinary compile error, and every lint, is catchable here for free.
+2. **Tier 2, on CPU.** Anything that is a compile, a count or a static gate.
+   `scripts/modal-run build` for codegen and lints, `scripts/modal-run
+   regcount` for the register table and the occupancy step. Cents, and the
+   highest value per minute here.
+3. **One container, one arm, for an A/B.** Two spellings of the same kernel
+   compared across two runs is not a comparison — #98 measured 2.9% of drift
+   between runs of the same tree. Put both arms in one sweep.
+4. **A batched session, for a claim that spans sweeps.** `session --arms`, per
+   rule 2 above.
 
 ## `scripts/modal-run`, and the three ways a Modal run costs you money
 

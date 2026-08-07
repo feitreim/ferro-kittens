@@ -78,6 +78,11 @@ Local usage:
                                       # where the gap to cuBLASLt lives, with
                                       # every control re-run in one container
                                       # and the residual epilogue decomposed
+    modal run modal_app.py::session --arms clc,ws,bench:gemm-sol
+                                      # several of the sweeps above in ONE
+                                      # container: one image pull, one build,
+                                      # one device, one clock. The commands are
+                                      # the entry points' own, off one table
     modal run modal_app.py::profile   # one launch under Nsight Compute (see
                                       # the note there: no counters on Modal)
     modal run modal_app.py::doctor    # env / GPU sanity check
@@ -86,6 +91,7 @@ Local usage:
 """
 
 import functools
+import os
 import re
 import subprocess
 import time
@@ -267,6 +273,60 @@ image = (
 
 app = modal.App("ferro-kittens", image=image)
 
+# --- the cargo cache, and the measurement that says where it belongs ---------
+#
+# Every entry point here used to build into a `target/` that died with its
+# container. The image's warm caches were populated for `/opt/warmup`, so the
+# project got no benefit from them and each run recompiled the pinned dependency
+# tree from nothing. CI.md called that out and left it; this volume is the fix.
+# `target/` lives on it now, one directory per crate, so the layout is the
+# layout the four crates already had and cargo sees exactly what it saw before
+# -- only somewhere that outlives the container.
+#
+# **It is mounted by the CPU entry points and deliberately not by the GPU ones,
+# and that is a measurement rather than a preference.** The obvious plan was the
+# other one: fill the cache on `build`'s eight CPUs, then let a B200 skip the
+# compile it was being billed for. Run at 41f9e57 on `device_tests`, warm:
+#
+#     dependency crates compiled     58  ->  1     (the cache works)
+#     `cargo` inside the container    53.3 s -> 66.0 s, 60.0 s over two runs
+#
+# The cache does exactly what it claims and the container still gets slower,
+# because the 58 dependencies were never the cost. They compile in parallel on
+# `cpu=8` and hide behind the long pole, which is the crate's own device codegen
+# -- and cargo-oxide redoes that on **every** invocation, cache or no cache: two
+# consecutive `run`s of an unchanged tree both recompiled `device-tests`. So on
+# a GPU function the cache trades work that was already free for artifact I/O
+# over a network filesystem, and loses. (`regcount --determinism`'s doc has been
+# saying the same thing from the other side for a long time: a second pass
+# "costs a second build of those two crates -- their dependencies stay
+# compiled".)
+#
+# What that leaves is worth writing down, because it is the whole GPU spending
+# story here: **a GPU container's build cannot be cached away, so the only lever
+# on it is fewer containers.** That lever is `session` below.
+#
+# The *registry* is deliberately not on here either, for the reason the GPU
+# functions are not: every dependency is already baked into `/root/.cargo` by
+# the warmup layer above, which is a content-addressed image layer and therefore
+# free, and a second copy on a network volume would be slower than the one in
+# the image.
+#
+# Two runs of two different trees share this, and Modal commits a volume per
+# file when the container exits, so the loser of a race sees the other tree's
+# artifacts. That is the case cargo is built for and not a hazard: a unit's
+# output is filed under a hash of its inputs, so a foreign artifact either has a
+# name this build never asks for or is byte-identical to the one it wanted. The
+# worst outcome is a rebuild, which is what every run did before this existed.
+#
+#     modal volume ls ferro-kittens-cargo              # what is on it
+#     modal volume rm -r ferro-kittens-cargo /target   # start over
+#
+# Deleting it is always safe and costs exactly one cold build.
+CARGO_CACHE = modal.Volume.from_name("ferro-kittens-cargo", create_if_missing=True)
+CACHE_DIR = "/cache"
+CACHE = {CACHE_DIR: CARGO_CACHE}
+
 HARNESS_DIR = f"{PROJECT_DIR}/device-tests"
 EXAMPLES_DIR = f"{PROJECT_DIR}/examples"
 EXPERIMENTS_DIR = f"{PROJECT_DIR}/experiments"
@@ -324,11 +384,36 @@ def completes(fn: Callable) -> Callable:
     return wrapped
 
 
+def _cached_target(cwd: str) -> dict[str, str]:
+    """Where the crate rooted at `cwd` compiles to: the cache volume, under the
+    crate's own name -- if this container has the cache volume at all.
+
+    Mounting `CACHE` is the whole switch, and it is deliberately the only one.
+    An entry point that mounts it builds onto it; one that does not builds where
+    it always did, into a `target/` beside the crate. There is no second flag to
+    forget to flip, and the mount is visible on the `@app.function` line.
+
+    A directory per crate rather than one shared `CARGO_TARGET_DIR` for all
+    four, because that is what the tree already had -- four separate workspaces,
+    four `target/`s -- and the point of this change is placement, not a new
+    build graph. `_measure` reads the emitted PTX out of the crate directory
+    (cargo-oxide writes it to the working directory, not under `target/`), so
+    moving `target/` out from under the crates does not move any artifact this
+    file reads.
+
+    Anything outside the project -- `upstream_ptx`'s throwaway clone, the warmup
+    crate `doctor` asks -- is left alone: a cache is only worth having where the
+    same tree comes back."""
+    if not cwd.startswith(PROJECT_DIR) or not Path(CACHE_DIR).is_dir():
+        return {}
+    return {"CARGO_TARGET_DIR": f"{CACHE_DIR}/target/{Path(cwd).name}"}
+
+
 def _run(cmd: list[str], cwd: str) -> None:
     print(f"$ {' '.join(cmd)}  (cwd={cwd})", flush=True)
     start = time.monotonic()
     try:
-        subprocess.run(cmd, cwd=cwd, check=True)
+        subprocess.run(cmd, cwd=cwd, check=True, env={**os.environ, **_cached_target(cwd)})
     finally:
         # Printed on the failure path too -- a step that ran for nineteen of a
         # twenty-minute budget and a step that died on contact are different
@@ -336,7 +421,7 @@ def _run(cmd: list[str], cwd: str) -> None:
         print(f"  ({time.monotonic() - start:.1f}s)", flush=True)
 
 
-@app.function(cpu=8, timeout=CHECKING)
+@app.function(cpu=8, timeout=CHECKING, volumes=CACHE)
 @completes
 def build() -> None:
     """Everything that does not need a GPU: the library's host surface (which
@@ -450,7 +535,7 @@ def build() -> None:
 def device_tests() -> None:
     """The harness itself. One binary, every case, non-zero exit on failure."""
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
-    _run(["cargo", "oxide", "run", "device-tests"], cwd=HARNESS_DIR)
+    _arm("device-tests")
 
 
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=RUNNING)
@@ -467,9 +552,7 @@ def examples() -> None:
     one of them, because the gate is what it always was: every entry point that
     computes a GEMM, at both check sizes and all three traversal widths."""
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
-    _run(["cargo", "oxide", "run", "kittens-examples"], cwd=EXAMPLES_DIR)
-    _run(["cargo", "oxide", "run", "kittens-experiments", "--", "check"],
-         cwd=EXPERIMENTS_DIR)
+    _arm("examples")
 
 
 # 5400 rather than 1800 since #86 put 16384^3 in the sweep: the *device* work is
@@ -506,30 +589,16 @@ def bench(case: str = "", m: int = 0, n: int = 0, k: int = 0) -> None:
     metric: a FLOP/s figure for a normalization kernel would be misleading, so
     the harness carries the distinction rather than assuming one.
     """
-    _run(
-        [
-            "nvidia-smi",
-            "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
-            "--format=csv",
-        ],
-        cwd="/",
-    )
+    _run(SMI, cwd="/")
     # `--case` narrows the sweep to one table, and `--m/--n/--k` to one row of
     # it. Re-staging 16384^3 to re-read a diagnostic row costs more host time
-    # than the row does device time.
-    narrowed = [case] if case else []
-    if case and (m or n or k):
-        narrowed += [str(m), str(n), str(k)]
-    # `--features cublas` (#92) puts a cuBLASLt column and a ratio beside the
-    # `gemm` table. It is off in the crate's default feature set so that tier 1
-    # CI and anyone without a devel CUDA toolkit are unaffected, and on here
-    # because this image always has one: a GEMM number with no denominator is
-    # the thing the feature exists to stop shipping.
-    _run(
-        ["cargo", "oxide", "run", "kittens-experiments", "--features", "cublas",
-         "--", "bench", *narrowed],
-        cwd=EXPERIMENTS_DIR,
-    )
+    # than the row does device time. `--features cublas` (#92) puts a cuBLASLt
+    # column and a ratio beside the `gemm` table: it is off in the crate's
+    # default feature set so that tier 1 CI and anyone without a devel CUDA
+    # toolkit are unaffected, and on here because this image always has one.
+    # Both live in `_bench_arm`, which `session` runs as `bench:<case>`.
+    for cmd, cwd in _bench_arm(case, m, n, k):
+        _run(cmd, cwd)
 
 
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
@@ -548,9 +617,8 @@ def clc_bench() -> None:
     operands and checks every one of 268 million output elements against the CPU
     reference, and this entry point does it once per scheduler.
     """
-    _run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
-          "--format=csv"], cwd="/")
-    _run(["cargo", "oxide", "run", "kittens-experiments", "--", "clc"], cwd=EXPERIMENTS_DIR)
+    _run(SMI, cwd="/")
+    _arm("clc")
 
 
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
@@ -594,13 +662,12 @@ def ws_bench(case: str = "") -> None:
     gigabyte of operands and checking 268 million output elements than it spends
     device time launching.
     """
-    _run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
-          "--format=csv"], cwd="/")
-    _run(
-        ["cargo", "oxide", "run", "kittens-experiments", "--features", "cublas",
-         "--", "ws"] + ([case] if case else []),
-        cwd=EXPERIMENTS_DIR,
-    )
+    _run(SMI, cwd="/")
+    # An unrecognised `--case` used to be passed through and silently ignored by
+    # `main.rs`, which runs `compare` for anything that is not `shallow`. Here it
+    # is a missing key and so a failed run, which is the right answer for an
+    # argument that asked for a table nobody has.
+    _arm(f"ws-{case}" if case else "ws")
 
 
 # `cpu=8` because on a cold container the *build* is a long pole in its own
@@ -633,15 +700,8 @@ def ladder_bench() -> None:
     timed rungs compile, and that they price identically to the ladder rungs
     they are twins of — is in `::regcount`, which is CPU-only; run that first.
     """
-    _run(
-        [
-            "nvidia-smi",
-            "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
-            "--format=csv",
-        ],
-        cwd="/",
-    )
-    _run(["cargo", "oxide", "run", "device-tests", "--", "bench-ladder"], cwd=HARNESS_DIR)
+    _run(SMI, cwd="/")
+    _arm("ladder")
 
 
 # Nsight Compute ships inside the CUDA 13 devel image already — the binary, the
@@ -719,11 +779,7 @@ def profile(kernel: str = "gemm", m: int = 8192, n: int = 8192, k: int = 8192) -
     `bench` reports, and half the point is to divide a measured byte count by a
     duration that belongs to the same table.
     """
-    _run(
-        ["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
-         "--format=csv"],
-        cwd="/",
-    )
+    _run(SMI, cwd="/")
     subprocess.run(
         ["bash", "-lc", "ls /usr/lib/x86_64-linux-gnu/libnvidia-pcc* 2>/dev/null "
          "|| echo 'libnvidia-pcc.so absent: the profiler will report LibraryNotLoaded'"],
@@ -780,6 +836,156 @@ WRITE_OPT_WRAPPER = (
 )
 
 
+# --- the sweeps as arms, so one container can run several ---------------------
+#
+# Every GPU entry point in this file is its own Modal function, so asking for
+# three tables is three containers: three image pulls, three cargo builds and
+# three B200 allocations for a couple of minutes of device time each. `bench.rs`
+# already makes this argument one level down -- its `--case` takes a
+# comma-separated list precisely so that a kernel, the kernel it is a port of
+# and their shared baseline are read off one device on one day -- but the sweeps
+# that are not `Case`s cannot ride that list: `clc`, `ws`, `sol-ablate` and
+# `upstream` each dispatch on `argv[1]` in `main.rs` and return.
+#
+# So they are named here instead, and `session` runs any comma-separated set of
+# them in one container. The entry points below are thin wrappers over the same
+# table, so a session and N separate `modal run`s issue **byte-identical**
+# commands and differ only in how many containers pay for them. That is the
+# property that makes batching safe to reach for: it cannot change a number.
+#
+# What deliberately has no arm: `bench --case sol-k`, which exists because a
+# launch that hangs takes every row after it (that is how it was found), and
+# `profile`, which serializes and replays launches. An arm that can wedge the
+# container belongs in its own process, and this table is not the place to
+# quietly give it company.
+RUN = ["cargo", "oxide", "run"]
+CUBLAS = ["--features", "cublas"]
+UPSTREAM = ["--features", "cublas,gemm-sol-upstream"]
+WITH_OPT = ["env", f"CUDA_OXIDE_OPT={OPT_NO_LOOKUP_TABLE}"]
+WRITE_WRAPPER = (["sh", "-c", WRITE_OPT_WRAPPER], "/")
+
+ARMS: dict[str, list[tuple[list[str], str]]] = {
+    "device-tests": [([*RUN, "device-tests"], HARNESS_DIR)],
+    "ladder": [([*RUN, "device-tests", "--", "bench-ladder"], HARNESS_DIR)],
+    "examples": [
+        ([*RUN, "kittens-examples"], EXAMPLES_DIR),
+        ([*RUN, "kittens-experiments", "--", "check"], EXPERIMENTS_DIR),
+    ],
+    "clc": [([*RUN, "kittens-experiments", "--", "clc"], EXPERIMENTS_DIR)],
+    "ws": [([*RUN, "kittens-experiments", *CUBLAS, "--", "ws"], EXPERIMENTS_DIR)],
+    "ws-shallow": [
+        ([*RUN, "kittens-experiments", *CUBLAS, "--", "ws", "shallow"], EXPERIMENTS_DIR)
+    ],
+    "sol-ablate": [
+        ([*RUN, "kittens-experiments", *CUBLAS, "--", "bench", "sol-ablate"], EXPERIMENTS_DIR),
+        WRITE_WRAPPER,
+        ([*WITH_OPT, *RUN, "kittens-experiments", *UPSTREAM, "--", "bench", "sol-ablate"],
+         EXPERIMENTS_DIR),
+    ],
+    "upstream": [
+        ([*RUN, "kittens-experiments", *CUBLAS, "--", "bench", "gemm-sol"], EXPERIMENTS_DIR),
+        WRITE_WRAPPER,
+        ([*WITH_OPT, *RUN, "kittens-experiments", *UPSTREAM, "--", "bench",
+          "gemm-sol,gemm-sol-upstream,gemm-sol-upstream-m512"], EXPERIMENTS_DIR),
+    ],
+}
+
+
+def _arm(name: str) -> None:
+    """Run one named sweep in whichever container is already running."""
+    for cmd, cwd in ARMS[name]:
+        _run(cmd, cwd)
+
+
+def _bench_arm(case: str, m: int = 0, n: int = 0, k: int = 0) -> list[tuple[list[str], str]]:
+    """`bench`'s own commands. Its `--case` is already a comma-separated list, so
+    this is one arm however many tables it prints; `--m/--n/--k` narrows it to a
+    single row, which is only meaningful with a case named."""
+    narrowed = [case] if case else []
+    if case and (m or n or k):
+        narrowed += [str(m), str(n), str(k)]
+    return [([*RUN, "kittens-experiments", *CUBLAS, "--", "bench", *narrowed], EXPERIMENTS_DIR)]
+
+
+# The four-column form. `device_tests` and `examples` ask for two of them, since
+# neither reports a rate and neither reads a clock.
+SMI = ["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
+       "--format=csv"]
+
+
+@app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
+@completes
+def session(arms: str = "") -> None:
+    """Several sweeps in one container -- one image pull, one build, one device.
+
+    `--arms` is a comma-separated list of the names in `ARMS` above, plus
+    `bench:<case>` for anything `bench` can narrow to. Order is the order given.
+
+        scripts/modal-run session --arms clc,ws,bench:gemm-sol
+        scripts/modal-run session --arms sol-ablate,upstream
+
+    The comma is the arm separator, so a `bench:` arm names exactly one case --
+    `bench:softmax,bench:layernorm` is two arms and two processes in this one
+    container, and `bench --case softmax,layernorm` is the single process that
+    prints both tables. Prefer the second when the tables are read against each
+    other; the difference is a process start, not a device.
+
+    Each arm runs the commands its own entry point runs, off the one table, so
+    this is a placement change and not a measurement change.
+
+    What it buys, measured at 41f9e57 on `bench:softmax,bench:layernorm,
+    device-tests` -- three arms that took 79.7 s, 97.5 s and 81.0 s as three
+    separate runs and 258.2 s together, against **161.2 s as one session**: 97 s
+    of B200, 38% of the bill, for the same three tables. Two things are saved
+    and one is not:
+
+      * the image pull and container start, once instead of three times;
+      * the *dependency* compile for an arm that follows one in the same crate
+        -- `bench:layernorm` built in 28.6 s behind `bench:softmax`'s 40.6 s,
+        against 60 s from cold;
+      * **not** the crate's own device codegen, which cargo-oxide redoes for
+        every invocation even inside one container. That is the same finding
+        the cache volume ran into (see `CARGO_CACHE`), and it is why the answer
+        to a GPU bill here is fewer containers rather than warmer ones.
+
+    It also buys the thing #98 and #118 keep paying for by hand -- 2.9% of
+    drift between two runs of the same tree, and a 16384^3 row that moved 3%
+    between two sessions. Arms taken in one container share a device, a driver,
+    a clock and a cuBLASLt, so a difference between two of them is theirs.
+
+    Keep an arm out of a session when a wedge in it would cost the others: see
+    the note on the table above. This function has no retry and no isolation --
+    the first arm that raises ends the run, deliberately, because the arms after
+    it would be reported against a container that had already failed."""
+    _run(SMI, cwd="/")
+    requested = [name for name in arms.split(",") if name]
+    if not requested:
+        raise RuntimeError(
+            "session needs --arms: a comma-separated list of "
+            f"{', '.join(sorted(ARMS))}, or bench:<case>"
+        )
+    unknown = [
+        name for name in requested
+        if name not in ARMS and not name.startswith("bench:")
+    ]
+    if unknown:
+        # Loud, and before the first arm runs. A typo that silently ran two of
+        # three sweeps would hand back a plausible-looking session missing the
+        # arm somebody asked for -- the same failure `bench.rs` refuses for its
+        # own case list, for the same reason.
+        raise RuntimeError(
+            f"no arm named {', '.join(unknown)}; the arms are "
+            f"{', '.join(sorted(ARMS))}, plus bench:<case>"
+        )
+    for name in requested:
+        print(f"\n=== session arm: {name} ===", flush=True)
+        for cmd, cwd in (_bench_arm(name.removeprefix("bench:")) if name.startswith("bench:")
+                         else ARMS[name]):
+            _run(cmd, cwd)
+
+
+# No cache mount: this one builds a throwaway clone under `/tmp`, which is a
+# different tree every run and the only thing here a cache could not help.
 @app.function(cpu=8, timeout=CHECKING)
 @completes
 def upstream_ptx() -> None:
@@ -845,17 +1051,8 @@ def upstream_bench() -> None:
     the port and every ratio in the second table has to be read against the
     second port row rather than the published one.
     """
-    _run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
-          "--format=csv"], cwd="/")
-    _run(["cargo", "oxide", "run", "kittens-experiments", "--features", "cublas",
-          "--", "bench", "gemm-sol"],
-         cwd=EXPERIMENTS_DIR)
-    _run(["sh", "-c", WRITE_OPT_WRAPPER], cwd="/")
-    _run(["env", f"CUDA_OXIDE_OPT={OPT_NO_LOOKUP_TABLE}",
-          "cargo", "oxide", "run", "kittens-experiments",
-          "--features", "cublas,gemm-sol-upstream",
-          "--", "bench", "gemm-sol,gemm-sol-upstream,gemm-sol-upstream-m512"],
-         cwd=EXPERIMENTS_DIR)
+    _run(SMI, cwd="/")
+    _arm("upstream")
 
 
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=SWEEPING)
@@ -879,17 +1076,8 @@ def sol_ablate() -> None:
     run's port rows rather than the first's. #145 measured that difference at
     0.006-0.15%.
     """
-    _run(["nvidia-smi", "--query-gpu=name,driver_version,clocks.max.sm,memory.total",
-          "--format=csv"], cwd="/")
-    _run(["cargo", "oxide", "run", "kittens-experiments", "--features", "cublas",
-          "--", "bench", "sol-ablate"],
-         cwd=EXPERIMENTS_DIR)
-    _run(["sh", "-c", WRITE_OPT_WRAPPER], cwd="/")
-    _run(["env", f"CUDA_OXIDE_OPT={OPT_NO_LOOKUP_TABLE}",
-          "cargo", "oxide", "run", "kittens-experiments",
-          "--features", "cublas,gemm-sol-upstream",
-          "--", "bench", "sol-ablate"],
-         cwd=EXPERIMENTS_DIR)
+    _run(SMI, cwd="/")
+    _arm("sol-ablate")
 
 
 @app.function(timeout=ASKING)
@@ -982,10 +1170,13 @@ def _measure(arch: str) -> dict[tuple[str, str], dict[str, int]]:
 
         ptx_files = sorted(Path(directory).rglob("*.ptx"))
         if not ptx_files:
-            listing = sorted(p for p in Path(directory, "target").rglob("*") if p.is_file())
+            roots = [Path(directory), *map(Path, _cached_target(directory).values())]
+            listing = sorted(
+                p for root in roots for p in root.rglob("*") if p.is_file()
+            )
             raise RuntimeError(
-                f"no PTX under {package}'s target dir; cargo-oxide's artifact layout "
-                f"must have moved. Files found:\n" + "\n".join(map(str, listing[:200]))
+                f"no PTX under {package}'s crate or target dir; cargo-oxide's artifact "
+                f"layout must have moved. Files found:\n" + "\n".join(map(str, listing[:200]))
             )
 
         for ptx in ptx_files:
@@ -2025,7 +2216,7 @@ def _print_local_depot() -> None:
     print(f"\n  {carrying} of {len(shipped)} shipped kernels carry local memory.")
 
 
-@app.function(cpu=8, timeout=CHECKING)
+@app.function(cpu=8, timeout=CHECKING, volumes=CACHE)
 @completes
 def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) -> None:
     """Register pressure of every kernel the harness and the two kernel crates emit,

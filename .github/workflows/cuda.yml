@@ -25,9 +25,16 @@
 # from a laptop and from CI. The price is that this tier needs a credential,
 # and therefore cannot run on a pull request from a fork. See CI.md.
 #
-# Cost: ~8 CPU for the length of a cold cargo build of the pinned deps. No GPU
-# is allocated, so this is Modal CPU-minutes — cents, not dollars. It is still
-# not free, which is why it does not run on every branch push.
+# Cost: ~8 CPU for the length of the build. No GPU is allocated, so this is
+# Modal CPU-minutes — cents, not dollars. It is still not free, which is why it
+# does not run on every branch push.
+#
+# Both jobs mount the `ferro-kittens-cargo` volume, which is where `target/`
+# lives: the pinned dependency tree is compiled once and restored after that.
+# Measured at 41f9e57, `build` warm against cold: 281 s of step time against
+# 457 s, with the four `clippy` steps collapsing from 67.6 s to 17.3 s. The GPU
+# entry points deliberately do NOT mount it — see the spending policy in CI.md
+# for the measurement that says so.
 
 name: cuda
 
