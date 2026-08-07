@@ -223,6 +223,46 @@ baked into `/root/.cargo` by the image's warmup layer, which is
 content-addressed and therefore free, and a second copy on a network filesystem
 would be slower than the one in the image.
 
+#### The volume served a stale build until `_freshen`, and rustdoc is what said so
+
+**A cache volume plus a Modal mount can make a gate pass a tree it never
+compiled.** Found on the launch-watchdog PR, on the first `build` after adding a
+module to `src/`:
+
+| | `clippy --features host` | unit tests it then ran |
+| --- | ---: | ---: |
+| volume warm, no `_freshen` | 1.05 s, **compiled nothing** | 127 — the count *before* the new module |
+| volume emptied | 13.5 s | 129 |
+| volume warm, `_freshen` | 4.4 s | 129 |
+
+The mechanism is cargo's freshness check, which for a path crate is *mtime
+against the fingerprint*. Modal's mounts do not hand the container mtimes newer
+than artifacts already sitting on the volume, so an edited file can look older
+than the object built from its predecessor — and cargo is right to believe what
+it was told. Neither cargo nor the volume is at fault; the pairing is.
+
+The tell was `rustdoc`, the one step that reads the sources unconditionally: it
+found the new module's doctest and failed it against a `libkittens.rlib` that
+had no such module. Without a doctest in the new module, that run would have
+been **green on a tree it had not built**.
+
+`_freshen` touches every `.rs`, `.toml` and `.lock` under the project once per
+container, before the first command. The project's own crates are then rebuilt
+every invocation — which is what anyone reading a gate assumes — and the
+dependency tree, which is what the volume is actually worth, is untouched
+because none of it lives under `PROJECT_DIR`. Measured on this tree, step time:
+
+| | steps |
+| --- | ---: |
+| volume empty (cold) | 384.3 s |
+| volume warm, `_freshen` | **295.2 s** |
+
+So the volume is still worth 89 s a run, 23%, and #226's warm figure of 291.8 s
+survives contact with a build that is actually happening — its saving was in the
+dependencies all along, exactly as it argued. What did not survive is the
+*guarantee*: any "identical output" comparison taken across a warm volume before
+this fix was comparing two runs of possibly the same artifacts.
+
 #### The volume is mounted by the CPU entry points and not the GPU ones
 
 That is a measurement, not a preference, and it is worth keeping written down so

@@ -105,7 +105,7 @@ use std::error::Error;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::Arc;
 
-use cuda_core::{CudaContext, DeviceBuffer};
+use cuda_core::CudaContext;
 
 use crate::bench::{Shape, Timings, time};
 use crate::gemm;
