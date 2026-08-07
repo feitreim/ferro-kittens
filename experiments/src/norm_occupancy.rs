@@ -55,6 +55,40 @@
 //! `WARPS` are already what the walk is parameterized on, and the only thing
 //! the library fixes is the 16-row floor a warp's band cannot go under.
 //!
+//! # What it measured
+//!
+//! B200, 148 SMs, at oxide-train's own `24576 × 3072`. Registers are `ptxas`'
+//! and the residency is the driver's, for each arm at its own launch envelope:
+//!
+//! ```text
+//! arm            threads  live f32   blocks   waves   regs  blocks/SM  threads/SM      GB/s  vs row
+//! per-row            256         2    24576  166.05     23          8        2048    6325.2   1.000
+//! walk c64 w4        128        32      384    2.59     48         10        1280    3030.6   2.087
+//! walk c64 w8        256        32      192    1.30     48          5        1280    2504.1   2.526
+//! walk c16 w4        128         8      384    2.59     32         16        2048    2326.3   2.719
+//! walk c16 w8        256         8      192    1.30     32          8        2048    2025.1   3.123
+//! ```
+//!
+//! **The occupancy lever was pulled, and it made the walk worse.** The narrow
+//! arms reach 2048 threads an SM — the reference's own number — and are the
+//! slowest two rows. All three shapes order the four walk arms identically, so
+//! what orders this table is chunk width and occupancy orders it backwards.
+//!
+//! The mechanism is the fragment map, not residency: a warp's paired access
+//! under [`BaseLdtm`] names 8 rows × 16 bytes — eight half-used 32-byte
+//! sectors — where the reference's 32 lanes name one contiguous 128-byte line.
+//! Identical bytes; not identical transactions. `docs/library/global.md` has
+//! said since #11 that a fragment layout is a bad shape to *store* from; this
+//! is the load side of that with a clock on it, and the reason a wider `CHUNK`
+//! wins is that at 64 columns a chunk's row is a whole 128-byte line.
+//!
+//! **The magnitudes are not oxide-train's** and this file does not claim them:
+//! its two arms were both at 1.8 TB/s where the reference here is near
+//! bandwidth, and its second read of a row was L1-resident as this one's is.
+//! What reproduces is the sign, and the ordering of the two levers — which is
+//! the internally controlled part, since the four walk arms differ from each
+//! other in nothing but two const parameters.
+//!
 //! # What the table cannot be read as
 //!
 //! The second read of a row is L1-resident for the per-row arm (one row, 6 KiB

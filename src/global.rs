@@ -13,7 +13,23 @@
 //! epilogue, a row statistic, a small irregular operand, or a band staged
 //! through shared memory takes to reach global memory.
 //!
-//! Design notes and measurements: `docs/library/global.md`.
+//! **A tile walk over this path is not the same idiom as a tile walk over a
+//! staged tile, and it has a pole where it loses** (#222). A warp's paired
+//! access under [`crate::reg::BaseLdtm`] names 8 rows × 16 bytes — eight
+//! half-used 32-byte sectors — where the block-per-row loop it would replace
+//! names one contiguous 128-byte line, so two kernels that issue identical
+//! *bytes* do not issue identical transactions. Measured on an RMS norm at
+//! `dim = 3072`, the walk runs **2.1×** the block-per-row form, and the
+//! narrow-chunk arm that reaches the reference's own 2048 threads an SM runs
+//! **2.7×** — occupancy is available here, it is two const parameters away, and
+//! it orders the table *backwards*. The other pole is the opposite verdict at
+//! the same magnitude: a band held as a value went 594 → 5996 GB/s when it was
+//! streamed a chunk at a time (`docs/kernels/layernorm.md`), out of a
+//! TMA-staged shared tile rather than out of this path. Compute achieved GB/s
+//! and count a warp's access width before rewriting; the idiom is not a cause.
+//!
+//! Design notes and measurements: `docs/library/global.md`, and the five arms
+//! are `experiments/src/norm_occupancy.rs`.
 
 use core::marker::PhantomData;
 

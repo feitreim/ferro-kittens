@@ -167,6 +167,26 @@ on. The rung is inherited from the column sweep above rather than re-swept —
 the two kernels differ only in the statistic's axis — and the shipped rung is
 measured.
 
+### The other pole of the same idiom
+
+594 → 5996 GB/s is the strongest result in this tree for chunked streaming, and
+it is worth stating what it is a result *about*, because the same rewrite has a
+measured negative. Both kernels here walk a **TMA-staged shared tile** through
+`ldst::load_tile`, and what the streaming fixed was a spilled band: 168
+registers and a 1536-byte frame down to 48 and none.
+
+The same walk written against **global memory** — `global::load_rows`, a warp's
+16-row band, no staging tile — measures 2.1× a block-per-row RMS norm at
+`dim = 3072`, and the narrow-chunk arm that buys back the reference's full 2048
+threads an SM measures 2.7× (#222, `experiments/src/norm_occupancy.rs`). Nothing
+about that kernel was frame-bound; what it paid was a warp's access width, and
+raising occupancy made it worse.
+
+So the two poles are not "walk versus no walk". They are: **a band that does not
+fit in registers wants streaming, and a row that is already coalesced in global
+memory does not want a fragment map.** `docs/library/global.md` carries the
+five-arm table and the decision rule.
+
 ### Why the variance pass centres first
 
 The shipped form centres and then squares. The one-pass alternative,
