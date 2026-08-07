@@ -37,6 +37,37 @@ This module is the host-side complement, and it is the general one: it makes no
 claim about *why* a launch did not return, only that it did not, and it applies
 to every launch in the tree at once.
 
+## Two deadlines, because one has a hole a device had to show
+
+`wait` bounds a driver call by recording an event behind it and polling that
+event. **It therefore cannot bound a driver call that never returns** — there is
+no moment at which the event gets recorded, and no thread left to poll it.
+
+That is not a theoretical gap. With a spin kernel resident on the device, the
+row's own `cuLaunchKernelEx` blocks: eight runs of `modal_app.py::wedge_demo`
+measured the host sitting inside the launch for the whole life of the spin,
+while the trace shows the guarded wait *after* it was never reached, and then
+reported `0.000 s` once the device freed up. The launch is asynchronous in the
+sense that it does not wait for the kernel to finish; it is not asynchronous in
+the sense of always returning promptly.
+
+So there is a second deadline, and it is a **thread**:
+
+| | armed by | budget | bounds |
+| --- | --- | ---: | --- |
+| the launch deadline | `wait` / `wait_event` | 30 s | any wait that is reached |
+| the row deadline | `watching`, at the row announcement | 10 min | the row, wherever the main thread is |
+
+A thread is the only place a deadline can sit that no driver call can hold, and
+the row is the only scope it can sensibly have — the announcement is the one
+point in a sweep that says "a new unit of work starts here". The budget is
+coarse to match: a row legitimately contains host work, and the 16384³ rows check
+268 million outputs against an f64 reference on the CPU. Ten minutes clears that
+and is still a sixth of the `SWEEPING` ceiling a wedge used to ride.
+
+Neither subsumes the other. The event poll is precise and fires in seconds on
+the common case; the thread is coarse and cannot be evaded.
+
 ## Poll rather than block, and spin before sleeping
 
 The whole mechanism is that `cuEventQuery` exists: it answers "has this event
@@ -132,9 +163,9 @@ nobody has watched fail is not a check. The spin is bounded rather than infinite
 so that a demonstration which goes wrong still gives the device back — which has
 been worth having.
 
-**It earned its keep before it ever passed, and it has not passed.** Six runs so
-far, none of which ended with the deadline firing, and each of which was a fact
-about this tree rather than a wasted container:
+**It earned its keep several times over before it passed.** Eight runs, none of
+which ended with a deadline firing, and each of which was a fact about this tree
+rather than a wasted container:
 
 1. Injected at the top of the process, it sat in `DeviceBuffer::from_host` —
    which is why `stage` and `cleared` exist at all.
@@ -147,18 +178,21 @@ about this tree rather than a wasted container:
 5. With `TRACE_VARIABLE` on, the answer: `watchdog: waited 0.000 s`, taken
    straight after a launch that was supposed to hold the device for a minute.
 6. The same on `clock64` instead of `globaltimer`.
+7. A volatile load in the loop *condition*, plus the PTX printed before the
+   arms run: `.visible .entry wedge`, `ld.volatile.global.b32`, and a backward
+   `bra`. The loop is in the PTX, and the host blocked for the spin's whole
+   length — but no deadline fired.
+8. The same, measured: 44 s of real silence against a 5 s budget, and the first
+   trace line after the device freed up reads `0.000 s`.
 
-Runs 5 and 6 are the ones that matter and they point away from this module: the
-wait records its event, polls it, finds the stream empty and says so, all
-correctly. **The spin kernel is what is missing**, deleted by LLVM's
-forward-progress rule — a loop with no side effect may be assumed to terminate,
-and a loop whose only content is a special-register read has no side effect.
-`Semaphore::wait_before` is not a counter-example: its condition calls
-`mbarrier_try_wait_parity`, which touches memory. The next spelling to try is one
-whose *condition* touches memory, bounded by `clock64` so the kernel still gives
-the device back. `experiments/src/wedge.rs` carries that as its own note.
+Runs 5 and 6 found the kernel: a loop with no side effect may be assumed to
+terminate and deleted, and a loop whose only content is a special-register read
+has no side effect. `Semaphore::wait_before` is not a counter-example — its
+condition calls `mbarrier_try_wait_parity`, which touches memory. A volatile load
+in the condition fixed it, and the PTX check in `wedge_demo` exists so that is
+never again something a container has to discover.
 
-Until that run comes back, the honest statement about this module is that it is
-reasoned and not demonstrated — which is exactly the thing `stall` exists to
-avoid one level out, and the reason this section is written in the negative
-rather than deleted.
+Runs 7 and 8 then found the *guard's* hole, which no amount of reasoning had:
+the host was blocked inside `cuLaunchKernelEx`, before any wait, so there was no
+event to poll and nothing to expire. That is what the row deadline above is for,
+and it is why this module has two.
