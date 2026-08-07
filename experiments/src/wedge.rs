@@ -46,7 +46,7 @@
 //! die. [`WEDGE_SECONDS`] is two minutes in `wedge_demo` against a budget of five
 //! seconds: indistinguishable from a true wedge for far longer than the
 //! demonstration needs, and self-terminating if everything else about it goes
-//! wrong. Getting a spin that is *both* bounded and real took four attempts and
+//! wrong. Getting a spin that is *both* bounded and real took six attempts and
 //! the watchdog's own trace to diagnose — see [`kernels::wedge`].
 
 use std::error::Error;
@@ -54,6 +54,7 @@ use std::sync::OnceLock;
 
 use cuda_core::{CudaStream, LaunchConfig};
 use cuda_device::{cuda_module, kernel};
+use kittens::watchdog;
 
 /// Set to a number of seconds to wedge the first row that launches; unset to do
 /// nothing at all. The arm that gets wedged is chosen by the environment rather
@@ -69,51 +70,56 @@ static INJECTED: OnceLock<()> = OnceLock::new();
 pub mod kernels {
     use super::*;
 
-    /// Occupy the device for `ticks` of the SM clock, computing nothing.
+    /// Occupy the device until `held` stops reading zero, or for `ticks` of the
+    /// SM clock — whichever comes first.
     ///
-    /// **This does not work yet, and the reason is written down rather than
-    /// guessed at again.** Two spellings have been run on a B200 — this one and
-    /// the same loop on `globaltimer` — and both launch and return immediately,
-    /// wedging nothing. The launch watchdog is what says so, once asked to trace:
-    /// the guarded wait taken straight after this launch reports
+    /// **The volatile load is the whole kernel**, and six runs of
+    /// `modal_app.py::wedge_demo` are why. Two earlier spellings spun on a
+    /// special register alone —
     ///
     /// ```text
-    ///   wedge: queued; the next wait on this stream is a wait on it
-    ///   watchdog: waited 0.000 s
+    /// while clock64().wrapping_sub(start) < ticks {}
     /// ```
     ///
-    /// with a sixty-second spin supposedly in front of it, and the sweep then
-    /// runs its whole ladder in the time that ladder costs with nothing in front
-    /// of it. So the guard records, polls and reports correctly; the kernel is
-    /// absent.
+    /// — and both launched and returned immediately, wedging nothing. The launch
+    /// watchdog is what said so, once asked to trace: the guarded wait taken
+    /// straight after the launch reported `watchdog: waited 0.000 s` with a
+    /// sixty-second spin supposedly in front of it, and the sweep then ran its
+    /// whole ladder in the time that ladder costs with nothing in front of it.
+    /// A store in the loop *body* did not save it either.
     ///
     /// The mechanism is LLVM's forward-progress rule: **a loop with no side
-    /// effect may be assumed to terminate, and may therefore be deleted.** A loop
-    /// whose only content is a special-register read has no side effect, and both
-    /// `clock64` and `globaltimer` are special-register reads. That is why
-    /// [`kittens::sync::Semaphore::wait_before`] is not a counter-example even
-    /// though `sol_watch` demonstrably spins on it: its condition calls
-    /// `mbarrier_try_wait_parity`, which touches memory.
+    /// effect may be assumed to terminate, and may therefore be deleted.** A
+    /// special-register read is not a side effect. `read_volatile` is one that
+    /// cannot be removed, reordered out of the loop or folded, which is why
+    /// [`kittens::sync::Semaphore::wait_before`] spins correctly on the same
+    /// nightly: its condition calls `mbarrier_try_wait_parity`, which touches
+    /// memory. This is that property, with nothing else in it.
     ///
-    /// **So the next spelling to try is one whose condition touches memory** —
-    /// spin on a volatile read of a device word the host leaves at zero, bounded
-    /// by `clock64` so the kernel still gives the device back. A third attempt
-    /// wrote each `globaltimer` reading to a `*mut u64` and also returned
-    /// immediately, so a store in the *body* was not enough on its own and the
-    /// condition is the part to move.
+    /// `held` is a device word the host allocates zeroed and never writes, so
+    /// the first term is always true and the `ticks` bound is what ends the
+    /// launch. Both terms are in the *condition* deliberately: the load has to be
+    /// something the loop cannot finish without.
     ///
-    /// The duration is approximate either way, and deliberately: `ticks` are SM
-    /// clocks, so a B200 at about 1.9 GHz gives roughly `n / 2` seconds for
-    /// `n * 1e9`. The demonstration only needs "much longer than the budget", and
-    /// shorter-than-nominal is the safe direction for a kernel whose other job is
-    /// to give the device back.
+    /// `ticks` are SM clocks and not nanoseconds, so the duration is
+    /// approximate — a B200 boosts to about 1.9 GHz, so `n * 1e9` ticks is
+    /// roughly `n / 2` seconds. Approximate is all this needs: the demonstration
+    /// only requires "much longer than the budget", and shorter-than-nominal is
+    /// the safe direction for a kernel whose other job is to give the device
+    /// back.
     ///
     /// One warp of one block is enough: what the host waits on is the stream, and
     /// the stream is not drained until this returns however small the launch is.
+    ///
+    /// # Safety
+    ///
+    /// `held` must be a readable device address that outlives the launch.
     #[kernel]
-    pub unsafe fn wedge(ticks: u64) {
+    pub unsafe fn wedge(ticks: u64, held: *const u32) {
         let start = cuda_device::debug::clock64();
-        while cuda_device::debug::clock64().wrapping_sub(start) < ticks {}
+        while unsafe { held.read_volatile() } == 0
+            && cuda_device::debug::clock64().wrapping_sub(start) < ticks
+        {}
     }
 }
 
@@ -145,10 +151,24 @@ pub fn inject(stream: &CudaStream) -> Result<(), Box<dyn Error>> {
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
+    eprintln!("  wedge: allocating the word the spin reads");
+    // Zeroed, never written, and never freed: the kernel reads it for as long as
+    // it runs, and the process this is demonstrating on is about to be ended by
+    // the watchdog. `Drop` would free it out from under a live launch.
+    let held = watchdog::cleared::<u32>(stream, 1)?;
+    let address = held.cu_deviceptr();
+    std::mem::forget(held);
     eprintln!("  wedge: launching");
     // SM clocks, not nanoseconds -- see the kernel. A B200 runs this at about
     // half the nominal seconds, which is far more than any budget needs.
-    unsafe { module.wedge(stream, config, seconds * 1_000_000_000)? };
+    unsafe {
+        module.wedge(
+            stream,
+            config,
+            seconds * 1_000_000_000,
+            address as *const u32,
+        )?
+    };
     eprintln!("  wedge: queued; the next wait on this stream is a wait on it");
     Ok(())
 }

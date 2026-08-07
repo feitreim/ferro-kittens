@@ -1187,6 +1187,23 @@ def session(arms: str = "") -> None:
 # its arms' entry points issue, and these deliberately are not.
 WEDGE_FEATURES = ["--features", "cublas,wedge"]
 
+# The wedge kernel's own PTX, out of the build the demonstration just did.
+# cargo-oxide writes the emitted PTX to the working directory, which is where
+# `regcount` reads it from too.
+#
+# It is the first thing `wedge_demo` prints because six runs of it failed for
+# want of exactly this: the spin was *deleted* by the backend -- a loop with no
+# side effect may be assumed to terminate -- and every one of those runs cost a
+# container to discover from the outside. Three lines say whether the loop is
+# there: the entry, the `ld.volatile` that makes the loop unremovable, and the
+# backward `bra`. A demonstration that opens by showing the thing it depends on
+# existing never has to be re-run to find out that it did not.
+WEDGE_PTX = (
+    r"sed -n '/\.entry wedge/,/^}/p' kittens_experiments.ptx"
+    r" | grep -E 'entry wedge|ld\.volatile|bra'"
+    r" || echo 'NO wedge ENTRY IN THE PTX -- the spin was optimized away'"
+)
+
 
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=RUNNING)
 @completes
@@ -1220,8 +1237,19 @@ def wedge_demo(seconds: int = 120, budget_ms: int = 5000) -> None:
     -- and so the override itself is exercised. `seconds` is twenty-four times
     that; the spin is bounded rather than infinite so that a demonstration that
     goes wrong still gives the device back, which has already been worth having
-    three times."""
+    three times.
+
+    It builds the crate and reads the wedge kernel's own PTX first. Six runs of
+    this demonstration failed because the spin was *deleted* by the backend --
+    a loop with no side effect may be assumed to terminate -- and each one cost a
+    container to discover from the outside. The loop is four lines of PTX and the
+    build has already emitted them; printing them is free, and a demonstration
+    that starts by showing the thing it depends on existing does not have to be
+    re-run to find out that it did not."""
     _run(SMI, cwd="/")
+    _run(["cargo", "oxide", "build", "kittens-experiments", "--arch", "sm_100a",
+          *WEDGE_FEATURES], cwd=EXPERIMENTS_DIR)
+    _run(["sh", "-c", WEDGE_PTX], cwd=EXPERIMENTS_DIR)
     green = "bench:softmax"
     wedged = "bench:sol-k"
     after = "device-tests"
