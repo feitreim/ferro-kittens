@@ -71,26 +71,42 @@ pub mod kernels {
 
     /// Occupy the device for `ticks` of the SM clock, computing nothing.
     ///
-    /// **`clock64` and not `globaltimer`, and that is a measurement.** The first
-    /// three spellings of this kernel read `globaltimer` — a wall clock in
-    /// nanoseconds, which is the number a caller would rather state — and all
-    /// three launched and returned immediately, wedging nothing. The launch
-    /// watchdog is what said so, once it was asked to trace: the guarded wait
-    /// straight after this launch reported **0.000 s** with a sixty-second spin
-    /// supposedly in front of it.
+    /// **This does not work yet, and the reason is written down rather than
+    /// guessed at again.** Two spellings have been run on a B200 — this one and
+    /// the same loop on `globaltimer` — and both launch and return immediately,
+    /// wedging nothing. The launch watchdog is what says so, once asked to trace:
+    /// the guarded wait taken straight after this launch reports
     ///
-    /// A loop with no side effect is a loop LLVM may assume terminates, and one
-    /// whose only content is a foldable register read has no side effect. So the
-    /// spin uses the primitive this tree has already watched terminate:
-    /// `clock64`, which is what [`kittens::sync::Semaphore::wait_before`] bounds
-    /// every spin in `sol_watch` with, per-SM and monotonic within a launch.
+    /// ```text
+    ///   wedge: queued; the next wait on this stream is a wait on it
+    ///   watchdog: waited 0.000 s
+    /// ```
     ///
-    /// The price is that `ticks` are SM clocks and not nanoseconds, so the
-    /// duration is approximate — a B200 boosts to about 1.9 GHz, so a caller
-    /// asking for `n * 1e9` ticks gets roughly `n / 2` seconds. Approximate is
-    /// all this needs: the demonstration only requires "much longer than the
-    /// budget", and being *shorter* than nominal is the safe direction for a
-    /// kernel whose other job is to give the device back.
+    /// with a sixty-second spin supposedly in front of it, and the sweep then
+    /// runs its whole ladder in the time that ladder costs with nothing in front
+    /// of it. So the guard records, polls and reports correctly; the kernel is
+    /// absent.
+    ///
+    /// The mechanism is LLVM's forward-progress rule: **a loop with no side
+    /// effect may be assumed to terminate, and may therefore be deleted.** A loop
+    /// whose only content is a special-register read has no side effect, and both
+    /// `clock64` and `globaltimer` are special-register reads. That is why
+    /// [`kittens::sync::Semaphore::wait_before`] is not a counter-example even
+    /// though `sol_watch` demonstrably spins on it: its condition calls
+    /// `mbarrier_try_wait_parity`, which touches memory.
+    ///
+    /// **So the next spelling to try is one whose condition touches memory** —
+    /// spin on a volatile read of a device word the host leaves at zero, bounded
+    /// by `clock64` so the kernel still gives the device back. A third attempt
+    /// wrote each `globaltimer` reading to a `*mut u64` and also returned
+    /// immediately, so a store in the *body* was not enough on its own and the
+    /// condition is the part to move.
+    ///
+    /// The duration is approximate either way, and deliberately: `ticks` are SM
+    /// clocks, so a B200 at about 1.9 GHz gives roughly `n / 2` seconds for
+    /// `n * 1e9`. The demonstration only needs "much longer than the budget", and
+    /// shorter-than-nominal is the safe direction for a kernel whose other job is
+    /// to give the device back.
     ///
     /// One warp of one block is enough: what the host waits on is the stream, and
     /// the stream is not drained until this returns however small the launch is.

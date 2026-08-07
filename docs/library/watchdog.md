@@ -132,13 +132,33 @@ nobody has watched fail is not a check. The spin is bounded rather than infinite
 so that a demonstration which goes wrong still gives the device back — which has
 been worth having.
 
-**It earned its keep before it ever passed.** The first attempt injected the spin
-at the top of the process rather than in front of a row, on the theory that
-wedging earlier can only be a stronger test. It sat in `DeviceBuffer::from_host`,
-which is why `stage` and `cleared` exist at all. The second, with those guarded,
-stopped before the sweep had printed its own header — ahead of the first guarded
-wait, with `kernels::load` the only candidate, which is a driver JIT this tree
-cannot put an event behind. Neither is the failure the watchdog is for, and a
-process wedged before it has loaded its kernels is a different test rather than a
-stronger one. The injection point moved to where #146 happened, and the spin
-gained a store in its loop so that "bounded" is a property rather than a hope.
+**It earned its keep before it ever passed, and it has not passed.** Six runs so
+far, none of which ended with the deadline firing, and each of which was a fact
+about this tree rather than a wasted container:
+
+1. Injected at the top of the process, it sat in `DeviceBuffer::from_host` —
+   which is why `stage` and `cleared` exist at all.
+2. With those guarded, it stopped before the sweep printed its own header, ahead
+   of the first guarded wait, with `kernels::load` the only candidate: a driver
+   JIT nothing here can put an event behind.
+3. Moved in front of the row's own launch — the shape #146 had — it stalled with
+   no way to say where, which is why `inject` announces each of its own steps.
+4. A `*mut u64` for the spin to store into: the launch returned immediately.
+5. With `TRACE_VARIABLE` on, the answer: `watchdog: waited 0.000 s`, taken
+   straight after a launch that was supposed to hold the device for a minute.
+6. The same on `clock64` instead of `globaltimer`.
+
+Runs 5 and 6 are the ones that matter and they point away from this module: the
+wait records its event, polls it, finds the stream empty and says so, all
+correctly. **The spin kernel is what is missing**, deleted by LLVM's
+forward-progress rule — a loop with no side effect may be assumed to terminate,
+and a loop whose only content is a special-register read has no side effect.
+`Semaphore::wait_before` is not a counter-example: its condition calls
+`mbarrier_try_wait_parity`, which touches memory. The next spelling to try is one
+whose *condition* touches memory, bounded by `clock64` so the kernel still gives
+the device back. `experiments/src/wedge.rs` carries that as its own note.
+
+Until that run comes back, the honest statement about this module is that it is
+reasoned and not demonstrated — which is exactly the thing `stall` exists to
+avoid one level out, and the reason this section is written in the negative
+rather than deleted.
