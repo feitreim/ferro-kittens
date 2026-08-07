@@ -115,6 +115,11 @@ const EPILOGUE_ROWS: u32 = (BLOCK_M / 32) as u32;
 /// other way at both entries and both passes, and the drain it was blamed on is
 /// now the part that gets faster: 4.72 µs to 3.05 µs an item at `[512, 256]`.
 ///
+/// #221 re-ran that table as a 2×2 and reproduced the `[512, 256]` win to a tenth
+/// of a percent (1.019 in both passes) but **not** the `[256, 256]` one, which
+/// came back 1.001 and 0.988 — inside that shape's own pass-to-pass spread. The
+/// split ships on the entry that has a same-container A/B that repeats.
+///
 /// The hardware argument that made the loss plausible is unchanged and was never
 /// the whole story — warps 0 and 4 do own the same 32 tensor-memory lanes, so the
 /// column split puts two requesters on each of four sub-partitions rather than
