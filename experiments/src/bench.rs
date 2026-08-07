@@ -1444,6 +1444,23 @@ pub fn main() -> ExitCode {
         };
     }
 
+    // `bench norm-occupancy` is #222's: a block-per-row norm against the tile
+    // walk at the walk's two levers. Its own sweep for `ldmatrix`' reason and
+    // one more — the deliverable is not a rate but a table whose other three
+    // columns come from the *driver* (registers, frame, blocks per SM), and a
+    // `Case` has nowhere to put those.
+    if let Some((name, _)) = &selected
+        && name == "norm-occupancy"
+    {
+        return match crate::norm_occupancy::compare(&context) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                println!("FAIL  {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // Each name in the list has to name a case. A list where one of three is a
     // typo would otherwise run two tables and say nothing about the third,
     // which is the failure mode worth being loud about: the reader gets a
