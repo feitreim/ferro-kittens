@@ -75,6 +75,13 @@ const STAGES: usize = 4;
 /// `docs/kernels/gemm_sol.md`.
 const ITEMS: usize = 4;
 /// Output tiles [`Small`] keeps in flight, and step 3 of [`ITEMS`]' derivation.
+///
+/// It is also the distance the release is deferred by, which is the whole of
+/// oxide-train #86's ping-pong: `Small::multiply` waits `empty(sequence − 2)`, so
+/// the accumulator an item takes was drained *two* items ago and item `i − 1`'s
+/// K walk has run since. [`Large`] cannot have that — its two slots are one
+/// item's two M-halves and its allocation is already the SM's whole 512 columns
+/// — and `docs/kernels/gemm_sol.md` has what follows from the asymmetry.
 const ACCUMULATORS: usize = 2;
 const _: () = assert!(ITEMS >= ACCUMULATORS + 2, "steps 3 and 4 above");
 const NARROW_N: usize = BLOCK_N / 2;
@@ -406,11 +413,12 @@ impl Common {
     /// the 256-wide entries and 8 at the narrow one. A lane guard that the count
     /// does not follow is a kernel that never launches a second item.
     ///
-    /// What makes the guard legal is [`Common::drain`]'s closing
-    /// `warp::sync_mask`: `tcgen05.wait::ld` retires every load the *warp* has
-    /// outstanding, so by the time lane 0 is through that sync no lane of it
-    /// still has the accumulator in flight. Nothing else in the drain reads
-    /// tensor memory.
+    /// What makes the guard legal is the `warp::sync_mask` [`Common::drain`]
+    /// puts between the last band's load and this call: `tcgen05.wait::ld`
+    /// retires every load the *warp* has outstanding, so by the time lane 0 is
+    /// through that sync no lane of it still has the accumulator in flight.
+    /// Nothing below that load reads tensor memory, which is why this is also
+    /// where the call belongs.
     #[inline(always)]
     unsafe fn release_accumulator(self, slot: u32) {
         unsafe {
@@ -463,12 +471,20 @@ impl Common {
 
     /// TMEM → registers → shared → `C`, a [`BAND_N`] band at a time, with both of
     /// the band's `.x8` issues in flight before one `tcgen05.wait::ld`.
+    ///
+    /// `slot` is released **the instant the last band's `tcgen05.wait::ld`
+    /// retires**, which is the instant the accumulator stops being read, and not
+    /// at the end of the drain. Everything below that load — the last band's
+    /// `stmatrix` pass and the `ld.shared`/`st.global` pass under it — leaves the
+    /// next item's critical path, and at `[512, 256]` that path is the whole
+    /// story: see `docs/kernels/gemm_sol.md`.
     #[inline(always)]
     unsafe fn drain<const N: usize, const STAGE_N: usize, const GROUPS: u32>(
         self,
         accumulator: TmemTile<BLOCK_M, N>,
         tile_row: u32,
         tile_column: u32,
+        slot: u32,
     ) {
         unsafe {
             const {
@@ -478,6 +494,7 @@ impl Common {
             let stage = self.staging::<STAGE_N>();
             let row = self.drain_row(tile_row);
             let (base, span) = self.drain_columns::<N, GROUPS>();
+            let last_band = span - BAND_N as u32;
             let mut column = 0u32;
             while column < span {
                 let mut band_column = 0u32;
@@ -486,6 +503,10 @@ impl Common {
                         32 * self.row_block(),
                         base + column + band_column,
                     );
+                    if column + band_column == last_band {
+                        warp::sync_mask(u32::MAX);
+                        self.release_accumulator(slot);
+                    }
                     store_tile_x4(stage.chunk_writer(), 0, band_column, self.lane, band);
                     band_column += BAND_N as u32;
                 }
@@ -672,8 +693,8 @@ impl<const N: usize, const HALF: usize, const STAGE: usize> Small<N, HALF, STAGE
                     Common::accumulator(self.accumulator, sequence),
                     row,
                     column,
+                    sequence,
                 );
-                common.release_accumulator(sequence);
                 sequence += 1;
             }
         }
@@ -859,8 +880,8 @@ impl Large {
                         self.accumulator.columns_right(half * BLOCK_N as u32),
                         info.row * 512 + half * 256,
                         info.column * BLOCK_N as u32,
+                        half,
                     );
-                    common.release_accumulator(half);
                     half += 1;
                 }
                 sequence += 1;

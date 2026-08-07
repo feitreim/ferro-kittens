@@ -315,6 +315,67 @@ whichever lane it came from. The count was never the term. It ships guarded
 anyway, because one arrival a warp is what the code means and 512 was an
 accident of where the guard was not.
 
+### The deferred release: one entry has it, the other cannot (#221)
+
+oxide-train #86's `gemm_sol_final` releases an accumulator so that the slot an
+item waits on drained a **full item's MMA ago** — `empty(i − SLOTS)` rather than
+`empty(i − 1)` — and reported the handoff collapsing from 4 815 to 100 SM ticks.
+Porting that here found the two entries in opposite states, and the difference is
+not a choice.
+
+**The `[256, N]` entries have had it all along.** `Small::multiply` waits
+
+```rust
+if common.rank == LEADER && sequence >= ACCUMULATORS as u32 {
+    common.empty.wait(sequence - ACCUMULATORS as u32);
+}
+```
+
+and `SemaphoreRing::<2>::wait(i − 2)` resolves to slot `(i − 2) % 2 == i % 2` at
+phase `((i − 2) / 2) & 1` — which is the arrival item `i − 2` made when *it*
+released that slot. It is `wait_recycled(sequence)` written out longhand: the
+accumulator item `i` takes was drained two items back, and item `i − 1`'s whole K
+walk has run since. The 512-column allocation ping-pongs **and** the wait skips a
+generation.
+
+**The `[512, 256]` entry does not, and no version of it can.** Its waits are
+`empty.sem(0).wait((sequence − 1) & 1)` at the top of `Large::multiply` and
+`empty.sem(1)` between the two MMA issues of the item's first stage: both are the
+*previous* item's drain. The reason is that its two slots are not a ping-pong
+across items at all — they are the item's own two 256-row halves of a 512-row
+macro-tile, both live for the whole K walk. Deferring by one item would need a
+third `[128, 256]` slot, and the entry's `alloc_cluster::<512>` is already the
+whole of an SM's tensor memory (`src/tmem.rs`: "an SM has 512"). There is no
+third slot to have.
+
+**Which is the reconciliation #197 was missing.** oxide-train's kernel is a
+one-accumulator geometry — this tree's `[256, 256]` — so the null oxide-train
+PR #119 measured for the warpgroup split was measured against an already-deferred
+release. #197's +2.1% was measured at `[512, 256]`, where the drain sits between
+an item and its successor entire, and the same table's `[256, 256]` arm read
++0.8%/+0.9%: the split's win tracks the deferral almost two and a half to one.
+The arithmetic agrees. At 8192³ the `[512, 256]` entry runs seven items a cluster
+in 0.5396 ms, so an item is 77 µs; the split cut the drain 4.72 µs → 3.05 µs, and
+1.67 / 77 is 2.2% against 2.1% measured. **The drain there is exposed
+essentially 1:1**, and the 3.05 µs that remain are 3.9% of the launch.
+
+### The release's other half: where in the drain it sits
+
+What `[512, 256]` cannot defer across items it can still stop paying for inside
+one. A warp is done with the accumulator the instant its **last** band's
+`tcgen05.wait::ld` retires — nothing below that load reads tensor memory — but
+the release used to sit at the end of `Common::drain`, past that band's
+`stmatrix` pass and past the `ld.shared`/`st.global` pass under it. Those are the
+two phases `bench sol-ablate`'s doubling ladder prices at most of the drain
+(`twice shared − twice global` alone is 69%), and every one of them was standing
+between an accumulator's last read and the next item's first MMA.
+
+So the arrival moved to the last band's load, behind one `warp::sync_mask` — the
+same sync that makes #218's lane guard legal, now placed where it also makes the
+timing legal. `drain` takes the slot it is draining rather than the epilogue
+releasing it afterwards, which is why the call has no site outside `drain` at
+all.
+
 ### The drain rungs
 
 The shipped drain is a band of 64 columns out of TMEM, `stmatrix` into the
