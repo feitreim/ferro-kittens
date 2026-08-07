@@ -11,11 +11,26 @@
 //! `profile` were kept out of `session --arms`: an arm that can wedge takes
 //! every row after it.
 //!
-//! This is the wait with a deadline on it. [`wait`] records an event behind
-//! whatever is queued on the stream and *polls* it rather than blocking, so the
-//! host keeps its own clock: past [`budget`] it prints the row the sweep last
-//! announced and ends the process. One row fails in seconds, and the rows after
-//! it — in later processes of the same container — run.
+//! This is the wait with a deadline on it, and there are **two** of them because
+//! one is not enough:
+//!
+//! 1. **[`wait`], on a launch.** It records an event behind whatever is queued on
+//!    the stream and *polls* it rather than blocking, so the host keeps its own
+//!    clock: past [`budget`] (30 s) it prints the row the sweep last announced and
+//!    ends the process. Precise, and fires fast.
+//! 2. **[`watching`], on a row.** A sentinel thread, armed by the row
+//!    announcement, that ends the process past [`row_budget`] (10 min) wherever
+//!    the main thread happens to be.
+//!
+//! The second exists because the first has a hole that only a device could show:
+//! **an event cannot be recorded behind a driver call that never returns.** With
+//! a spin kernel resident, the row's own `cuLaunchKernelEx` blocks — measured, on
+//! a B200, over eight runs of `modal_app.py::wedge_demo` — and the guarded wait
+//! after it is never reached, so nothing polls and nothing expires. A thread is
+//! the only place a deadline can sit that no driver call can hold.
+//!
+//! Either way: one row fails, and the rows after it — in later processes of the
+//! same container — run.
 //!
 //! ```no_run
 //! use kittens::watchdog::{ReadBack, watching};
@@ -65,6 +80,7 @@
 //! Design notes: `docs/library/watchdog.md`.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -103,37 +119,127 @@ const SPIN: Duration = Duration::from_millis(50);
 /// calls at this rate, which is free beside what it is waiting for.
 const POLL: Duration = Duration::from_millis(1);
 
+/// How long one announced row may take before it is a wedge, in milliseconds.
+///
+/// **The second deadline, and the one that catches what the first cannot.**
+/// [`wait`] can only bound a driver call that *returns* — it records an event
+/// behind the work and polls it, and a call that never comes back never reaches
+/// the poll. That is not hypothetical: with a spin kernel resident, the row's own
+/// `cuLaunchKernelEx` blocks, and eight runs of `modal_app.py::wedge_demo`
+/// measured the host sitting in it while the guarded wait after it was never
+/// reached. See `docs/library/watchdog.md`.
+///
+/// So this one runs on its own thread, where no driver call can hold it, and
+/// covers the row from the announcement onward — the launch, the module load,
+/// the staging, the wait, all of it. Its budget is correspondingly coarse,
+/// because a row legitimately includes host work: the 16384³ rows check 268
+/// million outputs against an f64 reference on the CPU, which is minutes. Ten
+/// minutes clears that and is still a sixth of the `SWEEPING` ceiling a wedge
+/// used to ride.
+///
+/// Two deadlines rather than one because they answer different questions and
+/// neither subsumes the other: 30 s on a *wait* is precise and fires fast; ten
+/// minutes on a *row* is coarse and cannot be evaded.
+pub const DEFAULT_ROW_BUDGET_MS: u64 = 600_000;
+
+/// Overrides [`DEFAULT_ROW_BUDGET_MS`] for one process, per [`BUDGET_VARIABLE`].
+pub const ROW_BUDGET_VARIABLE: &str = "KITTENS_ROW_BUDGET_MS";
+
+/// How often the sentinel thread looks at the clock. Coarse on purpose: it is
+/// checking a budget measured in minutes, and a thread that wakes four times a
+/// second costs nothing beside a sweep.
+const SENTINEL_POLL: Duration = Duration::from_millis(250);
+
 /// The row a sweep last announced, which is what a fired deadline names.
 static WATCHING: Mutex<Option<String>> = Mutex::new(None);
 
 static BUDGET: OnceLock<Duration> = OnceLock::new();
+static ROW_BUDGET: OnceLock<Duration> = OnceLock::new();
 
-/// Name what the next waits are waiting for.
+/// When the current row runs out, as milliseconds since [`STARTED`]. Zero is
+/// disarmed, which is every process that never announces a row.
+static ROW_DEADLINE: AtomicU64 = AtomicU64::new(0);
+static STARTED: OnceLock<Instant> = OnceLock::new();
+
+fn since_start() -> u64 {
+    STARTED.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Name what the next waits are waiting for, and start this row's clock.
 ///
 /// Call it where the sweep already announces a row — the announcement and this
 /// are the same fact, and `sol::sweep_k`'s doc has been leaning on the first
 /// half of it since #149: *"the last announced row is the one that did not
 /// return"*. A sweep that names nothing is named by its own command line, which
-/// still says which case is in flight.
+/// still says which case is in flight — and gets no row deadline, since nothing
+/// has said where a row begins.
 pub fn watching(what: impl Into<String>) {
     *WATCHING.lock().unwrap_or_else(|held| held.into_inner()) = Some(what.into());
+    ROW_DEADLINE.store(
+        since_start() + row_budget().as_millis() as u64,
+        Ordering::Relaxed,
+    );
+    sentinel();
+}
+
+/// The thread that watches [`ROW_DEADLINE`], started by the first [`watching`].
+///
+/// A thread and not a timer callback because the only requirement is that it is
+/// *not* the thread inside the driver. It is spawned once, never joined, and
+/// outlives every row; the process it is watching is one this module is prepared
+/// to end, so there is nothing to tear down.
+fn sentinel() {
+    static STARTED_SENTINEL: OnceLock<()> = OnceLock::new();
+    if STARTED_SENTINEL.set(()).is_err() {
+        return;
+    }
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(SENTINEL_POLL);
+            let deadline = ROW_DEADLINE.load(Ordering::Relaxed);
+            let now = since_start();
+            if deadline != 0 && now > deadline {
+                expired(
+                    "the row deadline",
+                    Duration::from_millis(now - deadline + row_budget().as_millis() as u64),
+                    row_budget(),
+                    ROW_BUDGET_VARIABLE,
+                );
+            }
+        }
+    });
+}
+
+/// The deadline every announced row carries.
+pub fn row_budget() -> Duration {
+    *ROW_BUDGET.get_or_init(|| {
+        parse_budget_or(
+            std::env::var(ROW_BUDGET_VARIABLE).ok().as_deref(),
+            DEFAULT_ROW_BUDGET_MS,
+        )
+    })
 }
 
 /// The deadline every wait in this process carries.
 pub fn budget() -> Duration {
-    *BUDGET.get_or_init(|| parse_budget(std::env::var(BUDGET_VARIABLE).ok().as_deref()))
+    *BUDGET.get_or_init(|| {
+        parse_budget_or(
+            std::env::var(BUDGET_VARIABLE).ok().as_deref(),
+            DEFAULT_BUDGET_MS,
+        )
+    })
 }
 
 /// [`BUDGET_VARIABLE`]'s value as a budget. Unset and unparseable are the same
 /// answer on purpose: a typo in a budget must not silently remove the deadline,
 /// and there is no reading of `KITTENS_LAUNCH_BUDGET_MS=forever` that a run
 /// should honour.
-fn parse_budget(setting: Option<&str>) -> Duration {
+fn parse_budget_or(setting: Option<&str>, default: u64) -> Duration {
     Duration::from_millis(
         setting
             .and_then(|text| text.trim().parse().ok())
             .filter(|&milliseconds| milliseconds > 0)
-            .unwrap_or(DEFAULT_BUDGET_MS),
+            .unwrap_or(default),
     )
 }
 
@@ -151,16 +257,19 @@ fn announced() -> String {
 /// is where the row announcements are, and a reader watching one should not have
 /// to find the other. Flushed explicitly because [`std::process::abort`] runs no
 /// handlers, which is the whole reason it is the one used.
-fn expired(waited: Duration) -> ! {
+fn expired(which: &str, waited: Duration, budget: Duration, variable: &str) -> ! {
     let report = format!(
         "\n== kittens: the launch watchdog fired ==\n  \
          {}\n  \
-         did not complete within {:.1} s ({} = {} ms). the launch is still in flight,\n  \
-         so this process ends here rather than reporting a device it gave up on.\n",
+         did not complete within {:.1} s -- {} of {:.1} s ({} = {} ms). the launch is\n  \
+         still in flight, so this process ends here rather than reporting a device it\n  \
+         gave up on.\n",
         announced(),
         waited.as_secs_f64(),
-        BUDGET_VARIABLE,
-        budget().as_millis(),
+        which,
+        budget.as_secs_f64(),
+        variable,
+        budget.as_millis(),
     );
     println!("{report}");
     let _ = std::io::stdout().flush();
@@ -200,7 +309,7 @@ pub fn wait_event(event: &CudaEvent) -> Result<(), DriverError> {
         }
         let waited = start.elapsed();
         if waited >= budget {
-            expired(waited);
+            expired("the launch deadline", waited, budget, BUDGET_VARIABLE);
         }
         if waited < SPIN {
             std::hint::spin_loop();
@@ -279,14 +388,27 @@ mod tests {
     /// one — the failure mode worth a test is a deadline switched off by a typo.
     #[test]
     fn a_budget_only_moves_for_a_positive_number() {
+        let of = |setting| parse_budget_or(setting, DEFAULT_BUDGET_MS);
         let default = Duration::from_millis(DEFAULT_BUDGET_MS);
-        assert_eq!(parse_budget(Some("1500")), Duration::from_millis(1500));
-        assert_eq!(parse_budget(Some(" 1500 ")), Duration::from_millis(1500));
-        assert_eq!(parse_budget(None), default);
-        assert_eq!(parse_budget(Some("")), default);
-        assert_eq!(parse_budget(Some("forever")), default);
-        assert_eq!(parse_budget(Some("-1")), default);
-        assert_eq!(parse_budget(Some("0")), default);
+        assert_eq!(of(Some("1500")), Duration::from_millis(1500));
+        assert_eq!(of(Some(" 1500 ")), Duration::from_millis(1500));
+        assert_eq!(of(None), default);
+        assert_eq!(of(Some("")), default);
+        assert_eq!(of(Some("forever")), default);
+        assert_eq!(of(Some("-1")), default);
+        assert_eq!(of(Some("0")), default);
+    }
+
+    /// The two budgets are separate settings with separate defaults, which is
+    /// the whole point of there being two of them.
+    #[test]
+    fn the_row_budget_is_its_own_number() {
+        const { assert!(DEFAULT_ROW_BUDGET_MS > DEFAULT_BUDGET_MS) };
+        assert_ne!(ROW_BUDGET_VARIABLE, BUDGET_VARIABLE);
+        assert_eq!(
+            parse_budget_or(None, DEFAULT_ROW_BUDGET_MS),
+            Duration::from_millis(DEFAULT_ROW_BUDGET_MS)
+        );
     }
 
     #[test]

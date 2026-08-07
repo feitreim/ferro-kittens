@@ -1232,9 +1232,12 @@ def wedge_demo(seconds: int = 120, budget_ms: int = 5000) -> None:
     did nothing; one where a green arm failed is a wedge that took a neighbour,
     which is the thing this whole change claims cannot happen. Both raise here.
 
-    `budget_ms` is `KITTENS_LAUNCH_BUDGET_MS`, five seconds rather than the
-    30 s default so the demonstration costs seconds of B200 rather than a minute
-    -- and so the override itself is exercised. `seconds` is twenty-four times
+    `budget_ms` sets *both* deadlines -- `KITTENS_LAUNCH_BUDGET_MS` and
+    `KITTENS_ROW_BUDGET_MS` -- to five seconds, against defaults of 30 s and ten
+    minutes, so the demonstration costs seconds of B200 and so the overrides are
+    themselves exercised. The one that fires is the row deadline: the wedged
+    launch never returns, so there is no event behind it for the wait deadline to
+    poll, which is the hole the sentinel thread exists to cover. `seconds` is twenty-four times
     that; the spin is bounded rather than infinite so that a demonstration that
     goes wrong still gives the device back, which has already been worth having
     three times.
@@ -1263,6 +1266,11 @@ def wedge_demo(seconds: int = 120, budget_ms: int = 5000) -> None:
                 {
                     "KITTENS_WEDGE_SECONDS": str(seconds),
                     "KITTENS_LAUNCH_BUDGET_MS": str(budget_ms),
+                    # The row deadline, and the one that actually fires here.
+                    # A launch that has not returned has no event behind it, so
+                    # the wait deadline above never gets to run -- see
+                    # `kittens::watchdog`. This is the sentinel thread's budget.
+                    "KITTENS_ROW_BUDGET_MS": str(budget_ms),
                     # Every wait says how long it took, so a run where the
                     # deadline does *not* fire still says whether this wait
                     # returned promptly (something else is blocking) or never
