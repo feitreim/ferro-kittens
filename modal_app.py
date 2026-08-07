@@ -1190,7 +1190,7 @@ WEDGE_FEATURES = ["--features", "cublas,wedge"]
 
 @app.function(gpu=DEFAULT_GPU, cpu=8, timeout=RUNNING)
 @completes
-def wedge_demo(seconds: int = 600, budget_ms: int = 5000) -> None:
+def wedge_demo(seconds: int = 120, budget_ms: int = 5000) -> None:
     """Watch the launch watchdog fire, and watch the session survive it.
 
     This is to `kittens::watchdog` what `stall` is to `scripts/modal-run`: the
@@ -1217,9 +1217,10 @@ def wedge_demo(seconds: int = 600, budget_ms: int = 5000) -> None:
 
     `budget_ms` is `KITTENS_LAUNCH_BUDGET_MS`, five seconds rather than the
     30 s default so the demonstration costs seconds of B200 rather than a minute
-    -- and so the override itself is exercised. `seconds` is two orders of
-    magnitude past it; the spin is bounded rather than infinite so that a
-    demonstration that goes wrong still gives the device back."""
+    -- and so the override itself is exercised. `seconds` is twenty-four times
+    that; the spin is bounded rather than infinite so that a demonstration that
+    goes wrong still gives the device back, which has already been worth having
+    three times."""
     _run(SMI, cwd="/")
     green = "bench:softmax"
     wedged = "bench:sol-k"
