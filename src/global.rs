@@ -851,6 +851,11 @@ pub unsafe fn accumulate_shared_rows<
 /// `cuModuleLoadData` with `DriverError(218)`, while offline `ptxas` assembled
 /// the same text without complaint (#225, oxide-train #127).
 ///
+/// It is measured here too, not only downstream: `regcount`'s jump-table census
+/// reads **0** tabled entry functions at 3ae07a8, **55** with the exhaustive
+/// match in the tree, and **0** again once the wildcard came back. That is the
+/// gate this note is now backed by.
+///
 /// A wildcard lets the dead rung fold. Adding a rung therefore means spelling
 /// it in the byte ladder, in [`access_width`], in both drains, and
 /// moving `RUNGS` — which is the compile error that says so.

@@ -110,15 +110,22 @@ with every ferro check green, and the opcode diff that found it was run in the
 consumer's repo because ferro had no number that moved.
 
 `regcount` counts `brx` per entry function now, beside the local-memory depot
-and for the same reason: a substrate `ptxas` never reports. It is a **report**,
-and its section comment in `modal_app.py` carries the census that made it one —
-the tables were already there at #218, the same set, and they load. What was
-missing was never a gate. It was a column to diff.
+and for the same reason: a substrate `ptxas` never reports. It is a **gate** —
+a kernel in the shipped set that carries a jump table fails the run — and its
+section comment in `modal_app.py` carries the three-ref history that armed it:
+**0 tables at 3ae07a8, 55 at bda3329, 0 at main**, each read from a build seen
+to recompile. #219 put every one of them in and #227 took every one of them
+out. The report that shipped with #227 said otherwise because it was taken
+across the stale cache window #228 found; every count in it is superseded.
+Probes stay report-only, the way the depot's do.
 
 The device tier's half of this is `device-tests`' `shared_drain_quad`, which
-puts the consumer's shape — four of the ladder's dispatches in one entry — in
+puts four of the ladder's dispatches in one entry — the consumer's shape — in
 a module the harness JIT-loads on every run, at no extra container and no extra
 device time. Module load is whole-module, so tier 3 exercises it by starting.
+What it does **not** demonstrate is a JIT accepting four tables: it was added
+after the fix that removed them, so it has never carried one. It is a standing
+check that the shape stays cheap, not evidence about a driver.
 
 Both jobs go through **`scripts/modal-run`**, so the wedge watchdog and the
 completion sentinel cover this tier — see the wrapper's own section below.
