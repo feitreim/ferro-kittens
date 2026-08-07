@@ -117,11 +117,24 @@ the function itself (`timeout=`, Modal).
 ## The control
 
 `modal_app.py::wedge_demo`, and `experiments/src/wedge.rs` behind an
-off-by-default feature: a kernel that spins for ten minutes, queued on the
-default stream ahead of a sweep's own work, so the next wait the sweep takes is a
-wait on a launch that is still running. A three-arm session goes through it and
-must come back with exactly the middle arm failed.
+off-by-default feature: a kernel that spins for two minutes against a five-second
+budget, queued **immediately in front of a row's own launch, on that row's own
+stream** — everything loaded, everything staged, then a launch that will not
+finish. A three-arm session goes through it and must come back with exactly the
+middle arm failed.
 
 That exists for the reason `modal_app.py::stall` exists one level out: a check
 nobody has watched fail is not a check. The spin is bounded rather than infinite
-so that a demonstration which goes wrong still gives the device back.
+so that a demonstration which goes wrong still gives the device back — which has
+been worth having.
+
+**It earned its keep before it ever passed.** The first attempt injected the spin
+at the top of the process rather than in front of a row, on the theory that
+wedging earlier can only be a stronger test. It sat in `DeviceBuffer::from_host`,
+which is why `stage` and `cleared` exist at all. The second, with those guarded,
+stopped before the sweep had printed its own header — ahead of the first guarded
+wait, with `kernels::load` the only candidate, which is a driver JIT this tree
+cannot put an event behind. Neither is the failure the watchdog is for, and a
+process wedged before it has loaded its kernels is a different test rather than a
+stronger one. The injection point moved to where #146 happened, and the spin
+gained a store in its loop so that "bounded" is a property rather than a hope.

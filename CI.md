@@ -392,7 +392,7 @@ fails them for a reason none of them prints. The summary is there to be read.
 
 `modal run modal_app.py::wedge_demo` is what makes that a demonstration rather
 than an argument, the way `stall` does for the wrapper below: it launches a
-kernel that spins for ten minutes and takes a three-arm session through it,
+kernel that does not return and takes a three-arm session through it,
 requiring exactly the middle arm to fail.
 
 ### 3. Measure at the cheapest tier that can see the thing

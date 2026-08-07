@@ -986,7 +986,7 @@ WRITE_OPT_WRAPPER = (
 #      the summary says which failed.
 #
 # `modal_app.py::wedge_demo` is what says this is true rather than reasoned:
-# it launches a kernel that spins for ten minutes and takes a three-arm session
+# it launches a kernel that does not return and takes a three-arm session
 # through it. The rule that replaces the old one is narrower and worth keeping:
 # **an arm may fail, and may not take the container with it.**
 RUN = ["cargo", "oxide", "run"]
