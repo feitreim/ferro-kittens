@@ -1460,21 +1460,24 @@ pub mod kernels {
     /// failing with `DriverError(218)` before a kernel was looked up, while
     /// offline `ptxas` accepted the same text (#225, oxide-train #127).
     ///
-    /// **What this measured, which is a negative result worth keeping.** On a
-    /// B200 on driver 580.95.05 — the driver in that report — this module
-    /// loads and the harness runs. So four jump tables in one entry are not
-    /// what a JIT refuses, and neither is one: at ferro #218, *before* the
-    /// commit the consumer bisected to, ferro's own PTX already carried 51 of
-    /// them and every gate was green (`modal_app.py`'s jump-table census
-    /// carries that comparison). Whatever tipped that module over is not the
-    /// count, and it is not reproducible here.
+    /// **What it does not show, which the doc it replaces claimed.** This entry
+    /// has never carried a jump table. It was added on the branch that fixed
+    /// #225, and that fix had already put both drains back on a three-case
+    /// dispatch, so the four instantiations here lower to four compare chains;
+    /// `modal_app.py`'s census reads zero for it and for every other entry in
+    /// the tree. The reading that said otherwise was taken across the stale
+    /// cache window #228 later found. So "a JIT accepts four tables in one
+    /// entry" is not something this module has ever demonstrated — the shape it
+    /// carries is the consumer's shape minus the construct the consumer failed
+    /// on.
     ///
-    /// It stays because it costs nothing and it is the only module in the tree
-    /// with the consumer's shape: module load is whole-module, so the harness
-    /// exercises this by starting at all, and a toolchain or driver that stops
-    /// taking the shape goes red here rather than downstream. No case launches
-    /// it. Launching it is safe (`DRAIN_THREADS`, the widest tile's shared
-    /// memory) and says nothing the four separate cases do not.
+    /// It stays because it costs nothing and it is still the only entry in the
+    /// tree that instantiates every drain at once: module load is whole-module,
+    /// so the harness exercises this by starting at all, and a change that makes
+    /// the ladder expensive again — four `brx.idx` here, or a spill — goes red
+    /// in a gate rather than in a consumer's bisect. No case launches it.
+    /// Launching it is safe (`DRAIN_THREADS`, the widest tile's shared memory)
+    /// and says nothing the four separate cases do not.
     #[kernel]
     pub unsafe fn shared_drain_quad(column: u32, mut out: DisjointSlice<u16>) {
         unsafe {

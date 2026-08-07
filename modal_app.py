@@ -2530,7 +2530,7 @@ def _print_local_depot() -> None:
     print(f"\n  {carrying} of {len(shipped)} shipped kernels carry local memory.")
 
 
-# --- the jump-table census ------------------------------------------------
+# --- the jump-table gate ----------------------------------------------------
 #
 # `brx.idx` is a computed branch through a `.branchtargets` label list — LLVM's
 # jump table, and the construct a downstream consumer's module died on: ferro
@@ -2538,58 +2538,68 @@ def _print_local_depot() -> None:
 # driver's PTX JIT refused the module at `cuModuleLoadData` with
 # `DriverError(218)`, before any kernel was looked up, while offline `ptxas`
 # assembled the same text and reported unchanged register counts (#225,
-# oxide-train #127). Every check on this page is `ptxas`, so every check on this
-# page was green.
+# oxide-train #127). Every other check on this page is `ptxas`, so every other
+# check on this page was green.
 #
-# **This is a report and not a gate, and the day-one census is why.** Measured
-# at bda3329: 55 of 318 entry functions carry one, and at 3ae07a8 -- the commit
-# before #219 -- 51 of 309 carry one, *the same set*, plus the four kernels that
-# did not exist yet. Every count is identical.
+# **The history, on three builds each verified fresh by `_freshen`.** Same
+# container recipe, same `sm_100a`, same pinned nightly, and all four crates seen
+# to recompile in each run:
 #
-# **At b589b8a the census reads zero, and that is not what #227 recorded.**
-# From a build verified fresh by `_freshen` -- all four crates recompiled in the
-# container, see the `find`/`touch` line at the top of the run -- this tree has
-# **0 of 319** entry functions carrying a `brx`, where #227's own codegen table
-# says "jump-table census: identical set, identical counts (+ the new probe)"
-# across the change that merged as b589b8a. 319 is 318 plus `shared_drain_quad`,
-# so the entry set is the one that comparison was about; only the counts differ,
-# and they differ by all of them.
+#     3ae07a8   #218, before the access ladder        0 of 309
+#     bda3329   after #219, before #227              55 of 318   (9 shipped)
+#     09beda9   main, after #227                      0 of 319
 #
-# The direction is the intended one -- #227 made both drains dispatch on
-# `access_width_bytes` with a wildcard, which is three cases, and LLVM branches
-# at three -- so what the fresh build says is that the fix removed every table in
-# the tree rather than none. #227 concluded the opposite, and its comparison was
-# taken across the warm cache volume this file's `_freshen` was written for: a
-# "main vs this branch" diff over that window could be two readings of the same
-# artifacts. That is the finding, not a defect in the fix.
+# So **#219 introduced every table in this tree and #227 removed every one of
+# them** — the consumer's bisect, exactly, in ferro's own PTX. Neither of the two
+# negative results #227 reported survives a fresh build:
 #
-# **So the arming condition below is now met** and deliberately not acted on
-# here: one fresh measurement of a report is not the same as a gate, and arming
-# one belongs to whoever re-takes the before/after on two verified-fresh builds. So the tables are not #219's in
-# this tree; they are what the four-rung access ladder has always lowered to
-# here, and they load: `device_tests` (57/57), `examples`, `kittens-experiments
-# -- check` and `bench --case gemm-sol` all run on a B200 on driver 580.95.05,
-# which is the driver in the report. `device-tests`' `shared_drain_quad` was
-# built to put the consumer's exact shape — four tables in one entry — in a
-# module the harness loads, and that loads too. So a `brx` is not sufficient to
-# fail a JIT load, and a gate here would fail every run of a tree that works.
+#   - *"The tables are not #219's: 3ae07a8 already emits 51 of the same set."*
+#     It emits **zero**. 3ae07a8 has no `AccessWidth` to match on — #219 is the
+#     commit that made the ladder a type — so both drains there dispatch on
+#     `access_width_bytes`, which is three cases, which LLVM branches. That is
+#     the same lowering #227 restored, and zero is the only count that tree can
+#     produce. The 51 was read across the warm cache volume, before `_freshen`.
+#   - *"Identical set, identical counts across the fix."* Same window, other
+#     side: 55 -> 0. The fix moved the count by all of it, in the direction its
+#     own argument predicted.
 #
-# What the census is for is the thing nobody had: a **number to diff**. The
-# regression downstream was one instruction class appearing in one module, and
-# it took a consumer's bisect to find because ferro measured registers, opcodes
-# and `.local` and never this. The column that moves is the finding.
+# **What that costs #225's "necessary but not sufficient", which is half.**
 #
-# Where it comes from, so a row that moves can be read: LLVM turns a switch into
-# a jump table at four cases and into branches at three
+#   - *"ferro's own 55 tabled kernels JIT-load fine on driver 580.95.05"*
+#     **stands.** No GPU entry point on this page mounts the cache volume (#226
+#     measured that the cache loses on a GPU container), so every device run has
+#     always built from source, stale window or not — and #227's B200 runs at
+#     then-main were runs of the 55-table tree. Those modules loaded.
+#   - *"`shared_drain_quad`'s four tables in one entry load fine"* **does not.**
+#     That probe was added on the fix branch, where the fix had already taken
+#     every table out of both drains; it is inside main's 0 of 319 and has never
+#     carried one. It has the consumer's shape minus the thing the consumer
+#     failed on, and its doc now says so.
+#
+# **So this arms**, on the condition the report set for itself — "it arms into a
+# gate when the shipped set reads zero" — now met on two builds known to be
+# fresh, at the ref before the ladder and at main. A shipped kernel that grows a
+# `brx` is a regression to the exact codegen that cost a consumer its module, and
+# there is no green tree left for the gate to fail.
+#
+# The gated set is the shipped one — every kernel `examples/` emits plus the
+# `GATED_KERNELS` rows — for the depot's reason next door: a probe exists to
+# measure a spelling, and a spelling worth measuring may be one the library must
+# not ship. That is not a hole here. Nine of bda3329's 55 were shipped, four of
+# them from `examples/` alone, so the #219 regression sits inside the gated set
+# with room to spare — and every tabled entry is printed either way. The table is
+# the diagnostic; the gate is how many of its rows are shipped.
+#
+# Where a row comes from, so one that appears can be read: LLVM turns a switch
+# into a jump table at four cases and into branches at three
 # (`MinimumJumpTableEntries`, checked against `llc -mtriple=nvptx64` at
 # sm_100a). The bf16 drains have four live rungs — 16, 8, 4 and 2 bytes — and
-# table; the fp32 drains have three, because `access_width` cannot return 2 for
-# a 4-byte element, and they never appear here. That pair is the in-tree
-# control. An exhaustive `match` over `AccessWidth` also *names* every rung, so
-# it re-materialises one a caller had constant-folded away — which is how a
-# consumer whose rungs folded to three acquired four (#225, `global`).
-#
-# It arms into a gate when the shipped set reads zero.
+# tabled at #219; the fp32 drains have three, because `access_width` cannot
+# return 2 for a 4-byte element, and never tabled at any commit. That pair is the
+# in-tree control on where the threshold is. An exhaustive `match` over
+# `AccessWidth` also *names* every rung, so it re-materialises one a caller had
+# constant-folded away — which is how a consumer whose rungs folded to three
+# acquired four (#225, `global`).
 JUMP_TABLE_PATTERN = "brx"
 
 
@@ -2636,21 +2646,23 @@ def _print_jump_tables() -> None:
     """`brx` in the PTX text, per entry function — the substrate `ptxas` cannot
     see and the one a runtime compiler can refuse.
 
-    A report, for the reason and with the numbers in the section comment above.
-    Diff it across a change the way the register table is diffed: a kernel that
-    gains a table has had a dispatch materialised, and a consumer that JIT-loads
-    it is the one who finds out."""
+    A **gate**, for the reason and on the history in the section comment above:
+    the shipped set reads zero at main and read zero before the access ladder
+    existed, and the one commit where it did not is the one that cost a consumer
+    its module. A shipped kernel carrying a table fails the run. Everything else
+    is printed and does not, so a probe may still spell a four-case dispatch on
+    purpose — and the table is the diagnostic either way, to be diffed like the
+    register table: a kernel that gains one has had a dispatch materialised."""
     counted = _jump_table_census()
     tabled = {key: count for key, count in counted.items() if count}
     print(
         f"\n  jump tables — `{JUMP_TABLE_PATTERN}` in the PTX text, per entry function.\n"
         "  LLVM tables a switch at four cases and branches at three, so this column is\n"
         "  the drain dispatch's arm count showing through. `ptxas` accepts a table and a\n"
-        "  driver's JIT may not (#225): diff it, do not read it."
+        "  driver's JIT may not (#225), so a shipped kernel carrying one fails this run."
     )
     if not tabled:
         print(f"    zero everywhere: none of the {len(counted)} entry functions carry one.")
-        print("    That is the census this report arms into a gate on — see modal_app.py.")
         return
 
     shipped = {key for key in counted if key[0] == "examples"}
@@ -2658,9 +2670,25 @@ def _print_jump_tables() -> None:
     for (crate, name), count in sorted(tabled.items()):
         mark = "shipped" if (crate, name) in shipped else ""
         print(f"    {crate + '/' + name:<52}{count:>6}{mark:>9}")
-    carrying = sum(1 for key in tabled if key in shipped)
-    print(f"\n  {len(tabled)} of {len(counted)} entry functions carry one, {carrying} of them shipped.")
+    carrying = sorted(key for key in tabled if key in shipped)
+    print(f"\n  {len(tabled)} of {len(counted)} entry functions carry one, {len(carrying)} of them shipped.")
     print(_jump_table_excerpt(), end="")
+
+    if not carrying:
+        return
+    raise RuntimeError(
+        f"{len(carrying)} shipped kernel(s) carry a `{JUMP_TABLE_PATTERN}` jump table:\n"
+        + "\n".join(f"  {crate}/{name}: {tabled[(crate, name)]}" for crate, name in carrying)
+        + "\n\nThis is the codegen that lost oxide-train its module at "
+        "`cuModuleLoadData` with DriverError(218) (#225): offline `ptxas` takes "
+        "it, a driver's PTX JIT may not, and nothing else on this page can see "
+        "it. The tree read zero at 3ae07a8 and reads zero at main, so this is a "
+        "regression and not a baseline.\n"
+        "The usual cause is a dispatch that names four cases where three are "
+        "live — an exhaustive `match` over the access ladder rather than one "
+        "over `access_width_bytes` with a wildcard (#227). The excerpt above "
+        "shows which dispatch built the first of them."
+    )
 
 
 @app.function(cpu=8, timeout=CHECKING, volumes=CACHE)
@@ -2712,9 +2740,9 @@ def regcount(arch: str = "sm_100a", label: str = "", determinism: bool = False) 
     The sixth reads that same substrate for the other thing a runtime compiler
     can refuse and `ptxas` cannot see: `brx` jump tables, which is what a
     four-case dispatch lowers to and what cost a consumer its module at
-    `cuModuleLoadData` (#225). Also a report, and its section comment carries
-    the day-one census, the driver it was measured on and the arming
-    condition.
+    `cuModuleLoadData` (#225). It is the second **gate** here — a shipped kernel
+    carrying one fails the run — and its section comment carries the three-ref
+    history that armed it and the reason probes stay report-only.
 
     `--determinism` measures the same tree twice, with both crates' artifacts
     thrown away in between, and asserts the two tables are identical. It is not
