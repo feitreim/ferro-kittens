@@ -173,6 +173,17 @@ arithmetic to cross a stacked subtile already exists — `mma::k_major_offset`
 does it for the typed walks — so a multi-atom `OperandWalk` is separable from
 the swizzle work. Both halves are recorded on #14.
 
+`BaseLdtm`'s **16-row floor** is the part of this entry with a measurement
+against it (#222). A warp's band cannot be shorter than 16 rows, which is what
+makes a row-wise kernel's threads-per-row 4 and its CTA `16 · WARPS` rows wide
+however few rows the problem has: at 6144 rows an 8-warp walk launches 48 CTAs
+on a 148-SM device. A second `FragmentLayout` with a shorter row block is the
+only thing that would move either number — but the same measurement says the
+walk's cost over *global* memory is a warp's access width and not its residency,
+so a narrower layout is not obviously the fix and is not filed as one.
+`experiments/src/norm_occupancy.rs` and `docs/library/global.md` carry the
+five-arm table.
+
 ### 1.4 Shared vectors — the type landed (#13), the ops did not
 
 TK has `sv` as a first-class type with its own maps, reductions, conversions and
@@ -627,6 +638,14 @@ other half — the vector half is #130's third item, the tile half is filed
 nowhere. Note also that everything above is warp
 scope. The fold four warps need is `sync::block_reduce` (1.1) — storage between
 two barriers, not a wider `Op`, because warps cannot shuffle to each other.
+
+`block_reduce` folds **one scalar a warp**, and there is no vector form: a
+`RegVec<M>` statistic that spans warps has no collective. That is the coupling
+that stops a band being split across warps by *column* — several warps sharing
+one 16-row band, each holding a narrower slice of it — which is the only shape
+left for raising a row-wise walk's threads-per-row (#222, 1.3). Filed nowhere,
+and #222 measured the reason not to build it first: the arm that already trades
+per-lane width for occupancy is the slowest of four.
 
 ### 3.3 MMA shape and dtype coverage — shapes done (#12), dtypes not
 

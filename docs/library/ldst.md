@@ -38,6 +38,25 @@ Each matrix instruction moves one `[16, 16]` block, and `load_tile` /
 (`place_block`, `take_block`) that `TmemTile::tile` uses over the drain. A band
 therefore cannot mean one thing in TMEM and another in shared memory.
 
+## A walk over *this* pair is not the walk that loses
+
+`load_tile` and `store_tile` are what the chunked band walk is normally written
+against, and the walk's two published verdicts belong to two different sources.
+Out of a TMA-staged shared tile — these movers — `groupnorm_tile` went
+**594 → 5996 GB/s** streaming a `CHUNK` at a time (`docs/kernels/layernorm.md`),
+and `layernorm_rows` sits beside it at 5539. Out of **global memory**, through
+`global::load_rows`, the same-shaped walk over an RMS norm's rows measures
+**2.1×** a block-per-row kernel at `dim = 3072`, and the arm that trades chunk
+width for occupancy measures 2.7× (`docs/library/global.md`, "When a row-wise
+walk over this path loses").
+
+The difference is where the scatter is paid. A fragment's addresses are
+scattered by construction, and `ldmatrix` is an instruction built for exactly
+that scatter across shared memory's banks; the same address set presented to
+global memory is eight half-used sectors a warp. So "the tile walk is slow here"
+is a claim about a *path* and never about the idiom, and the two are worth
+keeping apart when quoting either number.
+
 ## Why the vector pair is not a matrix instruction
 
 `load_vec` / `store_vec` are plain scalar accesses. A `ColVec`'s values are one

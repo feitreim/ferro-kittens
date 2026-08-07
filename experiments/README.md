@@ -5739,3 +5739,107 @@ now made that promotion:
 - **The swizzle and fragment layers.** No kernel here spells a swizzle phase, a
   chunk index, a subtile stride or a descriptor field — at any tile width,
   since #25. That is the library working.
+
+---
+
+## When a tile walk loses: the occupancy pole, measured (#222)
+
+`bench --case norm-occupancy`, `src/norm_occupancy.rs`. Five arms, one clock,
+one container. This section is the numbers; the argument is in
+`docs/library/global.md`.
+
+**Why it was run.** Two verdicts on the same idiom disagreed, and neither could
+be re-derived from the other's kernels. This tree's own: `groupnorm_tile` went
+**594 → 5996 GB/s** when a held band became a streamed one. oxide-train PR
+#124's: `rms_norm_forward_tile_bf16`, a faithful tile-walk rewrite of a
+block-per-row norm, measured **+7–14% across six runs, one sign**, and was
+reverted, with the mechanism given as occupancy — 8 blocks of 256 threads an SM
+against 8 of 128, identical bytes either way. #222 asked whether the walk could
+express a narrow-per-lane, high-occupancy form and dissolve the trade.
+
+**What the arms are.** Every arm computes `y = x · rsqrt(mean(x²) + ε)` per row,
+reads the row twice and writes it once, so all five issue identical bytes. The
+reference is a block-per-row kernel with no register tile in it — 256 threads, a
+`block_reduce_sum`, a pair of bf16 a lane at a time. The other four are the walk
+over `global::load_rows` at a `[16, CHUNK]` band a warp, differing only in
+`CHUNK` (fp32 live in a lane) and in warps a CTA (threads a block). That 2×2 is
+the point: the first parameter is register pressure and the second is block
+width, and #222's hypothesis is about the product of the two.
+
+Registers off `ptxas`, no spills and **no `.local` depot in any of the five**:
+23 for the reference, 32 at `CHUNK` 16, 48 at `CHUNK` 64.
+
+B200, 148 SMs, median of 3 whole measurements an arm taken round-robin, each the
+min over 30 timed launches after 5 warm-up, every arm checked against an f64
+reference over every element first (worst relative error 2.6–2.9e-3 against a
+2⁻⁷ tolerance).
+
+**24576 × 3072 — oxide-train's own shape, 453 MB a launch**
+
+| arm | threads | live f32 | blocks | waves | regs | blocks/SM | threads/SM | min ms | GB/s | vs row |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| block-per-row | 256 | 2 | 24576 | 166.05 | 23 | 8 | **2048** | 0.0716 | 6325.2 | 1.000 |
+| walk c64 w4 | 128 | 32 | 384 | 2.59 | 48 | 10 | 1280 | 0.1495 | 3030.6 | 2.087 |
+| walk c64 w8 | 256 | 32 | 192 | 1.30 | 48 | 5 | 1280 | 0.1809 | 2504.1 | 2.526 |
+| walk c16 w4 | 128 | 8 | 384 | 2.59 | 32 | 16 | **2048** | 0.1947 | 2326.3 | 2.719 |
+| walk c16 w8 | 256 | 8 | 192 | 1.30 | 32 | 8 | **2048** | 0.2237 | 2025.1 | 3.123 |
+
+**24576 × 1024 — the row length thirded, everything else held, 151 MB**
+
+| arm | threads/SM | min ms | GB/s | vs row |
+| --- | ---: | ---: | ---: | ---: |
+| block-per-row | 2048 | 0.0367 | 4110.3 | 1.000 |
+| walk c64 w4 | 1280 | 0.0453 | 3332.3 | 1.233 |
+| walk c64 w8 | 1280 | 0.0578 | 2614.2 | 1.572 |
+| walk c16 w4 | 2048 | 0.0595 | 2538.2 | 1.619 |
+| walk c16 w8 | 2048 | 0.0695 | 2171.5 | 1.893 |
+
+**6144 × 8192 — the granularity row: a walk CTA owns `16 · WARPS` rows, 302 MB**
+
+| arm | blocks | waves | threads/SM | min ms | GB/s | vs row |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| block-per-row | 6144 | 41.51 | 2048 | 0.0471 | 6411.1 | 1.000 |
+| walk c64 w4 | 96 | 0.65 | 1280 | 0.2480 | 1217.9 | 5.264 |
+| walk c64 w8 | 48 | 0.32 | 1280 | 0.2684 | 1124.9 | 5.699 |
+| walk c16 w4 | 96 | 0.65 | 2048 | 0.4832 | 625.0 | 10.257 |
+| walk c16 w8 | 48 | 0.32 | 2048 | 0.5187 | 582.2 | 11.012 |
+
+### What it says
+
+1. **The high-occupancy walk exists and needs no new API.** `CHUNK` and the warp
+   count are const parameters of the walk already; `c16 w8` is 8 fp32 a lane,
+   256 threads a block, 32 registers and **2048 threads an SM — the reference's
+   own occupancy**, confirmed by the driver at each arm's launch envelope rather
+   than derived.
+2. **It is the worst arm at every shape.** The four walk arms order identically
+   at 1024, 3072 and 8192 columns: `c64 w4` < `c64 w8` < `c16 w4` < `c16 w8`.
+   Chunk width orders this table and occupancy orders it backwards, so **#222's
+   API half is answered by measurement rather than by API** — the form it asked
+   for is expressible, was built, and loses.
+3. **The mechanism is access width, not residency.** Under `BaseLdtm` a warp's
+   paired access names 8 rows × 16 bytes — eight 32-byte sectors, half used —
+   where the reference's 32 lanes name one contiguous 128-byte line. Identical
+   bytes; not identical transactions. `docs/library/global.md` has said since
+   #11 that a fragment layout is a bad shape to *store* from; this is the load
+   side of that claim with a clock on it.
+4. **The 16-row floor costs a second thing, on the launch.** A CTA owns
+   `16 · WARPS` rows however few rows the problem has, so 6144 rows is 48 CTAs
+   on a 148-SM device. The `waves` column is why that third table is steeper
+   than the others, and a row under 1.00 there is measuring the launch shape.
+
+### What this is not
+
+The magnitudes are not oxide-train's. Its two arms were both at 1.8 TB/s, 23% of
+peak; the reference here reaches 6.3 TB/s of issued bytes at `dim = 3072`, and
+its second read of a 6 KiB row is L1-resident where a walk arm's 16-row band is
+not. So this reproduces the **sign** and the **lever ordering** — which is the
+part #222 asked about, and the part that is internally controlled, since the
+four walk arms differ from each other in nothing but two const parameters — and
+it does not reproduce the 7–14%.
+
+The remaining direction, for whoever wants it: split a 16-row band across warps
+by **column**, so several warps share one band at a narrower per-lane width.
+That is the one shape the walk cannot express today — its statistic is a
+`RegVec<16>` spanning warps, and `sync::block_reduce` folds one scalar per warp,
+with no vector form. Point 3 above is the reason to price the transactions
+before building it.

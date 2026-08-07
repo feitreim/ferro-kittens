@@ -153,6 +153,78 @@ instruction fed by 16 lanes' addresses; this is 32 threads each storing their ow
 values. A lane that does not call it leaves its own values unwritten rather than
 making an instruction ill-formed.
 
+### When a row-wise walk over this path loses, and what does not fix it
+
+The idiom this path invites is a **tile walk**: give a warp `load_rows` at
+`[16, CHUNK]`, carry a `RegVec` statistic across chunks, `store_rows` the
+result. It is short, it needs no shared memory and no barrier, and it is the
+right answer often enough that it is worth writing down where it is not.
+
+**Both poles are measured, and they are not the same kernel.**
+
+- **Frame- or depot-bound → the walk wins, by a lot.** `groupnorm_tile` held its
+  whole `[32, 128]` band as a value and went **594 → 5996 GB/s**, a factor of
+  10.1, when the band was streamed a `CHUNK` at a time — 168 registers and a
+  1536-byte frame down to 48 and none. `docs/kernels/layernorm.md` carries that
+  table. Note where that walk reads from: a **TMA-staged shared tile**, through
+  `ldst::load_tile`, not this path.
+- **Row-wise work already coalesced over global → the walk loses, and the loss
+  is the fragment map.** oxide-train PR #124 rewrote a block-per-row bf16 RMS
+  norm onto this path and measured **+7–14% worse across six runs, one sign**;
+  the kernel was reverted. `experiments/src/norm_occupancy.rs` is that
+  comparison rebuilt here, five arms on one clock, every arm reading the row
+  twice and writing it once so that all five issue identical bytes:
+
+| 24576 × 3072 | threads | live f32 | blocks | waves | regs | blocks/SM | threads/SM | GB/s | vs row |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| block-per-row | 256 | 2 | 24576 | 166.1 | 23 | 8 | **2048** | 6325 | 1.000 |
+| walk `CHUNK` 64, 4 warps | 128 | 32 | 384 | 2.59 | 48 | 10 | 1280 | 3031 | 2.087 |
+| walk `CHUNK` 64, 8 warps | 256 | 32 | 192 | 1.30 | 48 | 5 | 1280 | 2504 | 2.526 |
+| walk `CHUNK` 16, 4 warps | 128 | 8 | 384 | 2.59 | 32 | 16 | **2048** | 2326 | 2.719 |
+| walk `CHUNK` 16, 8 warps | 256 | 8 | 192 | 1.30 | 32 | 8 | **2048** | 2025 | 3.123 |
+
+**The occupancy lever was pulled and it made things worse.** A narrower chunk is
+fewer fp32 live in a lane, which is fewer registers, which is more resident
+threads: the `CHUNK` 16 arms reach 2048 threads an SM — the block-per-row arm's
+own number, at 32 registers against 23 — and they are the *slowest* two rows of
+the table. Every shape orders the four walk arms identically (`c64 w4` best,
+`c16 w8` worst) at 1024, 3072 and 8192 columns, so what orders this table is
+**chunk width**, and occupancy orders it backwards.
+
+That is the same claim the next section makes about storing, now with a clock on
+the load side: under `BaseLdtm` a warp's paired access names **8 rows × 16 bytes**
+— eight 32-byte sectors, half used — where the block-per-row arm's 32 lanes name
+one contiguous 128-byte line. Identical bytes, not identical transactions. A
+wider `CHUNK` buys some of that back (at 64 columns a chunk's row is a full
+128-byte line, walked by four lanes) which is exactly the direction the table
+runs in, and a narrower one spends it for registers nothing was short of.
+
+The 16-row floor costs a second thing, on the launch rather than in the lane: a
+CTA owns `16 · WARPS` rows however few rows the problem has. At 6144 rows the
+8-warp arms launch **48 CTAs on a 148-SM device** — 0.32 of a wave — and measure
+5.7× and 11.0× the reference. That row of the sweep is measuring the launch
+shape, and it is a property of the idiom rather than of the harness.
+
+So the decision rule, before rewriting a row-wise kernel onto this path:
+
+1. **Compute the achieved GB/s of what you have.** A kernel near HBM is not
+   waiting on registers and a mover rewrite cannot move traffic.
+2. **Count what a warp's fragment map names per access**, against what the
+   kernel it replaces names. Two adjacent bf16 out of a 16-row block is a
+   32-byte sector; a block-per-row loop is a 128-byte line. That ratio is the
+   thing the rewrite is spending.
+3. **Occupancy is not the answer to (2), and it is available**, so this is a
+   measurement rather than a wish: `CHUNK` and the warp count are both const
+   parameters of the walk, the narrow-per-lane high-occupancy form needs no API
+   this crate does not have, and it is the arm that lost worst.
+
+What is *not* expressible, for the reader who wants the remaining direction: a
+band split across warps by **column** rather than by row, so several warps share
+one 16-row band at a narrower per-lane width. Its statistic is a `RegVec<16>`
+spanning warps, and `sync::block_reduce` folds one **scalar** per warp — there is
+no vector form. That is the one structural coupling in the way, and the table
+above is the reason nobody should build it before measuring (2) first.
+
 ## Out of a staged tile instead
 
 `store_shared_rows` writes the same kind of destination `store_rows` does, out of
@@ -169,6 +241,10 @@ accesses widen to 16 bytes, and the addresses of a warp become one contiguous
 run. A warp of 32 lanes issuing `st.global.v4.b32` on consecutive chunks writes
 512 contiguous bytes, where the same band stored straight out of a fragment
 layout is 32 scattered pairs.
+
+The section above is what that costs when nobody pays it: the same scatter on
+the *load* side, timed, ordering a five-arm table by how many bytes a lane names
+per access.
 
 NVIDIA's own reference kernel takes exactly this route (`gemm_sol_final` in
 cuda-oxide at the pinned revision `20a5616`).

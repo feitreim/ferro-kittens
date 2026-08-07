@@ -68,6 +68,12 @@ Local usage:
                                       # the OTHER direction's width: softmax's
                                       # loads at ldmatrix .x2 against .x4,
                                       # paired and interleaved (#131)
+    modal run modal_app.py::bench --case norm-occupancy
+                                      # when a tile walk loses (#222): a
+                                      # block-per-row rms norm against the walk
+                                      # at both of the walk's levers, with the
+                                      # driver's registers and blocks/SM beside
+                                      # the clock
     modal run modal_app.py::bench --case residual
                                       # where the gap to cuBLASLt lives, with
                                       # every control re-run in one container

@@ -73,6 +73,9 @@ pub mod gemm_sol;
 #[cfg(feature = "gemm-sol-upstream")]
 pub mod gemm_sol_upstream;
 pub mod gemm_ws;
+/// The walk idiom's occupancy pole (#222): a block-per-row rms norm against the
+/// tile walk at both of the walk's levers, on one clock.
+pub mod norm_occupancy;
 /// `softmax` with its loads at `ldmatrix.m8n8.x4` — #131's arm, off the
 /// teaching crate's own device body with the load width as its only parameter.
 pub mod softmax_x4;
@@ -149,6 +152,14 @@ fn check(context: &std::sync::Arc<cuda_core::CudaContext>) -> ExitCode {
         (
             "softmax_x4",
             softmax_x4::check(context).map_err(|error| error.to_string()),
+        ),
+        // #222's five arms. They are a measurement and not a shipped kernel,
+        // which is exactly why they are on this gate: an occupancy table whose
+        // arms compute different norms would order them by which one dropped a
+        // pass.
+        (
+            "norm_occupancy",
+            norm_occupancy::check(context).map_err(|error| error.to_string()),
         ),
     ];
     // Only when the vendored upstream copy is compiled in, which is only under

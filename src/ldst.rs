@@ -29,6 +29,15 @@
 //! and are not that one transposed — see [`store_row_vec`] for why a column is
 //! a broadcast and a row is a scatter.
 //!
+//! **The chunked band walk these movers are written for is the form that wins**
+//! — `groupnorm_tile` streamed its band through [`load_tile`] at 594 → 5996
+//! GB/s (`docs/kernels/layernorm.md`). The *same* walk over
+//! [`crate::global::load_rows`] is the form that loses, by 2.1× on a row-wise
+//! norm (#222), because a fragment's scattered addresses are what `ldmatrix`
+//! exists for and are eight half-used sectors to global memory. Quoting either
+//! number about "the tile walk" without saying which path it was measured on is
+//! how one of them ends up applied to the other.
+//!
 //! Design notes and measurements: `docs/library/ldst.md`.
 
 use cuda_device::ptx_asm;
